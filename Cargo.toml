@@ -1,0 +1,52 @@
+[package]
+name = "javars"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Java as a fusevm frontend: a lexer/parser and compiler to fusevm::Chunk — Java source lowered to bytecode and run on the shared three-tier Cranelift JIT, with no bespoke VM or JVM"
+license = "MIT"
+repository = "https://github.com/MenkeTechnologies/javars"
+homepage = "https://menketechnologies.github.io/javars/"
+readme = "README.md"
+keywords = ["java", "compiler", "jit", "fusevm", "bytecode"]
+categories = ["command-line-utilities", "compilers"]
+publish = true
+# Dev-only artifacts kept out of the published crate. Consumers get src + the
+# `java` bin — not CI config, the integration-test corpus, or the .java examples.
+# None are referenced at compile time (no include_str! into them), so the
+# packaged crate still builds and its bin runs.
+exclude = [
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/docs/",
+]
+
+# javars is a standalone crate, not a workspace member. An explicit empty
+# `[workspace]` stops cargo walking up to the MenkeTechnologiesMeta parent.
+[workspace]
+
+[lib]
+name = "javars"
+path = "src/lib.rs"
+
+[[bin]]
+name = "java"
+path = "src/main.rs"
+
+[dependencies]
+# Java executes on fusevm. javars is a pure frontend: it lexes/parses Java and
+# lowers it to fusevm bytecode (src/compiler.rs). There is no local vm.rs/jit.rs
+# and no JVM — execution and codegen live in the shared engine behind zshrs,
+# stryke, awkrs, elisp, ruby.
+#
+# `jit-disk-cache` turns on fusevm's three-tier Cranelift JIT *and* its
+# persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
+# Java loops trace-compile and warm runs skip recompilation. `aot` enables the
+# ahead-of-time object emitter used by later `java --build` work.
+fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot"] }
+
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3"

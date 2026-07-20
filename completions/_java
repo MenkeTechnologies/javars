@@ -1,0 +1,14 @@
+#compdef java
+# Zsh completion for the javars `java` binary.
+
+_java() {
+  _arguments -s \
+    '(-version --version)'{-version,--version}'[print the version banner and exit]' \
+    '(-h --help -help)'{-h,--help,-help}'[print usage and exit]' \
+    '--dump-tokens[print the lexer token stream and exit]' \
+    '--dump-ast[print the parsed AST and exit]' \
+    '--disasm[print the lowered fusevm bytecode and exit]' \
+    '*:java file:_files -g "*.java"'
+}
+
+_java "$@"
