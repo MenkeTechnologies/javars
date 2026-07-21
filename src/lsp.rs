@@ -27,12 +27,12 @@ use lsp_types::{
 /// `docs/reference.html` generator. Every entry mirrors a surface the current
 /// javars build actually recognizes:
 ///   * "Keyword" → a reserved word in `lexer.rs` (`keyword_or_ident`).
-///   * "Type"    → an identifier javars accepts in declaration position
-///                 (`parser.rs` `looks_like_decl`); the runtime is dynamically
-///                 typed on the fusevm value model, so the annotation is
-///                 retained for diagnostics but does not gate execution yet.
-///   * "IO"      → the `System.out` methods lowered to the Java-formatting print
-///                 builtins in `host.rs` (`JPRINTLN` / `JPRINT`).
+///   * "Type" → an identifier javars accepts in declaration position
+///     (`parser.rs` `looks_like_decl`); the runtime is dynamically
+///     typed on the fusevm value model, so the annotation is
+///     retained for diagnostics but does not gate execution yet.
+///   * "IO" → the `System.out` methods lowered to the Java-formatting print
+///     builtins in `host.rs` (`JPRINTLN` / `JPRINT`).
 const CORPUS: &[(&str, &str, &str, &str)] = &[
     // ── Keyword (lexer keyword_or_ident) ──
     (
