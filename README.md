@@ -161,6 +161,23 @@ Implemented and checked against the reference `java`:
 | `--dump-tokens FILE` | Print the lexer token stream and exit. |
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--disasm FILE` | Print the lowered fusevm bytecode and exit. |
+| `--lsp` | Speak the Language Server Protocol over stdio (completion, hover, diagnostics). |
+| `--dap` | Speak the Debug Adapter Protocol over stdio (breakpoints, stepping, locals). |
+
+### Editor tooling
+
+`java --lsp` runs a read-only language server: completion and hover from the
+keyword / type / IO corpus (the same table that generates
+[`docs/reference.html`](https://menketechnologies.github.io/javars/reference.html)),
+and diagnostics from the runtime's own parser — a syntax error maps to a
+diagnostic on the reported line.
+
+`java --dap` runs a Debug Adapter over stdio: line breakpoints, single-stepping
+(`next` / `stepIn` / `stepOut` advance to the next statement in the single `main`
+frame), a `stackTrace` of the current frame, and `variables` inspection of
+`main`'s locals. The program is compiled with per-statement line markers only in
+this mode; `System.out` output is captured and forwarded as `output` events so it
+never corrupts the protocol channel.
 
 `java --version` reports the targeted language level (`java 21`) followed by the
 real engine (`javars <crate-version>`) and the host triple, so nothing is
