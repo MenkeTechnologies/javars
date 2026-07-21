@@ -59,8 +59,10 @@ impl Parser {
         std::mem::discriminant(self.peek()) == std::mem::discriminant(t)
     }
 
-    /// `[modifiers] class Name { members... }` — find the entry class and its
-    /// `main`. Leading `import`/`package` lines are tolerated (skipped to `;`).
+    /// A compilation unit: one or more top-level classes. Locates the class
+    /// declaring `public static void main(String[] args)` (the entry) and
+    /// flattens every class (top-level siblings and nested `static` classes)
+    /// into [`Program::classes`]. Leading `import`/`package` lines are tolerated.
     fn program(&mut self) -> Result<Program, String> {
         // Skip package/import prologue lines.
         loop {
@@ -74,67 +76,206 @@ impl Parser {
                 _ => break,
             }
         }
-        // class modifiers
-        while matches!(self.peek(), Tok::Public | Tok::Static) {
+        let mut entry: Option<(String, Vec<Stmt>)> = None;
+        let mut methods = Vec::new();
+        let mut classes = Vec::new();
+        // Top-level type declarations, in sequence.
+        while !self.is(&Tok::Eof) {
+            self.parse_class(&mut entry, &mut methods, &mut classes)?;
+        }
+        match entry {
+            Some((class_name, main)) => Ok(Program {
+                class_name,
+                main,
+                methods,
+                classes,
+            }),
+            None => Err(
+                "javars: no class declares `public static void main(String[] args)`".to_string(),
+            ),
+        }
+    }
+
+    /// Parse one `[modifiers] class Name [extends Super] { members }`. The entry
+    /// `main` body (when present) is written to `entry`; `static` methods go to
+    /// the flat `methods` pool; the class itself (with its fields, constructors,
+    /// and instance methods) is pushed to `classes`. Nested classes recurse into
+    /// the same three sinks (flattened namespace).
+    fn parse_class(
+        &mut self,
+        entry: &mut Option<(String, Vec<Stmt>)>,
+        methods: &mut Vec<Method>,
+        classes: &mut Vec<Class>,
+    ) -> Result<(), String> {
+        // modifiers (`public`, `static`, and ident-form `final`/`abstract`)
+        while matches!(self.peek(), Tok::Public | Tok::Static)
+            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract")
+        {
             self.advance();
         }
-        // `final`/`abstract` come through as idents; skip until `class`.
-        while !self.is(&Tok::Class) && !self.is(&Tok::Eof) {
-            self.advance();
-        }
+        let line = self.line();
         self.eat(&Tok::Class)?;
-        let class_name = self.ident()?;
+        let name = self.ident()?;
+        // optional `extends Super`
+        let superclass = if matches!(self.peek(), Tok::Ident(w) if w == "extends") {
+            self.advance();
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        // Java also allows `implements ...`; tolerate by skipping to `{`.
+        while !self.is(&Tok::LBrace) && !self.is(&Tok::Eof) {
+            self.advance();
+        }
         self.eat(&Tok::LBrace)?;
 
-        let mut main = None;
-        let mut methods = Vec::new();
+        let mut fields = Vec::new();
+        let mut ctors = Vec::new();
+        let mut inst_methods = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             if let Some(body) = self.try_main()? {
-                main = Some(body);
-            } else if let Some(m) = self.try_method()? {
-                methods.push(m);
+                *entry = Some((name.clone(), body));
+            } else if self.at_nested_class() {
+                self.parse_class(entry, methods, classes)?;
+            } else if let Some(c) = self.try_ctor(&name)? {
+                ctors.push(c);
+            } else if let Some((m, is_static)) = self.try_any_method()? {
+                if is_static {
+                    methods.push(m);
+                } else {
+                    inst_methods.push(m);
+                }
+            } else if let Some(fs) = self.try_fields()? {
+                fields.extend(fs);
             } else {
                 self.skip_member()?;
             }
         }
-
-        match main {
-            Some(main) => Ok(Program {
-                class_name,
-                main,
-                methods,
-            }),
-            None => Err(format!(
-                "javars: class `{class_name}` has no `public static void main(String[] args)`"
-            )),
-        }
+        self.eat(&Tok::RBrace)?;
+        classes.push(Class {
+            name,
+            superclass,
+            fields,
+            ctors,
+            methods: inst_methods,
+            line,
+        });
+        Ok(())
     }
 
-    /// If the cursor is at a `static` helper method (`[public] static <ret>
-    /// name(<params>) { ... }`), parse it. Otherwise restore the cursor and
-    /// return `None` so the member is skipped (fields, non-static methods,
-    /// constructors). `main` is matched earlier by [`Parser::try_main`], so it
-    /// never reaches here.
-    fn try_method(&mut self) -> Result<Option<Method>, String> {
+    /// True when the member at the cursor is a (possibly modifier-prefixed)
+    /// nested `class` declaration.
+    fn at_nested_class(&self) -> bool {
+        let mut j = self.pos;
+        while matches!(self.toks[j].kind, Tok::Public | Tok::Static)
+            || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "final" || w == "abstract")
+        {
+            j += 1;
+        }
+        matches!(self.toks[j].kind, Tok::Class)
+    }
+
+    /// If the cursor is at a constructor (`[public] Name(<params>) { ... }` where
+    /// `Name` is the enclosing class), parse it; otherwise restore and return
+    /// `None`. A constructor has no return type — the class name sits directly
+    /// before the `(`.
+    fn try_ctor(&mut self, class_name: &str) -> Result<Option<Ctor>, String> {
         let save = self.pos;
-        // Modifiers in any order; javars compiles only `static` methods (a
-        // static `main` can call them without an instance).
+        while matches!(self.peek(), Tok::Public | Tok::Static)
+            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract" || w == "private" || w == "protected")
+        {
+            self.advance();
+        }
+        let line = self.line();
+        let is_ctor = matches!(self.peek(), Tok::Ident(n) if n == class_name)
+            && matches!(&self.toks[self.pos + 1].kind, Tok::LParen);
+        if !is_ctor {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.advance(); // class name
+        self.eat(&Tok::LParen)?;
+        let params = self.params()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::LBrace)?;
+        let body = self.block()?;
+        Ok(Some(Ctor { params, body, line }))
+    }
+
+    /// Parse one or more instance-field declarations sharing a type
+    /// (`int x, y = 3;`). Restores and returns `None` if the member is not a
+    /// field (e.g. a method the earlier probes already rejected — a `type name (`
+    /// shape). `static` fields are accepted but treated as instance fields
+    /// (javars has no per-class statics yet).
+    fn try_fields(&mut self) -> Result<Option<Vec<FieldDecl>>, String> {
+        let save = self.pos;
+        while matches!(self.peek(), Tok::Public | Tok::Static)
+            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "private" || w == "protected" || w == "volatile" || w == "transient")
+        {
+            self.advance();
+        }
+        if !self.at_type() {
+            self.pos = save;
+            return Ok(None);
+        }
+        let ty = self.type_name()?;
+        // A field is `type name` where name is not followed by `(` (that would be
+        // a method the method-probe should have taken).
+        let first_is_field = matches!(self.peek(), Tok::Ident(_))
+            && !matches!(&self.toks[self.pos + 1].kind, Tok::LParen);
+        if !first_is_field {
+            self.pos = save;
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        loop {
+            let name = self.ident()?;
+            let init = if self.is(&Tok::Assign) {
+                self.advance();
+                Some(self.var_init()?)
+            } else {
+                None
+            };
+            out.push(FieldDecl {
+                ty: ty.clone(),
+                name,
+                init,
+            });
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::Semi)?;
+        Ok(Some(out))
+    }
+
+    /// If the cursor is at a method (`[modifiers] <ret> name(<params>) { ... }`),
+    /// parse it and report whether it was `static`. Otherwise restore the cursor
+    /// and return `None` (fields and constructors are handled by their own
+    /// probes). `main` is matched earlier by [`Parser::try_main`], so it never
+    /// reaches here.
+    fn try_any_method(&mut self) -> Result<Option<(Method, bool)>, String> {
+        let save = self.pos;
         let mut saw_static = false;
-        while matches!(self.peek(), Tok::Public | Tok::Static) {
+        while matches!(self.peek(), Tok::Public | Tok::Static)
+            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract" || w == "private" || w == "protected" || w == "synchronized")
+        {
             if matches!(self.peek(), Tok::Static) {
                 saw_static = true;
             }
             self.advance();
         }
-        // `final`/`abstract`/etc. arrive as idents; a return type is required,
-        // so peeking a non-type here means this is not a method we compile.
-        if !saw_static || !self.at_type() {
+        // A return type is required, so peeking a non-type here means this is not
+        // a method (it is a field or constructor).
+        if !self.at_type() {
             self.pos = save;
             return Ok(None);
         }
         let line = self.line();
         let ret = self.type_name()?;
-        // `<ret> name (` — anything else (e.g. `static int COUNT =`) is a field.
+        // `<ret> name (` — anything else (e.g. `int COUNT =`) is a field.
         let name = match self.peek().clone() {
             Tok::Ident(n) if matches!(&self.toks[self.pos + 1].kind, Tok::LParen) => {
                 self.advance();
@@ -150,13 +291,16 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         self.eat(&Tok::LBrace)?;
         let body = self.block()?;
-        Ok(Some(Method {
-            name,
-            params,
-            ret,
-            body,
-            line,
-        }))
+        Ok(Some((
+            Method {
+                name,
+                params,
+                ret,
+                body,
+                line,
+            },
+            saw_static,
+        )))
     }
 
     /// Parse a comma-separated formal parameter list `<type> <name>, ...`, the
@@ -358,13 +502,13 @@ impl Parser {
     /// the trailing `;` (false for the `for` init/update clauses).
     fn simple_statement(&mut self, expect_semi: bool) -> Result<StmtKind, String> {
         // A local declaration starts with a type keyword/ident followed by an
-        // identifier: `int x`, `String s`, `var v`, `long n`, `double d`.
+        // identifier: `int x`, `String s`, `var v`, `int[] a`, `Point p`.
         if self.looks_like_decl() {
-            let ty = self.ident()?;
+            let ty = self.type_name()?;
             let name = self.ident()?;
             let init = if self.is(&Tok::Assign) {
                 self.advance();
-                Some(self.expression()?)
+                Some(self.var_init()?)
             } else {
                 None
             };
@@ -374,7 +518,9 @@ impl Parser {
             return Ok(StmtKind::Local { ty, name, init });
         }
 
-        // Assignment or expression statement.
+        // Bare-variable fast paths: `x <op>= e` and `x++`/`x--`. Handled before
+        // the general expression parse because `primary` rejects a bare `x++` in
+        // value position (post-inc/dec is a statement, not an expression here).
         if let Tok::Ident(name) = self.peek().clone() {
             let next = &self.toks[self.pos + 1].kind;
             if let Some(op) = assign_op(next) {
@@ -386,7 +532,6 @@ impl Parser {
                 }
                 return Ok(StmtKind::Assign { name, op, value });
             }
-            // post-inc/dec statement: `i++;`
             if matches!(next, Tok::PlusPlus | Tok::MinusMinus) {
                 let inc = matches!(next, Tok::PlusPlus);
                 self.advance(); // name
@@ -398,12 +543,68 @@ impl Parser {
             }
         }
 
-        // Fallback: an expression statement (e.g. System.out.println(...)).
-        let e = self.expression()?;
+        // Otherwise parse an lvalue/expression, then decide by what follows: an
+        // `a[i] = …` / `obj.f = …` assignment, an `a[i]++` post-inc, or a plain
+        // expression statement (`System.out.println(...)`, a call, `new C(...)`).
+        let lhs = self.expression()?;
+        if let Some(op) = assign_op(self.peek()) {
+            self.advance();
+            let value = self.expression()?;
+            if expect_semi {
+                self.eat(&Tok::Semi)?;
+            }
+            return self.make_assign(lhs, op, value);
+        }
+        if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
+            let inc = matches!(self.peek(), Tok::PlusPlus);
+            self.advance();
+            if expect_semi {
+                self.eat(&Tok::Semi)?;
+            }
+            // The discarded statement result makes `a[i]++` == `a[i] += 1`.
+            let op = if inc { AssignOp::Add } else { AssignOp::Sub };
+            return self.make_assign(lhs, op, Expr::Int(1));
+        }
         if expect_semi {
             self.eat(&Tok::Semi)?;
         }
-        Ok(StmtKind::Expr(e))
+        Ok(StmtKind::Expr(lhs))
+    }
+
+    /// Build an assignment statement from a parsed lvalue expression, rejecting
+    /// non-assignable left-hand sides.
+    fn make_assign(&self, lhs: Expr, op: AssignOp, value: Expr) -> Result<StmtKind, String> {
+        match lhs {
+            Expr::Var(name) => Ok(StmtKind::Assign { name, op, value }),
+            Expr::Index { array, index } => Ok(StmtKind::IndexAssign {
+                array: *array,
+                index: *index,
+                op,
+                value,
+            }),
+            Expr::Field { recv, name } => Ok(StmtKind::FieldAssign {
+                recv: *recv,
+                name,
+                op,
+                value,
+            }),
+            other => Err(format!(
+                "javars: `{other:?}` is not an assignable target on line {}",
+                self.line()
+            )),
+        }
+    }
+
+    /// Parse a variable/field initializer: an array literal `{...}` when the
+    /// cursor is on `{`, otherwise an ordinary expression.
+    fn var_init(&mut self) -> Result<Expr, String> {
+        if self.is(&Tok::LBrace) {
+            self.advance();
+            let elems = self.array_lit_elems()?;
+            Ok(Expr::ArrayLit { elems })
+        } else {
+            self.expression()
+        }
     }
 
     /// Heuristic: two identifiers in a row (`Type name`) with the type not being
@@ -582,7 +783,21 @@ impl Parser {
 
     fn binary(&mut self, min_bp: u8) -> Result<Expr, String> {
         let mut lhs = self.unary()?;
-        while let Some((op, bp)) = binop(self.peek()) {
+        loop {
+            // `instanceof` is a relational operator (binding power 4) whose
+            // right-hand side is a type name, not an expression.
+            if matches!(self.peek(), Tok::Ident(w) if w == "instanceof") && 4 >= min_bp {
+                self.advance();
+                let class = self.ident()?;
+                lhs = Expr::InstanceOf {
+                    expr: Box::new(lhs),
+                    class,
+                };
+                continue;
+            }
+            let Some((op, bp)) = binop(self.peek()) else {
+                break;
+            };
             if bp < min_bp {
                 break;
             }
@@ -617,10 +832,10 @@ impl Parser {
         }
     }
 
-    /// Parse a primary followed by any postfix `.method(args)` chain — instance
-    /// method calls on the primary's value (e.g. `s.substring(1).length()`).
-    /// Field access (`x.foo` with no call parens) and indexing (`a[i]`) are not
-    /// yet supported and reported as errors, not silently accepted.
+    /// Parse a primary followed by any postfix chain: `.method(args)` instance
+    /// method calls, `.field` field access (an array's `.length` or an instance
+    /// field), and `[index]` array indexing. Chains compose left-to-right
+    /// (`grid[i][j]`, `s.substring(1).length()`, `p.next.value`).
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
         loop {
@@ -637,16 +852,19 @@ impl Parser {
                         line,
                     };
                 } else {
-                    return Err(format!(
-                        "javars: field access `.{member}` is not supported yet (line {})",
-                        self.line()
-                    ));
+                    e = Expr::Field {
+                        recv: Box::new(e),
+                        name: member,
+                    };
                 }
             } else if self.is(&Tok::LBracket) {
-                return Err(format!(
-                    "javars: array indexing is not supported yet (line {})",
-                    self.line()
-                ));
+                self.advance();
+                let index = self.expression()?;
+                self.eat(&Tok::RBracket)?;
+                e = Expr::Index {
+                    array: Box::new(e),
+                    index: Box::new(index),
+                };
             } else {
                 break;
             }
@@ -681,6 +899,11 @@ impl Parser {
                 let e = self.expression()?;
                 self.eat(&Tok::RParen)?;
                 Ok(e)
+            }
+            Tok::New => self.new_expr(),
+            Tok::Ident(name) if name == "this" => {
+                self.advance();
+                Ok(Expr::This)
             }
             Tok::Ident(name) => {
                 // `System.out.println(...)` / `.print(...)`, or a var read,
@@ -718,6 +941,59 @@ impl Parser {
                 self.line()
             )),
         }
+    }
+
+    /// Parse a `new` expression, the cursor sitting just past `new`:
+    /// `new Type[size]` (default-valued array), `new Type[]{elems}` /
+    /// `new Type[]{}` (array literal), or `new Class(args)` (object).
+    fn new_expr(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        self.eat(&Tok::New)?;
+        let ty = self.ident()?;
+        if self.is(&Tok::LBracket) {
+            self.advance();
+            if self.is(&Tok::RBracket) {
+                // `new T[]{...}` — an array literal with an explicit element type.
+                self.advance();
+                self.eat(&Tok::LBrace)?;
+                let elems = self.array_lit_elems()?;
+                return Ok(Expr::ArrayLit { elems });
+            }
+            let size = self.expression()?;
+            self.eat(&Tok::RBracket)?;
+            if self.is(&Tok::LBracket) {
+                return Err(format!(
+                    "javars: multi-dimensional `new {ty}[..][..]` is not supported yet (line {line})"
+                ));
+            }
+            return Ok(Expr::NewArray {
+                elem_ty: ty,
+                size: Box::new(size),
+            });
+        }
+        // `new Class(args)` — object construction.
+        let args = self.call_args()?;
+        Ok(Expr::NewObject {
+            class: ty,
+            args,
+            line,
+        })
+    }
+
+    /// Parse the elements of an array literal `{e, e, ...}` (a trailing comma is
+    /// allowed), the cursor sitting just past the opening `{`; consumes the `}`.
+    fn array_lit_elems(&mut self) -> Result<Vec<Expr>, String> {
+        let mut elems = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            elems.push(self.expression()?);
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(elems)
     }
 
     /// Parse a parenthesized, comma-separated argument list `( e, e, ... )`,

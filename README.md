@@ -63,12 +63,16 @@ pure frontend over the shared engine. Highlights:
   diffed byte-for-byte against a reference `java`; the tests freeze that output
   so CI needs no JDK installed.
 
-This is an early slice: single-class programs with locals, arithmetic, the
-C-style control statements, `System.out.print[ln]`, user-defined `static`
-methods (recursion, parameters, value returns), and `String` instance methods.
-Classes/objects, arrays, and the wider standard library are the next waves (see
-[`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported construct is a parse
-error, not a silent mis-run.
+Covered today: locals, arithmetic, the C-style control statements,
+`System.out.print[ln]`, user-defined `static` methods (recursion, parameters,
+value returns), `String` instance methods, **reference arrays** (`new int[n]`,
+`{…}` literals, indexing, `.length`, and true pass-by-reference/aliasing on a
+host-owned object heap), and a **class/object model** (fields, constructors,
+instance methods, `this`, `new`, field access, single inheritance with
+`extends`/`super(…)`, `instanceof`, virtual method dispatch, and `toString()`
+overrides). The wider standard library is the next wave (see [`BUGS.md`](BUGS.md)).
+Nothing is faked — an unsupported construct is a parse error, not a silent
+mis-run.
 
 ---
 
@@ -243,24 +247,36 @@ Java source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 
 ## [0x06] STATUS & ROADMAP
 
-This release: single-class programs, `main`, locals, arithmetic / comparison /
-logic, Java integer-vs-float division, the ternary `?:` operator, `if` /
-`while` / `do`-`while` / `for` / `switch` (with fall-through, on `int` and
-`String`) / `break` / `continue` (including labeled `break outer;` /
-`continue outer;`) / `return`, `System.out`/`System.err` `print[ln]`, string
-concatenation, user-defined `static` methods (recursion, parameters, value
-returns over fusevm's `Op::Call` frame ABI), `String` instance methods, and a
-first slice of the standard library (`Math.*`, `Integer.parseInt`/`valueOf`/
-`toString`, `Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`) — all
-verified byte-for-byte against OpenJDK.
+This release: `main`, locals, arithmetic / comparison / logic, Java
+integer-vs-float division, the ternary `?:` operator, `if` / `while` /
+`do`-`while` / `for` / `switch` (with fall-through, on `int` and `String`) /
+`break` / `continue` (including labeled `break outer;` / `continue outer;`) /
+`return`, `System.out`/`System.err` `print[ln]`, string concatenation,
+user-defined `static` methods (recursion, parameters, value returns over
+fusevm's `Op::Call` frame ABI), `String` instance methods, a first slice of the
+standard library (`Math.*`, `Integer.parseInt`/`valueOf`/`toString`,
+`Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`), **reference
+arrays** (default-valued `new T[n]`, `{…}` literals, get/set indexing, `.length`,
+and reference/aliasing semantics on a host-owned object heap keyed by
+`Value::Obj`), and a **class/object model** (instance fields with initializers,
+constructors, instance methods dispatched over the frame ABI, `this`, `new`,
+field access `obj.f`, single inheritance with `extends` and `super(…)`,
+`instanceof`, runtime-class virtual dispatch for overrides, and `toString()`
+overrides honoured by `println`) — all verified byte-for-byte against OpenJDK.
+
+The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
+handle into a frontend-owned slab of arrays and instances (the same pattern the
+`ruby`/`node`/`php` frontends use), so identity and aliasing are real rather than
+value-copied.
 
 Next waves, in priority order:
 
-1. **Reference types** — arrays (with real reference/aliasing semantics on a host
-   heap) and a class/instance object model.
-2. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
-   collections, more `String` methods, arrow-`switch` expressions, and
-   instance-method dispatch on non-`String` receivers.
+1. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
+   collections, more `String` methods, and arrow-`switch` expressions.
+2. **Object-model depth** — method overloading by parameter type, interfaces,
+   abstract classes, multi-dimensional arrays, and virtual `toString` inside
+   string concatenation (today concatenation with a plain object uses the default
+   `Class@hash` form; `println(obj)` and explicit `.toString()` use the override).
 3. **A differential parity harness** — a snippet corpus diffed live against a
    reference `java`, frozen and replayed in CI (the pattern `ruby`/`node`/
    `python` frontends use).

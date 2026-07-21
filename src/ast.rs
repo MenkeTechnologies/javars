@@ -15,8 +15,52 @@ pub struct Program {
     pub class_name: String,
     /// The statements of `public static void main(String[] args)`.
     pub main: Vec<Stmt>,
-    /// User-defined `static` methods declared in the class (excluding `main`).
+    /// User-defined `static` methods declared in any class (a flat pool — javars
+    /// resolves a bare `name(...)` call to one of these by name). `main` is
+    /// excluded (it is the entry [`Program::main`]).
     pub methods: Vec<Method>,
+    /// Every user-defined class in the compilation unit (top-level siblings and
+    /// nested `static` classes, flattened into one namespace). The entry class
+    /// (whichever declares `main`) is also present here so `new EntryClass()` and
+    /// its instance members resolve.
+    pub classes: Vec<Class>,
+}
+
+/// A user-defined class: its instance fields, constructors, and instance
+/// methods. `static` methods are hoisted into [`Program::methods`]; only the
+/// non-static members live here. Modeled as heap objects ([`crate::host`]
+/// `HostObj::Instance`) at runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Class {
+    pub name: String,
+    /// The direct superclass name (`class C extends B`), if any.
+    pub superclass: Option<String>,
+    /// Instance fields in declaration order (name, type, optional initializer).
+    pub fields: Vec<FieldDecl>,
+    /// Declared constructors. Empty means the implicit no-arg default ctor.
+    pub ctors: Vec<Ctor>,
+    /// Instance (non-static) methods.
+    pub methods: Vec<Method>,
+    /// 1-based source line the class starts on (diagnostics).
+    pub line: u32,
+}
+
+/// An instance field declaration: `int x;` or `String name = "?";`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecl {
+    pub ty: String,
+    pub name: String,
+    /// Field initializer expression, run (with default values first) before the
+    /// constructor body — Java's instance-initialization order.
+    pub init: Option<Expr>,
+}
+
+/// A constructor: `ClassName(<params>) { <body> }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ctor {
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub line: u32,
 }
 
 /// A user-defined `static` method: `static <ret> name(<params>) { <body> }`.
@@ -71,6 +115,20 @@ pub enum StmtKind {
     },
     /// An assignment to an existing variable: `x = expr;`, `x += expr;`.
     Assign {
+        name: String,
+        op: AssignOp,
+        value: Expr,
+    },
+    /// An assignment to an array element: `a[i] = expr;`, `a[i] += expr;`.
+    IndexAssign {
+        array: Expr,
+        index: Expr,
+        op: AssignOp,
+        value: Expr,
+    },
+    /// An assignment to an instance field: `obj.f = expr;`, `this.f += expr;`.
+    FieldAssign {
+        recv: Expr,
         name: String,
         op: AssignOp,
         value: Expr,
@@ -192,16 +250,56 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
-    /// An instance method call `recv.method(args...)`. Slice 1 dispatches these
-    /// on `String` receivers through the [`crate::host`] string builtins
-    /// (`length`, `substring`, `equals`, …); `System.out.print[ln]` keeps its
-    /// dedicated [`Expr::Println`] form. Field access (`arr.length`) and other
-    /// receiver types are parse errors until the object/array model lands.
+    /// An instance method call `recv.method(args...)`. Dispatches on the
+    /// receiver's static type: a `String` receiver runs the [`crate::host`]
+    /// string builtins (`length`, `substring`, …); a user-class receiver calls
+    /// the class's mangled instance-method subroutine (static-type dispatch —
+    /// exact when there is no overriding). `System.out.print[ln]` keeps its
+    /// dedicated [`Expr::Println`] form.
     MethodCall {
         recv: Box<Expr>,
         method: String,
         args: Vec<Expr>,
         line: u32,
+    },
+    /// `new int[n]` — a fresh reference array of `n` default-valued elements.
+    /// The element type sets the default (`int`→0, `double`→0.0,
+    /// `boolean`→false, a class/`String`→`null`). Lives on the host heap as an
+    /// `Obj` handle, so aliasing is by reference.
+    NewArray {
+        elem_ty: String,
+        size: Box<Expr>,
+    },
+    /// An array literal `{a, b, c}` (from `int[] a = {1,2,3}` or
+    /// `new int[]{1,2,3}`). Builds a heap array from the element values.
+    ArrayLit {
+        elems: Vec<Expr>,
+    },
+    /// `array[index]` — element read. Bounds-checked at runtime.
+    Index {
+        array: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `recv.field` field access with no call parens: an array's `.length` or an
+    /// instance field. (String's `.length()` keeps its method-call form.)
+    Field {
+        recv: Box<Expr>,
+        name: String,
+    },
+    /// `new ClassName(args...)` — construct a class instance on the host heap.
+    NewObject {
+        class: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// `this` — the receiver of the enclosing instance method or constructor
+    /// (frame slot 0).
+    This,
+    /// `expr instanceof ClassName` — true when `expr` is a non-null instance of
+    /// `ClassName` or a subclass.
+    InstanceOf {
+        expr: Box<Expr>,
+        class: String,
     },
 }
 

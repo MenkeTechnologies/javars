@@ -1,8 +1,7 @@
 # Known gaps
 
-An honest list of what javars does **not** do yet. Slice 1 is a single-class,
-single-`main` subset; unsupported constructs are reported as parse errors, never
-silently mis-run.
+An honest list of what javars does **not** do yet. Unsupported constructs are
+reported as parse errors, never silently mis-run.
 
 ## Implemented
 
@@ -30,32 +29,43 @@ silently mis-run.
   `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`, `replace`,
   `repeat`. Index/length semantics use Unicode scalar (`char`) positions — exact
   for ASCII/BMP, one unit per astral char (see the `char` simplification below).
+- **Reference arrays.** `new T[n]` (default-valued), `{…}` literals (and
+  `new T[]{…}`), get/set indexing (`a[i]`, `a[i] = v`, compound `a[i] += v`,
+  `a[i]++`), and `a.length`. Arrays are heap objects (`Value::Obj` handles into a
+  host slab in `src/host.rs`), so Java's *reference* semantics hold: pass an array
+  to a method, mutate an element, and the caller observes the change. Out-of-range
+  indices fault like `ArrayIndexOutOfBoundsException`.
+- **Classes and objects.** `class C { fields; C(params){…}; methods }` — instance
+  fields (with initializers that run before the constructor), constructors,
+  instance methods, `this`, `new C(…)`, field access (`obj.f`, `obj.f = v`), and
+  implicit-`this` field/method access. Multiple classes per file, including nested
+  `static` classes. Instances are heap objects with reference/aliasing semantics.
+- **Instance-method dispatch.** `recv.method(args)` on a user class dispatches to
+  the mangled `Class#method#argc` subroutine over fusevm's `Op::Call` frame ABI
+  (`this` in slot 0). When a method is overridden in a subclass, dispatch is
+  **virtual** — keyed on the receiver's runtime class via a compile-time chain.
+- **Inheritance.** `extends`, `super(…)` constructor chaining, inherited fields
+  and methods, method overriding, and `instanceof` (respecting the subclass
+  chain). `toString()` overrides are honoured by `System.out.println(obj)` and by
+  an explicit `obj.toString()`.
 
 ## Not implemented (parse errors today)
 
-- **Instance methods, method overloading.** Only `static` helpers are compiled,
-  and they are keyed by name — two methods with the same name (overloads)
-  collide. No `this`, no dispatch on a receiver's runtime type.
-- **Classes, fields, objects, `new`.** No instance model, no fields, no
-  constructors, no `this`. `new` is lexed but has no semantics.
-- **Arrays.** `int[] a = …`, indexing (`a[i]`), `.length`, `new int[n]`. The
-  `args` parameter of `main` is parsed and ignored. fusevm's `Value::Array` is a
-  by-value `Vec`, so a faithful implementation of Java's array *reference*
-  semantics (pass to a method, mutate an element, observe the change in the
-  caller) needs a heap/handle indirection that is not yet built — arrays stay
-  unsupported rather than silently mis-run the aliasing case.
+- **Method overloading by parameter type.** Methods are keyed by name **and
+  arity**, so same-name overloads differing only in parameter *types* (not count)
+  collide.
+- **Interfaces, abstract classes, enums, records, generics.**
+- **Multi-dimensional arrays** (`new int[m][n]`) and the enhanced `for`
+  (`for (var x : coll)`).
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
   `String` statics listed above and the `String` instance methods are the whole
-  library surface — no `java.util.*` collections, no non-`String` receiver
-  instance methods, no `Math` constants (`Math.PI`).
-- **Field access on values.** `arr.length` and any `x.field` (only
-  `recv.method(...)` calls dispatch; a bare `.field` is a parse error).
+  library surface — no `java.util.*` collections, no `Math` constants
+  (`Math.PI`), no boxed-type methods beyond the listed statics.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
-- **Arrow `switch` expressions**, `switch` on enums/patterns, and the enhanced
-  `for` (`for (var x : coll)`).
+- **Arrow `switch` expressions**, `switch` on enums/patterns.
 - **`try`/`catch`/`finally`, exceptions, `throw`.**
-- **Generics, lambdas, streams, records, `var` type inference beyond storage.**
+- **Lambdas, streams, `var` type inference beyond storage.**
 
 ## Modeled with a documented simplification
 
@@ -63,9 +73,11 @@ silently mis-run.
   diagnostics but do not gate execution — the runtime is dynamically typed on the
   fusevm value model. Definite-assignment and type errors that `javac` would
   reject may run.
-- **`==` on non-numbers compares by value**, not Java reference identity. In
-  slice 1 this only affects strings/booleans and matches the far more common
-  intent; true reference `==` arrives with the object model.
+- **`==` on objects is reference identity; on strings it compares by value.**
+  Object and array handles (`Value::Obj`) are identity-comparable, so `x == y`,
+  `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
+  `==`. String `==`, however, compares by *value* (Java's is identity) — this
+  matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
 - **`char` literals are one-character strings**, not an integer `char` type.
 - **Integer arithmetic uses fusevm's 64-bit semantics.** Java `int` 32-bit
   overflow wrapping is not yet modeled (values behave like `long`).

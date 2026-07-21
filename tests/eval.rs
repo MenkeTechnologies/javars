@@ -480,3 +480,197 @@ fn unknown_static_method_is_an_error() {
         "an unregistered static method must error rather than run"
     );
 }
+
+// ── Reference arrays (host-heap objects) ────────────────────────────────────
+
+#[test]
+fn new_int_array_defaults_indexing_and_length() {
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         int[] x = new int[4]; x[0] = 7; x[3] = x[0] * 2;\
+         System.out.println(x[0]); System.out.println(x[3]);\
+         System.out.println(x[1]); System.out.println(x.length); } }");
+    assert!(ok);
+    // x[1] is the zero default; length is 4.
+    assert_eq!(out, "7\n14\n0\n4\n");
+}
+
+#[test]
+fn array_literal_and_length_drive_a_loop() {
+    let (out, _) = run("public class Main { public static void main(String[] a) {\
+         int[] y = {5, 10, 15, 20}; int s = 0;\
+         for (int i = 0; i < y.length; i++) { s += y[i]; }\
+         System.out.println(s); System.out.println(y.length); } }");
+    assert_eq!(out, "50\n4\n");
+}
+
+#[test]
+fn array_is_passed_by_reference_and_mutation_is_visible_in_caller() {
+    // The aliasing case round 1 correctly refused to fake: a method mutates an
+    // element through the handle and the caller observes it.
+    let (out, _) = run("public class Main {\
+         static void fill(int[] a, int v) { for (int i = 0; i < a.length; i++) { a[i] = v; } }\
+         static void bump(int[] a) { a[0] += 100; }\
+         public static void main(String[] x) {\
+         int[] arr = new int[3]; fill(arr, 9); bump(arr);\
+         System.out.println(arr[0]); System.out.println(arr[1]); System.out.println(arr[2]); } }");
+    assert_eq!(out, "109\n9\n9\n");
+}
+
+#[test]
+fn array_element_compound_assignment_and_post_increment() {
+    let (out, _) = run("public class Main { public static void main(String[] a) {\
+         int[] x = {12, 20, 30}; x[0]++; x[1] -= 5; x[2] /= 4;\
+         System.out.println(x[0] + \" \" + x[1] + \" \" + x[2]); } }");
+    // 13, 15, 7 — note integer-truncating /= on the int[] element.
+    assert_eq!(out, "13 15 7\n");
+}
+
+#[test]
+fn string_array_elements_are_reference_typed() {
+    let (out, _) = run(
+        "public class Main { public static void main(String[] a) {\
+         String[] w = {\"al\", \"bob\", \"cy\"};\
+         for (int i = 0; i < w.length; i++) { System.out.println(w[i] + \":\" + w[i].length()); } } }",
+    );
+    assert_eq!(out, "al:2\nbob:3\ncy:2\n");
+}
+
+#[test]
+fn array_index_out_of_bounds_is_an_error() {
+    let (_out, ok) = run("public class Main { public static void main(String[] a) {\
+         int[] x = new int[2]; System.out.println(x[5]); } }");
+    assert!(
+        !ok,
+        "an out-of-range array read must fault, not return junk"
+    );
+}
+
+// ── Classes: fields, constructors, instance methods, `this` ─────────────────
+
+#[test]
+fn class_constructor_fields_and_instance_methods() {
+    let (out, ok) = run("public class Main {\
+         static class Point { int x; int y;\
+         Point(int x, int y) { this.x = x; this.y = y; }\
+         int sum() { return x + y; }\
+         void shift(int d) { this.x += d; this.y += d; } }\
+         public static void main(String[] a) {\
+         Point p = new Point(3, 4); System.out.println(p.sum());\
+         p.shift(10); System.out.println(p.x + \",\" + p.y); System.out.println(p.sum()); } }");
+    assert!(ok);
+    assert_eq!(out, "7\n13,14\n27\n");
+}
+
+#[test]
+fn instance_field_initializers_run_before_the_constructor() {
+    let (out, _) = run("public class Main {\
+         static class Acc { int n = 100; int hits;\
+         void add(int v) { n += v; hits++; } }\
+         public static void main(String[] a) {\
+         Acc c = new Acc(); c.add(5); c.add(7);\
+         System.out.println(c.n); System.out.println(c.hits); } }");
+    // n starts at its initializer 100 → 112; hits starts at its 0 default → 2.
+    assert_eq!(out, "112\n2\n");
+}
+
+#[test]
+fn objects_are_passed_and_assigned_by_reference() {
+    let (out, _) = run("public class Main {\
+         static class Box { int v; Box(int v) { this.v = v; } }\
+         static void set(Box b, int x) { b.v = x; }\
+         public static void main(String[] a) {\
+         Box b = new Box(1); set(b, 42); System.out.println(b.v);\
+         Box b2 = b; b2.v = 99; System.out.println(b.v); } }");
+    // Mutation through a passed reference and through an aliased binding both
+    // show in the original.
+    assert_eq!(out, "42\n99\n");
+}
+
+#[test]
+fn array_of_objects_constructed_in_a_loop() {
+    let (out, _) = run("public class Main {\
+         static class P { int x; P(int x) { this.x = x; } int get() { return x; } }\
+         public static void main(String[] a) {\
+         P[] ps = new P[3]; for (int i = 0; i < ps.length; i++) { ps[i] = new P(i * i); }\
+         int s = 0; for (int i = 0; i < ps.length; i++) { s += ps[i].get(); }\
+         System.out.println(s); } }");
+    // 0 + 1 + 4 = 5.
+    assert_eq!(out, "5\n");
+}
+
+// ── Inheritance, super(), instanceof, virtual dispatch, toString ────────────
+
+#[test]
+fn subclass_inherits_fields_and_super_constructor_runs() {
+    let (out, _) = run(
+        "public class Main {\
+         static class Animal { String name; Animal(String n) { this.name = n; } String describe() { return \"a \" + name; } }\
+         static class Dog extends Animal { Dog(String n) { super(n); } String bark() { return name + \" woofs\"; } }\
+         public static void main(String[] a) {\
+         Dog d = new Dog(\"Rex\");\
+         System.out.println(d.name); System.out.println(d.describe()); System.out.println(d.bark()); } }",
+    );
+    assert_eq!(out, "Rex\na Rex\nRex woofs\n");
+}
+
+#[test]
+fn overridden_method_dispatches_on_runtime_class() {
+    // A supertype-typed array holding subclass instances: each element's own
+    // override must run (true virtual dispatch, not static-type dispatch).
+    let (out, _) = run(
+        "public class Main {\
+         static class Shape { double area() { return 0.0; } }\
+         static class Circle extends Shape { double r; Circle(double r) { this.r = r; } double area() { return 3.0 * r * r; } }\
+         static class Square extends Shape { double s; Square(double s) { this.s = s; } double area() { return s * s; } }\
+         public static void main(String[] a) {\
+         Shape[] shapes = { new Circle(2.0), new Square(3.0), new Shape() };\
+         double t = 0.0; for (int i = 0; i < shapes.length; i++) { t += shapes[i].area(); }\
+         System.out.println(t); } }",
+    );
+    // 12.0 + 9.0 + 0.0 = 21.0.
+    assert_eq!(out, "21.0\n");
+}
+
+#[test]
+fn instanceof_respects_the_subclass_chain() {
+    let (out, _) = run("public class Main {\
+         static class A {} static class B extends A {}\
+         public static void main(String[] a) {\
+         A x = new B(); A y = new A();\
+         System.out.println(x instanceof A); System.out.println(x instanceof B);\
+         System.out.println(y instanceof B); System.out.println(y instanceof A); } }");
+    assert_eq!(out, "true\ntrue\nfalse\ntrue\n");
+}
+
+#[test]
+fn tostring_override_is_used_by_println_and_explicit_call() {
+    let (out, _) = run(
+        "public class Main {\
+         static class Point { int x; int y; Point(int x, int y) { this.x = x; this.y = y; }\
+         public String toString() { return \"(\" + x + \",\" + y + \")\"; } }\
+         public static void main(String[] a) {\
+         Point p = new Point(3, 4);\
+         System.out.println(p); System.out.println(p.toString()); System.out.println(\"P=\" + p.toString()); } }",
+    );
+    assert_eq!(out, "(3,4)\n(3,4)\nP=(3,4)\n");
+}
+
+#[test]
+fn object_equality_is_reference_identity() {
+    let (out, _) = run("public class Main {\
+         static class C { int v; C(int v) { this.v = v; } }\
+         public static void main(String[] a) {\
+         C x = new C(1); C y = new C(1); C z = x;\
+         System.out.println(x == y); System.out.println(x == z); } }");
+    // Distinct instances are not ==, an aliased binding is.
+    assert_eq!(out, "false\ntrue\n");
+}
+
+#[test]
+fn uninitialized_reference_field_is_null() {
+    let (out, _) = run("public class Main {\
+         static class N { int v; N next; N(int v) { this.v = v; } }\
+         public static void main(String[] a) {\
+         N n = new N(5); System.out.println(n.next == null); } }");
+    assert_eq!(out, "true\n");
+}

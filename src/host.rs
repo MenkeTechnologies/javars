@@ -16,6 +16,7 @@
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Builtin id for `System.out.println` (one Java-formatted arg + newline).
 pub const JPRINTLN: u16 = 700;
@@ -53,6 +54,107 @@ pub const JEPRINT: u16 = 707;
 /// [`b_static_dispatch`] to [`static_method`], returning its result.
 pub const JSTATIC_DISPATCH: u16 = 708;
 
+// ── Host object heap builtins (reference arrays + class instances) ──
+// `Value::Obj(u32)` is an opaque handle into [`HEAP`]; these builtins are the
+// only code that dereferences it. Aliasing is by reference: passing an `Obj`
+// copies the u32 handle, and a mutating builtin edits the shared heap object.
+
+/// `new T[n]` — allocate a default-valued array. Stack `[size, default]`
+/// (`default` on top); `argc == 2`. Pushes the array `Obj` handle.
+pub const JARRAY_NEW: u16 = 709;
+/// `{a, b, …}` array literal — pop `argc` element values (deepest first) and
+/// push a fresh array `Obj`.
+pub const JARRAY_LIT: u16 = 710;
+/// `a[i]` element read. Stack `[array, index]` (`index` on top); `argc == 2`.
+/// Pushes the element; an out-of-range index faults (`ArrayIndexOutOfBounds`).
+pub const JARRAY_GET: u16 = 711;
+/// `a[i] = v` element write. Stack `[array, index, value]` (`value` on top);
+/// `argc == 3`. Mutates the heap array; returns `value`.
+pub const JARRAY_SET: u16 = 712;
+/// `new C(...)` instance allocation. Stack `[className]`; `argc == 1`. Pushes a
+/// fresh instance `Obj` with an empty field map (the compiler emits field-init
+/// and constructor calls after).
+pub const JNEW: u16 = 713;
+/// `recv.field` read — an array's `.length` or an instance field. Stack
+/// `[recv, name]` (`name` on top); `argc == 2`. Pushes the value (`null`/`Undef`
+/// for an absent instance field).
+pub const JFIELD_GET: u16 = 714;
+/// `recv.field = v` write. Stack `[recv, name, value]` (`value` on top);
+/// `argc == 3`. Mutates the heap instance; returns `value`.
+pub const JFIELD_SET: u16 = 715;
+/// `x instanceof C` — stack `[obj, className]` (`className` on top);
+/// `argc == 2`. Pushes a `Bool`: true when `obj` is a non-null instance whose
+/// class is `C` or a subclass. Subclass links are resolved through [`SUPERS`].
+pub const JINSTANCEOF: u16 = 716;
+/// Runtime class name of an instance. Stack `[obj]`; `argc == 1`. Pushes the
+/// instance's class name as a `Str` (empty for a non-instance). Drives the
+/// compiler's virtual method-dispatch chain.
+pub const JCLASSOF: u16 = 717;
+
+/// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
+enum HostObj {
+    /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
+    /// is erased at runtime — the compiler sets each slot's default on creation.
+    Array(Vec<Value>),
+    /// A class instance: its runtime class name and its instance fields.
+    Instance {
+        class: String,
+        fields: HashMap<String, Value>,
+    },
+}
+
+thread_local! {
+    /// The host-owned Java object heap. `Value::Obj(id)` is an index into this
+    /// slab; the frontend owns the objects, fusevm just carries the handle. Grows
+    /// per run and is cleared by [`heap_reset`] at the start of every program so
+    /// handles never leak across runs.
+    static HEAP: RefCell<Vec<HostObj>> = const { RefCell::new(Vec::new()) };
+    /// Class → direct superclass name, populated by [`set_superclasses`] before a
+    /// run. Used by `instanceof` and default `toString` to walk the class chain.
+    static SUPERS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// Clear the object heap (and superclass table stays until reset). Called at the
+/// start of each program run so a fresh program never sees a prior run's handles.
+pub fn heap_reset() {
+    HEAP.with(|h| h.borrow_mut().clear());
+    SUPERS.with(|s| s.borrow_mut().clear());
+}
+
+/// Install the class → superclass map for the current program (used by
+/// `instanceof` and default `toString`). Call before running the chunk.
+pub fn set_superclasses(map: HashMap<String, String>) {
+    SUPERS.with(|s| *s.borrow_mut() = map);
+}
+
+/// Allocate `obj` on the heap and return its handle.
+fn heap_alloc(obj: HostObj) -> u32 {
+    HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        let id = h.len() as u32;
+        h.push(obj);
+        id
+    })
+}
+
+/// True when `class` is `target` or a (transitive) subclass of it.
+fn is_subclass_of(class: &str, target: &str) -> bool {
+    if class == target {
+        return true;
+    }
+    SUPERS.with(|s| {
+        let s = s.borrow();
+        let mut cur = class;
+        while let Some(sup) = s.get(cur) {
+            if sup == target {
+                return true;
+            }
+            cur = sup;
+        }
+        false
+    })
+}
+
 thread_local! {
     /// Set by an inline-Rust FFI fault (compile error, call error, or an
     /// unresolved export). A builtin cannot return a `Result`, so it stashes the
@@ -84,6 +186,259 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JFFI_CALL, b_ffi_call);
     vm.register_builtin(JSTR_DISPATCH, b_str_dispatch);
     vm.register_builtin(JSTATIC_DISPATCH, b_static_dispatch);
+    vm.register_builtin(JARRAY_NEW, b_array_new);
+    vm.register_builtin(JARRAY_LIT, b_array_lit);
+    vm.register_builtin(JARRAY_GET, b_array_get);
+    vm.register_builtin(JARRAY_SET, b_array_set);
+    vm.register_builtin(JNEW, b_new);
+    vm.register_builtin(JFIELD_GET, b_field_get);
+    vm.register_builtin(JFIELD_SET, b_field_set);
+    vm.register_builtin(JINSTANCEOF, b_instanceof);
+    vm.register_builtin(JCLASSOF, b_classof);
+}
+
+/// `classof(obj)` — the runtime class name of an instance (stack `[obj]`), or
+/// the empty string for a non-instance value.
+fn b_classof(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    match args.first() {
+        Some(Value::Obj(id)) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Instance { class, .. }) => Value::str(class.clone()),
+                _ => Value::str(""),
+            }
+        }),
+        _ => Value::str(""),
+    }
+}
+
+/// Pop `argc` values off the VM stack, restoring source (deepest-first) order.
+fn pop_args(vm: &mut VM, argc: u8) -> Vec<Value> {
+    let mut v = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        v.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    v.reverse();
+    v
+}
+
+/// `new T[n]` — build an `n`-element array filled with the element default
+/// (stack `[size, default]`).
+fn b_array_new(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let size = args.first().map(|v| v.to_int()).unwrap_or(0);
+    let default = args.get(1).cloned().unwrap_or(Value::Undef);
+    if size < 0 {
+        ffi_fault(vm, format!("javars: negative array size: {size}"));
+        return Value::Undef;
+    }
+    let arr = vec![default; size as usize];
+    Value::Obj(heap_alloc(HostObj::Array(arr)))
+}
+
+/// `{a, b, …}` — build an array from the popped element values.
+fn b_array_lit(vm: &mut VM, argc: u8) -> Value {
+    let elems = pop_args(vm, argc);
+    Value::Obj(heap_alloc(HostObj::Array(elems)))
+}
+
+/// `a[i]` read (stack `[array, index]`), bounds-checked.
+fn b_array_get(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let arr = args.first().cloned().unwrap_or(Value::Undef);
+    let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+    let id = match arr {
+        Value::Obj(id) => id,
+        _ => {
+            ffi_fault(
+                vm,
+                "javars: NullPointerException: array is null".to_string(),
+            );
+            return Value::Undef;
+        }
+    };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HostObj::Array(a)) => match usize::try_from(idx).ok().and_then(|i| a.get(i)) {
+                Some(v) => v.clone(),
+                None => {
+                    ffi_fault(
+                        vm,
+                        format!(
+                            "javars: ArrayIndexOutOfBoundsException: Index {idx} out of bounds for length {}",
+                            a.len()
+                        ),
+                    );
+                    Value::Undef
+                }
+            },
+            _ => {
+                ffi_fault(vm, "javars: not an array".to_string());
+                Value::Undef
+            }
+        }
+    })
+}
+
+/// `a[i] = v` write (stack `[array, index, value]`), bounds-checked. Returns `v`.
+fn b_array_set(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let arr = args.first().cloned().unwrap_or(Value::Undef);
+    let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+    let val = args.get(2).cloned().unwrap_or(Value::Undef);
+    let id = match arr {
+        Value::Obj(id) => id,
+        _ => {
+            ffi_fault(
+                vm,
+                "javars: NullPointerException: array is null".to_string(),
+            );
+            return Value::Undef;
+        }
+    };
+    let len = HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.get_mut(id as usize) {
+            Some(HostObj::Array(a)) => match usize::try_from(idx).ok().filter(|&i| i < a.len()) {
+                Some(i) => {
+                    a[i] = val.clone();
+                    None
+                }
+                None => Some(a.len()),
+            },
+            _ => Some(usize::MAX),
+        }
+    });
+    match len {
+        None => val,
+        Some(usize::MAX) => {
+            ffi_fault(vm, "javars: not an array".to_string());
+            Value::Undef
+        }
+        Some(n) => {
+            ffi_fault(
+                vm,
+                format!(
+                    "javars: ArrayIndexOutOfBoundsException: Index {idx} out of bounds for length {n}"
+                ),
+            );
+            Value::Undef
+        }
+    }
+}
+
+/// `new C(...)` — allocate an instance with an empty field map (stack
+/// `[className]`). The compiler emits field defaults/initializers and the
+/// constructor call after this.
+fn b_new(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let class = args
+        .first()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    Value::Obj(heap_alloc(HostObj::Instance {
+        class,
+        fields: HashMap::new(),
+    }))
+}
+
+/// `recv.field` read (stack `[recv, name]`): an array's `.length` or an instance
+/// field.
+fn b_field_get(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let recv = args.first().cloned().unwrap_or(Value::Undef);
+    let name = args
+        .get(1)
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let id = match recv {
+        Value::Obj(id) => id,
+        _ => {
+            ffi_fault(
+                vm,
+                format!("javars: NullPointerException: cannot read `{name}` of null"),
+            );
+            return Value::Undef;
+        }
+    };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HostObj::Array(a)) if name == "length" => Value::Int(a.len() as i64),
+            Some(HostObj::Instance { fields, .. }) => {
+                fields.get(&name).cloned().unwrap_or(Value::Undef)
+            }
+            _ => {
+                ffi_fault(vm, format!("javars: no field `{name}`"));
+                Value::Undef
+            }
+        }
+    })
+}
+
+/// `recv.field = v` write (stack `[recv, name, value]`). Returns `v`.
+fn b_field_set(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let recv = args.first().cloned().unwrap_or(Value::Undef);
+    let name = args
+        .get(1)
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let val = args.get(2).cloned().unwrap_or(Value::Undef);
+    let id = match recv {
+        Value::Obj(id) => id,
+        _ => {
+            ffi_fault(
+                vm,
+                format!("javars: NullPointerException: cannot assign `{name}` of null"),
+            );
+            return Value::Undef;
+        }
+    };
+    let ok = HEAP.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.get_mut(id as usize) {
+            Some(HostObj::Instance { fields, .. }) => {
+                fields.insert(name.clone(), val.clone());
+                true
+            }
+            _ => false,
+        }
+    });
+    if ok {
+        val
+    } else {
+        ffi_fault(vm, format!("javars: cannot assign field `{name}`"));
+        Value::Undef
+    }
+}
+
+/// `x instanceof C` (stack `[obj, className]`). Null is never an instance.
+fn b_instanceof(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let obj = args.first().cloned().unwrap_or(Value::Undef);
+    let target = args
+        .get(1)
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    match obj {
+        Value::Obj(id) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(id as usize) {
+                Some(HostObj::Instance { class, .. }) => {
+                    Value::bool(is_subclass_of(class, &target))
+                }
+                // A String value satisfies `instanceof String`.
+                _ => Value::bool(false),
+            }
+        }),
+        Value::Str(_) => {
+            Value::bool(target == "String" || target == "Object" || target == "CharSequence")
+        }
+        _ => Value::bool(false),
+    }
 }
 
 /// `__rust_compile("<base64>")` builtin: pop the base64-encoded `rust { ... }`
@@ -451,8 +806,27 @@ pub fn java_str(v: &Value) -> String {
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Float(f) => format_double(*f),
         Value::Undef => "null".to_string(),
+        // A heap handle renders like Java's default `Object.toString`
+        // (`ClassName@hex`). A user `toString()` override is dispatched by the
+        // compiler before the value reaches here (see `Compiler::method_call`),
+        // so this default only shows for classes that declare none.
+        Value::Obj(id) => obj_default_str(*id),
         other => other.as_str_cow().into_owned(),
     }
+}
+
+/// Java's default `toString` for a heap object: `ClassName@<identity-hash>` for
+/// an instance, `[@<hash>` for an array. The hash is the handle (deterministic
+/// within a run) rather than a JVM identity hash.
+fn obj_default_str(id: u32) -> String {
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HostObj::Instance { class, .. }) => format!("{class}@{id:x}"),
+            Some(HostObj::Array(_)) => format!("[@{id:x}"),
+            None => format!("(obj:{id})"),
+        }
+    })
 }
 
 /// Java's `Double.toString` prints whole values with a trailing `.0`

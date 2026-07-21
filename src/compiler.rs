@@ -54,24 +54,68 @@ struct MethodSig {
     ret: NumType,
 }
 
+/// Compile-time metadata for one user-defined class, resolved with inheritance
+/// (fields and methods include those from ancestors). Drives object layout,
+/// field-type lookup, and static-type method dispatch.
+struct ClassInfo {
+    /// Direct superclass name (for `super(...)` constructor chaining), if any.
+    superclass: Option<String>,
+    /// Every instance field this class has (ancestors first, then own), in
+    /// initialization order — the sequence the constructor prologue emits.
+    fields: Vec<FieldInit>,
+    /// Declared type of every field (own + inherited), for static typing.
+    field_types: HashMap<String, String>,
+    /// The declaring class of each `(method, arity)` this class can dispatch —
+    /// walking up the chain, most-derived wins. Value is `(defining_class, ret)`.
+    methods: HashMap<(String, usize), (String, String)>,
+    /// Constructor arities this class declares (empty ⇒ implicit default ctor).
+    ctor_arities: HashMap<usize, usize>,
+}
+
+/// A field with its declared type and optional initializer, in the order it is
+/// initialized (used to seed a fresh instance before the constructor runs).
+struct FieldInit {
+    name: String,
+    ty: String,
+    init: Option<Expr>,
+}
+
 /// The lowering scope for a user-defined method body. Locals and parameters
 /// live in fusevm call-frame slots (`GetSlot`/`SetSlot`) rather than the shared
 /// globals `main` uses, so recursion does not clobber a caller's variables.
 struct MethodScope {
     /// Local/parameter name → frame slot index (allocated on first mention).
     slots: HashMap<String, u16>,
-    /// Next free slot index.
+    /// Next free slot index. Starts at 1 for an instance method/constructor
+    /// (slot 0 is reserved for `this`).
     next_slot: u16,
     /// Declared numeric types of this method's locals/parameters.
     types: HashMap<String, NumType>,
+    /// Declared type name of each local/parameter (raw, e.g. `Point`, `int[]`).
+    decl_types: HashMap<String, String>,
+    /// Names actually declared as a local or parameter here — distinguishes a
+    /// true local from an implicit-`this` field reference.
+    declared: std::collections::HashSet<String>,
 }
 
 impl MethodScope {
+    /// A static-method scope: slots start at 0, no `this`.
     fn new() -> Self {
+        MethodScope::with_first_slot(0)
+    }
+
+    /// An instance-method/constructor scope: slot 0 is `this`, params start at 1.
+    fn for_instance() -> Self {
+        MethodScope::with_first_slot(1)
+    }
+
+    fn with_first_slot(first: u16) -> Self {
         MethodScope {
             slots: HashMap::new(),
-            next_slot: 0,
+            next_slot: first,
             types: HashMap::new(),
+            decl_types: HashMap::new(),
+            declared: std::collections::HashSet::new(),
         }
     }
 
@@ -162,6 +206,17 @@ struct Compiler {
     /// any body is lowered so calls (including forward and recursive ones)
     /// resolve.
     methods: HashMap<String, MethodSig>,
+    /// Declared type name of each `main`-scope local (parallel to
+    /// [`Compiler::global_types`] but the raw type string, for class typing).
+    global_decl_types: HashMap<String, String>,
+    /// Resolved metadata (fields/methods/ctors, inheritance-flattened) for every
+    /// user class. Keyed by class name; populated before any body is lowered.
+    classes: HashMap<String, ClassInfo>,
+    /// The class of `this` while lowering an instance method or constructor;
+    /// `None` in `main` and in `static` methods.
+    this_class: Option<String>,
+    /// Counter minting unique internal temp names (`new`/compound-assign temps).
+    temp_counter: u32,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
@@ -178,8 +233,9 @@ pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
 
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let has_ffi = body_has_ffi(&prog.main);
-    // Register every method signature up front so calls resolve regardless of
-    // source order (forward references, recursion, mutual recursion).
+    // Register every static-method signature up front so calls resolve
+    // regardless of source order (forward references, recursion, mutual
+    // recursion).
     let mut methods = HashMap::new();
     for m in &prog.methods {
         methods.insert(
@@ -190,6 +246,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             },
         );
     }
+    let classes = resolve_classes(prog)?;
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scopes: Vec::new(),
@@ -201,30 +258,118 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         global_types: HashMap::new(),
         scope: None,
         methods,
+        global_decl_types: HashMap::new(),
+        classes,
+        this_class: None,
+        temp_counter: 0,
     };
     // ── main body (global scope) ──
     for stmt in &prog.main {
         c.stmt(stmt)?;
     }
     // Patch any program-level `break`/`return;` to the position right after
-    // main. When methods follow, that position holds the skip-over jump.
+    // main. When subroutines follow, that position holds the skip-over jump.
     let end = c.b.current_pos();
     let exit_ops = std::mem::take(&mut c.exit_ops);
     for op in exit_ops {
         c.b.patch_jump(op, end);
     }
-    // ── method bodies ──
+    // ── subroutine bodies (static methods, then instance methods + ctors) ──
     // Emitted after `main` and jumped over so control never falls into them;
     // each is reached only via `Op::Call`.
-    if !prog.methods.is_empty() {
+    let has_subs = !prog.methods.is_empty()
+        || prog
+            .classes
+            .iter()
+            .any(|cl| !cl.methods.is_empty() || !cl.ctors.is_empty());
+    if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
         for m in &prog.methods {
             c.compile_method(m)?;
+        }
+        for cl in &prog.classes {
+            for m in &cl.methods {
+                c.compile_instance_method(&cl.name, m)?;
+            }
+            for ctor in &cl.ctors {
+                c.compile_ctor(cl, ctor)?;
+            }
         }
         let after = c.b.current_pos();
         c.b.patch_jump(skip, after);
     }
     Ok(c.b.build())
+}
+
+/// Resolve every class's metadata with inheritance flattened: fields listed
+/// ancestors-first (Java initialization order), field types merged, and each
+/// `(method, arity)` mapped to its most-derived defining class.
+fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String> {
+    let by_name: HashMap<&str, &Class> =
+        prog.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    // The ancestor chain of `name`, farthest ancestor first, `name` last.
+    let chain = |name: &str| -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        let mut cur = Some(name.to_string());
+        let mut guard = 0;
+        while let Some(n) = cur {
+            if let Some(cl) = by_name.get(n.as_str()) {
+                out.push(n.clone());
+                cur = cl.superclass.clone();
+            } else {
+                // An unknown superclass (e.g. a JDK class) terminates the chain.
+                break;
+            }
+            guard += 1;
+            if guard > 1000 {
+                return Err(format!("javars: cyclic class hierarchy at `{name}`"));
+            }
+        }
+        out.reverse();
+        Ok(out)
+    };
+    let mut out = HashMap::new();
+    for cl in &prog.classes {
+        let ancestry = chain(&cl.name)?;
+        let mut fields = Vec::new();
+        let mut field_types = HashMap::new();
+        let mut methods: HashMap<(String, usize), (String, String)> = HashMap::new();
+        for anc_name in &ancestry {
+            let anc = by_name[anc_name.as_str()];
+            for f in &anc.fields {
+                field_types.insert(f.name.clone(), f.ty.clone());
+                fields.push(FieldInit {
+                    name: f.name.clone(),
+                    ty: f.ty.clone(),
+                    init: f.init.clone(),
+                });
+            }
+            // More-derived ancestors overwrite an inherited method entry (this is
+            // the override resolution for static-type dispatch).
+            for m in &anc.methods {
+                methods.insert(
+                    (m.name.clone(), m.params.len()),
+                    (anc_name.clone(), m.ret.clone()),
+                );
+            }
+        }
+        let ctor_arities = cl
+            .ctors
+            .iter()
+            .map(|c| (c.params.len(), c.params.len()))
+            .collect();
+        out.insert(
+            cl.name.clone(),
+            ClassInfo {
+                superclass: cl.superclass.clone(),
+                fields,
+                field_types,
+                methods,
+                ctor_arities,
+            },
+        );
+    }
+    Ok(out)
 }
 
 impl Compiler {
@@ -271,6 +416,133 @@ impl Compiler {
         }
     }
 
+    /// Declare a local/parameter with its raw declared type: records the numeric
+    /// category (for `/` typing), the raw type string (for class-typed dispatch),
+    /// and marks the name as a true local (so it shadows any same-named field).
+    fn declare_local(&mut self, name: &str, ty: &str, nt: NumType) {
+        self.declare_type(name, nt);
+        match &mut self.scope {
+            Some(scope) => {
+                scope.decl_types.insert(name.to_string(), ty.to_string());
+                scope.declared.insert(name.to_string());
+            }
+            None => {
+                self.global_decl_types
+                    .insert(name.to_string(), ty.to_string());
+            }
+        }
+    }
+
+    /// True when `name` resolves to a real local/parameter in the active scope
+    /// (rather than an implicit `this.field`). In `main`, every bare name is a
+    /// global "local".
+    fn is_local(&self, name: &str) -> bool {
+        match &self.scope {
+            Some(scope) => scope.declared.contains(name),
+            None => true,
+        }
+    }
+
+    /// True when `name` was actually declared as a variable in the active scope
+    /// (a real local/parameter, or a `main` global). Distinguishes a variable
+    /// receiver from a bare stdlib class name like `Math`.
+    fn is_declared_var(&self, name: &str) -> bool {
+        match &self.scope {
+            Some(scope) => scope.declared.contains(name),
+            None => {
+                self.global_types.contains_key(name) || self.global_decl_types.contains_key(name)
+            }
+        }
+    }
+
+    /// If `name` is not a local but is a field of the enclosing `this` class,
+    /// return that class — the receiver for an implicit `this.name` access.
+    fn implicit_this_field(&self, name: &str) -> Option<String> {
+        if self.is_local(name) {
+            return None;
+        }
+        let this = self.this_class.as_deref()?;
+        let info = self.classes.get(this)?;
+        info.field_types
+            .contains_key(name)
+            .then(|| this.to_string())
+    }
+
+    /// The declared type string of a variable in the active scope, if known.
+    fn var_decl_type(&self, name: &str) -> Option<&str> {
+        match &self.scope {
+            Some(scope) => scope.decl_types.get(name).map(|s| s.as_str()),
+            None => self.global_decl_types.get(name).map(|s| s.as_str()),
+        }
+    }
+
+    /// The declared array-type string of an expression (`int[]`, `Shape[]`), if
+    /// statically known — a local/param variable or an instance field.
+    fn expr_array_type(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(name) => {
+                let ty = self.var_decl_type(name)?;
+                if ty.ends_with("[]") {
+                    return Some(ty.to_string());
+                }
+                // A bare field of `this`.
+                let this = self.this_class.as_ref()?;
+                let ft = self.classes.get(this)?.field_types.get(name)?;
+                ft.ends_with("[]").then(|| ft.clone())
+            }
+            Expr::Field { recv, name } => {
+                let rc = self.expr_class(recv)?;
+                let ft = self.classes.get(&rc)?.field_types.get(name)?;
+                ft.ends_with("[]").then(|| ft.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The user-class name an expression statically evaluates to (for instance
+    /// method/field dispatch), or `None` when it is not a known class type.
+    fn expr_class(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::This => self.this_class.clone(),
+            Expr::Var(name) => {
+                if let Some(ty) = self.var_decl_type(name) {
+                    if self.classes.contains_key(ty) {
+                        return Some(ty.to_string());
+                    }
+                }
+                // A bare field reference of `this`.
+                let this = self.this_class.as_ref()?;
+                let ty = self.classes.get(this)?.field_types.get(name)?;
+                self.classes.contains_key(ty).then(|| ty.to_string())
+            }
+            Expr::Field { recv, name } => {
+                let rc = self.expr_class(recv)?;
+                let ty = self.classes.get(&rc)?.field_types.get(name)?;
+                self.classes.contains_key(ty).then(|| ty.to_string())
+            }
+            Expr::NewObject { class, .. } => Some(class.clone()),
+            // An element of a class-typed array (`Shape[] → Shape`).
+            Expr::Index { array, .. } => {
+                let arr_ty = self.expr_array_type(array)?;
+                let elem = arr_ty.strip_suffix("[]")?;
+                self.classes.contains_key(elem).then(|| elem.to_string())
+            }
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
+                let rc = self.expr_class(recv)?;
+                let (defining, ret) = self
+                    .classes
+                    .get(&rc)?
+                    .methods
+                    .get(&(method.clone(), args.len()))?;
+                let _ = defining;
+                self.classes.contains_key(ret).then(|| ret.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Look up the declared numeric type of `name`, defaulting to `Other` when
     /// unknown (an undeclared read, or a type javars does not track).
     fn lookup_type(&self, name: &str) -> NumType {
@@ -279,6 +551,181 @@ impl Compiler {
             None => &self.global_types,
         };
         map.get(name).copied().unwrap_or(NumType::Other)
+    }
+
+    /// Mint a unique internal temp name (`#t0`, `#t1`, …). `#` is not a legal
+    /// Java identifier char, so these never collide with user variables.
+    fn temp(&mut self) -> String {
+        let t = format!("#t{}", self.temp_counter);
+        self.temp_counter += 1;
+        t
+    }
+
+    /// Resolve an instance method on a static receiver class: the mangled
+    /// subroutine name (`DefiningClass#method#argc`) and its return numeric type.
+    fn resolve_method(&self, class: &str, method: &str, argc: usize) -> Option<(String, NumType)> {
+        let info = self.classes.get(class)?;
+        let (defining, ret) = info.methods.get(&(method.to_string(), argc))?;
+        Some((
+            mangle(defining, method, argc),
+            numtype_of_ty(ret).unwrap_or(NumType::Other),
+        ))
+    }
+
+    /// True when `class` is `base` or a (transitive) subclass of it.
+    fn is_subclass(&self, class: &str, base: &str) -> bool {
+        let mut cur = class;
+        let mut guard = 0;
+        loop {
+            if cur == base {
+                return true;
+            }
+            match self
+                .classes
+                .get(cur)
+                .and_then(|ci| ci.superclass.as_deref())
+            {
+                Some(sup) => cur = sup,
+                None => return false,
+            }
+            guard += 1;
+            if guard > 1000 {
+                return false;
+            }
+        }
+    }
+
+    /// The virtual-dispatch targets for `method(argc)` on a static receiver class
+    /// `rc`: for every class in `rc`'s subtree, its resolved `(class, mangled)`.
+    /// `None` when `rc` does not resolve the method at all. Sorted by class name
+    /// for deterministic bytecode.
+    fn virtual_targets(
+        &self,
+        rc: &str,
+        method: &str,
+        argc: usize,
+    ) -> Option<Vec<(String, String)>> {
+        // The method must resolve on the static type (else it is a type error).
+        self.resolve_method(rc, method, argc)?;
+        let mut v: Vec<(String, String)> = self
+            .classes
+            .keys()
+            .filter(|k| self.is_subclass(k, rc))
+            .filter_map(|k| {
+                self.resolve_method(k, method, argc)
+                    .map(|(m, _)| (k.clone(), m))
+            })
+            .collect();
+        v.sort();
+        Some(v)
+    }
+
+    /// Emit a call to instance `method(args)` on `recv` (whose static class is
+    /// `rc`), binding `recv` as `this`. When the method is not overridden anywhere
+    /// in `rc`'s subtree, a direct `Op::Call` is emitted; otherwise a runtime
+    /// dispatch chain keyed on the receiver's actual class selects the override
+    /// (true virtual dispatch — arguments are evaluated once into temps).
+    fn dispatch_instance_method(
+        &mut self,
+        recv: &Expr,
+        rc: &str,
+        method: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        let targets = self
+            .virtual_targets(rc, method, args.len())
+            .ok_or_else(|| {
+                format!(
+                "javars: class `{rc}` has no method `{method}` taking {} argument(s) (line {line})",
+                args.len()
+            )
+            })?;
+        let distinct: std::collections::HashSet<&str> =
+            targets.iter().map(|(_, m)| m.as_str()).collect();
+        // Fast path: a single implementation across the whole subtree.
+        if distinct.len() <= 1 {
+            let (mangled, _) = self.resolve_method(rc, method, args.len()).unwrap();
+            self.expr(recv)?; // this (deepest)
+            for a in args {
+                self.expr(a)?;
+            }
+            let idx = self.b.add_name(&mangled);
+            self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            return Ok(());
+        }
+        // Virtual path: stash receiver + args in temps (single evaluation), read
+        // the runtime class, then dispatch.
+        let recv_t = self.temp();
+        self.expr(recv)?;
+        self.emit_set(&recv_t, line);
+        let arg_ts: Vec<String> = args
+            .iter()
+            .map(|a| {
+                let t = self.temp();
+                self.expr(a)?;
+                self.emit_set(&t, line);
+                Ok(t)
+            })
+            .collect::<Result<_, String>>()?;
+        let class_t = self.temp();
+        self.emit_get(&recv_t, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
+        self.emit_set(&class_t, line);
+
+        let argc = args.len() as u8 + 1;
+        let mut end_jumps = Vec::new();
+        for (class, mangled) in &targets {
+            // if classof == "class" { this + args; Call(mangled) }
+            self.emit_get(&class_t, line);
+            let cc = self.b.add_constant(Value::str(class.clone()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::StrEq, line);
+            let skip = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_get(&recv_t, line);
+            for t in &arg_ts {
+                self.emit_get(t, line);
+            }
+            let idx = self.b.add_name(mangled);
+            self.b.emit(Op::Call(idx, argc), line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(skip, next);
+        }
+        // Fallback (unreachable at runtime — every concrete class is a target):
+        // call the static-type resolution so the stack stays balanced.
+        let (base, _) = self.resolve_method(rc, method, args.len()).unwrap();
+        self.emit_get(&recv_t, line);
+        for t in &arg_ts {
+            self.emit_get(t, line);
+        }
+        let idx = self.b.add_name(&base);
+        self.b.emit(Op::Call(idx, argc), line);
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Emit the Java default value for a declared type: `0` for integral, `0.0`
+    /// for floating point, `false` for `boolean`, `null` (`Undef`) for arrays,
+    /// `String`, and class references.
+    fn emit_type_default(&mut self, ty: &str, line: u32) {
+        match ty {
+            "int" | "long" | "short" | "byte" | "char" => {
+                self.b.emit(Op::LoadInt(0), line);
+            }
+            "double" | "float" => {
+                self.b.emit(Op::LoadFloat(0.0), line);
+            }
+            "boolean" => {
+                self.b.emit(Op::LoadFalse, line);
+            }
+            _ => {
+                self.b.emit(Op::LoadUndef, line);
+            }
+        }
     }
 
     /// The static numeric category of `e` under Java's binary numeric promotion.
@@ -331,12 +778,20 @@ impl Compiler {
                 .get(name)
                 .map(|s| s.ret)
                 .unwrap_or(NumType::Other),
-            Expr::MethodCall { recv, method, .. } => {
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
                 // Static stdlib calls that yield an `int` participate in `/`
                 // truncation typing.
                 if let Expr::Var(class) = recv.as_ref() {
                     if let Some(nt) = static_call_numtype(class, method) {
                         return nt;
+                    }
+                }
+                // A user-class instance method's declared return type.
+                if let Some(rc) = self.expr_class(recv) {
+                    if let Some((_, ret)) = self.resolve_method(&rc, method, args.len()) {
+                        return ret;
                     }
                 }
                 // The `String` instance methods that return `int`.
@@ -345,6 +800,35 @@ impl Compiler {
                     _ => NumType::Other,
                 }
             }
+            // An array element's category comes from the array's declared type
+            // (`int[]` → int, `double[]` → double); `.length` is always `int`.
+            Expr::Index { array, .. } => match array.as_ref() {
+                Expr::Var(name) => self
+                    .var_decl_type(name)
+                    .map(array_elem_numtype)
+                    .unwrap_or(NumType::Other),
+                _ => NumType::Other,
+            },
+            Expr::Field { recv, name } => {
+                if name == "length" {
+                    return NumType::Int;
+                }
+                self.expr_class(recv)
+                    .and_then(|rc| {
+                        self.classes
+                            .get(&rc)
+                            .and_then(|ci| ci.field_types.get(name))
+                            .and_then(|ty| numtype_of_ty(ty))
+                    })
+                    .unwrap_or(NumType::Other)
+            }
+            // Reference- and boolean-valued expressions are never a numeric
+            // category.
+            Expr::NewArray { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::NewObject { .. }
+            | Expr::InstanceOf { .. }
+            | Expr::This => NumType::Other,
         }
     }
 
@@ -359,16 +843,7 @@ impl Compiler {
         self.b.add_sub_entry(name_idx, entry);
 
         let mut scope = MethodScope::new();
-        // Pre-allocate parameter slots 0..n in declaration order and record
-        // their declared types.
-        for p in &m.params {
-            let slot = scope.slot(&p.name);
-            scope.types.insert(
-                p.name.clone(),
-                numtype_of_ty(&p.ty).unwrap_or(NumType::Other),
-            );
-            debug_assert_eq!(slot as usize, scope.slots.len() - 1);
-        }
+        register_params(&mut scope, &m.params);
         self.scope = Some(scope);
 
         // Prologue: pop args into their slots. The last parameter is on top of
@@ -388,6 +863,64 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower one instance method to a subroutine named `Class#method#argc`. Slot
+    /// 0 holds `this`; parameters take slots `1..=argc`. The prologue binds all
+    /// `argc + 1` incoming values (this deepest).
+    fn compile_instance_method(&mut self, class: &str, m: &Method) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        let mangled = mangle(class, &m.name, m.params.len());
+        let name_idx = self.b.add_name(&mangled);
+        self.b.add_sub_entry(name_idx, entry);
+
+        let mut scope = MethodScope::for_instance();
+        register_params(&mut scope, &m.params);
+        self.scope = Some(scope);
+        self.this_class = Some(class.to_string());
+
+        // Prologue: bind `this` (slot 0) + params (slots 1..=n), high-to-low.
+        for i in (0..=m.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), m.line);
+        }
+        for s in &m.body {
+            self.stmt(s)?;
+        }
+        self.b.emit(Op::LoadUndef, m.line);
+        self.b.emit(Op::ReturnValue, m.line);
+
+        self.scope = None;
+        self.this_class = None;
+        Ok(())
+    }
+
+    /// Lower a constructor to a subroutine named `Class#<init>#argc`. Field
+    /// defaults/initializers are emitted by [`Compiler::new_object`] before the
+    /// call, so the body only runs the programmer's constructor statements.
+    /// `this` is slot 0; the ctor returns `null` (its result is discarded).
+    fn compile_ctor(&mut self, cl: &Class, ctor: &Ctor) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        let mangled = mangle(&cl.name, "<init>", ctor.params.len());
+        let name_idx = self.b.add_name(&mangled);
+        self.b.add_sub_entry(name_idx, entry);
+
+        let mut scope = MethodScope::for_instance();
+        register_params(&mut scope, &ctor.params);
+        self.scope = Some(scope);
+        self.this_class = Some(cl.name.clone());
+
+        for i in (0..=ctor.params.len()).rev() {
+            self.b.emit(Op::SetSlot(i as u16), ctor.line);
+        }
+        for s in &ctor.body {
+            self.stmt(s)?;
+        }
+        self.b.emit(Op::LoadUndef, ctor.line);
+        self.b.emit(Op::ReturnValue, ctor.line);
+
+        self.scope = None;
+        self.this_class = None;
+        Ok(())
+    }
+
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
         // In debug mode, emit a line marker before the statement so `--dap` can
         // stop on it. `CallBuiltin` always pushes its return value, so pop it.
@@ -400,20 +933,42 @@ impl Compiler {
         match &s.kind {
             StmtKind::Local { ty, name, init } => {
                 // Record the declared numeric type (for `/` truncation); `var`
-                // and untracked types are inferred from the initializer.
+                // and untracked types are inferred from the initializer. The raw
+                // type string powers class-typed dispatch — for `var`, infer the
+                // class from the initializer.
                 let nt = numtype_of_ty(ty)
                     .or_else(|| init.as_ref().map(|e| self.expr_type(e)))
                     .unwrap_or(NumType::Other);
-                self.declare_type(name, nt);
+                let raw = if ty == "var" {
+                    init.as_ref()
+                        .and_then(|e| self.expr_class(e))
+                        .unwrap_or_else(|| ty.clone())
+                } else {
+                    ty.clone()
+                };
+                self.declare_local(name, &raw, nt);
                 if let Some(e) = init {
                     self.expr(e)?;
                     self.emit_set(name, line);
                 }
                 // An uninitialized local is simply unbound until first assigned
-                // (Java's definite-assignment check is not enforced in slice 1).
+                // (Java's definite-assignment check is not enforced yet).
                 Ok(())
             }
             StmtKind::Assign { name, op, value } => {
+                // A bare name that is a field of `this` (not a local) is an
+                // implicit `this.name = …` field assignment.
+                if let Some(class) = self.implicit_this_field(name) {
+                    let recv = Expr::This;
+                    let ft = self
+                        .classes
+                        .get(&class)
+                        .and_then(|ci| ci.field_types.get(name))
+                        .and_then(|ty| numtype_of_ty(ty))
+                        .unwrap_or(NumType::Other);
+                    return self.field_assign(&recv, name, *op, value, ft, line);
+                }
+                let l = self.lookup_type(name);
                 match op {
                     AssignOp::Assign => {
                         self.expr(value)?;
@@ -421,7 +976,6 @@ impl Compiler {
                     AssignOp::Div => {
                         // `x /= e` — integer division truncates when both `x`
                         // and `e` are statically integral (Java `int /= int`).
-                        let l = self.lookup_type(name);
                         self.emit_get(name, line);
                         let r = self.expr_type(value);
                         self.expr(value)?;
@@ -437,6 +991,29 @@ impl Compiler {
                 self.emit_set(name, line);
                 Ok(())
             }
+            StmtKind::IndexAssign {
+                array,
+                index,
+                op,
+                value,
+            } => self.index_assign(array, index, *op, value, line),
+            StmtKind::FieldAssign {
+                recv,
+                name,
+                op,
+                value,
+            } => {
+                let ft = self
+                    .expr_class(recv)
+                    .and_then(|rc| {
+                        self.classes
+                            .get(&rc)
+                            .and_then(|ci| ci.field_types.get(name))
+                            .and_then(|ty| numtype_of_ty(ty))
+                    })
+                    .unwrap_or(NumType::Other);
+                self.field_assign(recv, name, *op, value, ft, line)
+            }
             StmtKind::Expr(Expr::Println { newline, err, arg }) => {
                 // The print builtin returns `null`; discard it in statement
                 // position.
@@ -444,10 +1021,7 @@ impl Compiler {
                 self.b.emit(Op::Pop, line);
                 Ok(())
             }
-            StmtKind::Expr(Expr::PostIncDec { name, inc }) => {
-                self.post_inc_dec(name, *inc);
-                Ok(())
-            }
+            StmtKind::Expr(Expr::PostIncDec { name, inc }) => self.post_inc_dec(name, *inc),
             StmtKind::Expr(e) => {
                 self.expr(e)?;
                 self.b.emit(Op::Pop, line);
@@ -752,11 +1326,28 @@ impl Compiler {
         })
     }
 
-    fn post_inc_dec(&mut self, name: &str, inc: bool) {
+    /// Lower `name++` / `name--` as a statement (result discarded), mutating a
+    /// local/global or — when `name` is an implicit `this` field — that field.
+    fn post_inc_dec(&mut self, name: &str, inc: bool) -> Result<(), String> {
+        let op = if inc { AssignOp::Add } else { AssignOp::Sub };
+        if let Some(class) = self.implicit_this_field(name) {
+            let ft = self.field_numtype(&class, name);
+            return self.field_assign(&Expr::This, name, op, &Expr::Int(1), ft, 0);
+        }
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
         self.emit_set(name, 0);
+        Ok(())
+    }
+
+    /// The numeric category of a field, for compound-assignment `/` typing.
+    fn field_numtype(&self, class: &str, name: &str) -> NumType {
+        self.classes
+            .get(class)
+            .and_then(|ci| ci.field_types.get(name))
+            .and_then(|ty| numtype_of_ty(ty))
+            .unwrap_or(NumType::Other)
     }
 
     /// Lower `System.out.print[ln](arg)` (or the `System.err` variant when
@@ -765,7 +1356,7 @@ impl Compiler {
     fn println(&mut self, newline: bool, err: bool, arg: Option<&Expr>) -> Result<(), String> {
         let n = match arg {
             Some(e) => {
-                self.expr(e)?;
+                self.emit_stringified(e)?;
                 1
             }
             None => 0,
@@ -778,6 +1369,20 @@ impl Compiler {
         };
         self.b.emit(Op::CallBuiltin(id, n), 0);
         Ok(())
+    }
+
+    /// Evaluate `e`, dispatching a user-defined `toString()` when `e` is an
+    /// instance of a class whose (subtree) declares one — so `println(obj)`
+    /// honours the override. Otherwise evaluate normally (the host's `java_str`
+    /// renders the default `Class@hash` form). String concatenation with a plain
+    /// object and `String.valueOf(obj)` still use the default form (see BUGS.md).
+    fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
+        if let Some(rc) = self.expr_class(e) {
+            if self.resolve_method(&rc, "toString", 0).is_some() {
+                return self.dispatch_instance_method(e, &rc, "toString", &[], 0);
+            }
+        }
+        self.expr(e)
     }
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
@@ -798,7 +1403,50 @@ impl Compiler {
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
             }
             Expr::Var(name) => {
-                self.emit_get(name, 0);
+                // A bare name that is a field of `this` (not a local) reads
+                // `this.name`; otherwise it is a plain local/global.
+                if self.implicit_this_field(name).is_some() {
+                    self.b.emit(Op::GetSlot(0), 0); // this
+                    self.emit_field_get(name, 0);
+                } else {
+                    self.emit_get(name, 0);
+                }
+            }
+            Expr::This => {
+                if self.this_class.is_none() {
+                    return Err("javars: `this` used outside an instance method".to_string());
+                }
+                self.b.emit(Op::GetSlot(0), 0);
+            }
+            Expr::NewArray { elem_ty, size } => {
+                self.expr(size)?;
+                self.emit_type_default(elem_ty, 0);
+                self.b.emit(Op::CallBuiltin(crate::host::JARRAY_NEW, 2), 0);
+            }
+            Expr::ArrayLit { elems } => {
+                for el in elems {
+                    self.expr(el)?;
+                }
+                self.b.emit(
+                    Op::CallBuiltin(crate::host::JARRAY_LIT, elems.len() as u8),
+                    0,
+                );
+            }
+            Expr::Index { array, index } => {
+                self.expr(array)?;
+                self.expr(index)?;
+                self.b.emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), 0);
+            }
+            Expr::Field { recv, name } => {
+                self.expr(recv)?;
+                self.emit_field_get(name, 0);
+            }
+            Expr::NewObject { class, args, line } => self.new_object(class, args, *line)?,
+            Expr::InstanceOf { expr, class } => {
+                self.expr(expr)?;
+                let class_c = self.b.add_constant(Value::str(class.clone()));
+                self.b.emit(Op::LoadConst(class_c), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), 0);
             }
             Expr::Unary { op, rhs } => {
                 self.expr(rhs)?;
@@ -820,8 +1468,14 @@ impl Compiler {
                 self.println(*newline, *err, arg.as_deref())?;
             }
             Expr::PostIncDec { name, inc } => {
-                self.emit_get(name, 0);
-                self.post_inc_dec(name, *inc);
+                // Value position: push the old value, then apply the mutation.
+                if self.implicit_this_field(name).is_some() {
+                    self.b.emit(Op::GetSlot(0), 0);
+                    self.emit_field_get(name, 0);
+                } else {
+                    self.emit_get(name, 0);
+                }
+                self.post_inc_dec(name, *inc)?;
             }
             Expr::Call { name, args, line } => self.call(name, args, *line)?,
             Expr::MethodCall {
@@ -834,10 +1488,12 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower an instance method call `recv.method(args...)`. Slice 1 dispatches
-    /// on `String` receivers through the [`crate::host::JSTR_DISPATCH`] builtin:
-    /// the receiver is pushed first, then the arguments, then the method name,
-    /// matching the builtin's `[recv, args…, name]` stack contract.
+    /// Lower an instance method call `recv.method(args...)`. Dispatch order:
+    /// a bare stdlib class receiver (`Math.abs`) → the static-dispatch builtin;
+    /// a user-class receiver (resolved by the receiver's static type) → a direct
+    /// `Op::Call` to the class's mangled instance-method subroutine, with the
+    /// receiver bound as `this` (frame slot 0); anything else → the `String`
+    /// method-dispatch builtin.
     fn method_call(
         &mut self,
         recv: &Expr,
@@ -850,7 +1506,7 @@ impl Compiler {
         // receiver is not a value, so it is not evaluated. Args, then the class
         // and method names, are handed to the static-dispatch builtin.
         if let Expr::Var(class) = recv {
-            if is_static_class(class) {
+            if is_static_class(class) && !self.is_declared_var(class) {
                 for a in args {
                     self.expr(a)?;
                 }
@@ -866,6 +1522,12 @@ impl Compiler {
                 return Ok(());
             }
         }
+        // A user-class receiver: dispatch on the receiver's runtime class
+        // (virtual dispatch), collapsing to a direct call when not overridden.
+        if let Some(rc) = self.expr_class(recv) {
+            return self.dispatch_instance_method(recv, &rc, method, args, line);
+        }
+        // Otherwise a `String` method.
         self.expr(recv)?;
         for a in args {
             self.expr(a)?;
@@ -877,6 +1539,195 @@ impl Compiler {
             Op::CallBuiltin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2),
             line,
         );
+        Ok(())
+    }
+
+    /// Emit `recv.field` read given the receiver value is already on the stack:
+    /// push the field name and call the field-get builtin.
+    fn emit_field_get(&mut self, name: &str, line: u32) {
+        let name_c = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(name_c), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JFIELD_GET, 2), line);
+    }
+
+    /// Lower `new ClassName(args...)`: allocate the instance, seed its fields
+    /// (defaults then declared initializers, ancestors first), run the matching
+    /// constructor, and leave the instance handle on the stack.
+    fn new_object(&mut self, class: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        let info = self
+            .classes
+            .get(class)
+            .ok_or_else(|| format!("javars: unknown class `{class}` (line {line})"))?;
+        // Constructor resolution up front (immutable borrow released before we
+        // emit anything mutating `self`).
+        let has_ctor = info.ctor_arities.contains_key(&args.len());
+        let ctor_arities: Vec<usize> = info.ctor_arities.keys().copied().collect();
+        // Field-init plan (name, type, optional init expr), cloned so the
+        // ChunkBuilder borrow does not alias `self.classes`.
+        let field_plan: Vec<(String, String, Option<Expr>)> = info
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone(), f.init.clone()))
+            .collect();
+
+        // Allocate: push class name, call JNEW → instance handle.
+        let class_c = self.b.add_constant(Value::str(class.to_string()));
+        self.b.emit(Op::LoadConst(class_c), line);
+        self.b.emit(Op::CallBuiltin(crate::host::JNEW, 1), line);
+        let obj = self.temp();
+        self.emit_set(&obj, line);
+
+        // Seed each field: default value, then its declared initializer if any.
+        for (fname, fty, finit) in &field_plan {
+            self.emit_get(&obj, line);
+            let name_c = self.b.add_constant(Value::str(fname.clone()));
+            self.b.emit(Op::LoadConst(name_c), line);
+            match finit {
+                Some(e) => self.expr(e)?,
+                None => self.emit_type_default(fty, line),
+            }
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+            self.b.emit(Op::Pop, line);
+        }
+
+        // Run the constructor (if declared for this arity).
+        if has_ctor {
+            self.emit_get(&obj, line); // this
+            for a in args {
+                self.expr(a)?;
+            }
+            let mangled = mangle(class, "<init>", args.len());
+            let name_idx = self.b.add_name(&mangled);
+            self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
+            self.b.emit(Op::Pop, line); // discard the ctor's (Undef) result
+        } else if !args.is_empty() {
+            return Err(format!(
+                "javars: class `{class}` has no constructor taking {} argument(s) (declared: {:?}) (line {line})",
+                args.len(),
+                ctor_arities
+            ));
+        }
+
+        // The expression value is the new instance.
+        self.emit_get(&obj, line);
+        Ok(())
+    }
+
+    /// Lower `a[i] <op>= v`. A plain assignment writes directly; a compound one
+    /// reads the element, applies the operator, and writes it back — evaluating
+    /// the array and index once (into temps) so their side effects don't repeat.
+    fn index_assign(
+        &mut self,
+        array: &Expr,
+        index: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        if op == AssignOp::Assign {
+            self.expr(array)?;
+            self.expr(index)?;
+            self.expr(value)?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JARRAY_SET, 3), line);
+            self.b.emit(Op::Pop, line);
+            return Ok(());
+        }
+        // Compound: stash array + index in temps, read old, combine, write back.
+        let arr_t = self.temp();
+        let idx_t = self.temp();
+        self.expr(array)?;
+        self.emit_set(&arr_t, line);
+        self.expr(index)?;
+        self.emit_set(&idx_t, line);
+        // old element
+        self.emit_get(&arr_t, line);
+        self.emit_get(&idx_t, line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), line);
+        // combine with value
+        let elem_t = match array {
+            Expr::Var(n) => self
+                .var_decl_type(n)
+                .map(array_elem_numtype)
+                .unwrap_or(NumType::Other),
+            _ => NumType::Other,
+        };
+        self.emit_compound(op, value, elem_t, line)?;
+        let new_t = self.temp();
+        self.emit_set(&new_t, line);
+        // write back
+        self.emit_get(&arr_t, line);
+        self.emit_get(&idx_t, line);
+        self.emit_get(&new_t, line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JARRAY_SET, 3), line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
+    /// Lower `recv.field <op>= v` (and implicit `this.field`). Plain assignment
+    /// writes directly; a compound one reads the field, applies the operator, and
+    /// writes it back — evaluating the receiver once (into a temp).
+    fn field_assign(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        op: AssignOp,
+        value: &Expr,
+        field_ty: NumType,
+        line: u32,
+    ) -> Result<(), String> {
+        if op == AssignOp::Assign {
+            self.expr(recv)?;
+            let name_c = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(name_c), line);
+            self.expr(value)?;
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+            self.b.emit(Op::Pop, line);
+            return Ok(());
+        }
+        let obj_t = self.temp();
+        self.expr(recv)?;
+        self.emit_set(&obj_t, line);
+        // old field value
+        self.emit_get(&obj_t, line);
+        self.emit_field_get(name, line);
+        self.emit_compound(op, value, field_ty, line)?;
+        let new_t = self.temp();
+        self.emit_set(&new_t, line);
+        // write back
+        self.emit_get(&obj_t, line);
+        let name_c = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(name_c), line);
+        self.emit_get(&new_t, line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
+    /// Combine an already-pushed left operand with `value` under a compound
+    /// operator, leaving the result on the stack. `/=` truncates when both the
+    /// target and the value are statically integral (Java `int /= int`).
+    fn emit_compound(
+        &mut self,
+        op: AssignOp,
+        value: &Expr,
+        target: NumType,
+        line: u32,
+    ) -> Result<(), String> {
+        if op == AssignOp::Div {
+            let r = self.expr_type(value);
+            self.expr(value)?;
+            self.emit_div(target, r, line);
+        } else {
+            self.expr(value)?;
+            self.b.emit(compound_op(op), line);
+        }
         Ok(())
     }
 
@@ -907,6 +1758,37 @@ impl Compiler {
             }
             return Ok(());
         }
+        // `super(args)` — chain to the superclass constructor. Instance fields
+        // (including inherited ones) are already seeded by `new_object`, so this
+        // just runs the parent constructor body on the same `this`.
+        if name == "super" {
+            if let Some(this_class) = self.this_class.clone() {
+                if let Some(sup) = self
+                    .classes
+                    .get(&this_class)
+                    .and_then(|ci| ci.superclass.clone())
+                {
+                    let has = self
+                        .classes
+                        .get(&sup)
+                        .is_some_and(|ci| ci.ctor_arities.contains_key(&args.len()));
+                    if has {
+                        self.b.emit(Op::GetSlot(0), line); // this
+                        for a in args {
+                            self.expr(a)?;
+                        }
+                        let mangled = mangle(&sup, "<init>", args.len());
+                        let idx = self.b.add_name(&mangled);
+                        self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+                        return Ok(());
+                    }
+                }
+            }
+            // No user-class superclass constructor for this arity — a no-op that
+            // still leaves a (discarded) value for statement position.
+            self.b.emit(Op::LoadUndef, line);
+            return Ok(());
+        }
         // A user-defined static method resolves to the native call-frame ABI.
         if let Some(sig) = self.methods.get(name) {
             if args.len() != sig.arity {
@@ -922,6 +1804,14 @@ impl Compiler {
             let name_idx = self.b.add_name(name);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
             return Ok(());
+        }
+        // A bare call inside an instance method/ctor that names an instance
+        // method of `this` is an implicit `this.name(args)` — dispatched
+        // virtually on `this`'s runtime class.
+        if let Some(this_class) = self.this_class.clone() {
+            if self.resolve_method(&this_class, name, args.len()).is_some() {
+                return self.dispatch_instance_method(&Expr::This, &this_class, name, args, line);
+            }
         }
         if self.has_ffi {
             for a in args {
@@ -1027,6 +1917,13 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
         StmtKind::Assign { value, .. } => expr_has_ffi(value),
+        StmtKind::IndexAssign {
+            array,
+            index,
+            value,
+            ..
+        } => expr_has_ffi(array) || expr_has_ffi(index) || expr_has_ffi(value),
+        StmtKind::FieldAssign { recv, value, .. } => expr_has_ffi(recv) || expr_has_ffi(value),
         StmtKind::Expr(e) => expr_has_ffi(e),
         StmtKind::If { cond, then, els } => {
             expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
@@ -1069,12 +1966,51 @@ fn expr_has_ffi(e: &Expr) -> bool {
         }
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
         Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
+        Expr::NewArray { size, .. } => expr_has_ffi(size),
+        Expr::ArrayLit { elems } => elems.iter().any(expr_has_ffi),
+        Expr::Index { array, index } => expr_has_ffi(array) || expr_has_ffi(index),
+        Expr::Field { recv, .. } => expr_has_ffi(recv),
+        Expr::NewObject { args, .. } => args.iter().any(expr_has_ffi),
+        Expr::InstanceOf { expr, .. } => expr_has_ffi(expr),
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Var(_)
+        | Expr::This
         | Expr::PostIncDec { .. } => false,
+    }
+}
+
+/// The mangled subroutine name for a class member: `Class#member#argc`. `#` is
+/// not a legal Java identifier char, so mangled names never collide with a
+/// user-declared static method. Constructors use the member name `<init>`.
+fn mangle(class: &str, member: &str, argc: usize) -> String {
+    format!("{class}#{member}#{argc}")
+}
+
+/// Register a subroutine's formal parameters into its scope: allocate slots in
+/// declaration order and record each parameter's numeric type, raw declared
+/// type, and its status as a true local (so a same-named field is shadowed).
+fn register_params(scope: &mut MethodScope, params: &[Param]) {
+    for p in params {
+        scope.slot(&p.name);
+        scope.types.insert(
+            p.name.clone(),
+            numtype_of_ty(&p.ty).unwrap_or(NumType::Other),
+        );
+        scope.decl_types.insert(p.name.clone(), p.ty.clone());
+        scope.declared.insert(p.name.clone());
+    }
+}
+
+/// The numeric category of an array's elements from its declared type string:
+/// `int[]`/`long[]`/… → int, `double[]`/`float[]` → float, else non-numeric.
+fn array_elem_numtype(array_ty: &str) -> NumType {
+    match array_ty.strip_suffix("[]") {
+        Some("int" | "long" | "short" | "byte" | "char") => NumType::Int,
+        Some("double" | "float") => NumType::Float,
+        _ => NumType::Other,
     }
 }
 
