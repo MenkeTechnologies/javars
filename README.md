@@ -147,6 +147,9 @@ Implemented and checked against the reference `java`:
   `for (init; cond; update)`, `break`, `continue`, and a bare `return;`.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
+- **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
+  compiles to a cached cdylib whose exported functions are callable by name
+  (via `fusevm::ffi`); see [`examples/Ffi.java`](examples/Ffi.java).
 - **Comments** — `//` line, `/* … */` block.
 
 ---
@@ -182,6 +185,26 @@ never corrupts the protocol channel.
 `java --version` reports the targeted language level (`java 21`) followed by the
 real engine (`javars <crate-version>`) and the host triple, so nothing is
 misrepresented as the JDK.
+
+### Inline Rust FFI
+
+A `rust { … }` block inside `main` embeds native Rust in a Java program:
+
+```java
+public class Ffi {
+    public static void main(String[] args) {
+        rust { pub extern "C" fn j_triple(x: i64) -> i64 { x * 3 } }
+        System.out.println(j_triple(14));   // => 42
+    }
+}
+```
+
+Before lexing, the block is rewritten to a `__rust_compile("<base64>", line)`
+call; the runtime hands the base64-encoded body to `fusevm::ffi`, which compiles
+it to a cdylib (cached by content hash) and registers its `pub extern "C"`
+exports. A bareword call whose name is not a local resolves to an FFI export by
+name — but only when the program contains a `rust { … }` block; without one, an
+unknown call stays an ordinary `unresolved reference` compile error.
 
 ---
 

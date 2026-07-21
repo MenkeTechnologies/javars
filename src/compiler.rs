@@ -14,6 +14,10 @@
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 
+/// The desugar target an inline `rust { ... }` FFI block lowers to (see
+/// [`crate::rust_ffi`]).
+const RUST_COMPILE: &str = "__rust_compile";
+
 /// One enclosing loop's backpatch targets.
 struct Loop {
     /// `continue` jumps here (the loop's step/condition entry).
@@ -31,6 +35,11 @@ struct Compiler {
     /// `--dap` debugger can stop on statement lines. Normal runs leave this off
     /// and carry zero extra ops.
     debug: bool,
+    /// True when the program contains an inline `rust { ... }` FFI block (a
+    /// `__rust_compile` call). Only then does an unresolved call name lower to a
+    /// runtime FFI dispatch instead of a compile error — so non-FFI programs keep
+    /// their exact "unresolved reference" compile-time diagnostic.
+    has_ffi: bool,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
@@ -46,11 +55,13 @@ pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
 }
 
 fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
+    let has_ffi = body_has_ffi(&prog.main);
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         loops: Vec::new(),
         exit_ops: Vec::new(),
         debug,
+        has_ffi,
     };
     for stmt in &prog.main {
         c.stmt(stmt)?;
@@ -308,8 +319,50 @@ impl Compiler {
                 self.b.emit(Op::GetVar(idx), 0);
                 self.post_inc_dec(name, *inc);
             }
+            Expr::Call { name, args, line } => self.call(name, args, *line)?,
         }
         Ok(())
+    }
+
+    /// Lower a bare-identifier call `name(args...)`. Slice 1 declares no user
+    /// methods, so the only calls that resolve are the inline-Rust FFI ones:
+    ///
+    /// - `__rust_compile("<base64>", line)` — the desugar target of a
+    ///   `rust { ... }` block. Compile the base64 body and register its exports
+    ///   via the `JFFI_COMPILE` builtin; the call evaluates to `null`.
+    /// - any other name, **when a `rust { ... }` block is present** — an export
+    ///   registered at runtime, dispatched by name through the `JFFI_CALL`
+    ///   builtin (args pushed deepest-first, then the name on top).
+    ///
+    /// With no FFI block in the program, an unknown name stays a compile-time
+    /// "unresolved reference" error — javars's existing diagnostic is preserved.
+    /// Every branch leaves exactly one value on the stack (the builtin's return,
+    /// or the error path never emits).
+    fn call(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        if name == RUST_COMPILE {
+            // Compile only the base64 body (first arg); the line arg is metadata
+            // the builtin does not need.
+            if let Some(body) = args.first() {
+                self.expr(body)?;
+                self.b.emit(Op::CallBuiltin(crate::host::JFFI_COMPILE, 1), line);
+            } else {
+                self.b.emit(Op::LoadUndef, line);
+            }
+            return Ok(());
+        }
+        if self.has_ffi {
+            for a in args {
+                self.expr(a)?;
+            }
+            let c = self.b.add_constant(Value::str(name.to_string()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JFFI_CALL, args.len() as u8 + 1), line);
+            return Ok(());
+        }
+        Err(format!(
+            "javars: unresolved reference: {name} (line {line})"
+        ))
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
@@ -353,6 +406,47 @@ impl Compiler {
         };
         self.b.emit(vop, 0);
         Ok(())
+    }
+}
+
+// ── FFI detection (does the program contain a `rust { ... }` block?) ────────
+
+/// True if any statement in `body` (recursively) evaluates a `__rust_compile`
+/// call — the desugar target of an inline `rust { ... }` block.
+fn body_has_ffi(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
+        StmtKind::Assign { value, .. } => expr_has_ffi(value),
+        StmtKind::Expr(e) => expr_has_ffi(e),
+        StmtKind::If { cond, then, els } => {
+            expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
+        }
+        StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            init.as_deref().is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+                || cond.as_ref().is_some_and(expr_has_ffi)
+                || update
+                    .as_deref()
+                    .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+                || body_has_ffi(body)
+        }
+        StmtKind::Break | StmtKind::Continue => false,
+    })
+}
+
+fn expr_has_ffi(e: &Expr) -> bool {
+    match e {
+        Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
+        Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
+        Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
+        Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Var(_)
+        | Expr::PostIncDec { .. } => false,
     }
 }
 

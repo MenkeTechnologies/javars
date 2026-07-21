@@ -50,7 +50,12 @@ path = "src/bin/gen_docs.rs"
 # persistent on-disk cache of compiled native code (keyed by chunk hash), so hot
 # Java loops trace-compile and warm runs skip recompilation. `aot` enables the
 # ahead-of-time object emitter used by later `java --build` work.
-fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot"] }
+#
+# `ffi` enables fusevm's inline-Rust FFI bridge: a `rust { pub extern "C" fn … }`
+# block compiles to a cdylib whose exports are callable by name from Java
+# (src/rust_ffi.rs desugars the block; src/host.rs routes the `__rust_compile` /
+# by-name-call dispatch into `fusevm::ffi`).
+fusevm = { version = "0.14.11", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 thiserror = "2.0"
 

@@ -15,18 +15,23 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod rust_ffi;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};
 
-/// Parse Java `src` to an AST.
+/// Parse Java `src` to an AST. Inline `rust { ... }` FFI blocks are desugared to
+/// `__rust_compile(...)` statements first (see [`rust_ffi`]), so every parse
+/// path — run, `--dump-ast`, `--disasm`, `--dap` — sees the same rewritten
+/// source. No-op when the source has no `rust` block.
 pub fn parse(src: &str) -> Result<ast::Program, String> {
-    parser::parse(src)
+    let src = rust_ffi::desugar(src);
+    parser::parse(&src)
 }
 
 /// Parse and lower Java `src` to a runnable fusevm chunk.
 pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
-    let prog = parser::parse(src)?;
+    let prog = parse(src)?;
     compiler::compile(&prog)
 }
 
@@ -39,7 +44,13 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     vm.enable_tracing_jit();
     match vm.run() {
         VMResult::Ok(v) => Ok(v),
-        VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
+        // A halt raised by an inline-Rust FFI fault (compile error / call error /
+        // unresolved export) carries a message the host stashed; surface it as a
+        // `javars:` error rather than a silent success.
+        VMResult::Halted => match host::take_ffi_error() {
+            Some(e) => Err(e),
+            None => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
+        },
         VMResult::Error(e) => Err(e),
     }
 }

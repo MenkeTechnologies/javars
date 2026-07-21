@@ -443,10 +443,12 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 // `System.out.println(...)` / `.print(...)`, or a var read,
-                // or an unsupported call/field access.
+                // a bare-identifier call `name(args)`, or unsupported field
+                // access.
                 if name == "System" {
                     return self.system_out();
                 }
+                let line = self.line();
                 self.advance();
                 // post-inc/dec as an expression value is not modeled; only as a
                 // statement (handled in simple_statement). A trailing ++/-- here
@@ -458,7 +460,15 @@ impl Parser {
                         self.line()
                     ));
                 }
-                if self.is(&Tok::LParen) || self.is(&Tok::Dot) {
+                // `name(args...)` — a call. The compiler resolves it: the FFI
+                // desugar target `__rust_compile(...)` and `rust { ... }`-exported
+                // barewords lower to `fusevm::ffi`; any other name with no FFI
+                // block present is an unresolved reference.
+                if self.is(&Tok::LParen) {
+                    let args = self.call_args()?;
+                    return Ok(Expr::Call { name, args, line });
+                }
+                if self.is(&Tok::Dot) {
                     return Err(format!(
                         "javars: method/field access on `{name}` is not supported yet (line {})",
                         self.line()
@@ -471,6 +481,25 @@ impl Parser {
                 self.line()
             )),
         }
+    }
+
+    /// Parse a parenthesized, comma-separated argument list `( e, e, ... )`,
+    /// the cursor sitting on the opening `(`.
+    fn call_args(&mut self) -> Result<Vec<Expr>, String> {
+        self.eat(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if !self.is(&Tok::RParen) {
+            loop {
+                args.push(self.expression()?);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(args)
     }
 
     /// Parse `System.out.println(arg)` / `System.out.print(arg)`.

@@ -114,6 +114,17 @@ pub enum Expr {
         name: String,
         inc: bool,
     },
+    /// A bare-identifier function call `name(args...)`. Slice 1 declares no
+    /// user methods, so the only calls that reach the compiler are the inline
+    /// Rust FFI desugar target `__rust_compile("<base64>", line)` and the
+    /// barewords a `rust { ... }` block exports (routed to `fusevm::ffi` by
+    /// name — see [`crate::rust_ffi`] and [`crate::host`]). A call name that is
+    /// neither, with no FFI block present, is an unresolved reference.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
 }
 
 /// Unary operators.
