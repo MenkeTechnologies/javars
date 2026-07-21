@@ -38,7 +38,7 @@ pub const JFFI_CALL: u16 = 704;
 /// Builtin id for an instance method call on a `String` receiver. The stack
 /// holds `[recv, arg0, …, argN, methodName]` (the method name — a `Str` — on
 /// top); `argc` counts every one of those items (`recv + args + name`).
-/// Dispatches through [`b_str_dispatch`] to the `java.lang.String` method of
+/// Dispatches through `b_str_dispatch` to the `java.lang.String` method of
 /// that name, returning its result.
 pub const JSTR_DISPATCH: u16 = 705;
 /// Builtin id for `System.err.println` (one Java-formatted arg + newline, on
@@ -51,7 +51,7 @@ pub const JEPRINT: u16 = 707;
 /// `String.valueOf`, …). The stack holds `[arg0, …, argN, className,
 /// methodName]` (the method name — a `Str` — on top, the class name below it);
 /// `argc` counts the args plus those two names. Dispatches through
-/// [`b_static_dispatch`] to [`static_method`], returning its result.
+/// `b_static_dispatch` to `static_method`, returning its result.
 pub const JSTATIC_DISPATCH: u16 = 708;
 
 // ── Host object heap builtins (reference arrays + class instances) ──
@@ -84,7 +84,7 @@ pub const JFIELD_GET: u16 = 714;
 pub const JFIELD_SET: u16 = 715;
 /// `x instanceof C` — stack `[obj, className]` (`className` on top);
 /// `argc == 2`. Pushes a `Bool`: true when `obj` is a non-null instance whose
-/// class is `C` or a subclass. Subclass links are resolved through [`SUPERS`].
+/// class is `C` or a subclass. Subclass links are resolved through `SUPERS`.
 pub const JINSTANCEOF: u16 = 716;
 /// Runtime class name of an instance. Stack `[obj]`; `argc == 1`. Pushes the
 /// instance's class name as a `Str` (empty for a non-instance). Drives the
@@ -971,7 +971,7 @@ fn int_to_radix_string(n: i64, radix: i64) -> Result<String, String> {
         return Ok("0".to_string());
     }
     let neg = n < 0;
-    let mut v = (n as i128).unsigned_abs() as u128;
+    let mut v = (n as i128).unsigned_abs();
     let mut digits = Vec::new();
     while v > 0 {
         let d = (v % radix as u128) as u32;
