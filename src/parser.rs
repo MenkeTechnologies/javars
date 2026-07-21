@@ -293,10 +293,26 @@ impl Parser {
     }
 
     fn statement_kind(&mut self) -> Result<StmtKind, String> {
+        // A labeled statement `label: <stmt>` — an identifier immediately
+        // followed by `:`. (A ternary is never a valid statement expression, so
+        // a leading `Ident :` is unambiguously a label.)
+        if let Tok::Ident(label) = self.peek().clone() {
+            if matches!(self.toks[self.pos + 1].kind, Tok::Colon) {
+                self.advance(); // label
+                self.advance(); // :
+                let body = self.statement()?;
+                return Ok(StmtKind::Labeled {
+                    label,
+                    body: Box::new(body),
+                });
+            }
+        }
         match self.peek() {
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
+            Tok::Do => self.do_stmt(),
             Tok::For => self.for_stmt(),
+            Tok::Switch => self.switch_stmt(),
             Tok::Return => {
                 // `return;` or `return <expr>;`. The compiler resolves the
                 // context: a value return is valid in a method but rejected in
@@ -313,13 +329,15 @@ impl Parser {
             }
             Tok::Break => {
                 self.advance();
+                let label = self.optional_label();
                 self.eat(&Tok::Semi)?;
-                Ok(StmtKind::Break)
+                Ok(StmtKind::Break(label))
             }
             Tok::Continue => {
                 self.advance();
+                let label = self.optional_label();
                 self.eat(&Tok::Semi)?;
-                Ok(StmtKind::Continue)
+                Ok(StmtKind::Continue(label))
             }
             Tok::LBrace => {
                 self.advance();
@@ -463,10 +481,103 @@ impl Parser {
         })
     }
 
+    /// Consume an optional label identifier following `break`/`continue`
+    /// (`break outer;`). Returns `None` when the next token is the `;`.
+    fn optional_label(&mut self) -> Option<String> {
+        if let Tok::Ident(name) = self.peek().clone() {
+            self.advance();
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    fn do_stmt(&mut self) -> Result<StmtKind, String> {
+        self.eat(&Tok::Do)?;
+        let body = self.braced_or_single()?;
+        self.eat(&Tok::While)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expression()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::Semi)?;
+        Ok(StmtKind::DoWhile { body, cond })
+    }
+
+    /// Parse `switch (disc) { (case E:|default:)+ stmts ... }`. Consecutive
+    /// `case`/`default` labels with no statements between them share the body
+    /// that follows (`case 1: case 2: body`), forming one [`SwitchGroup`].
+    fn switch_stmt(&mut self) -> Result<StmtKind, String> {
+        self.eat(&Tok::Switch)?;
+        self.eat(&Tok::LParen)?;
+        let disc = self.expression()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::LBrace)?;
+        let mut groups = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            // Collect the run of labels that introduce this group.
+            let mut labels = Vec::new();
+            let mut is_default = false;
+            loop {
+                if self.is(&Tok::Case) {
+                    self.advance();
+                    // Case labels are constant expressions; parse below the
+                    // ternary so the group-terminating `:` is not swallowed.
+                    labels.push(self.binary(0)?);
+                    self.eat(&Tok::Colon)?;
+                } else if self.is(&Tok::Default) {
+                    self.advance();
+                    self.eat(&Tok::Colon)?;
+                    is_default = true;
+                } else {
+                    break;
+                }
+            }
+            if labels.is_empty() && !is_default {
+                return Err(format!(
+                    "javars: expected `case` or `default` in switch body (line {})",
+                    self.line()
+                ));
+            }
+            // Statements up to the next label or the closing brace.
+            let mut body = Vec::new();
+            while !self.is(&Tok::Case)
+                && !self.is(&Tok::Default)
+                && !self.is(&Tok::RBrace)
+                && !self.is(&Tok::Eof)
+            {
+                body.push(self.statement()?);
+            }
+            groups.push(SwitchGroup {
+                labels,
+                is_default,
+                body,
+            });
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(StmtKind::Switch { disc, groups })
+    }
+
     // ── expressions (precedence climbing) ─────────────────────────────────
 
+    /// A full expression: a binary/precedence-climbed operand optionally
+    /// followed by the ternary `? then : els`. The ternary binds looser than
+    /// every binary operator and is right-associative — `a ? b : c ? d : e`
+    /// parses as `a ? b : (c ? d : e)` because the `els` branch recurses through
+    /// `expression`.
     fn expression(&mut self) -> Result<Expr, String> {
-        self.binary(0)
+        let cond = self.binary(0)?;
+        if self.is(&Tok::Question) {
+            self.advance();
+            let then = self.expression()?;
+            self.eat(&Tok::Colon)?;
+            let els = self.expression()?;
+            return Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                els: Box::new(els),
+            });
+        }
+        Ok(cond)
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<Expr, String> {
@@ -628,17 +739,22 @@ impl Parser {
         Ok(args)
     }
 
-    /// Parse `System.out.println(arg)` / `System.out.print(arg)`.
+    /// Parse `System.out.println(arg)` / `System.out.print(arg)` and the
+    /// `System.err` variants (which print to stderr).
     fn system_out(&mut self) -> Result<Expr, String> {
         self.ident()?; // System
         self.eat(&Tok::Dot)?;
-        let out = self.ident()?;
-        if out != "out" {
-            return Err(format!(
-                "javars: only `System.out` is supported, not `System.{out}` (line {})",
-                self.line()
-            ));
-        }
+        let stream = self.ident()?;
+        let err = match stream.as_str() {
+            "out" => false,
+            "err" => true,
+            _ => {
+                return Err(format!(
+                    "javars: only `System.out`/`System.err` are supported, not `System.{stream}` (line {})",
+                    self.line()
+                ))
+            }
+        };
         self.eat(&Tok::Dot)?;
         let method = self.ident()?;
         let newline = match method.as_str() {
@@ -646,7 +762,7 @@ impl Parser {
             "print" => false,
             _ => {
                 return Err(format!(
-                "javars: only `System.out.println`/`print` are supported, not `{method}` (line {})",
+                "javars: only `System.{stream}.println`/`print` are supported, not `{method}` (line {})",
                 self.line()
             ))
             }
@@ -658,7 +774,7 @@ impl Parser {
             Some(Box::new(self.expression()?))
         };
         self.eat(&Tok::RParen)?;
-        Ok(Expr::Println { newline, arg })
+        Ok(Expr::Println { newline, err, arg })
     }
 
     fn ident(&mut self) -> Result<String, String> {

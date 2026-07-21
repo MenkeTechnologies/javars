@@ -6,6 +6,19 @@ silently mis-run.
 
 ## Implemented
 
+- **Control flow.** `if`/`else`, `while`, `do`/`while`, C-style `for`, and the
+  ternary `cond ? a : b` (right-associative, result typed by branch promotion).
+  `switch (x) { case L: … break; default: }` on `int` and `String`, with
+  fall-through between groups and grouped labels (`case 1: case 2:`). `break`
+  and `continue`, including the labeled forms (`outer: for (…) { break outer; }`)
+  — a labeled `break` exits the named loop/`switch`, a labeled `continue` steps
+  the named loop.
+- **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
+  `ceil`/`round` (with Java's int-vs-double overload result typing),
+  `Integer.parseInt` (with radix)/`valueOf`/`toString` (with radix),
+  `Long.parseLong`, `Boolean.parseBoolean`, and `String.valueOf`. Malformed
+  numeric input faults like `NumberFormatException`; an unregistered static
+  method is an error. `System.err.print[ln]` writes to stderr.
 - **User-defined `static` methods.** `static <ret> name(<params>) { … }` lowers
   to fusevm's native `Op::Call` frame ABI — parameters and locals live in call-
   frame slots, so recursion, mutual recursion, and forward references all work.
@@ -31,14 +44,16 @@ silently mis-run.
   semantics (pass to a method, mutate an element, observe the change in the
   caller) needs a heap/handle indirection that is not yet built — arrays stay
   unsupported rather than silently mis-run the aliasing case.
-- **The standard library.** No `Math`, `Integer.parseInt`, `java.util.*`, and no
-  non-`String` receiver methods. `System.out.print`/`println` and the `String`
-  methods above are the only library surface.
-- **Field access on values.** `arr.length`, `System.err`, and any `x.field`
-  (only `recv.method(...)` calls dispatch; a bare `.field` is a parse error).
+- **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
+  `String` statics listed above and the `String` instance methods are the whole
+  library surface — no `java.util.*` collections, no non-`String` receiver
+  instance methods, no `Math` constants (`Math.PI`).
+- **Field access on values.** `arr.length` and any `x.field` (only
+  `recv.method(...)` calls dispatch; a bare `.field` is a parse error).
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
-- **`switch`, `do/while`, labeled break, ternary `?:`, enhanced `for`.**
+- **Arrow `switch` expressions**, `switch` on enums/patterns, and the enhanced
+  `for` (`for (var x : coll)`).
 - **`try`/`catch`/`finally`, exceptions, `throw`.**
 - **Generics, lambdas, streams, records, `var` type inference beyond storage.**
 

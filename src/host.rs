@@ -40,6 +40,18 @@ pub const JFFI_CALL: u16 = 704;
 /// Dispatches through [`b_str_dispatch`] to the `java.lang.String` method of
 /// that name, returning its result.
 pub const JSTR_DISPATCH: u16 = 705;
+/// Builtin id for `System.err.println` (one Java-formatted arg + newline, on
+/// stderr).
+pub const JEPRINTLN: u16 = 706;
+/// Builtin id for `System.err.print` (one Java-formatted arg, no newline, on
+/// stderr).
+pub const JEPRINT: u16 = 707;
+/// Builtin id for a static stdlib method call (`Math.*`, `Integer.*`,
+/// `String.valueOf`, …). The stack holds `[arg0, …, argN, className,
+/// methodName]` (the method name — a `Str` — on top, the class name below it);
+/// `argc` counts the args plus those two names. Dispatches through
+/// [`b_static_dispatch`] to [`static_method`], returning its result.
+pub const JSTATIC_DISPATCH: u16 = 708;
 
 thread_local! {
     /// Set by an inline-Rust FFI fault (compile error, call error, or an
@@ -66,9 +78,12 @@ fn ffi_fault(vm: &mut VM, msg: impl Into<String>) {
 pub fn install(vm: &mut VM) {
     vm.register_builtin(JPRINTLN, b_println);
     vm.register_builtin(JPRINT, b_print);
+    vm.register_builtin(JEPRINTLN, b_eprintln);
+    vm.register_builtin(JEPRINT, b_eprint);
     vm.register_builtin(JFFI_COMPILE, b_ffi_compile);
     vm.register_builtin(JFFI_CALL, b_ffi_call);
     vm.register_builtin(JSTR_DISPATCH, b_str_dispatch);
+    vm.register_builtin(JSTATIC_DISPATCH, b_static_dispatch);
 }
 
 /// `__rust_compile("<base64>")` builtin: pop the base64-encoded `rust { ... }`
@@ -224,6 +239,146 @@ fn char_index_of(s: &str, needle: &str) -> i64 {
     }
 }
 
+/// Static stdlib dispatch builtin (`Math.*`, `Integer.*`, `String.valueOf`, …).
+/// Pops the method name (top of stack), the class name, and the `argc - 2`
+/// arguments, then evaluates the corresponding static method. A faulting call
+/// (bad arity, `NumberFormatException`, unknown method) surfaces as a `javars:`
+/// error rather than a wrong value.
+fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
+    let method = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let class = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let n = argc.saturating_sub(2) as usize; // minus class name and method name
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    match static_method(&class, &method, &args) {
+        Ok(v) => v,
+        Err(e) => {
+            ffi_fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// Evaluate a static stdlib method `Class.method(args)`.
+///
+/// Numeric overloads follow Java at the value level: `Math.abs`/`max`/`min`
+/// keep an `int` result for integral operands and a `double` result when any
+/// operand is floating point; `Math.pow`/`sqrt`/`floor`/`ceil` always return a
+/// `double`; `Math.round` returns an integer (`floor(x + 0.5)`, ties toward
+/// positive infinity). `Integer.parseInt`/`Long.parseLong` reject malformed
+/// input the way `javac`-compiled code would throw `NumberFormatException`.
+fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, String> {
+    let both_int = |a: &Value, b: &Value| matches!(a, Value::Int(_)) && matches!(b, Value::Int(_));
+    match (class, method, args.len()) {
+        // ── java.lang.Math ──
+        ("Math", "abs", 1) => Ok(match &args[0] {
+            Value::Int(n) => Value::Int(n.abs()),
+            other => Value::float(other.to_float().abs()),
+        }),
+        ("Math", "max", 2) => Ok(if both_int(&args[0], &args[1]) {
+            Value::Int(args[0].to_int().max(args[1].to_int()))
+        } else {
+            Value::float(args[0].to_float().max(args[1].to_float()))
+        }),
+        ("Math", "min", 2) => Ok(if both_int(&args[0], &args[1]) {
+            Value::Int(args[0].to_int().min(args[1].to_int()))
+        } else {
+            Value::float(args[0].to_float().min(args[1].to_float()))
+        }),
+        ("Math", "pow", 2) => Ok(Value::float(args[0].to_float().powf(args[1].to_float()))),
+        ("Math", "sqrt", 1) => Ok(Value::float(args[0].to_float().sqrt())),
+        ("Math", "floor", 1) => Ok(Value::float(args[0].to_float().floor())),
+        ("Math", "ceil", 1) => Ok(Value::float(args[0].to_float().ceil())),
+        // Java `Math.round(double)` = `(long) Math.floor(a + 0.5d)` — ties round
+        // toward positive infinity (round(-2.5) == -2), unlike Rust's `round`.
+        ("Math", "round", 1) => Ok(Value::Int((args[0].to_float() + 0.5).floor() as i64)),
+
+        // ── java.lang.Integer / Long ──
+        ("Integer", "parseInt", 1) => {
+            parse_int_radix(&args[0].as_str_cow(), 10, "Integer.parseInt")
+        }
+        ("Integer", "parseInt", 2) => {
+            let radix = args[1].to_int();
+            parse_int_radix(&args[0].as_str_cow(), radix, "Integer.parseInt")
+        }
+        ("Long", "parseLong", 1) => parse_int_radix(&args[0].as_str_cow(), 10, "Long.parseLong"),
+        // `Integer.valueOf(String)` parses; `Integer.valueOf(int)` is identity.
+        ("Integer", "valueOf", 1) => match &args[0] {
+            Value::Str(s) => parse_int_radix(s, 10, "Integer.valueOf"),
+            other => Ok(Value::Int(other.to_int())),
+        },
+        // `Integer.toString(int)` / `Integer.toString(int, radix)`.
+        ("Integer", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
+        ("Integer", "toString", 2) => Ok(Value::str(int_to_radix_string(
+            args[0].to_int(),
+            args[1].to_int(),
+        )?)),
+
+        // ── java.lang.Boolean ──
+        ("Boolean", "parseBoolean", 1) => Ok(Value::bool(
+            args[0].as_str_cow().eq_ignore_ascii_case("true"),
+        )),
+
+        // ── java.lang.String ──
+        // `String.valueOf(x)` renders any value with Java's `println` rules.
+        ("String", "valueOf", 1) => Ok(Value::str(java_str(&args[0]))),
+
+        _ => Err(format!(
+            "javars: unsupported static method `{class}.{method}` with {} argument(s)",
+            args.len()
+        )),
+    }
+}
+
+/// Parse a signed integer in the given radix, reporting Java's
+/// `NumberFormatException` message shape on failure.
+fn parse_int_radix(s: &str, radix: i64, who: &str) -> Result<Value, String> {
+    if !(2..=36).contains(&radix) {
+        return Err(format!("javars: {who}: radix {radix} out of range"));
+    }
+    match i64::from_str_radix(s.trim(), radix as u32) {
+        Ok(n) => Ok(Value::Int(n)),
+        Err(_) => Err(format!(
+            "javars: {who}: NumberFormatException: For input string: \"{s}\""
+        )),
+    }
+}
+
+/// Render `n` in the given radix (2..=36), matching `Integer.toString(i, radix)`.
+fn int_to_radix_string(n: i64, radix: i64) -> Result<String, String> {
+    if !(2..=36).contains(&radix) {
+        // Java falls back to radix 10 for an out-of-range radix.
+        return Ok(n.to_string());
+    }
+    let radix = radix as u64;
+    if n == 0 {
+        return Ok("0".to_string());
+    }
+    let neg = n < 0;
+    let mut v = (n as i128).unsigned_abs() as u128;
+    let mut digits = Vec::new();
+    while v > 0 {
+        let d = (v % radix as u128) as u32;
+        digits.push(std::char::from_digit(d, radix as u32).unwrap());
+        v /= radix as u128;
+    }
+    if neg {
+        digits.push('-');
+    }
+    Ok(digits.iter().rev().collect())
+}
+
 /// Install the debug line-marker builtin used by `java --dap`. The marker fires
 /// synchronously at each statement; it delegates to the DAP server, which pauses
 /// in place when the line is a breakpoint or step target.
@@ -242,15 +397,25 @@ fn b_dbg_line(vm: &mut VM, _argc: u8) -> Value {
 /// `System.out.println` builtin: pop `argc` values (0 or 1 in slice 1), print
 /// them Java-formatted followed by a newline, and return `null`.
 fn b_println(vm: &mut VM, argc: u8) -> Value {
-    print_args(vm, argc, true)
+    print_args(vm, argc, true, false)
 }
 
 /// `System.out.print` builtin: as [`b_println`] but with no trailing newline.
 fn b_print(vm: &mut VM, argc: u8) -> Value {
-    print_args(vm, argc, false)
+    print_args(vm, argc, false, false)
 }
 
-fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
+/// `System.err.println` builtin: as [`b_println`] but on stderr.
+fn b_eprintln(vm: &mut VM, argc: u8) -> Value {
+    print_args(vm, argc, true, true)
+}
+
+/// `System.err.print` builtin: as [`b_print`] but on stderr.
+fn b_eprint(vm: &mut VM, argc: u8) -> Value {
+    print_args(vm, argc, false, true)
+}
+
+fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
     use std::io::Write;
     // Pop the args (pushed left-to-right, so the last is on top) and restore
     // source order.
@@ -259,11 +424,17 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool) -> Value {
         vals.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     vals.reverse();
+    // Format once, then write to the selected stream. Boxing the lock keeps the
+    // two branches on one write path.
+    let text: String = vals.iter().map(java_str).collect();
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    for v in &vals {
-        let _ = write!(lock, "{}", java_str(v));
-    }
+    let stderr = std::io::stderr();
+    let mut lock: Box<dyn Write> = if err {
+        Box::new(stderr.lock())
+    } else {
+        Box::new(stdout.lock())
+    };
+    let _ = write!(lock, "{text}");
     if newline {
         let _ = writeln!(lock);
     }

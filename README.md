@@ -244,18 +244,23 @@ Java source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 ## [0x06] STATUS & ROADMAP
 
 This release: single-class programs, `main`, locals, arithmetic / comparison /
-logic, Java integer-vs-float division, `if` / `while` / `for` / `break` /
-`continue` / `return`, `System.out.print[ln]`, string concatenation,
-user-defined `static` methods (recursion, parameters, value returns over
-fusevm's `Op::Call` frame ABI), and `String` instance methods — all verified
-byte-for-byte against OpenJDK.
+logic, Java integer-vs-float division, the ternary `?:` operator, `if` /
+`while` / `do`-`while` / `for` / `switch` (with fall-through, on `int` and
+`String`) / `break` / `continue` (including labeled `break outer;` /
+`continue outer;`) / `return`, `System.out`/`System.err` `print[ln]`, string
+concatenation, user-defined `static` methods (recursion, parameters, value
+returns over fusevm's `Op::Call` frame ABI), `String` instance methods, and a
+first slice of the standard library (`Math.*`, `Integer.parseInt`/`valueOf`/
+`toString`, `Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`) — all
+verified byte-for-byte against OpenJDK.
 
 Next waves, in priority order:
 
 1. **Reference types** — arrays (with real reference/aliasing semantics on a host
    heap) and a class/instance object model.
-2. **Standard library surface** — `Math`, `String`/`Integer` statics, common
-   `java.util` collections, more `String` methods, instance-method dispatch.
+2. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
+   collections, more `String` methods, arrow-`switch` expressions, and
+   instance-method dispatch on non-`String` receivers.
 3. **A differential parity harness** — a snippet corpus diffed live against a
    reference `java`, frozen and replayed in CI (the pattern `ruby`/`node`/
    `python` frontends use).

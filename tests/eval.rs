@@ -20,6 +20,24 @@ fn run(src: &str) -> (String, bool) {
     )
 }
 
+/// Run a Java source string and return (stdout, stderr, ok) — for exercising
+/// `System.err`, which the stdout-only [`run`] helper cannot observe.
+fn run_streams(src: &str) -> (String, String, bool) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("javars_test_{}.java", fasthash(src)));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .output()
+        .expect("spawn java");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
 fn fasthash(s: &str) -> u64 {
     // A tiny FNV-1a so concurrent tests use distinct temp files.
     let mut h: u64 = 0xcbf29ce484222325;
@@ -277,5 +295,188 @@ fn string_index_out_of_range_is_an_error() {
     assert!(
         !ok,
         "an out-of-range charAt must surface an error, not a wrong value"
+    );
+}
+
+// ── ternary conditional operator ──
+
+#[test]
+fn ternary_selects_branch_by_condition() {
+    let (out, _) = run(&wrap(
+        "int x = 5; System.out.println(x > 0 ? \"pos\" : \"nonpos\"); \
+         System.out.println(x < 0 ? \"neg\" : \"nonneg\");",
+    ));
+    assert_eq!(out, "pos\nnonneg\n");
+}
+
+#[test]
+fn ternary_is_right_associative() {
+    // `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`. With x=5:
+    // x<0 is false, so evaluate x>3 ? 9 : 2 → 9.
+    let (out, _) = run(&wrap(
+        "int x = 5; System.out.println(x < 0 ? 1 : x > 3 ? 9 : 2);",
+    ));
+    assert_eq!(out, "9\n");
+}
+
+#[test]
+fn ternary_result_type_drives_division() {
+    // A conditional with two `int` branches truncates the following `/`; a
+    // branch typed `double` promotes the whole expression to floating point.
+    let (out, _) = run(&wrap(
+        "boolean f = true; System.out.println((f ? 7 : 8) / 2); \
+         System.out.println((f ? 7.0 : 8) / 2);",
+    ));
+    assert_eq!(out, "3\n3.5\n");
+}
+
+// ── switch statement (classic, with fall-through) ──
+
+#[test]
+fn switch_int_fallthrough_and_grouped_labels() {
+    // case 0 breaks; cases 1 and 2 share a body then break; anything else hits
+    // default. Verifies grouped labels (`case 1: case 2:`) and break/default.
+    let (out, _) = run(&wrap(
+        "for (int i = 0; i < 5; i++) { switch (i) { \
+         case 0: System.out.println(\"zero\"); break; \
+         case 1: case 2: System.out.println(\"one-two\"); break; \
+         default: System.out.println(\"big\"); } }",
+    ));
+    assert_eq!(out, "zero\none-two\none-two\nbig\nbig\n");
+}
+
+#[test]
+fn switch_string_falls_through_without_break() {
+    // A matched `case` with no `break` falls into the following group's body —
+    // here into `default`. Switch on `String` uses value equality.
+    let (out, _) = run(&wrap(
+        "String s = \"b\"; switch (s) { \
+         case \"a\": System.out.println(\"A\"); break; \
+         case \"b\": System.out.println(\"B\"); \
+         default: System.out.println(\"fell\"); }",
+    ));
+    assert_eq!(out, "B\nfell\n");
+}
+
+#[test]
+fn switch_default_reached_when_no_case_matches() {
+    // `default` need not be last, and an unmatched discriminant jumps to it.
+    let (out, _) = run(&wrap(
+        "int x = 9; switch (x) { \
+         case 1: System.out.println(\"1\"); break; \
+         default: System.out.println(\"def\"); break; \
+         case 2: System.out.println(\"2\"); } System.out.println(\"end\");",
+    ));
+    assert_eq!(out, "def\nend\n");
+}
+
+#[test]
+fn switch_break_exits_switch_not_enclosing_loop() {
+    // Inside a loop: `break` leaves the switch (so `after` still prints), while
+    // `continue` skips to the next loop iteration (so `after` is skipped).
+    let (out, _) = run(&wrap(
+        "for (int i = 0; i < 4; i++) { switch (i) { \
+         case 1: continue; \
+         case 2: break; \
+         default: System.out.println(\"d\" + i); } System.out.println(\"after\" + i); }",
+    ));
+    assert_eq!(out, "d0\nafter0\nafter2\nd3\nafter3\n");
+}
+
+// ── do/while and labeled break/continue ──
+
+#[test]
+fn do_while_runs_body_before_testing() {
+    // The body runs once even when the condition is false on entry.
+    let (out, _) = run(&wrap(
+        "int i = 0; do { System.out.println(i); i++; } while (i < 3); \
+         int j = 10; do { System.out.println(\"once\"); } while (j < 5);",
+    ));
+    assert_eq!(out, "0\n1\n2\nonce\n");
+}
+
+#[test]
+fn labeled_break_exits_outer_loop() {
+    let (out, _) = run(&wrap(
+        "outer: for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) { \
+         if (i + j == 3) { break outer; } System.out.println(i + \",\" + j); } }",
+    ));
+    assert_eq!(out, "0,0\n0,1\n0,2\n1,0\n1,1\n");
+}
+
+#[test]
+fn labeled_continue_advances_outer_loop() {
+    // `continue outer` abandons the inner loop and steps the outer one, so only
+    // the `j == 0` row of each `i` prints.
+    let (out, _) = run(&wrap(
+        "outer: for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) { \
+         if (j == 1) { continue outer; } System.out.println(i + \",\" + j); } }",
+    ));
+    assert_eq!(out, "0,0\n1,0\n2,0\n");
+}
+
+// ── stdlib essentials (Math, Integer, String.valueOf, Boolean, System.err) ──
+
+#[test]
+fn math_functions_match_java_overload_typing() {
+    // abs/max/min keep an int result for int operands and a double result when
+    // any operand is floating point; pow/sqrt/floor/ceil are always double;
+    // round returns an integer (ties toward positive infinity).
+    let (out, _) = run(&wrap(
+        "System.out.println(Math.abs(-5)); System.out.println(Math.abs(-5.5)); \
+         System.out.println(Math.max(3, 7)); System.out.println(Math.min(3.0, 7)); \
+         System.out.println(Math.pow(2, 10)); System.out.println(Math.sqrt(16)); \
+         System.out.println(Math.floor(2.7)); System.out.println(Math.ceil(2.1)); \
+         System.out.println(Math.round(2.5)); System.out.println(Math.round(-2.5));",
+    ));
+    assert_eq!(out, "5\n5.5\n7\n3.0\n1024.0\n4.0\n2.0\n3.0\n3\n-2\n");
+}
+
+#[test]
+fn integer_parse_value_and_to_string_with_radix() {
+    let (out, _) = run(&wrap(
+        "System.out.println(Integer.parseInt(\"42\")); \
+         System.out.println(Integer.parseInt(\"ff\", 16)); \
+         System.out.println(Integer.valueOf(\"7\") + 1); \
+         System.out.println(Integer.toString(255)); \
+         System.out.println(Integer.toString(255, 16));",
+    ));
+    assert_eq!(out, "42\n255\n8\n255\nff\n");
+}
+
+#[test]
+fn integer_parse_int_rejects_non_numeric() {
+    let (_out, ok) = run(&wrap("System.out.println(Integer.parseInt(\"notnum\"));"));
+    assert!(
+        !ok,
+        "parseInt of a non-numeric string must fault, not return a wrong value"
+    );
+}
+
+#[test]
+fn string_value_of_and_boolean_parse() {
+    let (out, _) = run(&wrap(
+        "System.out.println(String.valueOf(42)); System.out.println(String.valueOf(true)); \
+         System.out.println(String.valueOf(3.0)); System.out.println(Boolean.parseBoolean(\"TRUE\"));",
+    ));
+    assert_eq!(out, "42\ntrue\n3.0\ntrue\n");
+}
+
+#[test]
+fn system_err_writes_to_stderr_not_stdout() {
+    let (out, err, ok) = run_streams(&wrap(
+        "System.out.println(\"to-out\"); System.err.println(\"to-err\"); System.err.print(\"tail\");",
+    ));
+    assert!(ok);
+    assert_eq!(out, "to-out\n");
+    assert_eq!(err, "to-err\ntail");
+}
+
+#[test]
+fn unknown_static_method_is_an_error() {
+    let (_out, ok) = run(&wrap("System.out.println(Math.tan(1.0));"));
+    assert!(
+        !ok,
+        "an unregistered static method must error rather than run"
     );
 }

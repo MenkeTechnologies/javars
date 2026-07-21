@@ -104,32 +104,52 @@
           <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { System.out.println(i); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-9">
-          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>return</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>do</code></h3>
+          <p>do/while loop: run the body once, then repeat while the condition holds</p>
+          <pre><code class="lang-java">int i = 0; do { i++; } while (i &lt; 3);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-10">
+          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>switch</code></h3>
+          <p>multi-way branch on an int or String; groups fall through until `break`</p>
+          <pre><code class="lang-java">switch (n) { case 1: System.out.println("one"); break; default: }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-11">
+          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>case</code></h3>
+          <p>a `switch` label; a matched case runs until a `break` or the switch end</p>
+          <pre><code class="lang-java">case 2: System.out.println("two"); break;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-12">
+          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>default</code></h3>
+          <p>the `switch` label taken when no `case` matches</p>
+          <pre><code class="lang-java">default: System.out.println("other");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-13">
+          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>return</code></h3>
           <p>return from the current method (bare `return;` ends `void main`)</p>
           <pre><code class="lang-java">if (done) return;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>break</code></h3>
-          <p>exit the nearest enclosing loop immediately</p>
-          <pre><code class="lang-java">for (int i = 0; ; i++) { if (i == 5) break; }</code></pre>
+        <article class="doc-entry" id="doc-keyword-14">
+          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>break</code></h3>
+          <p>exit the nearest loop/switch, or a labeled one: `break outer;`</p>
+          <pre><code class="lang-java">outer: for (int i = 0; ; i++) { if (i == 5) break outer; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>continue</code></h3>
-          <p>skip to the next iteration of the nearest loop</p>
+        <article class="doc-entry" id="doc-keyword-15">
+          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>continue</code></h3>
+          <p>skip to the next iteration of the nearest (or labeled) loop</p>
           <pre><code class="lang-java">for (int i = 0; i &lt; 5; i++) { if (i == 2) continue; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>true</code></h3>
+        <article class="doc-entry" id="doc-keyword-16">
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>true</code></h3>
           <p>the boolean literal true</p>
           <pre><code class="lang-java">boolean b = true;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>false</code></h3>
           <p>the boolean literal false</p>
           <pre><code class="lang-java">boolean b = false;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>new</code></h3>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>new</code></h3>
           <p>object/array allocation keyword (reserved; recognized by the lexer)</p>
           <pre><code class="lang-java">int[] a = new int[3];</code></pre>
         </article>
@@ -210,6 +230,11 @@
           <h3><a class="doc-anchor" href="#doc-io-4">#</a> <code>out</code></h3>
           <p>System.out — the standard output stream (println / print)</p>
           <pre><code class="lang-java">System.out.print("x");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-io-5">
+          <h3><a class="doc-anchor" href="#doc-io-5">#</a> <code>err</code></h3>
+          <p>System.err — the standard error stream (println / print)</p>
+          <pre><code class="lang-java">System.err.println("oops");</code></pre>
         </article>
       </section>
 

@@ -87,20 +87,60 @@ impl MethodScope {
     }
 }
 
-/// One enclosing loop's backpatch targets.
-struct Loop {
+/// What kind of construct a [`BreakScope`] wraps. A `break` may target either a
+/// loop or a `switch`; a `continue` targets only a loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Loop,
+    Switch,
+}
+
+/// One enclosing breakable construct's backpatch targets. Loops and `switch`
+/// bodies both catch `break`; only loops catch `continue`. An optional `label`
+/// lets `break label;`/`continue label;` target a specific enclosing construct.
+struct BreakScope {
+    kind: ScopeKind,
+    /// The source label naming this construct (`outer: for …`), if any.
+    label: Option<String>,
     /// `continue` jump op indices, patched to the loop's continue target (the
     /// step/condition entry) once it is known. Backpatched — not read eagerly —
     /// because a `for` loop's continue target (the update clause) is only known
-    /// after its body is lowered.
+    /// after its body is lowered. Always empty for a `switch` scope.
     continue_ops: Vec<usize>,
-    /// `break` jump op indices, patched to the loop exit once known.
+    /// `break` jump op indices, patched to the construct's exit once known.
     break_ops: Vec<usize>,
+}
+
+impl BreakScope {
+    fn loop_scope(label: Option<String>) -> Self {
+        BreakScope {
+            kind: ScopeKind::Loop,
+            label,
+            continue_ops: Vec::new(),
+            break_ops: Vec::new(),
+        }
+    }
+    fn switch_scope(label: Option<String>) -> Self {
+        BreakScope {
+            kind: ScopeKind::Switch,
+            label,
+            continue_ops: Vec::new(),
+            break_ops: Vec::new(),
+        }
+    }
 }
 
 struct Compiler {
     b: ChunkBuilder,
-    loops: Vec<Loop>,
+    /// The stack of enclosing breakable constructs (loops and `switch`es),
+    /// innermost last. `break`/`continue` backpatch through it.
+    scopes: Vec<BreakScope>,
+    /// A pending source label consumed by the next loop/`switch` it prefixes
+    /// (`outer: for …`). Set by [`StmtKind::Labeled`], taken when the construct
+    /// pushes its [`BreakScope`].
+    pending_label: Option<String>,
+    /// Counter minting unique internal names for `switch` discriminant temps.
+    switch_counter: u32,
     /// A top-level `break`/`return;` (no enclosing loop) jumps to program end.
     exit_ops: Vec<usize>,
     /// When true, emit a per-statement `CallBuiltin(DBG_LINE)` line marker so the
@@ -152,7 +192,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     let mut c = Compiler {
         b: ChunkBuilder::new(),
-        loops: Vec::new(),
+        scopes: Vec::new(),
+        pending_label: None,
+        switch_counter: 0,
         exit_ops: Vec::new(),
         debug,
         has_ffi,
@@ -271,16 +313,38 @@ impl Compiler {
             },
             Expr::PostIncDec { name, .. } => self.lookup_type(name),
             Expr::Println { .. } => NumType::Other,
+            // A conditional expression's numeric category is the promotion of
+            // its two result branches (Java's conditional-expression typing).
+            Expr::Ternary { then, els, .. } => {
+                let t = self.expr_type(then);
+                let e = self.expr_type(els);
+                if t == NumType::Other || e == NumType::Other {
+                    NumType::Other
+                } else if t == NumType::Float || e == NumType::Float {
+                    NumType::Float
+                } else {
+                    NumType::Int
+                }
+            }
             Expr::Call { name, .. } => self
                 .methods
                 .get(name)
                 .map(|s| s.ret)
                 .unwrap_or(NumType::Other),
-            // The `String` methods that return `int` participate in `/` typing.
-            Expr::MethodCall { method, .. } => match method.as_str() {
-                "length" | "indexOf" => NumType::Int,
-                _ => NumType::Other,
-            },
+            Expr::MethodCall { recv, method, .. } => {
+                // Static stdlib calls that yield an `int` participate in `/`
+                // truncation typing.
+                if let Expr::Var(class) = recv.as_ref() {
+                    if let Some(nt) = static_call_numtype(class, method) {
+                        return nt;
+                    }
+                }
+                // The `String` instance methods that return `int`.
+                match method.as_str() {
+                    "length" | "indexOf" => NumType::Int,
+                    _ => NumType::Other,
+                }
+            }
         }
     }
 
@@ -373,10 +437,10 @@ impl Compiler {
                 self.emit_set(name, line);
                 Ok(())
             }
-            StmtKind::Expr(Expr::Println { newline, arg }) => {
+            StmtKind::Expr(Expr::Println { newline, err, arg }) => {
                 // The print builtin returns `null`; discard it in statement
                 // position.
-                self.println(*newline, arg.as_deref())?;
+                self.println(*newline, *err, arg.as_deref())?;
                 self.b.emit(Op::Pop, line);
                 Ok(())
             }
@@ -391,28 +455,39 @@ impl Compiler {
             }
             StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els),
             StmtKind::While { cond, body } => self.while_stmt(cond, body),
+            StmtKind::DoWhile { body, cond } => self.do_while_stmt(body, cond),
             StmtKind::For {
                 init,
                 cond,
                 update,
                 body,
             } => self.for_stmt(init, cond, update, body),
-            StmtKind::Break => {
-                let op = self.b.emit(Op::Jump(0), line);
-                match self.loops.last_mut() {
-                    Some(l) => l.break_ops.push(op),
-                    None => self.exit_ops.push(op),
+            StmtKind::Switch { disc, groups } => self.switch_stmt(disc, groups),
+            StmtKind::Labeled { label, body } => {
+                // A label prefixing a loop/`switch` is consumed by that
+                // construct's own `BreakScope` (via `pending_label`). A label on
+                // any other statement (a block, an `if`) gets a break-only scope
+                // so `break label;` can still exit it.
+                if is_breakable(body) {
+                    self.pending_label = Some(label.clone());
+                    self.stmt(body)?;
+                    // If the construct did not consume the label (should not
+                    // happen for breakables), clear it so it cannot leak.
+                    self.pending_label = None;
+                } else {
+                    self.scopes
+                        .push(BreakScope::switch_scope(Some(label.clone())));
+                    self.stmt(body)?;
+                    let scope = self.scopes.pop().unwrap();
+                    let end = self.b.current_pos();
+                    for op in scope.break_ops {
+                        self.b.patch_jump(op, end);
+                    }
                 }
                 Ok(())
             }
-            StmtKind::Continue => {
-                let op = self.b.emit(Op::Jump(0), line);
-                match self.loops.last_mut() {
-                    Some(l) => l.continue_ops.push(op),
-                    None => return Err("javars: `continue` outside a loop".to_string()),
-                }
-                Ok(())
-            }
+            StmtKind::Break(label) => self.break_stmt(label.as_deref(), line),
+            StmtKind::Continue(label) => self.continue_stmt(label.as_deref(), line),
             StmtKind::Return(val) => {
                 if self.scope.is_some() {
                     // In a method: return a value (or `null` for `void`).
@@ -462,24 +537,47 @@ impl Compiler {
     }
 
     fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> Result<(), String> {
+        let label = self.pending_label.take();
         let top = self.b.current_pos();
         self.expr(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-        self.loops.push(Loop {
-            continue_ops: Vec::new(),
-            break_ops: Vec::new(),
-        });
+        self.scopes.push(BreakScope::loop_scope(label));
         for s in body {
             self.stmt(s)?;
         }
         // `continue` re-tests the condition — target it at the loop top.
-        let l = self.loops.pop().unwrap();
+        let l = self.scopes.pop().unwrap();
         for op in &l.continue_ops {
             self.b.patch_jump(*op, top);
         }
         self.b.emit(Op::Jump(top), 0);
         let end = self.b.current_pos();
         self.b.patch_jump(jf, end);
+        for op in l.break_ops {
+            self.b.patch_jump(op, end);
+        }
+        Ok(())
+    }
+
+    /// `do { body } while (cond);` — the body runs once unconditionally, then
+    /// the condition gates a backward jump. `continue` targets the condition
+    /// test; `break` targets the exit.
+    fn do_while_stmt(&mut self, body: &[Stmt], cond: &Expr) -> Result<(), String> {
+        let label = self.pending_label.take();
+        let top = self.b.current_pos();
+        self.scopes.push(BreakScope::loop_scope(label));
+        for s in body {
+            self.stmt(s)?;
+        }
+        // `continue` re-tests the condition — target it at the test emitted next.
+        let test = self.b.current_pos();
+        let l = self.scopes.pop().unwrap();
+        for op in &l.continue_ops {
+            self.b.patch_jump(*op, test);
+        }
+        self.expr(cond)?;
+        self.b.emit(Op::JumpIfTrue(top), 0);
+        let end = self.b.current_pos();
         for op in l.break_ops {
             self.b.patch_jump(op, end);
         }
@@ -493,6 +591,7 @@ impl Compiler {
         update: &Option<Box<Stmt>>,
         body: &[Stmt],
     ) -> Result<(), String> {
+        let label = self.pending_label.take();
         if let Some(init) = init {
             self.stmt(init)?;
         }
@@ -506,10 +605,7 @@ impl Compiler {
         };
         // `continue` runs the update clause, then re-tests — target it at the
         // step label emitted after the body.
-        self.loops.push(Loop {
-            continue_ops: Vec::new(),
-            break_ops: Vec::new(),
-        });
+        self.scopes.push(BreakScope::loop_scope(label));
         for s in body {
             self.stmt(s)?;
         }
@@ -524,7 +620,7 @@ impl Compiler {
         if let Some(jf) = jf {
             self.b.patch_jump(jf, end);
         }
-        let l = self.loops.pop().unwrap();
+        let l = self.scopes.pop().unwrap();
         for op in l.continue_ops {
             self.b.patch_jump(op, step);
         }
@@ -534,6 +630,128 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower a classic `switch`. The discriminant is evaluated once into an
+    /// internal temp, then a dispatch chain compares it (via `==`, matching
+    /// javars's value-equality model for both `int` and `String`) against each
+    /// group's labels and jumps to the first match. Group bodies are laid out
+    /// consecutively so control falls through into the next group unless a
+    /// `break` intervenes; an unmatched discriminant jumps to `default` (or the
+    /// switch exit when there is no default).
+    fn switch_stmt(&mut self, disc: &Expr, groups: &[SwitchGroup]) -> Result<(), String> {
+        let label = self.pending_label.take();
+        // Evaluate the discriminant once and stash it in an internal temp. The
+        // name uses `#` (not a legal Java identifier char) so it never collides
+        // with a user variable.
+        let temp = format!("#switch{}", self.switch_counter);
+        self.switch_counter += 1;
+        self.expr(disc)?;
+        self.emit_set(&temp, 0);
+
+        // Dispatch: for each group's labels, compare and jump-if-equal to that
+        // group's body. Body positions are not known yet, so collect the jumps
+        // and backpatch once the bodies are emitted.
+        let mut group_jumps: Vec<Vec<usize>> = Vec::with_capacity(groups.len());
+        let mut default_group: Option<usize> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            let mut jumps = Vec::new();
+            for lab in &g.labels {
+                self.emit_get(&temp, 0);
+                self.expr(lab)?;
+                self.b.emit(Op::NumEq, 0);
+                jumps.push(self.b.emit(Op::JumpIfTrue(0), 0));
+            }
+            if g.is_default {
+                default_group = Some(gi);
+            }
+            group_jumps.push(jumps);
+        }
+        // No label matched: jump to the default body (patched later) or the exit.
+        let to_default = self.b.emit(Op::Jump(0), 0);
+
+        // Bodies, laid out in source order for fall-through.
+        self.scopes.push(BreakScope::switch_scope(label));
+        let mut group_starts = Vec::with_capacity(groups.len());
+        for g in groups {
+            group_starts.push(self.b.current_pos());
+            for s in &g.body {
+                self.stmt(s)?;
+            }
+        }
+        let end = self.b.current_pos();
+        let scope = self.scopes.pop().unwrap();
+
+        // Patch each label's jump to its group body.
+        for (gi, jumps) in group_jumps.into_iter().enumerate() {
+            for op in jumps {
+                self.b.patch_jump(op, group_starts[gi]);
+            }
+        }
+        // Patch the no-match jump to the default body, or the exit.
+        match default_group {
+            Some(gi) => self.b.patch_jump(to_default, group_starts[gi]),
+            None => self.b.patch_jump(to_default, end),
+        }
+        for op in scope.break_ops {
+            self.b.patch_jump(op, end);
+        }
+        Ok(())
+    }
+
+    /// Lower `break;` / `break label;`. An unlabeled break targets the innermost
+    /// loop or `switch`; a labeled break targets the matching named construct.
+    fn break_stmt(&mut self, label: Option<&str>, line: u32) -> Result<(), String> {
+        let op = self.b.emit(Op::Jump(0), line);
+        match self.find_scope(label, |_| true) {
+            Some(idx) => {
+                self.scopes[idx].break_ops.push(op);
+                Ok(())
+            }
+            None if label.is_none() => {
+                // A top-level `break` (no enclosing construct) ends the program,
+                // preserving javars's existing behavior.
+                self.exit_ops.push(op);
+                Ok(())
+            }
+            None => Err(format!(
+                "javars: undefined label `{}` for break (line {line})",
+                label.unwrap()
+            )),
+        }
+    }
+
+    /// Lower `continue;` / `continue label;`. Targets the innermost enclosing
+    /// loop (skipping `switch` scopes), or the named loop for a labeled form.
+    fn continue_stmt(&mut self, label: Option<&str>, line: u32) -> Result<(), String> {
+        let op = self.b.emit(Op::Jump(0), line);
+        match self.find_scope(label, |s| s.kind == ScopeKind::Loop) {
+            Some(idx) => {
+                self.scopes[idx].continue_ops.push(op);
+                Ok(())
+            }
+            None => Err(match label {
+                Some(l) => format!("javars: undefined label `{l}` for continue (line {line})"),
+                None => "javars: `continue` outside a loop".to_string(),
+            }),
+        }
+    }
+
+    /// Find the index of the innermost enclosing scope satisfying `pred`. With a
+    /// label, the scope must also carry that label; without one, the innermost
+    /// matching scope is used.
+    fn find_scope(&self, label: Option<&str>, pred: impl Fn(&BreakScope) -> bool) -> Option<usize> {
+        self.scopes.iter().enumerate().rev().find_map(|(i, s)| {
+            let label_ok = match label {
+                Some(l) => s.label.as_deref() == Some(l),
+                None => true,
+            };
+            if label_ok && pred(s) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+    }
+
     fn post_inc_dec(&mut self, name: &str, inc: bool) {
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
@@ -541,9 +759,10 @@ impl Compiler {
         self.emit_set(name, 0);
     }
 
-    /// Lower `System.out.print[ln](arg)` to the Java-formatting print builtin.
-    /// Leaves the builtin's `null` return value on the stack.
-    fn println(&mut self, newline: bool, arg: Option<&Expr>) -> Result<(), String> {
+    /// Lower `System.out.print[ln](arg)` (or the `System.err` variant when
+    /// `err`) to the Java-formatting print builtin. Leaves the builtin's `null`
+    /// return value on the stack.
+    fn println(&mut self, newline: bool, err: bool, arg: Option<&Expr>) -> Result<(), String> {
         let n = match arg {
             Some(e) => {
                 self.expr(e)?;
@@ -551,10 +770,11 @@ impl Compiler {
             }
             None => 0,
         };
-        let id = if newline {
-            crate::host::JPRINTLN
-        } else {
-            crate::host::JPRINT
+        let id = match (err, newline) {
+            (false, true) => crate::host::JPRINTLN,
+            (false, false) => crate::host::JPRINT,
+            (true, true) => crate::host::JEPRINTLN,
+            (true, false) => crate::host::JEPRINT,
         };
         self.b.emit(Op::CallBuiltin(id, n), 0);
         Ok(())
@@ -592,11 +812,12 @@ impl Compiler {
                 }
             }
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
+            Expr::Ternary { cond, then, els } => self.ternary(cond, then, els)?,
             // Println/PostIncDec in value position are handled as statements;
             // if one reaches here (nested), the print builtin already leaves its
             // `null` return value on the stack.
-            Expr::Println { newline, arg } => {
-                self.println(*newline, arg.as_deref())?;
+            Expr::Println { newline, err, arg } => {
+                self.println(*newline, *err, arg.as_deref())?;
             }
             Expr::PostIncDec { name, inc } => {
                 self.emit_get(name, 0);
@@ -624,6 +845,27 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        // A call whose receiver is a bare capitalized class name (`Math.abs`,
+        // `Integer.parseInt`, `String.valueOf`) is a static stdlib call: the
+        // receiver is not a value, so it is not evaluated. Args, then the class
+        // and method names, are handed to the static-dispatch builtin.
+        if let Expr::Var(class) = recv {
+            if is_static_class(class) {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let class_c = self.b.add_constant(Value::str(class.clone()));
+                self.b.emit(Op::LoadConst(class_c), line);
+                let method_c = self.b.add_constant(Value::str(method.to_string()));
+                self.b.emit(Op::LoadConst(method_c), line);
+                // argc counts the args plus the class-name and method-name strings.
+                self.b.emit(
+                    Op::CallBuiltin(crate::host::JSTATIC_DISPATCH, args.len() as u8 + 2),
+                    line,
+                );
+                return Ok(());
+            }
+        }
         self.expr(recv)?;
         for a in args {
             self.expr(a)?;
@@ -696,6 +938,21 @@ impl Compiler {
         Err(format!(
             "javars: unresolved reference: {name} (line {line})"
         ))
+    }
+
+    /// Lower `cond ? then : els`. Evaluates `cond`, jumps to the `els` branch
+    /// when false, and leaves exactly one branch's value on the stack.
+    fn ternary(&mut self, cond: &Expr, then: &Expr, els: &Expr) -> Result<(), String> {
+        self.expr(cond)?;
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.expr(then)?;
+        let jend = self.b.emit(Op::Jump(0), 0);
+        let else_start = self.b.current_pos();
+        self.b.patch_jump(jf, else_start);
+        self.expr(els)?;
+        let end = self.b.current_pos();
+        self.b.patch_jump(jend, end);
+        Ok(())
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
@@ -775,6 +1032,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
             expr_has_ffi(cond) || body_has_ffi(then) || body_has_ffi(els)
         }
         StmtKind::While { cond, body } => expr_has_ffi(cond) || body_has_ffi(body),
+        StmtKind::DoWhile { body, cond } => body_has_ffi(body) || expr_has_ffi(cond),
         StmtKind::For {
             init,
             cond,
@@ -789,8 +1047,15 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                     .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
                 || body_has_ffi(body)
         }
+        StmtKind::Switch { disc, groups } => {
+            expr_has_ffi(disc)
+                || groups
+                    .iter()
+                    .any(|g| g.labels.iter().any(expr_has_ffi) || body_has_ffi(&g.body))
+        }
+        StmtKind::Labeled { body, .. } => body_has_ffi(std::slice::from_ref(body)),
         StmtKind::Return(val) => val.as_ref().is_some_and(expr_has_ffi),
-        StmtKind::Break | StmtKind::Continue => false,
+        StmtKind::Break(_) | StmtKind::Continue(_) => false,
     })
 }
 
@@ -799,6 +1064,9 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
+        Expr::Ternary { cond, then, els } => {
+            expr_has_ffi(cond) || expr_has_ffi(then) || expr_has_ffi(els)
+        }
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
         Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
         Expr::Int(_)
@@ -808,6 +1076,40 @@ fn expr_has_ffi(e: &Expr) -> bool {
         | Expr::Var(_)
         | Expr::PostIncDec { .. } => false,
     }
+}
+
+/// True when `name` is a stdlib class whose methods javars dispatches
+/// statically (rather than treating `name` as a value/receiver).
+fn is_static_class(name: &str) -> bool {
+    matches!(
+        name,
+        "Math" | "Integer" | "Long" | "Double" | "Boolean" | "String" | "Character"
+    )
+}
+
+/// The static numeric category of a known stdlib static call, when it is
+/// statically `int`-typed (so it participates in `/` truncation). Methods whose
+/// result is `int`-or-`double` at runtime (`Math.abs`/`max`/`min`) stay `None`
+/// (treated as `Other`) rather than mis-typing a `double` result as `int`.
+fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
+    match (class, method) {
+        ("Integer", "parseInt") | ("Integer", "valueOf") => Some(NumType::Int),
+        ("Long", "parseLong") => Some(NumType::Int),
+        ("Math", "round") => Some(NumType::Int),
+        _ => None,
+    }
+}
+
+/// True when a statement is a loop or `switch` — a construct that owns its own
+/// [`BreakScope`] and therefore consumes a prefixing label directly.
+fn is_breakable(s: &Stmt) -> bool {
+    matches!(
+        s.kind,
+        StmtKind::While { .. }
+            | StmtKind::DoWhile { .. }
+            | StmtKind::For { .. }
+            | StmtKind::Switch { .. }
+    )
 }
 
 fn compound_op(op: AssignOp) -> Op {

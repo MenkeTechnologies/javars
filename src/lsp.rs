@@ -31,8 +31,9 @@ use lsp_types::{
 ///     (`parser.rs` `looks_like_decl`); the runtime is dynamically
 ///     typed on the fusevm value model, so the annotation is
 ///     retained for diagnostics but does not gate execution yet.
-///   * "IO" → the `System.out` methods lowered to the Java-formatting print
-///     builtins in `host.rs` (`JPRINTLN` / `JPRINT`).
+///   * "IO" → the `System.out` / `System.err` methods lowered to the Java-
+///     formatting print builtins in `host.rs` (`JPRINTLN` / `JPRINT` /
+///     `JEPRINTLN` / `JEPRINT`).
 const CORPUS: &[(&str, &str, &str, &str)] = &[
     // ── Keyword (lexer keyword_or_ident) ──
     (
@@ -84,6 +85,30 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "for (int i = 0; i < 3; i++) { System.out.println(i); }",
     ),
     (
+        "do",
+        "Keyword",
+        "do/while loop: run the body once, then repeat while the condition holds",
+        "int i = 0; do { i++; } while (i < 3);",
+    ),
+    (
+        "switch",
+        "Keyword",
+        "multi-way branch on an int or String; groups fall through until `break`",
+        "switch (n) { case 1: System.out.println(\"one\"); break; default: }",
+    ),
+    (
+        "case",
+        "Keyword",
+        "a `switch` label; a matched case runs until a `break` or the switch end",
+        "case 2: System.out.println(\"two\"); break;",
+    ),
+    (
+        "default",
+        "Keyword",
+        "the `switch` label taken when no `case` matches",
+        "default: System.out.println(\"other\");",
+    ),
+    (
         "return",
         "Keyword",
         "return from the current method (bare `return;` ends `void main`)",
@@ -92,13 +117,13 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "break",
         "Keyword",
-        "exit the nearest enclosing loop immediately",
-        "for (int i = 0; ; i++) { if (i == 5) break; }",
+        "exit the nearest loop/switch, or a labeled one: `break outer;`",
+        "outer: for (int i = 0; ; i++) { if (i == 5) break outer; }",
     ),
     (
         "continue",
         "Keyword",
-        "skip to the next iteration of the nearest loop",
+        "skip to the next iteration of the nearest (or labeled) loop",
         "for (int i = 0; i < 5; i++) { if (i == 2) continue; }",
     ),
     (
@@ -204,6 +229,12 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "IO",
         "System.out — the standard output stream (println / print)",
         "System.out.print(\"x\");",
+    ),
+    (
+        "err",
+        "IO",
+        "System.err — the standard error stream (println / print)",
+        "System.err.println(\"oops\");",
     ),
 ];
 

@@ -85,6 +85,9 @@ pub enum StmtKind {
     },
     /// `while (cond) { .. }`.
     While { cond: Expr, body: Vec<Stmt> },
+    /// `do { .. } while (cond);` — the body runs once before the condition is
+    /// first tested.
+    DoWhile { body: Vec<Stmt>, cond: Expr },
     /// `for (init; cond; update) { .. }` — the C-style loop.
     For {
         init: Option<Box<Stmt>>,
@@ -92,14 +95,38 @@ pub enum StmtKind {
         update: Option<Box<Stmt>>,
         body: Vec<Stmt>,
     },
-    /// `break;`
-    Break,
-    /// `continue;`
-    Continue,
+    /// `switch (disc) { case L: .. break; default: .. }` — the classic
+    /// statement form with fall-through between groups.
+    Switch {
+        disc: Expr,
+        groups: Vec<SwitchGroup>,
+    },
+    /// A labeled statement `label: <stmt>`. The label names the enclosing loop
+    /// or switch so `break label;`/`continue label;` can target it.
+    Labeled { label: String, body: Box<Stmt> },
+    /// `break;` or `break label;`.
+    Break(Option<String>),
+    /// `continue;` or `continue label;`.
+    Continue(Option<String>),
     /// `return;` or `return <expr>;`. In `main` (which is `void`) a bare return
     /// ends the program and a value return is rejected; in a method it lowers to
     /// `Op::ReturnValue`.
     Return(Option<Expr>),
+}
+
+/// One group of a `switch`: its `case` label expressions (and/or `default`),
+/// followed by the statements that run when a label matches. Fall-through is
+/// modeled by laying the groups' bodies out consecutively — control drops into
+/// the next group's body unless a `break` intervenes. `case 1: case 2: body`
+/// is a single group with two labels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchGroup {
+    /// The `case` label constant expressions selecting this group.
+    pub labels: Vec<Expr>,
+    /// True when this group carries the `default:` label.
+    pub is_default: bool,
+    /// The statements of this group.
+    pub body: Vec<Stmt>,
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.
@@ -133,10 +160,19 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// `System.out.println(arg)` / `System.out.print(arg)`. Modeled directly
-    /// (rather than as a general method call) until user methods land.
+    /// `cond ? then : els` — the conditional (ternary) operator. Right-
+    /// associative; the result takes the value of the selected branch.
+    Ternary {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
+    /// `System.out.println(arg)` / `System.out.print(arg)`, or the `System.err`
+    /// variants when `err` is set. Modeled directly (rather than as a general
+    /// method call) because `System.out`/`err` are streams, not values.
     Println {
         newline: bool,
+        err: bool,
         arg: Option<Box<Expr>>,
     },
     /// Post-increment / post-decrement of a variable (`i++`, `i--`), evaluated
