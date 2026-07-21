@@ -20,6 +20,9 @@ use fusevm::{NumOp, Value, VM};
 pub const JPRINTLN: u16 = 700;
 /// Builtin id for `System.out.print` (one Java-formatted arg, no newline).
 pub const JPRINT: u16 = 701;
+/// Builtin id for the `--dap` per-statement line marker. Emitted only by
+/// [`crate::compiler::compile_debug`]; a normal run never carries it.
+pub const DBG_LINE: u16 = 702;
 
 /// Install javars builtins on a VM: the Java-formatting print builtins. This is
 /// the single install choke point later waves (methods, `String`/array objects)
@@ -27,6 +30,21 @@ pub const JPRINT: u16 = 701;
 pub fn install(vm: &mut VM) {
     vm.register_builtin(JPRINTLN, b_println);
     vm.register_builtin(JPRINT, b_print);
+}
+
+/// Install the debug line-marker builtin used by `java --dap`. The marker fires
+/// synchronously at each statement; it delegates to the DAP server, which pauses
+/// in place when the line is a breakpoint or step target.
+pub fn install_debug(vm: &mut VM) {
+    install(vm);
+    vm.register_builtin(DBG_LINE, b_dbg_line);
+}
+
+/// The `DBG_LINE` marker builtin: hand control to the DAP server for this line,
+/// then return `null` (popped by the trailing `Op::Pop` the compiler emits).
+fn b_dbg_line(vm: &mut VM, _argc: u8) -> Value {
+    crate::dap::on_debug_line(vm);
+    Value::Undef
 }
 
 /// `System.out.println` builtin: pop `argc` values (0 or 1 in slice 1), print

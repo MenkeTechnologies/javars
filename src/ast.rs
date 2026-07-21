@@ -16,9 +16,24 @@ pub struct Program {
     pub main: Vec<Stmt>,
 }
 
-/// A Java statement.
+/// A Java statement with its 1-based source line (threaded through the parser so
+/// the debug-compile path can emit a per-statement line marker for `--dap`).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub struct Stmt {
+    pub line: u32,
+    pub kind: StmtKind,
+}
+
+impl Stmt {
+    /// Build a statement carrying its source line.
+    pub fn new(line: u32, kind: StmtKind) -> Self {
+        Stmt { line, kind }
+    }
+}
+
+/// The kind of a Java statement (the payload of [`Stmt`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
     /// A local variable declaration: `int x = expr;`, `var s = expr;`. The
     /// declared type is retained for diagnostics; the runtime is dynamically
     /// typed on the fusevm value model, so it does not gate execution yet.

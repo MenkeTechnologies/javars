@@ -192,7 +192,13 @@ impl Parser {
         }
     }
 
+    /// Parse one statement, tagging it with the source line it starts on.
     fn statement(&mut self) -> Result<Stmt, String> {
+        let line = self.line();
+        Ok(Stmt::new(line, self.statement_kind()?))
+    }
+
+    fn statement_kind(&mut self) -> Result<StmtKind, String> {
         match self.peek() {
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
@@ -204,7 +210,7 @@ impl Parser {
                 if self.is(&Tok::Semi) {
                     self.advance();
                     // model as a no-op break out of nothing — end of main only
-                    Ok(Stmt::Break)
+                    Ok(StmtKind::Break)
                 } else {
                     Err(format!(
                         "javars: `return <value>` from void main is not supported yet (line {})",
@@ -215,19 +221,19 @@ impl Parser {
             Tok::Break => {
                 self.advance();
                 self.eat(&Tok::Semi)?;
-                Ok(Stmt::Break)
+                Ok(StmtKind::Break)
             }
             Tok::Continue => {
                 self.advance();
                 self.eat(&Tok::Semi)?;
-                Ok(Stmt::Continue)
+                Ok(StmtKind::Continue)
             }
             Tok::LBrace => {
                 self.advance();
                 // a bare block: flatten into a single synthetic if-true. Slice 1
                 // has no lexical scopes, so inlining is behavior-preserving.
                 let body = self.block()?;
-                Ok(Stmt::If {
+                Ok(StmtKind::If {
                     cond: Expr::Bool(true),
                     then: body,
                     els: vec![],
@@ -239,7 +245,7 @@ impl Parser {
 
     /// Local decl, assignment, or expression statement. `expect_semi` consumes
     /// the trailing `;` (false for the `for` init/update clauses).
-    fn simple_statement(&mut self, expect_semi: bool) -> Result<Stmt, String> {
+    fn simple_statement(&mut self, expect_semi: bool) -> Result<StmtKind, String> {
         // A local declaration starts with a type keyword/ident followed by an
         // identifier: `int x`, `String s`, `var v`, `long n`, `double d`.
         if self.looks_like_decl() {
@@ -254,7 +260,7 @@ impl Parser {
             if expect_semi {
                 self.eat(&Tok::Semi)?;
             }
-            return Ok(Stmt::Local { ty, name, init });
+            return Ok(StmtKind::Local { ty, name, init });
         }
 
         // Assignment or expression statement.
@@ -267,7 +273,7 @@ impl Parser {
                 if expect_semi {
                     self.eat(&Tok::Semi)?;
                 }
-                return Ok(Stmt::Assign { name, op, value });
+                return Ok(StmtKind::Assign { name, op, value });
             }
             // post-inc/dec statement: `i++;`
             if matches!(next, Tok::PlusPlus | Tok::MinusMinus) {
@@ -277,7 +283,7 @@ impl Parser {
                 if expect_semi {
                     self.eat(&Tok::Semi)?;
                 }
-                return Ok(Stmt::Expr(Expr::PostIncDec { name, inc }));
+                return Ok(StmtKind::Expr(Expr::PostIncDec { name, inc }));
             }
         }
 
@@ -286,7 +292,7 @@ impl Parser {
         if expect_semi {
             self.eat(&Tok::Semi)?;
         }
-        Ok(Stmt::Expr(e))
+        Ok(StmtKind::Expr(e))
     }
 
     /// Heuristic: two identifiers in a row (`Type name`) with the type not being
@@ -308,7 +314,7 @@ impl Parser {
         matches!(self.toks[j].kind, Tok::Ident(_))
     }
 
-    fn if_stmt(&mut self) -> Result<Stmt, String> {
+    fn if_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::If)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expression()?;
@@ -320,25 +326,26 @@ impl Parser {
         } else {
             vec![]
         };
-        Ok(Stmt::If { cond, then, els })
+        Ok(StmtKind::If { cond, then, els })
     }
 
-    fn while_stmt(&mut self) -> Result<Stmt, String> {
+    fn while_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::While)?;
         self.eat(&Tok::LParen)?;
         let cond = self.expression()?;
         self.eat(&Tok::RParen)?;
         let body = self.braced_or_single()?;
-        Ok(Stmt::While { cond, body })
+        Ok(StmtKind::While { cond, body })
     }
 
-    fn for_stmt(&mut self) -> Result<Stmt, String> {
+    fn for_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         let init = if self.is(&Tok::Semi) {
             None
         } else {
-            Some(Box::new(self.simple_statement(false)?))
+            let line = self.line();
+            Some(Box::new(Stmt::new(line, self.simple_statement(false)?)))
         };
         self.eat(&Tok::Semi)?;
         let cond = if self.is(&Tok::Semi) {
@@ -350,11 +357,12 @@ impl Parser {
         let update = if self.is(&Tok::RParen) {
             None
         } else {
-            Some(Box::new(self.simple_statement(false)?))
+            let line = self.line();
+            Some(Box::new(Stmt::new(line, self.simple_statement(false)?)))
         };
         self.eat(&Tok::RParen)?;
         let body = self.braced_or_single()?;
-        Ok(Stmt::For {
+        Ok(StmtKind::For {
             init,
             cond,
             update,

@@ -27,14 +27,30 @@ struct Compiler {
     loops: Vec<Loop>,
     /// A top-level `break`/`return;` (no enclosing loop) jumps to program end.
     exit_ops: Vec<usize>,
+    /// When true, emit a per-statement `CallBuiltin(DBG_LINE)` line marker so the
+    /// `--dap` debugger can stop on statement lines. Normal runs leave this off
+    /// and carry zero extra ops.
+    debug: bool,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
 pub fn compile(prog: &Program) -> Result<Chunk, String> {
+    compile_with(prog, false)
+}
+
+/// Compile with per-statement `DBG_LINE` line markers for the `--dap` debugger.
+/// Identical to [`compile`] except each statement is preceded by a marker
+/// carrying its source line (see [`crate::host::DBG_LINE`]).
+pub fn compile_debug(prog: &Program) -> Result<Chunk, String> {
+    compile_with(prog, true)
+}
+
+fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         loops: Vec::new(),
         exit_ops: Vec::new(),
+        debug,
     };
     for stmt in &prog.main {
         c.stmt(stmt)?;
@@ -50,18 +66,26 @@ pub fn compile(prog: &Program) -> Result<Chunk, String> {
 
 impl Compiler {
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
-        match s {
-            Stmt::Local { name, init, .. } => {
+        // In debug mode, emit a line marker before the statement so `--dap` can
+        // stop on it. `CallBuiltin` always pushes its return value, so pop it.
+        if self.debug && s.line != 0 {
+            self.b
+                .emit(Op::CallBuiltin(crate::host::DBG_LINE, 0), s.line);
+            self.b.emit(Op::Pop, s.line);
+        }
+        let line = s.line;
+        match &s.kind {
+            StmtKind::Local { name, init, .. } => {
                 if let Some(e) = init {
                     self.expr(e)?;
                     let idx = self.b.add_name(name);
-                    self.b.emit(Op::SetVar(idx), 0);
+                    self.b.emit(Op::SetVar(idx), line);
                 }
                 // An uninitialized local is simply unbound until first assigned
                 // (Java's definite-assignment check is not enforced in slice 1).
                 Ok(())
             }
-            Stmt::Assign { name, op, value } => {
+            StmtKind::Assign { name, op, value } => {
                 let idx = self.b.add_name(name);
                 match op {
                     AssignOp::Assign => {
@@ -69,53 +93,53 @@ impl Compiler {
                     }
                     _ => {
                         // `x <op>= e` → x = x <op> e
-                        self.b.emit(Op::GetVar(idx), 0);
+                        self.b.emit(Op::GetVar(idx), line);
                         self.expr(value)?;
-                        self.b.emit(compound_op(*op), 0);
+                        self.b.emit(compound_op(*op), line);
                     }
                 }
-                self.b.emit(Op::SetVar(idx), 0);
+                self.b.emit(Op::SetVar(idx), line);
                 Ok(())
             }
-            Stmt::Expr(Expr::Println { newline, arg }) => {
+            StmtKind::Expr(Expr::Println { newline, arg }) => {
                 // The print builtin returns `null`; discard it in statement
                 // position.
                 self.println(*newline, arg.as_deref())?;
-                self.b.emit(Op::Pop, 0);
+                self.b.emit(Op::Pop, line);
                 Ok(())
             }
-            Stmt::Expr(Expr::PostIncDec { name, inc }) => {
+            StmtKind::Expr(Expr::PostIncDec { name, inc }) => {
                 self.post_inc_dec(name, *inc);
                 Ok(())
             }
-            Stmt::Expr(e) => {
+            StmtKind::Expr(e) => {
                 self.expr(e)?;
-                self.b.emit(Op::Pop, 0);
+                self.b.emit(Op::Pop, line);
                 Ok(())
             }
-            Stmt::If { cond, then, els } => self.if_stmt(cond, then, els),
-            Stmt::While { cond, body } => self.while_stmt(cond, body),
-            Stmt::For {
+            StmtKind::If { cond, then, els } => self.if_stmt(cond, then, els),
+            StmtKind::While { cond, body } => self.while_stmt(cond, body),
+            StmtKind::For {
                 init,
                 cond,
                 update,
                 body,
             } => self.for_stmt(init, cond, update, body),
-            Stmt::Break => {
-                let op = self.b.emit(Op::Jump(0), 0);
+            StmtKind::Break => {
+                let op = self.b.emit(Op::Jump(0), line);
                 match self.loops.last_mut() {
                     Some(l) => l.break_ops.push(op),
                     None => self.exit_ops.push(op),
                 }
                 Ok(())
             }
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 let target = self
                     .loops
                     .last()
                     .map(|l| l.continue_target)
                     .ok_or_else(|| "javars: `continue` outside a loop".to_string())?;
-                self.b.emit(Op::Jump(target), 0);
+                self.b.emit(Op::Jump(target), line);
                 Ok(())
             }
         }
