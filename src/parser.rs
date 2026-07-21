@@ -114,18 +114,49 @@ impl Parser {
             self.advance();
         }
         let line = self.line();
-        self.eat(&Tok::Class)?;
-        let name = self.ident()?;
-        // optional `extends Super`
-        let superclass = if matches!(self.peek(), Tok::Ident(w) if w == "extends") {
+        // `class Name` or `interface Name`. `interface` is an ordinary ident
+        // (not a reserved token), matched here.
+        let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
+        if is_interface {
             self.advance();
-            Some(self.ident()?)
         } else {
-            None
-        };
-        // Java also allows `implements ...`; tolerate by skipping to `{`.
-        while !self.is(&Tok::LBrace) && !self.is(&Tok::Eof) {
+            self.eat(&Tok::Class)?;
+        }
+        let name = self.ident()?;
+        // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
+        // `<K, V>` — erased (parsed and discarded).
+        self.skip_generics();
+        // `extends`: a class has a single superclass; an interface may extend
+        // several interfaces (collected as `interfaces`).
+        let mut superclass = None;
+        let mut interfaces = Vec::new();
+        if matches!(self.peek(), Tok::Ident(w) if w == "extends") {
             self.advance();
+            loop {
+                let sup = self.type_name()?;
+                if is_interface {
+                    interfaces.push(sup);
+                } else {
+                    superclass = Some(sup);
+                }
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        // `implements I, J` (classes only).
+        if matches!(self.peek(), Tok::Ident(w) if w == "implements") {
+            self.advance();
+            loop {
+                interfaces.push(self.type_name()?);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
         }
         self.eat(&Tok::LBrace)?;
 
@@ -155,12 +186,41 @@ impl Parser {
         classes.push(Class {
             name,
             superclass,
+            interfaces,
+            is_interface,
             fields,
             ctors,
             methods: inst_methods,
             line,
         });
         Ok(())
+    }
+
+    /// Skip a generic type-parameter/argument group `< ... >` when the cursor is
+    /// on `<`, matching nested `<`/`>` (Java erases these at runtime, so javars
+    /// parses and discards them). A no-op when the cursor is not on `<`.
+    fn skip_generics(&mut self) {
+        if !self.is(&Tok::Lt) {
+            return;
+        }
+        let mut depth = 0;
+        loop {
+            match self.peek() {
+                Tok::Lt => depth += 1,
+                Tok::Gt => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.advance();
+                        return;
+                    }
+                }
+                // `>=`/`>>`-style tokens never appear inside a type-arg list from
+                // this lexer (it emits single `>`); stop defensively at EOF.
+                Tok::Eof => return,
+                _ => {}
+            }
+            self.advance();
+        }
     }
 
     /// True when the member at the cursor is a (possibly modifier-prefixed)
@@ -173,6 +233,7 @@ impl Parser {
             j += 1;
         }
         matches!(self.toks[j].kind, Tok::Class)
+            || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "interface")
     }
 
     /// If the cursor is at a constructor (`[public] Name(<params>) { ... }` where
@@ -259,14 +320,18 @@ impl Parser {
     fn try_any_method(&mut self) -> Result<Option<(Method, bool)>, String> {
         let save = self.pos;
         let mut saw_static = false;
-        while matches!(self.peek(), Tok::Public | Tok::Static)
-            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract" || w == "private" || w == "protected" || w == "synchronized")
+        // Modifiers, including interface method modifiers (`default`, `abstract`)
+        // and access/other qualifiers, in any order.
+        while matches!(self.peek(), Tok::Public | Tok::Static | Tok::Default)
+            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract" || w == "private" || w == "protected" || w == "synchronized" || w == "native")
         {
             if matches!(self.peek(), Tok::Static) {
                 saw_static = true;
             }
             self.advance();
         }
+        // Optional generic method type parameters `<T> T id(T x)` — erased.
+        self.skip_generics();
         // A return type is required, so peeking a non-type here means this is not
         // a method (it is a field or constructor).
         if !self.at_type() {
@@ -289,14 +354,22 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         let params = self.params()?;
         self.eat(&Tok::RParen)?;
-        self.eat(&Tok::LBrace)?;
-        let body = self.block()?;
+        // An interface abstract method (or `abstract` class method) ends in `;`
+        // with no body; a concrete/`default` method has a `{ ... }` block.
+        let (body, is_abstract) = if self.is(&Tok::Semi) {
+            self.advance();
+            (Vec::new(), true)
+        } else {
+            self.eat(&Tok::LBrace)?;
+            (self.block()?, false)
+        };
         Ok(Some((
             Method {
                 name,
                 params,
                 ret,
                 body,
+                is_abstract,
                 line,
             },
             saw_static,
@@ -333,6 +406,9 @@ impl Parser {
     /// Trailing `[]` pairs are folded into the returned name (e.g. `int[]`).
     fn type_name(&mut self) -> Result<String, String> {
         let mut ty = self.ident()?;
+        // Generic type arguments (`List<String>`, `Map<K, V>`) are erased — the
+        // erased type is just the raw name.
+        self.skip_generics();
         while self.is(&Tok::LBracket) {
             self.advance();
             self.eat(&Tok::RBracket)?;
@@ -617,6 +693,25 @@ impl Parser {
             return false;
         }
         let mut j = self.pos + 1;
+        // optional generic type arguments on the type (`List<String> xs`)
+        if matches!(self.toks[j].kind, Tok::Lt) {
+            let mut depth = 0;
+            while j < self.toks.len() {
+                match self.toks[j].kind {
+                    Tok::Lt => depth += 1,
+                    Tok::Gt => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    Tok::Eof => return false,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
         // optional array brackets on the type
         while matches!(self.toks[j].kind, Tok::LBracket)
             && matches!(self.toks.get(j + 1).map(|t| &t.kind), Some(Tok::RBracket))
@@ -950,6 +1045,9 @@ impl Parser {
         let line = self.line();
         self.eat(&Tok::New)?;
         let ty = self.ident()?;
+        // Diamond / explicit type arguments (`new Box<>()`, `new Box<Integer>()`)
+        // — erased.
+        self.skip_generics();
         if self.is(&Tok::LBracket) {
             self.advance();
             if self.is(&Tok::RBracket) {
@@ -959,16 +1057,30 @@ impl Parser {
                 let elems = self.array_lit_elems()?;
                 return Ok(Expr::ArrayLit { elems });
             }
-            let size = self.expression()?;
+            // `new T[s0][s1]…[sK][]…` — collect the sized dimensions, then any
+            // trailing unsized `[]` (whose elements default to null).
+            let mut sizes = vec![self.expression()?];
             self.eat(&Tok::RBracket)?;
-            if self.is(&Tok::LBracket) {
-                return Err(format!(
-                    "javars: multi-dimensional `new {ty}[..][..]` is not supported yet (line {line})"
-                ));
+            let mut extra_dims = 0;
+            while self.is(&Tok::LBracket) {
+                self.advance();
+                if self.is(&Tok::RBracket) {
+                    self.advance();
+                    extra_dims += 1;
+                } else {
+                    if extra_dims > 0 {
+                        return Err(format!(
+                            "javars: a sized array dimension cannot follow an empty one (line {line})"
+                        ));
+                    }
+                    sizes.push(self.expression()?);
+                    self.eat(&Tok::RBracket)?;
+                }
             }
             return Ok(Expr::NewArray {
                 elem_ty: ty,
-                size: Box::new(size),
+                sizes,
+                extra_dims,
             });
         }
         // `new Class(args)` — object construction.
@@ -985,7 +1097,14 @@ impl Parser {
     fn array_lit_elems(&mut self) -> Result<Vec<Expr>, String> {
         let mut elems = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            elems.push(self.expression()?);
+            // A nested `{…}` element is a sub-array literal (`{{1,2},{3,4}}`).
+            if self.is(&Tok::LBrace) {
+                self.advance();
+                let inner = self.array_lit_elems()?;
+                elems.push(Expr::ArrayLit { elems: inner });
+            } else {
+                elems.push(self.expression()?);
+            }
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {

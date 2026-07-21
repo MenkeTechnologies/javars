@@ -90,6 +90,11 @@ pub const JINSTANCEOF: u16 = 716;
 /// instance's class name as a `Str` (empty for a non-instance). Drives the
 /// compiler's virtual method-dispatch chain.
 pub const JCLASSOF: u16 = 717;
+/// `new T[s0][s1]…` — allocate a rectangular multi-dimensional array. Stack
+/// `[s0, s1, …, sK, leafDefault]` (`leafDefault` on top); `argc == K + 2`.
+/// Builds `K+1` nested levels of default-valued arrays and pushes the outer
+/// handle. Aliasing is by reference like any other array.
+pub const JARRAY_NEW_MULTI: u16 = 718;
 
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
@@ -109,9 +114,10 @@ thread_local! {
     /// per run and is cleared by [`heap_reset`] at the start of every program so
     /// handles never leak across runs.
     static HEAP: RefCell<Vec<HostObj>> = const { RefCell::new(Vec::new()) };
-    /// Class → direct superclass name, populated by [`set_superclasses`] before a
-    /// run. Used by `instanceof` and default `toString` to walk the class chain.
-    static SUPERS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Type → its direct supertypes (superclass + implemented/extended
+    /// interfaces), populated by [`set_supertypes`] before a run. Used by
+    /// `instanceof` and default `toString` to walk the supertype graph.
+    static SUPERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
 }
 
 /// Clear the object heap (and superclass table stays until reset). Called at the
@@ -121,9 +127,9 @@ pub fn heap_reset() {
     SUPERS.with(|s| s.borrow_mut().clear());
 }
 
-/// Install the class → superclass map for the current program (used by
+/// Install the type → direct-supertypes map for the current program (used by
 /// `instanceof` and default `toString`). Call before running the chunk.
-pub fn set_superclasses(map: HashMap<String, String>) {
+pub fn set_supertypes(map: HashMap<String, Vec<String>>) {
     SUPERS.with(|s| *s.borrow_mut() = map);
 }
 
@@ -137,19 +143,27 @@ fn heap_alloc(obj: HostObj) -> u32 {
     })
 }
 
-/// True when `class` is `target` or a (transitive) subclass of it.
+/// True when `class` is `target`, a (transitive) subclass of it, or a type that
+/// implements/extends the interface `target` — walking the supertype graph
+/// (superclass + interfaces).
 fn is_subclass_of(class: &str, target: &str) -> bool {
     if class == target {
         return true;
     }
     SUPERS.with(|s| {
         let s = s.borrow();
-        let mut cur = class;
-        while let Some(sup) = s.get(cur) {
-            if sup == target {
+        let mut stack = vec![class.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if cur == target {
                 return true;
             }
-            cur = sup;
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(sups) = s.get(&cur) {
+                stack.extend(sups.iter().cloned());
+            }
         }
         false
     })
@@ -187,6 +201,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JSTR_DISPATCH, b_str_dispatch);
     vm.register_builtin(JSTATIC_DISPATCH, b_static_dispatch);
     vm.register_builtin(JARRAY_NEW, b_array_new);
+    vm.register_builtin(JARRAY_NEW_MULTI, b_array_new_multi);
     vm.register_builtin(JARRAY_LIT, b_array_lit);
     vm.register_builtin(JARRAY_GET, b_array_get);
     vm.register_builtin(JARRAY_SET, b_array_set);
@@ -235,6 +250,46 @@ fn b_array_new(vm: &mut VM, argc: u8) -> Value {
     }
     let arr = vec![default; size as usize];
     Value::Obj(heap_alloc(HostObj::Array(arr)))
+}
+
+/// `new T[s0][s1]…` — build a rectangular nested array (stack
+/// `[s0, …, sK, leafDefault]`). The innermost level is filled with `leafDefault`
+/// (the element type default for a fully-sized `new int[2][3]`, or `null` when
+/// trailing dimensions are unsized as in `new int[2][]`).
+fn b_array_new_multi(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc);
+    // Last arg is the leaf default; the rest are the dimension sizes.
+    let default = args.pop().unwrap_or(Value::Undef);
+    let sizes: Vec<i64> = args.iter().map(|v| v.to_int()).collect();
+    if sizes.iter().any(|&s| s < 0) {
+        ffi_fault(vm, "javars: negative array size".to_string());
+        return Value::Undef;
+    }
+    match build_nested(&sizes, &default) {
+        Some(v) => v,
+        None => {
+            ffi_fault(
+                vm,
+                "javars: multi-dimensional array needs a size".to_string(),
+            );
+            Value::Undef
+        }
+    }
+}
+
+/// Recursively allocate `sizes.len()` nested array levels; the innermost holds
+/// clones of `default`. `None` when `sizes` is empty (no dimension).
+fn build_nested(sizes: &[i64], default: &Value) -> Option<Value> {
+    let (&head, rest) = sizes.split_first()?;
+    let n = head.max(0) as usize;
+    let elems: Vec<Value> = if rest.is_empty() {
+        vec![default.clone(); n]
+    } else {
+        (0..n)
+            .map(|_| build_nested(rest, default).unwrap_or(Value::Undef))
+            .collect()
+    };
+    Some(Value::Obj(heap_alloc(HostObj::Array(elems))))
 }
 
 /// `{a, b, …}` — build an array from the popped element values.
@@ -688,11 +743,206 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Str
         // ── java.lang.String ──
         // `String.valueOf(x)` renders any value with Java's `println` rules.
         ("String", "valueOf", 1) => Ok(Value::str(java_str(&args[0]))),
+        // `String.format(fmt, args…)` — printf-style formatting (subset).
+        ("String", "format", _) if !args.is_empty() => {
+            let fmt = args[0].as_str_cow().into_owned();
+            java_format(&fmt, &args[1..])
+        }
+
+        // ── java.util.Arrays ──
+        // `Arrays.toString(a)` — shallow `[e0, e1, …]` (null → "null").
+        ("Arrays", "toString", 1) => Ok(Value::str(arrays_to_string(&args[0]))),
 
         _ => Err(format!(
             "javars: unsupported static method `{class}.{method}` with {} argument(s)",
             args.len()
         )),
+    }
+}
+
+/// `Arrays.toString(a)` — a shallow `[e0, e1, …]` rendering (Java's
+/// `java.util.Arrays.toString`), each element via [`java_str`]. A `null`
+/// reference renders as `null`.
+fn arrays_to_string(v: &Value) -> String {
+    match v {
+        Value::Obj(id) => HEAP.with(|h| {
+            let h = h.borrow();
+            match h.get(*id as usize) {
+                Some(HostObj::Array(a)) => {
+                    let inner: Vec<String> = a.iter().map(java_str).collect();
+                    format!("[{}]", inner.join(", "))
+                }
+                _ => java_str(v),
+            }
+        }),
+        Value::Undef => "null".to_string(),
+        _ => java_str(v),
+    }
+}
+
+/// `String.format(fmt, args…)` — a faithful subset of `java.util.Formatter`:
+/// conversions `d s S f b B x X o c %` and `%n`, with `-` (left-justify), `0`
+/// (zero-pad), `+` (leading sign) flags, an optional width, and an optional
+/// `.precision` (decimals for `f`, max length for `s`). Unsupported conversions
+/// surface an error rather than a wrong string.
+fn java_format(fmt: &str, args: &[Value]) -> Result<Value, String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut argi = 0usize;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // flags
+        let mut left = false;
+        let mut zero = false;
+        let mut plus = false;
+        while let Some(&f) = chars.peek() {
+            match f {
+                '-' => left = true,
+                '0' => zero = true,
+                '+' => plus = true,
+                ' ' | '#' | ',' | '(' => {}
+                _ => break,
+            }
+            chars.next();
+        }
+        // width
+        let mut width = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                width.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // .precision
+        let mut prec: Option<usize> = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut p = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    p.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            prec = Some(p.parse().unwrap_or(0));
+        }
+        let conv = chars
+            .next()
+            .ok_or_else(|| "javars: String.format: dangling `%`".to_string())?;
+        let width_n: Option<usize> = width.parse().ok();
+        match conv {
+            '%' => out.push('%'),
+            'n' => out.push('\n'),
+            _ => {
+                let arg = args
+                    .get(argi)
+                    .ok_or_else(|| "javars: String.format: not enough arguments".to_string())?;
+                argi += 1;
+                let (s, numeric) = format_conversion(conv, arg, prec, plus)?;
+                out.push_str(&pad(&s, width_n, left, zero && numeric));
+            }
+        }
+    }
+    Ok(Value::str(out))
+}
+
+/// Render one `String.format` conversion. Returns the rendered text and whether
+/// it is a numeric conversion (which may be zero-padded).
+fn format_conversion(
+    conv: char,
+    arg: &Value,
+    prec: Option<usize>,
+    plus: bool,
+) -> Result<(String, bool), String> {
+    let sign = |neg: bool| {
+        if neg {
+            ""
+        } else if plus {
+            "+"
+        } else {
+            ""
+        }
+    };
+    match conv {
+        'd' => {
+            let n = arg.to_int();
+            Ok((format!("{}{n}", sign(n < 0)), true))
+        }
+        'f' => {
+            let x = arg.to_float();
+            let p = prec.unwrap_or(6);
+            Ok((
+                format!("{}{x:.p$}", sign(x.is_sign_negative() && x != 0.0)),
+                true,
+            ))
+        }
+        's' => {
+            let mut s = java_str(arg);
+            if let Some(p) = prec {
+                s = s.chars().take(p).collect();
+            }
+            Ok((s, false))
+        }
+        'S' => {
+            let mut s = java_str(arg).to_uppercase();
+            if let Some(p) = prec {
+                s = s.chars().take(p).collect();
+            }
+            Ok((s, false))
+        }
+        'b' => Ok((java_bool(arg).to_string(), false)),
+        'B' => Ok((java_bool(arg).to_string().to_uppercase(), false)),
+        'x' => Ok((format!("{:x}", arg.to_int()), true)),
+        'X' => Ok((format!("{:X}", arg.to_int()), true)),
+        'o' => Ok((format!("{:o}", arg.to_int()), true)),
+        'c' => Ok((java_str(arg), false)),
+        other => Err(format!(
+            "javars: String.format: unsupported conversion `%{other}`"
+        )),
+    }
+}
+
+/// Java `%b`: `true` for a `true` Boolean, `false` for `false`/`null`, `true`
+/// for any other non-null value.
+fn java_bool(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Undef => false,
+        _ => true,
+    }
+}
+
+/// Pad `s` to `width` (char count). Left-justify with `-`; otherwise right-
+/// justify, zero-padding after any leading sign when `zero` is set.
+fn pad(s: &str, width: Option<usize>, left: bool, zero: bool) -> String {
+    let w = match width {
+        Some(w) => w,
+        None => return s.to_string(),
+    };
+    let len = s.chars().count();
+    if len >= w {
+        return s.to_string();
+    }
+    let fill = w - len;
+    if left {
+        format!("{s}{}", " ".repeat(fill))
+    } else if zero {
+        // Zero-pad after a leading sign (`-`/`+`).
+        if let Some(rest) = s.strip_prefix(['-', '+']) {
+            let sign = &s[..1];
+            format!("{sign}{}{rest}", "0".repeat(fill))
+        } else {
+            format!("{}{s}", "0".repeat(fill))
+        }
+    } else {
+        format!("{}{s}", " ".repeat(fill))
     }
 }
 

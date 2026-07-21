@@ -40,11 +40,11 @@ pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
 /// map (for `instanceof`/`toString`). Returns the last top-of-stack value.
 fn run_chunk(
     chunk: fusevm::Chunk,
-    supers: std::collections::HashMap<String, String>,
+    supers: std::collections::HashMap<String, Vec<String>>,
 ) -> Result<Value, String> {
     // A fresh object heap per run — no handle leaks across programs.
     host::heap_reset();
-    host::set_superclasses(supers);
+    host::set_supertypes(supers);
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
@@ -70,11 +70,16 @@ fn run_chunk(
 /// Compile and run a Java source string; return the last VM value.
 pub fn run_str(src: &str) -> Result<Value, String> {
     let prog = parse(src)?;
-    // The class → superclass map drives runtime `instanceof`/`toString`.
+    // The type → direct-supertypes map (superclass + interfaces) drives runtime
+    // `instanceof`/`toString`.
     let supers = prog
         .classes
         .iter()
-        .filter_map(|c| c.superclass.clone().map(|s| (c.name.clone(), s)))
+        .map(|c| {
+            let mut sups: Vec<String> = c.superclass.clone().into_iter().collect();
+            sups.extend(c.interfaces.iter().cloned());
+            (c.name.clone(), sups)
+        })
         .collect();
     let chunk = compiler::compile(&prog)?;
     run_chunk(chunk, supers)

@@ -65,14 +65,20 @@ pure frontend over the shared engine. Highlights:
 
 Covered today: locals, arithmetic, the C-style control statements,
 `System.out.print[ln]`, user-defined `static` methods (recursion, parameters,
-value returns), `String` instance methods, **reference arrays** (`new int[n]`,
-`{…}` literals, indexing, `.length`, and true pass-by-reference/aliasing on a
+value returns), `String` instance methods, **reference arrays** including
+**multi-dimensional** (`new int[n]`, `new int[m][n]`, `{…}` and `{{…},{…}}`
+literals, indexing, `.length`, and true pass-by-reference/aliasing on a
 host-owned object heap), and a **class/object model** (fields, constructors,
 instance methods, `this`, `new`, field access, single inheritance with
 `extends`/`super(…)`, `instanceof`, virtual method dispatch, and `toString()`
-overrides). The wider standard library is the next wave (see [`BUGS.md`](BUGS.md)).
-Nothing is faked — an unsupported construct is a parse error, not a silent
-mis-run.
+overrides). **Interfaces** (abstract + `default` methods, multiple
+implements, interface inheritance, polymorphic dispatch), **method overloading
+by parameter type** (most-specific resolution for methods and constructors), and
+**type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
+X>`, the diamond, erased library type args) all run. `String.format` (a
+`Formatter` subset) and `Arrays.toString` round out the stdlib essentials; the
+wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). Nothing is
+faked — an unsupported construct is a parse error, not a silent mis-run.
 
 ---
 
@@ -255,14 +261,20 @@ integer-vs-float division, the ternary `?:` operator, `if` / `while` /
 user-defined `static` methods (recursion, parameters, value returns over
 fusevm's `Op::Call` frame ABI), `String` instance methods, a first slice of the
 standard library (`Math.*`, `Integer.parseInt`/`valueOf`/`toString`,
-`Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`), **reference
-arrays** (default-valued `new T[n]`, `{…}` literals, get/set indexing, `.length`,
-and reference/aliasing semantics on a host-owned object heap keyed by
-`Value::Obj`), and a **class/object model** (instance fields with initializers,
-constructors, instance methods dispatched over the frame ABI, `this`, `new`,
-field access `obj.f`, single inheritance with `extends` and `super(…)`,
-`instanceof`, runtime-class virtual dispatch for overrides, and `toString()`
-overrides honoured by `println`) — all verified byte-for-byte against OpenJDK.
+`Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`, `String.format`,
+`Arrays.toString`), **reference arrays** including **multi-dimensional**
+(default-valued `new T[n]` / `new T[m][n]`, `{…}` and nested `{{…},{…}}` literals,
+get/set indexing, `.length` at each level, and reference/aliasing semantics on a
+host-owned object heap keyed by `Value::Obj`), a **class/object model** (instance
+fields with initializers, constructors, instance methods dispatched over the
+frame ABI, `this`, `new`, field access `obj.f`, single inheritance with `extends`
+and `super(…)`, `instanceof`, runtime-class virtual dispatch for overrides, and
+`toString()` overrides honoured by `println`), **interfaces** (abstract +
+`default` methods, multiple `implements`, `interface extends`, polymorphic
+dispatch through an interface type), **method overloading by parameter type**
+(most-specific resolution for methods and constructors), and **type-erased
+generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the diamond)
+— all verified byte-for-byte against OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
@@ -273,10 +285,10 @@ Next waves, in priority order:
 
 1. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
    collections, more `String` methods, and arrow-`switch` expressions.
-2. **Object-model depth** — method overloading by parameter type, interfaces,
-   abstract classes, multi-dimensional arrays, and virtual `toString` inside
-   string concatenation (today concatenation with a plain object uses the default
-   `Class@hash` form; `println(obj)` and explicit `.toString()` use the override).
+2. **Object-model depth** — enums and records, abstract classes, the enhanced
+   `for`, and virtual `toString` inside string concatenation (today concatenation
+   with a plain object uses the default `Class@hash` form; `println(obj)` and
+   explicit `.toString()` use the override).
 3. **A differential parity harness** — a snippet corpus diffed live against a
    reference `java`, frozen and replayed in CI (the pattern `ruby`/`node`/
    `python` frontends use).

@@ -674,3 +674,291 @@ fn uninitialized_reference_field_is_null() {
          N n = new N(5); System.out.println(n.next == null); } }");
     assert_eq!(out, "true\n");
 }
+
+// ── Interfaces (abstract + default methods, multiple, polymorphism) ──────────
+
+#[test]
+fn interface_dispatch_through_interface_typed_variable() {
+    // A variable typed as the interface dispatches to the implementing class's
+    // override at runtime.
+    let (out, ok) = run("public class Main {\
+         interface Speaker { String speak(); }\
+         static class Dog implements Speaker { public String speak() { return \"woof\"; } }\
+         static class Cat implements Speaker { public String speak() { return \"meow\"; } }\
+         public static void main(String[] a) {\
+         Speaker s = new Dog(); System.out.println(s.speak());\
+         s = new Cat(); System.out.println(s.speak()); } }");
+    assert!(ok);
+    assert_eq!(out, "woof\nmeow\n");
+}
+
+#[test]
+fn interface_default_method_calls_abstract_method() {
+    // A `default` method with a body may call an abstract method; the call
+    // dispatches to the implementor's concrete definition.
+    let (out, ok) = run("public class Main {\
+         interface Greeter { String name(); default String greet() { return \"Hi, \" + name(); } }\
+         static class En implements Greeter { public String name() { return \"Sam\"; } }\
+         static class Fancy implements Greeter { public String name() { return \"Sam\"; }\
+         public String greet() { return \"Welcome, \" + name(); } }\
+         public static void main(String[] a) {\
+         Greeter g = new En(); System.out.println(g.greet());\
+         Greeter f = new Fancy(); System.out.println(f.greet()); } }");
+    assert!(ok);
+    // En inherits the default; Fancy overrides it.
+    assert_eq!(out, "Hi, Sam\nWelcome, Sam\n");
+}
+
+#[test]
+fn method_taking_interface_calls_polymorphically() {
+    // A method parameter typed as the interface calls `.m()` polymorphically on
+    // whatever concrete instance is passed.
+    let (out, _) = run(
+        "public class Main {\
+         interface Shape { double area(); }\
+         static class Circle implements Shape { double r; Circle(double r) { this.r = r; } public double area() { return 3.0 * r * r; } }\
+         static class Square implements Shape { double s; Square(double s) { this.s = s; } public double area() { return s * s; } }\
+         static double total(Shape[] xs) { double t = 0.0; for (int i = 0; i < xs.length; i++) { t += xs[i].area(); } return t; }\
+         public static void main(String[] a) {\
+         Shape[] xs = { new Circle(2.0), new Square(3.0) };\
+         System.out.println(total(xs)); } }",
+    );
+    // 12.0 + 9.0 = 21.0.
+    assert_eq!(out, "21.0\n");
+}
+
+#[test]
+fn class_implementing_multiple_interfaces_and_instanceof() {
+    // A class implementing two interfaces satisfies `instanceof` for both, and
+    // an instance of a class implementing only one does not satisfy the other.
+    let (out, _) = run(
+        "public class Main {\
+         interface Named { String name(); }\
+         interface Aged { int age(); }\
+         static class Person implements Named, Aged { public String name() { return \"Al\"; } public int age() { return 30; } }\
+         static class Robot implements Named { public String name() { return \"R2\"; } }\
+         public static void main(String[] a) {\
+         Person p = new Person(); Robot r = new Robot();\
+         System.out.println(p.name() + \" \" + p.age());\
+         System.out.println(p instanceof Named); System.out.println(p instanceof Aged);\
+         System.out.println(r instanceof Named); System.out.println(r instanceof Aged); } }",
+    );
+    assert_eq!(out, "Al 30\ntrue\ntrue\ntrue\nfalse\n");
+}
+
+#[test]
+fn interface_extends_interface_default_override() {
+    // A sub-interface may override a super-interface `default`, and a class with
+    // no override inherits the most-specific default.
+    let (out, _) = run("public class Main {\
+         interface A { default String who() { return \"A\"; } }\
+         interface B extends A { default String who() { return \"B+\" + tag(); } String tag(); }\
+         static class C implements B { public String tag() { return \"c\"; } }\
+         static class D implements A { }\
+         public static void main(String[] x) {\
+         A a = new C(); System.out.println(a.who());\
+         A d = new D(); System.out.println(d.who());\
+         System.out.println(a instanceof B); System.out.println(d instanceof B); } }");
+    assert_eq!(out, "B+c\nA\ntrue\nfalse\n");
+}
+
+#[test]
+fn instantiating_an_interface_is_an_error() {
+    let (_out, ok) = run("public class Main { interface I { void m(); }\
+         public static void main(String[] a) { I x = new I(); } }");
+    assert!(!ok, "an interface must not be instantiable");
+}
+
+// ── Method overloading by parameter type ─────────────────────────────────────
+
+#[test]
+fn static_overload_resolves_by_primitive_and_string_type() {
+    // Same name + arity, different parameter type: the static argument type
+    // selects the overload.
+    let (out, ok) = run("public class Main {\
+         static String f(int x) { return \"int:\" + x; }\
+         static String f(String x) { return \"str:\" + x; }\
+         static String f(double x) { return \"dbl:\" + x; }\
+         public static void main(String[] a) {\
+         System.out.println(f(5)); System.out.println(f(\"hi\")); System.out.println(f(3.5)); } }");
+    assert!(ok);
+    assert_eq!(out, "int:5\nstr:hi\ndbl:3.5\n");
+}
+
+#[test]
+fn overload_by_reference_type_picks_most_specific() {
+    // Dog is more specific than Animal, which is more specific than Object; a
+    // Dog argument selects `g(Dog)`, and a supertype-typed argument selects the
+    // overload for its static type.
+    let (out, _) = run("public class Main {\
+         static class Animal { String n; Animal(String n) { this.n = n; } }\
+         static class Dog extends Animal { Dog(String n) { super(n); } }\
+         static String g(Animal x) { return \"animal:\" + x.n; }\
+         static String g(Dog x) { return \"dog:\" + x.n; }\
+         static String g(Object x) { return \"obj\"; }\
+         public static void main(String[] a) {\
+         System.out.println(g(new Dog(\"Rex\")));\
+         System.out.println(g(new Animal(\"Cat\")));\
+         Animal poly = new Dog(\"Poly\"); System.out.println(g(poly));\
+         System.out.println(g(\"plain\")); } }");
+    // Dog -> g(Dog); Animal -> g(Animal); Animal-typed Dog -> g(Animal) (static
+    // type wins for overload choice); String -> g(Object).
+    assert_eq!(out, "dog:Rex\nanimal:Cat\nanimal:Poly\nobj\n");
+}
+
+#[test]
+fn constructor_overloading_by_type() {
+    let (out, _) = run("public class Main {\
+         static class Box { String tag;\
+         Box(int x) { this.tag = \"fromInt:\" + x; }\
+         Box(String s) { this.tag = \"fromStr:\" + s; } }\
+         public static void main(String[] a) {\
+         System.out.println(new Box(7).tag); System.out.println(new Box(\"hey\").tag); } }");
+    assert_eq!(out, "fromInt:7\nfromStr:hey\n");
+}
+
+#[test]
+fn instance_method_overloading_by_type() {
+    let (out, _) = run("public class Main {\
+         static class P {\
+         String d(int n) { return \"int:\" + n; }\
+         String d(String s) { return \"str:\" + s; } }\
+         public static void main(String[] a) {\
+         P p = new P(); System.out.println(p.d(9)); System.out.println(p.d(\"x\")); } }");
+    assert_eq!(out, "int:9\nstr:x\n");
+}
+
+#[test]
+fn overriding_one_overload_dispatches_virtually() {
+    // Sub overrides only the `int` overload; a Base-typed reference to a Sub
+    // instance runs Sub's `int` override and Base's inherited `String` overload.
+    let (out, _) = run(
+        "public class Main {\
+         static class Base { String h(int x) { return \"B-int:\" + x; } String h(String s) { return \"B-str:\" + s; } }\
+         static class Sub extends Base { String h(int x) { return \"S-int:\" + (x + 1); } }\
+         public static void main(String[] a) {\
+         Base b = new Sub(); System.out.println(b.h(10)); System.out.println(b.h(\"hi\")); } }",
+    );
+    assert_eq!(out, "S-int:11\nB-str:hi\n");
+}
+
+// ── Generics (type-erased, like javac) ───────────────────────────────────────
+
+#[test]
+fn generic_class_box_erases_and_runs() {
+    // A `Box<T>` with a T field, T-returning getter, and T-taking setter; the
+    // diamond `new Box<>()` and explicit `new Box<String>()` both work.
+    let (out, ok) = run(
+        "public class Main {\
+         static class Box<T> { T v; Box(T v) { this.v = v; } T get() { return v; } void set(T x) { this.v = x; } }\
+         public static void main(String[] a) {\
+         Box<Integer> bi = new Box<>(5); System.out.println(bi.get());\
+         bi.set(42); System.out.println(bi.get());\
+         Box<String> bs = new Box<String>(\"hello\"); System.out.println(bs.get()); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "5\n42\nhello\n");
+}
+
+#[test]
+fn generic_class_with_two_type_params() {
+    let (out, _) = run("public class Main {\
+         static class Pair<K, V> { K k; V val; Pair(K k, V val) { this.k = k; this.val = val; }\
+         String show() { return k + \"=\" + val; } }\
+         public static void main(String[] a) {\
+         Pair<String, Integer> p = new Pair<>(\"age\", 30); System.out.println(p.show()); } }");
+    assert_eq!(out, "age=30\n");
+}
+
+#[test]
+fn generic_static_method_and_bounded_type_param() {
+    // `<T> T id(T x)` and a bounded `<T extends Number>` both parse and run
+    // (erased at runtime).
+    let (out, _) = run(
+        "public class Main {\
+         static <T> T id(T x) { return x; }\
+         static <T extends Number> String describe(T n) { return \"num:\" + n; }\
+         public static void main(String[] a) {\
+         System.out.println(id(99)); System.out.println(id(\"str\")); System.out.println(describe(7)); } }",
+    );
+    assert_eq!(out, "99\nstr\nnum:7\n");
+}
+
+// ── Multi-dimensional arrays, String.format, Arrays.toString ─────────────────
+
+#[test]
+fn multidimensional_array_allocate_index_and_length() {
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         int[][] g = new int[2][3];\
+         for (int i = 0; i < 2; i++) { for (int j = 0; j < 3; j++) { g[i][j] = i * 10 + j; } }\
+         System.out.println(g[0][0] + \" \" + g[1][2]);\
+         System.out.println(g.length + \" \" + g[0].length); } }");
+    assert!(ok);
+    assert_eq!(out, "0 12\n2 3\n");
+}
+
+#[test]
+fn nested_array_literal_including_jagged_rows() {
+    let (out, _) = run(
+        "public class Main { public static void main(String[] a) {\
+         int[][] lit = {{1, 2}, {3, 4, 5}};\
+         System.out.println(lit[1][2]); System.out.println(lit[0].length + \" \" + lit[1].length); } }",
+    );
+    assert_eq!(out, "5\n2 3\n");
+}
+
+#[test]
+fn arrays_to_string_of_int_and_string_arrays() {
+    let (out, _) = run("import java.util.Arrays;\
+         public class Main { public static void main(String[] a) {\
+         int[] xs = {5, 10, 15}; String[] ws = {\"a\", \"b\"};\
+         System.out.println(Arrays.toString(xs));\
+         System.out.println(Arrays.toString(ws)); } }");
+    assert_eq!(out, "[5, 10, 15]\n[a, b]\n");
+}
+
+#[test]
+fn string_format_conversions_flags_and_width() {
+    let (out, _) = run("public class Main { public static void main(String[] a) {\
+         System.out.println(String.format(\"%d-%s-%.2f\", 7, \"hi\", 3.14159));\
+         System.out.println(String.format(\"[%5d][%-5d][%05d]\", 42, 42, 42));\
+         System.out.println(String.format(\"%x %b %+d %%\", 255, true, 8)); } }");
+    assert_eq!(out, "7-hi-3.14\n[   42][42   ][00042]\nff true +8 %\n");
+}
+
+#[test]
+fn generic_interface_method_dispatches_to_erased_override() {
+    // A generic interface method `apply(T)` is implemented with the concrete
+    // erased type `apply(String)`; dispatch through the interface-typed variable
+    // must reach that override (erasure links the differing raw signatures). The
+    // `default tag()` calls the abstract method on `this`.
+    let (out, ok) = run(
+        "public class Main {\
+         interface Transform<T> { String apply(T x); default String tag() { return \"t:\" + apply(null); } }\
+         static class Upper implements Transform<String> { public String apply(String s) { return s == null ? \"<null>\" : s.toUpperCase(); } }\
+         static class Wrap implements Transform<Integer> { public String apply(Integer n) { return \"[\" + n + \"]\"; } }\
+         public static void main(String[] a) {\
+         Transform<String> t = new Upper(); System.out.println(t.apply(\"hi\")); System.out.println(t.tag());\
+         Transform<Integer> w = new Wrap(); System.out.println(w.apply(5));\
+         System.out.println(t instanceof Transform); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "HI\nt:<null>\n[5]\ntrue\n");
+}
+
+#[test]
+fn erased_library_generic_type_args_parse() {
+    // `List<String>` / `Map<K,V>` type arguments (and a nested generic bound)
+    // parse and erase — the declared references default to null.
+    let (out, _) = run(
+        "import java.util.List;\
+         import java.util.Map;\
+         public class Main {\
+         static class Holder<T extends Comparable<T>> { T val; Holder(T v) { this.val = v; } T value() { return val; } }\
+         public static void main(String[] a) {\
+         List<String> xs = null; Map<String, Integer> m = null;\
+         System.out.println(xs == null); System.out.println(m == null);\
+         Holder<Integer> h = new Holder<>(8); System.out.println(h.value()); } }",
+    );
+    assert_eq!(out, "true\ntrue\n8\n");
+}

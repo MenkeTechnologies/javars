@@ -46,12 +46,22 @@ fn numtype_of_ty(ty: &str) -> Option<NumType> {
     }
 }
 
-/// Static signature of a user-defined static method: its parameter arity (for
-/// call-site checking) and the numeric category of its return type (so a call
-/// participates in division typing).
+/// Static signature of one user-defined static-method overload: its declared
+/// parameter types (for overload resolution + mangling) and the numeric category
+/// of its return type (so a call participates in division typing). The raw
+/// return-type name is kept for static typing of a call result.
 struct MethodSig {
-    arity: usize,
+    param_tys: Vec<String>,
     ret: NumType,
+    ret_name: String,
+}
+
+/// A resolved static-method call: the mangled target subroutine name and its
+/// return type (numeric category + raw name).
+struct StaticResolved {
+    mangled: String,
+    ret: NumType,
+    ret_name: String,
 }
 
 /// Compile-time metadata for one user-defined class, resolved with inheritance
@@ -60,16 +70,40 @@ struct MethodSig {
 struct ClassInfo {
     /// Direct superclass name (for `super(...)` constructor chaining), if any.
     superclass: Option<String>,
+    /// Direct supertypes (superclass + implemented/extended interfaces), for
+    /// `instanceof` and virtual-dispatch subtype tests.
+    supertypes: Vec<String>,
+    /// True when this is an `interface` (not instantiable; a dispatch-only type).
+    is_interface: bool,
     /// Every instance field this class has (ancestors first, then own), in
     /// initialization order — the sequence the constructor prologue emits.
     fields: Vec<FieldInit>,
     /// Declared type of every field (own + inherited), for static typing.
     field_types: HashMap<String, String>,
-    /// The declaring class of each `(method, arity)` this class can dispatch —
-    /// walking up the chain, most-derived wins. Value is `(defining_class, ret)`.
-    methods: HashMap<(String, usize), (String, String)>,
-    /// Constructor arities this class declares (empty ⇒ implicit default ctor).
-    ctor_arities: HashMap<usize, usize>,
+    /// Every method this class can dispatch, keyed by `(name, param_types)` so
+    /// same-name overloads differing only in parameter type coexist. Interface
+    /// abstract/`default` methods are folded in first, then the class chain
+    /// (most-derived wins). An entry whose defining type is an interface abstract
+    /// method has no subroutine; it is only reached through virtual dispatch to a
+    /// concrete implementor.
+    methods: Vec<MethodMeta>,
+    /// Constructor parameter-type signatures this class declares (empty ⇒
+    /// implicit default ctor). Enables constructor overload resolution by type.
+    ctors: Vec<Vec<String>>,
+}
+
+/// One dispatchable method's compile-time signature: its name, declared
+/// parameter types (for overload resolution and mangling), the class that
+/// defines the body (`this` binding), and its declared return type.
+#[derive(Clone)]
+struct MethodMeta {
+    name: String,
+    param_tys: Vec<String>,
+    defining: String,
+    ret: String,
+    /// True for a bodyless interface/abstract method — it has no subroutine and
+    /// is never itself a concrete virtual-dispatch target.
+    is_abstract: bool,
 }
 
 /// A field with its declared type and optional initializer, in the order it is
@@ -202,10 +236,11 @@ struct Compiler {
     /// The active method scope while lowering a method body; `None` while
     /// lowering `main`. Selects slot-based vs. global variable access.
     scope: Option<MethodScope>,
-    /// User-defined static method signatures, keyed by name — populated before
+    /// User-defined static-method overloads, keyed by name — populated before
     /// any body is lowered so calls (including forward and recursive ones)
-    /// resolve.
-    methods: HashMap<String, MethodSig>,
+    /// resolve. Multiple entries per name are overloads resolved by argument
+    /// type at the call site.
+    methods: HashMap<String, Vec<MethodSig>>,
     /// Declared type name of each `main`-scope local (parallel to
     /// [`Compiler::global_types`] but the raw type string, for class typing).
     global_decl_types: HashMap<String, String>,
@@ -236,15 +271,13 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Register every static-method signature up front so calls resolve
     // regardless of source order (forward references, recursion, mutual
     // recursion).
-    let mut methods = HashMap::new();
+    let mut methods: HashMap<String, Vec<MethodSig>> = HashMap::new();
     for m in &prog.methods {
-        methods.insert(
-            m.name.clone(),
-            MethodSig {
-                arity: m.params.len(),
-                ret: numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
-            },
-        );
+        methods.entry(m.name.clone()).or_default().push(MethodSig {
+            param_tys: m.params.iter().map(|p| p.ty.clone()).collect(),
+            ret: numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
+            ret_name: m.ret.clone(),
+        });
     }
     let classes = resolve_classes(prog)?;
     let mut c = Compiler {
@@ -289,6 +322,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         }
         for cl in &prog.classes {
             for m in &cl.methods {
+                // Abstract methods (interface signatures, `abstract` class
+                // methods) have no body — no subroutine is emitted. A concrete
+                // implementor supplies the body reached by virtual dispatch.
+                if m.is_abstract {
+                    continue;
+                }
                 c.compile_instance_method(&cl.name, m)?;
             }
             for ctor in &cl.ctors {
@@ -328,12 +367,67 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         out.reverse();
         Ok(out)
     };
+    // Collect a type's transitive interfaces, super-interfaces first (so a more
+    // specific interface's `default` overrides a less specific one), deduped.
+    fn collect_ifaces(
+        name: &str,
+        by_name: &HashMap<&str, &Class>,
+        order: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        if let Some(cl) = by_name.get(name) {
+            for i in &cl.interfaces {
+                collect_ifaces(i, by_name, order, seen);
+            }
+            if cl.is_interface {
+                order.push(name.to_string());
+            }
+        }
+    }
     let mut out = HashMap::new();
     for cl in &prog.classes {
         let ancestry = chain(&cl.name)?;
+        // The interfaces this type (and its superclass chain) brings in, super-
+        // interfaces first. `extends`-ed interfaces of an interface, and
+        // `implements`-ed interfaces of every class in the ancestry.
+        let mut iface_order = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for anc_name in &ancestry {
+            let anc = by_name[anc_name.as_str()];
+            for i in &anc.interfaces {
+                collect_ifaces(i, &by_name, &mut iface_order, &mut seen);
+            }
+        }
         let mut fields = Vec::new();
         let mut field_types = HashMap::new();
-        let mut methods: HashMap<(String, usize), (String, String)> = HashMap::new();
+        // Keyed by (name, param_types) so type-overloads coexist while an
+        // override (same name + same param types) replaces the inherited entry.
+        let mut methods: HashMap<(String, Vec<String>), MethodMeta> = HashMap::new();
+        let param_tys =
+            |m: &Method| -> Vec<String> { m.params.iter().map(|p| p.ty.clone()).collect() };
+        // 1. Interface methods (abstract + `default`), super-interfaces first —
+        //    later (more specific) entries overwrite earlier ones.
+        for iface in &iface_order {
+            let icl = by_name[iface.as_str()];
+            for m in &icl.methods {
+                let ptys = param_tys(m);
+                methods.insert(
+                    (m.name.clone(), ptys.clone()),
+                    MethodMeta {
+                        name: m.name.clone(),
+                        param_tys: ptys,
+                        defining: iface.clone(),
+                        ret: m.ret.clone(),
+                        is_abstract: m.is_abstract,
+                    },
+                );
+            }
+        }
+        // 2. Class-chain fields and methods (ancestors first) — a class method
+        //    always overrides an inherited interface `default`.
         for anc_name in &ancestry {
             let anc = by_name[anc_name.as_str()];
             for f in &anc.fields {
@@ -344,28 +438,41 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                     init: f.init.clone(),
                 });
             }
-            // More-derived ancestors overwrite an inherited method entry (this is
-            // the override resolution for static-type dispatch).
             for m in &anc.methods {
+                let ptys = param_tys(m);
                 methods.insert(
-                    (m.name.clone(), m.params.len()),
-                    (anc_name.clone(), m.ret.clone()),
+                    (m.name.clone(), ptys.clone()),
+                    MethodMeta {
+                        name: m.name.clone(),
+                        param_tys: ptys,
+                        defining: anc_name.clone(),
+                        ret: m.ret.clone(),
+                        is_abstract: m.is_abstract,
+                    },
                 );
             }
         }
-        let ctor_arities = cl
+        let methods: Vec<MethodMeta> = methods.into_values().collect();
+        let ctors: Vec<Vec<String>> = cl
             .ctors
             .iter()
-            .map(|c| (c.params.len(), c.params.len()))
+            .map(|c| c.params.iter().map(|p| p.ty.clone()).collect())
             .collect();
+        let mut supertypes = Vec::new();
+        if let Some(sup) = &cl.superclass {
+            supertypes.push(sup.clone());
+        }
+        supertypes.extend(cl.interfaces.iter().cloned());
         out.insert(
             cl.name.clone(),
             ClassInfo {
                 superclass: cl.superclass.clone(),
+                supertypes,
+                is_interface: cl.is_interface,
                 fields,
                 field_types,
                 methods,
-                ctor_arities,
+                ctors,
             },
         );
     }
@@ -531,13 +638,125 @@ impl Compiler {
                 recv, method, args, ..
             } => {
                 let rc = self.expr_class(recv)?;
-                let (defining, ret) = self
-                    .classes
-                    .get(&rc)?
-                    .methods
-                    .get(&(method.clone(), args.len()))?;
-                let _ = defining;
-                self.classes.contains_key(ret).then(|| ret.clone())
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let (_, ret_name, _) = self.resolve_instance_call(&rc, method, &arg_tys)?;
+                self.classes.contains_key(&ret_name).then_some(ret_name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared type-name of a bare variable read `name`: a local/param/
+    /// global declared type, else an instance field of the enclosing `this`.
+    fn bare_var_type(&self, name: &str) -> Option<String> {
+        if let Some(t) = self.var_decl_type(name) {
+            return Some(t.to_string());
+        }
+        let this = self.this_class.as_ref()?;
+        self.classes.get(this)?.field_types.get(name).cloned()
+    }
+
+    /// The static Java type-name of an expression (`int`, `double`, `boolean`,
+    /// `String`, a class/interface name, an array type, `null`), or `None` when
+    /// it cannot be determined statically. Drives overload resolution by argument
+    /// type; an unknown type falls back to arity-only matching at the call site.
+    fn expr_java_type(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Int(_) => Some("int".to_string()),
+            Expr::Float(_) => Some("double".to_string()),
+            Expr::Bool(_) => Some("boolean".to_string()),
+            Expr::Str(_) => Some("String".to_string()),
+            Expr::This => self.this_class.clone(),
+            Expr::Var(name) => self.bare_var_type(name),
+            Expr::Unary { op, rhs } => match op {
+                UnOp::Neg => self.expr_java_type(rhs),
+                UnOp::Not => Some("boolean".to_string()),
+            },
+            Expr::Binary { op, lhs, rhs } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    let l = self.expr_java_type(lhs);
+                    let r = self.expr_java_type(rhs);
+                    // `+` with a String operand is concatenation.
+                    if matches!(op, BinOp::Add)
+                        && (l.as_deref() == Some("String") || r.as_deref() == Some("String"))
+                    {
+                        return Some("String".to_string());
+                    }
+                    let lr = l.as_deref().and_then(numeric_rank)?;
+                    let rr = r.as_deref().and_then(numeric_rank)?;
+                    Some(rank_name(lr.max(rr)).to_string())
+                }
+                _ => Some("boolean".to_string()),
+            },
+            Expr::Ternary { then, els, .. } => {
+                let t = self.expr_java_type(then);
+                let e2 = self.expr_java_type(els);
+                if t == e2 {
+                    return t;
+                }
+                let tr = t.as_deref().and_then(numeric_rank)?;
+                let er = e2.as_deref().and_then(numeric_rank)?;
+                Some(rank_name(tr.max(er)).to_string())
+            }
+            Expr::Field { recv, name } => {
+                if name == "length" {
+                    return Some("int".to_string());
+                }
+                let rc = self.expr_class(recv)?;
+                self.classes.get(&rc)?.field_types.get(name).cloned()
+            }
+            Expr::Index { array, .. } => {
+                let arr_ty = self.expr_array_type(array)?;
+                arr_ty.strip_suffix("[]").map(|s| s.to_string())
+            }
+            Expr::NewObject { class, .. } => Some(class.clone()),
+            Expr::NewArray {
+                elem_ty,
+                sizes,
+                extra_dims,
+            } => Some(format!(
+                "{elem_ty}{}",
+                "[]".repeat(sizes.len() + extra_dims)
+            )),
+            Expr::InstanceOf { .. } => Some("boolean".to_string()),
+            Expr::PostIncDec { name, .. } => self.bare_var_type(name),
+            Expr::Call { name, args, .. } => {
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                self.resolve_static_call(name, &arg_tys).map(|s| s.ret_name)
+            }
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                if let Some(rc) = self.expr_class(recv) {
+                    if let Some((_, ret_name, _)) =
+                        self.resolve_instance_call(&rc, method, &arg_tys)
+                    {
+                        return Some(ret_name);
+                    }
+                }
+                // A `String` receiver's known return types.
+                match (method.as_str(), args.len()) {
+                    ("length", 0) | ("indexOf", 1) => Some("int".to_string()),
+                    ("isEmpty", 0)
+                    | ("contains", 1)
+                    | ("equals", 1)
+                    | ("startsWith", 1)
+                    | ("endsWith", 1)
+                    | ("equalsIgnoreCase", 1) => Some("boolean".to_string()),
+                    ("substring", _)
+                    | ("toUpperCase", 0)
+                    | ("toLowerCase", 0)
+                    | ("trim", 0)
+                    | ("concat", 1)
+                    | ("replace", 2)
+                    | ("repeat", 1)
+                    | ("charAt", 1) => Some("String".to_string()),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -561,38 +780,265 @@ impl Compiler {
         t
     }
 
-    /// Resolve an instance method on a static receiver class: the mangled
-    /// subroutine name (`DefiningClass#method#argc`) and its return numeric type.
-    fn resolve_method(&self, class: &str, method: &str, argc: usize) -> Option<(String, NumType)> {
+    /// The conversion cost from static type `from` to a parameter type `to`, or
+    /// `None` when `from` is not assignable to `to`. `0` is an identity match;
+    /// numeric widening costs the rank distance; a reference upcast costs its
+    /// subtype distance. Lower cost = more specific (drives overload resolution).
+    fn assign_cost(&self, from: &str, to: &str) -> Option<u32> {
+        if from == to {
+            return Some(0);
+        }
+        if let (Some(f), Some(t)) = (numeric_rank(from), numeric_rank(to)) {
+            return (f <= t).then(|| t - f);
+        }
+        if from == "null" {
+            return is_reference_type(to).then_some(50);
+        }
+        if let Some(d) = self.subtype_distance(from, to) {
+            return Some(d);
+        }
+        if from == "String" && matches!(to, "Object" | "CharSequence") {
+            return Some(1);
+        }
+        if to == "Object" && is_reference_type(from) {
+            return Some(40);
+        }
+        None
+    }
+
+    /// The number of supertype hops from `from` up to `to` (0 when equal), or
+    /// `None` when `to` is not a supertype of `from`. Walks superclass +
+    /// interface edges breadth-first for the shortest path.
+    fn subtype_distance(&self, from: &str, to: &str) -> Option<u32> {
+        if from == to {
+            return Some(0);
+        }
+        let mut frontier = vec![from.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        let mut dist = 0u32;
+        while !frontier.is_empty() {
+            dist += 1;
+            let mut next = Vec::new();
+            for cur in &frontier {
+                if let Some(ci) = self.classes.get(cur) {
+                    for sup in &ci.supertypes {
+                        if sup == to {
+                            return Some(dist);
+                        }
+                        if seen.insert(sup.clone()) {
+                            next.push(sup.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+            if dist > 10000 {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Choose the most-specific applicable overload for argument types `arg_tys`
+    /// among candidates whose parameter-type lists are `cands`. Returns the index
+    /// into `cands`, or an error naming the failure (none applicable / ambiguous).
+    /// An argument whose static type is unknown (`None`) matches any parameter
+    /// without contributing to specificity.
+    fn pick_overload(
+        &self,
+        cands: &[&[String]],
+        arg_tys: &[Option<String>],
+        who: &str,
+    ) -> Result<usize, String> {
+        if cands.len() == 1 {
+            return Ok(0);
+        }
+        let mut best: Option<(usize, u32)> = None;
+        let mut tie = false;
+        for (i, ptys) in cands.iter().enumerate() {
+            let mut total = 0u32;
+            let mut ok = true;
+            for (p, a) in ptys.iter().zip(arg_tys) {
+                if let Some(at) = a {
+                    match self.assign_cost(at, p) {
+                        Some(c) => total += c,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            match best {
+                None => {
+                    best = Some((i, total));
+                    tie = false;
+                }
+                Some((_, bc)) => {
+                    if total < bc {
+                        best = Some((i, total));
+                        tie = false;
+                    } else if total == bc {
+                        tie = true;
+                    }
+                }
+            }
+        }
+        match best {
+            Some((i, _)) if !tie => Ok(i),
+            Some(_) => Err(format!("javars: ambiguous overload for `{who}`")),
+            None => Err(format!("javars: no applicable overload for `{who}`")),
+        }
+    }
+
+    /// Resolve an instance-method call on a static receiver class by argument
+    /// type: the chosen overload's parameter types, its return type name, and its
+    /// return numeric category. `None` when no method of that name+arity exists.
+    fn resolve_instance_call(
+        &self,
+        class: &str,
+        method: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<(Vec<String>, String, NumType)> {
         let info = self.classes.get(class)?;
-        let (defining, ret) = info.methods.get(&(method.to_string(), argc))?;
+        let cands: Vec<&MethodMeta> = info
+            .methods
+            .iter()
+            .filter(|m| m.name == method && m.param_tys.len() == arg_tys.len())
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+        let cand_tys: Vec<&[String]> = cands.iter().map(|m| m.param_tys.as_slice()).collect();
+        let idx = self.pick_overload(&cand_tys, arg_tys, method).ok()?;
+        let m = cands[idx];
         Some((
-            mangle(defining, method, argc),
-            numtype_of_ty(ret).unwrap_or(NumType::Other),
+            m.param_tys.clone(),
+            m.ret.clone(),
+            numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
         ))
     }
 
-    /// True when `class` is `base` or a (transitive) subclass of it.
+    /// Resolve the concrete implementation of an exact `(method, param_tys)`
+    /// signature visible on `class`: the mangled subroutine name and its return
+    /// type name. Used per-subclass for virtual dispatch (the overload is chosen
+    /// once statically; each runtime class supplies its own override body).
+    fn resolve_instance_sig(
+        &self,
+        class: &str,
+        method: &str,
+        param_tys: &[String],
+    ) -> Option<(String, String)> {
+        let info = self.classes.get(class)?;
+        // Exact signature match to a concrete (bodied) method — the common case.
+        if let Some(m) = info
+            .methods
+            .iter()
+            .find(|m| !m.is_abstract && m.name == method && m.param_tys == param_tys)
+        {
+            return Some((mangle(&m.defining, method, &m.param_tys), m.ret.clone()));
+        }
+        // Erased-generic override: an interface/base method with a type-variable
+        // parameter (`score(T)`) is implemented with the concrete erased type
+        // (`score(String)`), so the raw strings differ. When exactly one concrete
+        // method of this name+arity exists on the class, it is that override.
+        let mut same_arity = info
+            .methods
+            .iter()
+            .filter(|m| !m.is_abstract && m.name == method && m.param_tys.len() == param_tys.len());
+        let only = same_arity.next()?;
+        if same_arity.next().is_none() {
+            return Some((
+                mangle(&only.defining, method, &only.param_tys),
+                only.ret.clone(),
+            ));
+        }
+        None
+    }
+
+    /// Resolve a top-level user `static` method call by argument type: the
+    /// mangled target subroutine and its return type. `None` when no method of
+    /// that name+arity exists (an unresolved reference or arity mismatch).
+    fn resolve_static_call(
+        &self,
+        name: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<StaticResolved> {
+        let overloads = self.methods.get(name)?;
+        let filtered: Vec<&MethodSig> = overloads
+            .iter()
+            .filter(|s| s.param_tys.len() == arg_tys.len())
+            .collect();
+        if filtered.is_empty() {
+            return None;
+        }
+        let cand_tys: Vec<&[String]> = filtered.iter().map(|s| s.param_tys.as_slice()).collect();
+        let idx = self.pick_overload(&cand_tys, arg_tys, name).ok()?;
+        let s = filtered[idx];
+        Some(StaticResolved {
+            mangled: mangle_static(name, &s.param_tys),
+            ret: s.ret,
+            ret_name: s.ret_name.clone(),
+        })
+    }
+
+    /// Resolve a constructor of `class` by argument type: the chosen ctor's
+    /// parameter-type list (for mangling the `<init>` subroutine). `None` when
+    /// no constructor of that arity is declared.
+    fn resolve_ctor(&self, class: &str, arg_tys: &[Option<String>]) -> Option<Vec<String>> {
+        let info = self.classes.get(class)?;
+        let filtered: Vec<&Vec<String>> = info
+            .ctors
+            .iter()
+            .filter(|c| c.len() == arg_tys.len())
+            .collect();
+        if filtered.is_empty() {
+            return None;
+        }
+        let cand_tys: Vec<&[String]> = filtered.iter().map(|c| c.as_slice()).collect();
+        let idx = self.pick_overload(&cand_tys, arg_tys, "<init>").ok()?;
+        Some(filtered[idx].clone())
+    }
+
+    /// True when `class` declares or inherits any method named `method` with
+    /// `argc` parameters (an existence check for dispatch decisions).
+    fn has_instance_method(&self, class: &str, method: &str, argc: usize) -> bool {
+        self.classes.get(class).is_some_and(|ci| {
+            ci.methods
+                .iter()
+                .any(|m| m.name == method && m.param_tys.len() == argc)
+        })
+    }
+
+    /// True when `class` is `base`, a (transitive) subclass of it, or a type
+    /// that implements/extends the interface `base` — walking the full supertype
+    /// graph (superclass + interfaces).
     fn is_subclass(&self, class: &str, base: &str) -> bool {
-        let mut cur = class;
+        if class == base {
+            return true;
+        }
+        let mut stack = vec![class.to_string()];
+        let mut seen = std::collections::HashSet::new();
         let mut guard = 0;
-        loop {
+        while let Some(cur) = stack.pop() {
             if cur == base {
                 return true;
             }
-            match self
-                .classes
-                .get(cur)
-                .and_then(|ci| ci.superclass.as_deref())
-            {
-                Some(sup) => cur = sup,
-                None => return false,
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(ci) = self.classes.get(&cur) {
+                stack.extend(ci.supertypes.iter().cloned());
             }
             guard += 1;
-            if guard > 1000 {
+            if guard > 10000 {
                 return false;
             }
         }
+        false
     }
 
     /// The virtual-dispatch targets for `method(argc)` on a static receiver class
@@ -603,16 +1049,24 @@ impl Compiler {
         &self,
         rc: &str,
         method: &str,
-        argc: usize,
+        param_tys: &[String],
     ) -> Option<Vec<(String, String)>> {
-        // The method must resolve on the static type (else it is a type error).
-        self.resolve_method(rc, method, argc)?;
+        // The method must exist on the static type (else it is a type error).
+        // An abstract-only method on an interface still gates dispatch — the
+        // concrete implementors below supply the bodies.
+        if !self.has_instance_method(rc, method, param_tys.len()) {
+            return None;
+        }
         let mut v: Vec<(String, String)> = self
             .classes
-            .keys()
+            .iter()
+            // Only concrete (instantiable) classes are runtime dispatch targets;
+            // an interface is never a runtime class of any object.
+            .filter(|(_, ci)| !ci.is_interface)
+            .map(|(k, _)| k)
             .filter(|k| self.is_subclass(k, rc))
             .filter_map(|k| {
-                self.resolve_method(k, method, argc)
+                self.resolve_instance_sig(k, method, param_tys)
                     .map(|(m, _)| (k.clone(), m))
             })
             .collect();
@@ -633,8 +1087,19 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        // Resolve which overload the static argument types select, then dispatch
+        // that exact signature virtually on the receiver's runtime class.
+        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let (param_tys, _, _) = self
+            .resolve_instance_call(rc, method, &arg_tys)
+            .ok_or_else(|| {
+                format!(
+                "javars: class `{rc}` has no method `{method}` taking {} argument(s) (line {line})",
+                args.len()
+            )
+            })?;
         let targets = self
-            .virtual_targets(rc, method, args.len())
+            .virtual_targets(rc, method, &param_tys)
             .ok_or_else(|| {
                 format!(
                 "javars: class `{rc}` has no method `{method}` taking {} argument(s) (line {line})",
@@ -643,9 +1108,13 @@ impl Compiler {
             })?;
         let distinct: std::collections::HashSet<&str> =
             targets.iter().map(|(_, m)| m.as_str()).collect();
-        // Fast path: a single implementation across the whole subtree.
+        // Fast path: a single concrete implementation across the whole subtree.
+        // Use the concrete target's mangled name (not the static type's), so an
+        // interface- or abstract-typed receiver still calls a real subroutine.
         if distinct.len() <= 1 {
-            let (mangled, _) = self.resolve_method(rc, method, args.len()).unwrap();
+            let mangled = targets.first().map(|(_, m)| m.clone()).ok_or_else(|| {
+                format!("javars: no concrete implementation of `{method}` for `{rc}` (line {line})")
+            })?;
             self.expr(recv)?; // this (deepest)
             for a in args {
                 self.expr(a)?;
@@ -693,8 +1162,10 @@ impl Compiler {
             self.b.patch_jump(skip, next);
         }
         // Fallback (unreachable at runtime — every concrete class is a target):
-        // call the static-type resolution so the stack stays balanced.
-        let (base, _) = self.resolve_method(rc, method, args.len()).unwrap();
+        // call an arbitrary concrete target so the stack stays balanced. Using a
+        // real target (not the static type) keeps this valid when `rc` is an
+        // interface whose own method has no subroutine.
+        let base = targets[0].1.clone();
         self.emit_get(&recv_t, line);
         for t in &arg_ts {
             self.emit_get(t, line);
@@ -773,11 +1244,13 @@ impl Compiler {
                     NumType::Int
                 }
             }
-            Expr::Call { name, .. } => self
-                .methods
-                .get(name)
-                .map(|s| s.ret)
-                .unwrap_or(NumType::Other),
+            Expr::Call { name, args, .. } => {
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                self.resolve_static_call(name, &arg_tys)
+                    .map(|s| s.ret)
+                    .unwrap_or(NumType::Other)
+            }
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
@@ -790,7 +1263,9 @@ impl Compiler {
                 }
                 // A user-class instance method's declared return type.
                 if let Some(rc) = self.expr_class(recv) {
-                    if let Some((_, ret)) = self.resolve_method(&rc, method, args.len()) {
+                    let arg_tys: Vec<Option<String>> =
+                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    if let Some((_, _, ret)) = self.resolve_instance_call(&rc, method, &arg_tys) {
                         return ret;
                     }
                 }
@@ -839,7 +1314,8 @@ impl Compiler {
     /// always stack-balanced.
     fn compile_method(&mut self, m: &Method) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let name_idx = self.b.add_name(&m.name);
+        let param_tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
+        let name_idx = self.b.add_name(&mangle_static(&m.name, &param_tys));
         self.b.add_sub_entry(name_idx, entry);
 
         let mut scope = MethodScope::new();
@@ -868,7 +1344,8 @@ impl Compiler {
     /// `argc + 1` incoming values (this deepest).
     fn compile_instance_method(&mut self, class: &str, m: &Method) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let mangled = mangle(class, &m.name, m.params.len());
+        let param_tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
+        let mangled = mangle(class, &m.name, &param_tys);
         let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
 
@@ -898,7 +1375,8 @@ impl Compiler {
     /// `this` is slot 0; the ctor returns `null` (its result is discarded).
     fn compile_ctor(&mut self, cl: &Class, ctor: &Ctor) -> Result<(), String> {
         let entry = self.b.current_pos();
-        let mangled = mangle(&cl.name, "<init>", ctor.params.len());
+        let param_tys: Vec<String> = ctor.params.iter().map(|p| p.ty.clone()).collect();
+        let mangled = mangle(&cl.name, "<init>", &param_tys);
         let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
 
@@ -1378,7 +1856,7 @@ impl Compiler {
     /// object and `String.valueOf(obj)` still use the default form (see BUGS.md).
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
         if let Some(rc) = self.expr_class(e) {
-            if self.resolve_method(&rc, "toString", 0).is_some() {
+            if self.has_instance_method(&rc, "toString", 0) {
                 return self.dispatch_instance_method(e, &rc, "toString", &[], 0);
             }
         }
@@ -1418,10 +1896,33 @@ impl Compiler {
                 }
                 self.b.emit(Op::GetSlot(0), 0);
             }
-            Expr::NewArray { elem_ty, size } => {
-                self.expr(size)?;
-                self.emit_type_default(elem_ty, 0);
-                self.b.emit(Op::CallBuiltin(crate::host::JARRAY_NEW, 2), 0);
+            Expr::NewArray {
+                elem_ty,
+                sizes,
+                extra_dims,
+            } => {
+                if sizes.len() == 1 && *extra_dims == 0 {
+                    // Single dimension — the direct allocate builtin.
+                    self.expr(&sizes[0])?;
+                    self.emit_type_default(elem_ty, 0);
+                    self.b.emit(Op::CallBuiltin(crate::host::JARRAY_NEW, 2), 0);
+                } else {
+                    // Multi-dimensional: push each sized dimension, then the leaf
+                    // default (the element-type default when fully sized, else
+                    // `null` for the inner unsized levels).
+                    for s in sizes {
+                        self.expr(s)?;
+                    }
+                    if *extra_dims > 0 {
+                        self.b.emit(Op::LoadUndef, 0);
+                    } else {
+                        self.emit_type_default(elem_ty, 0);
+                    }
+                    self.b.emit(
+                        Op::CallBuiltin(crate::host::JARRAY_NEW_MULTI, sizes.len() as u8 + 1),
+                        0,
+                    );
+                }
             }
             Expr::ArrayLit { elems } => {
                 for el in elems {
@@ -1559,10 +2060,16 @@ impl Compiler {
             .classes
             .get(class)
             .ok_or_else(|| format!("javars: unknown class `{class}` (line {line})"))?;
+        if info.is_interface {
+            return Err(format!(
+                "javars: `{class}` is an interface and cannot be instantiated (line {line})"
+            ));
+        }
         // Constructor resolution up front (immutable borrow released before we
-        // emit anything mutating `self`).
-        let has_ctor = info.ctor_arities.contains_key(&args.len());
-        let ctor_arities: Vec<usize> = info.ctor_arities.keys().copied().collect();
+        // emit anything mutating `self`). The chosen overload's parameter types
+        // mangle the `<init>` target.
+        let has_any_ctor = !info.ctors.is_empty();
+        let ctor_arities: Vec<usize> = info.ctors.iter().map(|c| c.len()).collect();
         // Field-init plan (name, type, optional init expr), cloned so the
         // ChunkBuilder borrow does not alias `self.classes`.
         let field_plan: Vec<(String, String, Option<Expr>)> = info
@@ -1592,19 +2099,22 @@ impl Compiler {
             self.b.emit(Op::Pop, line);
         }
 
-        // Run the constructor (if declared for this arity).
-        if has_ctor {
+        // Run the constructor (resolving the overload by argument type). A class
+        // with no declared ctor accepts only `new C()`.
+        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let ctor_sig = self.resolve_ctor(class, &arg_tys);
+        if let Some(param_tys) = ctor_sig {
             self.emit_get(&obj, line); // this
             for a in args {
                 self.expr(a)?;
             }
-            let mangled = mangle(class, "<init>", args.len());
+            let mangled = mangle(class, "<init>", &param_tys);
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
             self.b.emit(Op::Pop, line); // discard the ctor's (Undef) result
-        } else if !args.is_empty() {
+        } else if has_any_ctor || !args.is_empty() {
             return Err(format!(
-                "javars: class `{class}` has no constructor taking {} argument(s) (declared: {:?}) (line {line})",
+                "javars: class `{class}` has no constructor taking {} argument(s) (declared arities: {:?}) (line {line})",
                 args.len(),
                 ctor_arities
             ));
@@ -1768,16 +2278,14 @@ impl Compiler {
                     .get(&this_class)
                     .and_then(|ci| ci.superclass.clone())
                 {
-                    let has = self
-                        .classes
-                        .get(&sup)
-                        .is_some_and(|ci| ci.ctor_arities.contains_key(&args.len()));
-                    if has {
+                    let arg_tys: Vec<Option<String>> =
+                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    if let Some(param_tys) = self.resolve_ctor(&sup, &arg_tys) {
                         self.b.emit(Op::GetSlot(0), line); // this
                         for a in args {
                             self.expr(a)?;
                         }
-                        let mangled = mangle(&sup, "<init>", args.len());
+                        let mangled = mangle(&sup, "<init>", &param_tys);
                         let idx = self.b.add_name(&mangled);
                         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
                         return Ok(());
@@ -1789,19 +2297,21 @@ impl Compiler {
             self.b.emit(Op::LoadUndef, line);
             return Ok(());
         }
-        // A user-defined static method resolves to the native call-frame ABI.
-        if let Some(sig) = self.methods.get(name) {
-            if args.len() != sig.arity {
-                return Err(format!(
-                    "javars: method `{name}` expects {} argument(s) but got {} (line {line})",
-                    sig.arity,
+        // A user-defined static method resolves to the native call-frame ABI,
+        // choosing the overload that matches the argument types.
+        if self.methods.contains_key(name) {
+            let arg_tys: Vec<Option<String>> =
+                args.iter().map(|a| self.expr_java_type(a)).collect();
+            let resolved = self.resolve_static_call(name, &arg_tys).ok_or_else(|| {
+                format!(
+                    "javars: no `{name}` overload matches {} argument(s) (line {line})",
                     args.len()
-                ));
-            }
+                )
+            })?;
             for a in args {
                 self.expr(a)?;
             }
-            let name_idx = self.b.add_name(name);
+            let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
             return Ok(());
         }
@@ -1809,7 +2319,7 @@ impl Compiler {
         // method of `this` is an implicit `this.name(args)` — dispatched
         // virtually on `this`'s runtime class.
         if let Some(this_class) = self.this_class.clone() {
-            if self.resolve_method(&this_class, name, args.len()).is_some() {
+            if self.has_instance_method(&this_class, name, args.len()) {
                 return self.dispatch_instance_method(&Expr::This, &this_class, name, args, line);
             }
         }
@@ -1966,7 +2476,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
         }
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
         Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
-        Expr::NewArray { size, .. } => expr_has_ffi(size),
+        Expr::NewArray { sizes, .. } => sizes.iter().any(expr_has_ffi),
         Expr::ArrayLit { elems } => elems.iter().any(expr_has_ffi),
         Expr::Index { array, index } => expr_has_ffi(array) || expr_has_ffi(index),
         Expr::Field { recv, .. } => expr_has_ffi(recv),
@@ -1982,11 +2492,54 @@ fn expr_has_ffi(e: &Expr) -> bool {
     }
 }
 
-/// The mangled subroutine name for a class member: `Class#member#argc`. `#` is
-/// not a legal Java identifier char, so mangled names never collide with a
-/// user-declared static method. Constructors use the member name `<init>`.
-fn mangle(class: &str, member: &str, argc: usize) -> String {
-    format!("{class}#{member}#{argc}")
+/// The mangled subroutine name for a class member: `Class#member#ty1,ty2`. `#`
+/// is not a legal Java identifier char, so mangled names never collide with a
+/// user-declared static method. Including the parameter types disambiguates
+/// same-name/same-arity overloads. Constructors use the member name `<init>`.
+fn mangle(class: &str, member: &str, param_tys: &[String]) -> String {
+    format!("{class}#{member}#{}", param_tys.join(","))
+}
+
+/// The mangled subroutine name for a top-level user `static` method, including
+/// its parameter types so overloads get distinct subroutines. Prefixed with `#`
+/// so it never collides with an instance mangle or a user identifier.
+fn mangle_static(name: &str, param_tys: &[String]) -> String {
+    format!("#s#{name}#{}", param_tys.join(","))
+}
+
+/// The numeric widening rank of a primitive type (`byte` < `short`/`char` <
+/// `int` < `long` < `float` < `double`); `None` for non-numeric types. Used by
+/// overload resolution to score widening conversions.
+fn numeric_rank(ty: &str) -> Option<u32> {
+    Some(match ty {
+        "byte" => 1,
+        "short" | "char" => 2,
+        "int" => 3,
+        "long" => 4,
+        "float" => 5,
+        "double" => 6,
+        _ => return None,
+    })
+}
+
+/// The type name for a numeric rank, promoted to at least `int` (Java's binary
+/// numeric promotion never yields a sub-`int` result).
+fn rank_name(rank: u32) -> &'static str {
+    match rank.max(3) {
+        3 => "int",
+        4 => "long",
+        5 => "float",
+        _ => "double",
+    }
+}
+
+/// True when `ty` is a reference type (a class, interface, array, or `String`)
+/// rather than a primitive or `void`.
+fn is_reference_type(ty: &str) -> bool {
+    !matches!(
+        ty,
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean" | "void"
+    )
 }
 
 /// Register a subroutine's formal parameters into its scope: allocate slots in
@@ -2019,7 +2572,7 @@ fn array_elem_numtype(array_ty: &str) -> NumType {
 fn is_static_class(name: &str) -> bool {
     matches!(
         name,
-        "Math" | "Integer" | "Long" | "Double" | "Boolean" | "String" | "Character"
+        "Math" | "Integer" | "Long" | "Double" | "Boolean" | "String" | "Character" | "Arrays"
     )
 }
 

@@ -33,8 +33,17 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Class {
     pub name: String,
-    /// The direct superclass name (`class C extends B`), if any.
+    /// The direct superclass name (`class C extends B`), if any. For an
+    /// `interface` this is always `None` (extended interfaces go in
+    /// [`Class::interfaces`]).
     pub superclass: Option<String>,
+    /// Directly implemented interfaces (`class C implements I, J`). For an
+    /// `interface`, the interfaces it `extends` (`interface I extends A, B`).
+    pub interfaces: Vec<String>,
+    /// True when this declaration is an `interface` rather than a `class`. An
+    /// interface is not instantiable; its abstract methods are dispatch-only and
+    /// its `default` methods supply an inherited body to implementors.
+    pub is_interface: bool,
     /// Instance fields in declaration order (name, type, optional initializer).
     pub fields: Vec<FieldDecl>,
     /// Declared constructors. Empty means the implicit no-arg default ctor.
@@ -75,6 +84,10 @@ pub struct Method {
     /// typing; not otherwise checked).
     pub ret: String,
     pub body: Vec<Stmt>,
+    /// True for a bodyless method — an interface abstract method (`void m();`)
+    /// or an `abstract` class method. No subroutine is emitted; the method is a
+    /// virtual-dispatch target resolved to a concrete override at runtime.
+    pub is_abstract: bool,
     /// 1-based source line the method starts on (for the debug line marker and
     /// prologue ops).
     pub line: u32,
@@ -262,13 +275,17 @@ pub enum Expr {
         args: Vec<Expr>,
         line: u32,
     },
-    /// `new int[n]` — a fresh reference array of `n` default-valued elements.
-    /// The element type sets the default (`int`→0, `double`→0.0,
-    /// `boolean`→false, a class/`String`→`null`). Lives on the host heap as an
-    /// `Obj` handle, so aliasing is by reference.
+    /// `new int[n]` / `new int[m][n]` — a fresh (possibly multi-dimensional)
+    /// array of default-valued elements. The element type sets the leaf default
+    /// (`int`→0, `double`→0.0, `boolean`→false, a class/`String`→`null`).
+    /// `sizes` holds the explicitly-sized dimensions (outer first); `extra_dims`
+    /// counts trailing unsized `[]` dimensions (`new int[2][]` → `sizes=[2]`,
+    /// `extra_dims=1`), whose innermost elements default to `null`. Lives on the
+    /// host heap as `Obj` handles, so aliasing is by reference.
     NewArray {
         elem_ty: String,
-        size: Box<Expr>,
+        sizes: Vec<Expr>,
+        extra_dims: usize,
     },
     /// An array literal `{a, b, c}` (from `int[] a = {1,2,3}` or
     /// `new int[]{1,2,3}`). Builds a heap array from the element values.

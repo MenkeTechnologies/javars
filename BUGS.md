@@ -15,7 +15,9 @@ reported as parse errors, never silently mis-run.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
   `ceil`/`round` (with Java's int-vs-double overload result typing),
   `Integer.parseInt` (with radix)/`valueOf`/`toString` (with radix),
-  `Long.parseLong`, `Boolean.parseBoolean`, and `String.valueOf`. Malformed
+  `Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`, `String.format`
+  (a `Formatter` subset: `%d %s %S %f %b %B %x %X %o %c %%`, `%n`, the `-`/`0`/`+`
+  flags, width, and `.precision`), and `Arrays.toString` (shallow). Malformed
   numeric input faults like `NumberFormatException`; an unregistered static
   method is an error. `System.err.print[ln]` writes to stderr.
 - **User-defined `static` methods.** `static <ret> name(<params>) { … }` lowers
@@ -48,18 +50,36 @@ reported as parse errors, never silently mis-run.
   and methods, method overriding, and `instanceof` (respecting the subclass
   chain). `toString()` overrides are honoured by `System.out.println(obj)` and by
   an explicit `obj.toString()`.
+- **Interfaces.** `interface I { void m(); }` with abstract and `default`
+  methods, `class C implements I, J`, `interface B extends A`, dispatch through
+  an interface-typed variable or parameter (virtual on the runtime class),
+  `instanceof I` over the full supertype graph, and interface-typed arrays. A
+  `default` method may call an abstract method (resolved to the implementor);
+  interfaces are not instantiable.
+- **Method overloading by parameter type.** Same-name/same-arity overloads
+  differing by parameter type resolve at the call site from the static argument
+  types, choosing the most-specific applicable overload (identity < numeric
+  widening < reference upcast; ambiguity is an error). Applies to `static`
+  methods, instance methods (with virtual dispatch keyed on the statically-chosen
+  signature), and constructors.
+- **Generics (type-erased).** `class Box<T>`, `class Pair<K, V>`, `<T> T id(T x)`,
+  bounded `<T extends Number>` / `<T extends Comparable<T>>`, the diamond
+  `new Box<>()`, and library type arguments (`List<String>`, `Map<K, V>`) all
+  parse and run with type arguments erased at runtime, exactly like `javac`.
+- **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
+  (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
+  (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
+  so aliasing holds.
 
 ## Not implemented (parse errors today)
 
-- **Method overloading by parameter type.** Methods are keyed by name **and
-  arity**, so same-name overloads differing only in parameter *types* (not count)
-  collide.
-- **Interfaces, abstract classes, enums, records, generics.**
-- **Multi-dimensional arrays** (`new int[m][n]`) and the enhanced `for`
-  (`for (var x : coll)`).
+- **Abstract classes, enums, records.** (Interface abstract methods and
+  `abstract` method *signatures* parse; a standalone `abstract class` body is not
+  specially modeled.)
+- **The enhanced `for`** (`for (var x : coll)`).
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
-  `String` statics listed above and the `String` instance methods are the whole
-  library surface — no `java.util.*` collections, no `Math` constants
+  `String`/`Arrays` statics listed above and the `String` instance methods are
+  the whole library surface — no `java.util.*` collections, no `Math` constants
   (`Math.PI`), no boxed-type methods beyond the listed statics.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
@@ -70,9 +90,14 @@ reported as parse errors, never silently mis-run.
 ## Modeled with a documented simplification
 
 - **Types are not checked.** Declared types (`int`, `String`, …) are retained for
-  diagnostics but do not gate execution — the runtime is dynamically typed on the
-  fusevm value model. Definite-assignment and type errors that `javac` would
-  reject may run.
+  diagnostics and for overload resolution / `/`-truncation typing, but do not gate
+  execution — the runtime is dynamically typed on the fusevm value model.
+  Definite-assignment and type errors that `javac` would reject may run.
+- **No widening *value* conversion.** Overload *resolution* uses static types
+  (so `f(int)` vs `f(double)` picks correctly), but the argument value is not
+  coerced: an `int` bound to a `double` parameter (or `double d = 7;`) keeps its
+  integer value, so it prints `7`, not `7.0`. A `char` argument is a one-character
+  string (see below), so it selects a `String` overload rather than an `int` one.
 - **`==` on objects is reference identity; on strings it compares by value.**
   Object and array handles (`Value::Obj`) are identity-comparable, so `x == y`,
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
