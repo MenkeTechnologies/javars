@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="javars — Engineering report. A Java frontend in Rust, hosted on the fusevm bytecode VM with a three-tier Cranelift JIT. No bespoke VM, no JVM: architecture, value model, tooling, roadmap, and dependency posture. MIT licensed.">
+  <title>javars &mdash; Engineering Report</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 76rem; }
+    .file-table { width:100%;border-collapse:collapse;margin:0.6rem 0;font-size:12px; }
+    .file-table th { background:var(--bg-secondary);color:var(--cyan);font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;text-align:left;padding:7px 10px;border:1px solid var(--border); }
+    .file-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:middle; }
+    .file-table tr:hover td { background:var(--bg-hover); }
+    .file-table td:first-child { font-family:'Share Tech Mono',monospace;color:var(--accent-light);font-weight:600;white-space:nowrap; }
+    .file-table code { font-size:11px;color:var(--accent-light);background:var(--bg-primary);padding:1px 4px;border-radius:2px; }
+    .stat-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:0.75rem;margin:1.2rem 0; }
+    .stat-card { border:1px solid var(--border);border-top:3px solid var(--cyan);background:var(--bg-card);padding:1rem 1.2rem;border-radius:2px;text-align:center; }
+    .stat-card .stat-val { font-family:'Orbitron',sans-serif;font-size:28px;font-weight:900;color:var(--cyan);line-height:1.1;text-shadow:0 0 20px var(--cyan-glow); }
+    .stat-card .stat-val.accent { color:var(--accent);text-shadow:0 0 20px var(--accent-glow); }
+    .stat-card .stat-label { font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);margin-top:0.5rem; }
+    .feature-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(22rem,1fr));gap:0.65rem;margin:0.8rem 0; }
+    .feature-card { border:1px solid var(--border);border-left:3px solid var(--cyan);background:var(--bg-card);padding:0.7rem 1rem;border-radius:2px; }
+    .feature-card h4 { font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--cyan);margin:0 0 0.3rem; }
+    .feature-card p { margin:0;font-size:11px;color:var(--text-dim);line-height:1.55; }
+    .feature-card code { font-size:10.5px;color:var(--accent-light);background:var(--bg-primary);padding:1px 4px;border-radius:2px; }
+    .section-rule { border:none;border-top:1px dashed var(--border);margin:2rem 0; }
+    .hub-scheme-strip { border-bottom:1px dashed var(--border);background:color-mix(in srgb, var(--bg-secondary) 85%, transparent);padding:0.55rem 1.5rem 0.65rem;position:relative; }
+    .hub-scheme-strip-inner { max-width:76rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
+    .hub-scheme-strip .hud-scheme-label { flex:0 0 auto;font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--accent);text-align:left; }
+    .hub-scheme-strip .scheme-grid { flex:1 1 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px; }
+    @media (max-width:720px){ .hub-scheme-strip-inner{flex-direction:column;align-items:stretch}.hub-scheme-strip .scheme-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+    .docs-build-line { margin:0.35rem 0 0;font-family:'Share Tech Mono',ui-monospace,monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;max-width:42rem;opacity:0.75; }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// JAVARS — ENGINEERING REPORT</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Engineering Report</span>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/javars" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">javars v0.1.0 · Java on fusevm · lex/parse → AST → bytecode → Cranelift JIT · no bespoke VM · no JVM · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="index.html">Docs</a>
+          <a class="btn btn-secondary" href="reference.html">Reference</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/javars" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ENGINEERING REPORT</h2>
+      <p class="tutorial-subtitle">javars is a Java frontend in Rust, hosted on the <code>fusevm</code> bytecode VM and its three-tier Cranelift JIT. This report describes the architecture, the value model, the current state of the tree, and the dependency posture. The statements below are facts about the design and the manifest, not aspirational metrics.</p>
+
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-val accent">Java</div><div class="stat-label">fusevm language host</div></div>
+        <div class="stat-card"><div class="stat-val">3</div><div class="stat-label">Cranelift JIT tiers</div></div>
+        <div class="stat-card"><div class="stat-val">v0.1.0</div><div class="stat-label">version</div></div>
+        <div class="stat-card"><div class="stat-val">MIT</div><div class="stat-label">license · free / OSS</div></div>
+      </div>
+
+      <section class="tutorial-section">
+        <h2>Summary</h2>
+        <p>Every prior Java runtime targets the JVM. javars takes a different path: it lexes and parses Java to an AST, lowers that to <code>fusevm</code> bytecode, and runs it on a compiled VM with a Cranelift JIT. Arithmetic and comparison operators lower to native VM ops so the JIT can trace hot loops; Java-specific behaviour — the <code>String</code> <code>+</code> overload and Java-flavoured value formatting — is served through the host numeric hook and a pair of numbered print builtins. It joins <a href="https://github.com/MenkeTechnologies/fusevm">fusevm</a> alongside <code>zshrs</code>, <code>stryke</code>, <code>awkrs</code>, <code>elisp</code>, and <code>rubylang</code>, and reuses that shared bytecode VM and JIT rather than shipping its own. There are no <code>.class</code> files and no JVM.</p>
+        <p>The current tree is a single-class, single-<code>main</code> slice: the lexer/parser, AST-to-bytecode lowering, local declarations, plain and compound assignment, C-style <code>if</code>/<code>while</code>/<code>for</code> with <code>break</code>/<code>continue</code>, post-increment/decrement, the short-circuiting <code>&amp;&amp;</code>/<code>||</code>, <code>String</code> concatenation, and <code>System.out.print</code>/<code>println</code>. On top of the runtime it ships editor tooling: a read-only LSP (<code>--lsp</code>) with completion, hover, and parser-driven diagnostics, and a DAP debugger (<code>--dap</code>) with line breakpoints, stepping, a stack trace, and local-variable inspection. User methods, classes, objects, arrays, and the standard library are future waves — see <a href="https://github.com/MenkeTechnologies/javars/blob/main/BUGS.md">BUGS.md</a> for the honest ledger.</p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Hosting on fusevm</h2>
+        <p>javars contains no virtual machine or JIT of its own. The execution path is:</p>
+<pre>Java source  →  lexer  →  parser → AST  →  lower to fusevm bytecode  →  fusevm VM + Cranelift JIT
+                                                  │
+                                     host: String + concat, Java value formatting, print builtins</pre>
+        <div class="feature-grid">
+          <div class="feature-card"><h4>Shared engine</h4><p>fusevm is pulled from crates.io with the <code>jit</code>, <code>jit-disk-cache</code>, and <code>aot</code> features. JIT and VM improvements land once and benefit zshrs, stryke, awkrs, elisp, rubylang, and javars together.</p></div>
+          <div class="feature-card"><h4>Native arithmetic</h4><p>Operators lower to native fusevm ops; a strict numeric hook supplies Java's <code>String</code> <code>+</code> concatenation only for the non-numeric operand cases the VM does not compute natively (<code>src/host.rs</code>).</p></div>
+          <div class="feature-card"><h4>Persistent native code</h4><p><code>jit-disk-cache</code> persists compiled machine code across runs, keyed by chunk hash, so hot Java loops trace-compile once and warm runs skip recompilation.</p></div>
+          <div class="feature-card"><h4>Editor tooling in-binary</h4><p>The same <code>java</code> binary speaks LSP (<code>--lsp</code>) and DAP (<code>--dap</code>) over stdio, so completion, diagnostics, and a stepping debugger work from any editor that speaks the protocols.</p></div>
+        </div>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Value model</h2>
+        <p>The current slice runs directly on the fusevm value model — there is no javars object heap yet. Immediate values (<code>int</code>, <code>double</code>, <code>boolean</code>) ride through the VM as <code>fusevm::Value</code>; a String literal is a heap string value, and a char literal is modeled as a one-character string. Locals are addressed by name through <code>GetVar</code>/<code>SetVar</code> into the VM's global slot table (a single <code>main</code> frame with no lexical scopes yet), which is also what the <code>--dap</code> debugger reads to list a frame's locals.</p>
+        <p>Two places need Java semantics the VM's default flavour does not supply. Printing lowers <code>System.out.print</code>/<code>println</code> to registered builtins that format through Java's <code>String.valueOf</code> rules — <code>true</code>/<code>false</code>, a whole <code>double</code> as <code>3.0</code>, an unbound value as <code>null</code> — rather than the shell-flavoured default. And Java's <code>+</code> is string concatenation when either operand is a <code>String</code>: once the strict numeric hook is installed, any operation with a non-numeric operand delegates to it, where <code>+</code> concatenates via the same Java formatting and non-<code>+</code> arithmetic on a String is reported as a type error.</p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Component status</h2>
+        <table class="file-table">
+          <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>lexer / parser → AST</td><td>Implemented</td><td>Hand-written tokenizer + recursive-descent parser with precedence climbing (<code>src/lexer.rs</code>, <code>src/parser.rs</code>).</td></tr>
+            <tr><td>AST → fusevm bytecode</td><td>Implemented</td><td>Native arithmetic + <code>CallBuiltin</code> print dispatch, backpatched control flow; no local VM (<code>src/compiler.rs</code>).</td></tr>
+            <tr><td>entry class + <code>main</code> body</td><td>Implemented</td><td>Single-class, single-<code>main</code> subset; other members skipped by brace matching (<code>src/parser.rs</code>).</td></tr>
+            <tr><td>locals / assignment / compound</td><td>Implemented</td><td><code>int x = e;</code>, <code>x += e;</code>, post-inc/dec; declared type retained for diagnostics.</td></tr>
+            <tr><td>control flow</td><td>Implemented</td><td><code>if</code>/<code>else</code>, <code>while</code>, C-style <code>for</code>, <code>break</code>/<code>continue</code>, short-circuiting <code>&amp;&amp;</code>/<code>||</code>.</td></tr>
+            <tr><td><code>String</code> <code>+</code> &amp; Java formatting</td><td>Implemented</td><td>Host numeric hook concat; <code>true</code>/<code>false</code>, <code>3.0</code>, <code>null</code> (<code>src/host.rs</code>).</td></tr>
+            <tr><td>console IO</td><td>Implemented</td><td><code>System.out.print</code>/<code>println</code> lowered to Java-formatting print builtins.</td></tr>
+            <tr><td>LSP server (<code>--lsp</code>)</td><td>Implemented</td><td>Completion + hover from the keyword/type/IO corpus, parser-driven diagnostics on syntax errors (<code>src/lsp.rs</code>).</td></tr>
+            <tr><td>DAP debugger (<code>--dap</code>)</td><td>Implemented</td><td>Line breakpoints, stepping, stack trace, <code>main</code>-locals inspection via per-statement debug line markers (<code>src/dap.rs</code>).</td></tr>
+            <tr><td>reference doc generator</td><td>Implemented</td><td><code>gen-docs</code> renders <code>docs/reference.html</code> from the LSP corpus (<code>src/bin/gen_docs.rs</code>).</td></tr>
+            <tr><td>dumps (<code>--dump-tokens</code>/<code>--dump-ast</code>/<code>--disasm</code>)</td><td>Implemented</td><td>Print an artifact and exit (<code>src/main.rs</code>).</td></tr>
+            <tr><td>user methods / classes / objects / arrays</td><td>Planned</td><td>Multiple classes, instance state, method calls, arrays, and a String/object heap are future waves (see BUGS.md).</td></tr>
+            <tr><td>standard library / generics / exceptions</td><td>Planned</td><td><code>java.util</code>/<code>java.lang</code> beyond <code>System.out</code>, generics, <code>try</code>/<code>catch</code>, lambdas pending.</td></tr>
+            <tr><td>inline <code>rust { }</code> FFI</td><td>Planned</td><td>Requires general call-expression support the current single-<code>main</code> parser does not yet have.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Dependency posture</h2>
+        <p>Dependencies are kept foundational and durable — the goal is a crate that still builds cleanly years from now. Direct dependencies from <code>Cargo.toml</code>:</p>
+        <table class="file-table">
+          <thead><tr><th>Crate</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td>fusevm</td><td>Language-agnostic bytecode VM + three-tier Cranelift JIT (<code>jit</code>, <code>jit-disk-cache</code>, <code>aot</code>)</td></tr>
+            <tr><td>thiserror</td><td>Error type derivation</td></tr>
+            <tr><td>lsp-server / lsp-types</td><td>LSP transport + protocol types (<code>--lsp</code> server)</td></tr>
+            <tr><td>serde / serde_json</td><td>DAP JSON-RPC message plumbing</td></tr>
+            <tr><td>libc</td><td>DAP pipe + dup2 to capture the debuggee's stdout as <code>output</code> events</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Compatibility &amp; longevity</h2>
+        <div class="feature-grid">
+          <div class="feature-card"><h4>Reference semantics</h4><p>Behaviour tracks <code>java</code> where the slice is implemented — <code>String</code> <code>+</code> concatenation, a whole <code>double</code> printed as <code>3.0</code> — with expected outputs frozen byte-for-byte in the integration tests.</p></div>
+          <div class="feature-card"><h4>Corpus-driven docs</h4><p>The LSP completion/hover corpus is the single source of truth for <code>docs/reference.html</code>, so the static page and the language server never drift.</p></div>
+          <div class="feature-card"><h4>Cross-architecture</h4><p>macOS aarch64 and Linux x86_64 / aarch64 via the Cranelift JIT; portable bytecode underneath.</p></div>
+          <div class="feature-card"><h4>Standalone crate</h4><p>An explicit empty <code>[workspace]</code> keeps javars buildable on its own, independent of the meta repo.</p></div>
+        </div>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Links</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a></li>
+          <li><strong>Language reference</strong> — <a href="reference.html">reference.html</a></li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/javars">github.com/MenkeTechnologies/javars</a></li>
+          <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/javars/issues">github.com/MenkeTechnologies/javars/issues</a></li>
+          <li><strong>fusevm</strong> — <a href="https://github.com/MenkeTechnologies/fusevm">github.com/MenkeTechnologies/fusevm</a> (the shared VM)</li>
+          <li><strong>License</strong> — MIT (<a href="https://github.com/MenkeTechnologies/javars/blob/main/LICENSE">LICENSE</a>)</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>
