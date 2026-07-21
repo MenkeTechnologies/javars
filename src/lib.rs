@@ -42,15 +42,20 @@ fn run_chunk(chunk: fusevm::Chunk) -> Result<Value, String> {
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
     vm.enable_tracing_jit();
-    match vm.run() {
+    let result = vm.run();
+    // A host builtin fault (inline-Rust FFI compile/call error, or a `String`
+    // method fault such as an out-of-range index) stashes its message and halts
+    // the VM. The VM reports `Ok(top-of-stack)` when a value remains on the
+    // stack and `Halted` only when it is empty, so the pending message must be
+    // checked on **both** paths — a fault mid-expression (e.g. inside a
+    // `println(...)` argument) leaves its `Undef` return on the stack and would
+    // otherwise be silently swallowed.
+    if let Some(e) = host::take_ffi_error() {
+        return Err(e);
+    }
+    match result {
         VMResult::Ok(v) => Ok(v),
-        // A halt raised by an inline-Rust FFI fault (compile error / call error /
-        // unresolved export) carries a message the host stashed; surface it as a
-        // `javars:` error rather than a silent success.
-        VMResult::Halted => match host::take_ffi_error() {
-            Some(e) => Err(e),
-            None => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
-        },
+        VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),
     }
 }

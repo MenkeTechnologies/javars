@@ -63,9 +63,10 @@ pure frontend over the shared engine. Highlights:
   diffed byte-for-byte against a reference `java`; the tests freeze that output
   so CI needs no JDK installed.
 
-This is an early slice: single-class programs whose `main` uses locals,
-arithmetic, the C-style control statements, and `System.out.print[ln]`. User
-methods, classes, and the standard library are the next waves (see
+This is an early slice: single-class programs with locals, arithmetic, the
+C-style control statements, `System.out.print[ln]`, user-defined `static`
+methods (recursion, parameters, value returns), and `String` instance methods.
+Classes/objects, arrays, and the wider standard library are the next waves (see
 [`BUGS.md`](BUGS.md)). Nothing is faked — an unsupported construct is a parse
 error, not a silent mis-run.
 
@@ -134,8 +135,8 @@ Buzz
 Implemented and checked against the reference `java`:
 
 - **Entry point** — `public class Name { public static void main(String[] args) { … } }`.
-  A class that also declares other members still parses and runs its `main`
-  (non-`main` members are skipped in slice 1).
+  A class may also declare `static` helper methods (compiled — see below); other
+  members (fields, constructors, instance methods) are skipped.
 - **Locals** — `int` / `long` / `double` / `boolean` / `String` / `var`
   declarations with optional initializers; plain and compound assignment
   (`=`, `+=`, `-=`, `*=`, `/=`, `%=`); post-increment / post-decrement
@@ -144,7 +145,19 @@ Implemented and checked against the reference `java`:
   binary operators `+ - * / %`, `== != < > <= >=`, `&& ||` (short-circuiting);
   unary `-` and `!`; parenthesised grouping; Java's `+` string concatenation.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
-  `for (init; cond; update)`, `break`, `continue`, and a bare `return;`.
+  `for (init; cond; update)`, `break`, `continue`, and `return` (a bare
+  `return;` ends `main`; `return <expr>;` returns a value from a method).
+- **Division** — Java's binary numeric promotion: `int / int` truncates toward
+  zero (`7 / 2` → `3`, `-7 / 2` → `-3`), and a `double` operand keeps the
+  fractional result (`7.0 / 2` → `3.5`), decided from the operands' static types.
+- **Static methods** — `static <ret> name(<params>) { … }` compiled to fusevm's
+  `Op::Call` frame ABI: parameters and locals in call-frame slots, so recursion,
+  mutual recursion, and forward references work; `void` and value returns; arity
+  checked at compile time.
+- **`String` methods** — postfix `recv.method(args)` dispatch on `String`
+  receivers: `length`, `isEmpty`, `charAt`, `substring`, `indexOf`, `contains`,
+  `equals`, `equalsIgnoreCase`, `toUpperCase`, `toLowerCase`, `trim`,
+  `startsWith`, `endsWith`, `concat`, `replace`, `repeat` (chainable).
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
@@ -230,20 +243,20 @@ Java source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 
 ## [0x06] STATUS & ROADMAP
 
-Slice 1 (this release): single-class programs, `main`, locals, arithmetic /
-comparison / logic, `if` / `while` / `for` / `break` / `continue`,
-`System.out.print[ln]`, string concatenation — all verified byte-for-byte
-against OpenJDK.
+This release: single-class programs, `main`, locals, arithmetic / comparison /
+logic, Java integer-vs-float division, `if` / `while` / `for` / `break` /
+`continue` / `return`, `System.out.print[ln]`, string concatenation,
+user-defined `static` methods (recursion, parameters, value returns over
+fusevm's `Op::Call` frame ABI), and `String` instance methods — all verified
+byte-for-byte against OpenJDK.
 
 Next waves, in priority order:
 
-1. **User-defined static methods** (recursion, parameters, returns) over
-   fusevm's native `Op::Call` frame ABI.
-2. **Reference types** — real `String` methods, arrays, and a class/instance
-   object model on a host heap.
-3. **Standard library surface** — `Math`, `String`/`Integer` statics, common
-   `java.util` collections.
-4. **A differential parity harness** — a snippet corpus diffed live against a
+1. **Reference types** — arrays (with real reference/aliasing semantics on a host
+   heap) and a class/instance object model.
+2. **Standard library surface** — `Math`, `String`/`Integer` statics, common
+   `java.util` collections, more `String` methods, instance-method dispatch.
+3. **A differential parity harness** — a snippet corpus diffed live against a
    reference `java`, frozen and replayed in CI (the pattern `ruby`/`node`/
    `python` frontends use).
 

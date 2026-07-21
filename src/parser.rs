@@ -87,20 +87,114 @@ impl Parser {
         self.eat(&Tok::LBrace)?;
 
         let mut main = None;
+        let mut methods = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             if let Some(body) = self.try_main()? {
                 main = Some(body);
+            } else if let Some(m) = self.try_method()? {
+                methods.push(m);
             } else {
                 self.skip_member()?;
             }
         }
 
         match main {
-            Some(main) => Ok(Program { class_name, main }),
+            Some(main) => Ok(Program {
+                class_name,
+                main,
+                methods,
+            }),
             None => Err(format!(
                 "javars: class `{class_name}` has no `public static void main(String[] args)`"
             )),
         }
+    }
+
+    /// If the cursor is at a `static` helper method (`[public] static <ret>
+    /// name(<params>) { ... }`), parse it. Otherwise restore the cursor and
+    /// return `None` so the member is skipped (fields, non-static methods,
+    /// constructors). `main` is matched earlier by [`Parser::try_main`], so it
+    /// never reaches here.
+    fn try_method(&mut self) -> Result<Option<Method>, String> {
+        let save = self.pos;
+        // Modifiers in any order; javars compiles only `static` methods (a
+        // static `main` can call them without an instance).
+        let mut saw_static = false;
+        while matches!(self.peek(), Tok::Public | Tok::Static) {
+            if matches!(self.peek(), Tok::Static) {
+                saw_static = true;
+            }
+            self.advance();
+        }
+        // `final`/`abstract`/etc. arrive as idents; a return type is required,
+        // so peeking a non-type here means this is not a method we compile.
+        if !saw_static || !self.at_type() {
+            self.pos = save;
+            return Ok(None);
+        }
+        let line = self.line();
+        let ret = self.type_name()?;
+        // `<ret> name (` — anything else (e.g. `static int COUNT =`) is a field.
+        let name = match self.peek().clone() {
+            Tok::Ident(n) if matches!(&self.toks[self.pos + 1].kind, Tok::LParen) => {
+                self.advance();
+                n
+            }
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        self.eat(&Tok::LParen)?;
+        let params = self.params()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::LBrace)?;
+        let body = self.block()?;
+        Ok(Some(Method {
+            name,
+            params,
+            ret,
+            body,
+            line,
+        }))
+    }
+
+    /// Parse a comma-separated formal parameter list `<type> <name>, ...`, the
+    /// cursor sitting just past the opening `(`. Stops at the closing `)`.
+    fn params(&mut self) -> Result<Vec<Param>, String> {
+        let mut out = Vec::new();
+        if self.is(&Tok::RParen) {
+            return Ok(out);
+        }
+        loop {
+            let ty = self.type_name()?;
+            let name = self.ident()?;
+            out.push(Param { ty, name });
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// True when the cursor sits on a type name (`void` or an identifier,
+    /// possibly followed by `[]`).
+    fn at_type(&self) -> bool {
+        matches!(self.peek(), Tok::Void | Tok::Ident(_))
+    }
+
+    /// Parse a declaration-position type: `void`, `int`, `String`, `int[]`, ….
+    /// Trailing `[]` pairs are folded into the returned name (e.g. `int[]`).
+    fn type_name(&mut self) -> Result<String, String> {
+        let mut ty = self.ident()?;
+        while self.is(&Tok::LBracket) {
+            self.advance();
+            self.eat(&Tok::RBracket)?;
+            ty.push_str("[]");
+        }
+        Ok(ty)
     }
 
     /// If the cursor is at `public static void main(String[] args)`, parse its
@@ -204,18 +298,17 @@ impl Parser {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Return => {
-                // slice 1: `main` is `void`; a bare `return;` ends it, and a
-                // value return is rejected rather than silently dropped.
+                // `return;` or `return <expr>;`. The compiler resolves the
+                // context: a value return is valid in a method but rejected in
+                // `void main`.
                 self.advance();
                 if self.is(&Tok::Semi) {
                     self.advance();
-                    // model as a no-op break out of nothing — end of main only
-                    Ok(StmtKind::Break)
+                    Ok(StmtKind::Return(None))
                 } else {
-                    Err(format!(
-                        "javars: `return <value>` from void main is not supported yet (line {})",
-                        self.line()
-                    ))
+                    let e = self.expression()?;
+                    self.eat(&Tok::Semi)?;
+                    Ok(StmtKind::Return(Some(e)))
                 }
             }
             Tok::Break => {
@@ -409,8 +502,45 @@ impl Parser {
                     rhs: Box::new(self.unary()?),
                 })
             }
-            _ => self.primary(),
+            _ => self.postfix(),
         }
+    }
+
+    /// Parse a primary followed by any postfix `.method(args)` chain — instance
+    /// method calls on the primary's value (e.g. `s.substring(1).length()`).
+    /// Field access (`x.foo` with no call parens) and indexing (`a[i]`) are not
+    /// yet supported and reported as errors, not silently accepted.
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        loop {
+            if self.is(&Tok::Dot) {
+                let line = self.line();
+                self.advance();
+                let member = self.ident()?;
+                if self.is(&Tok::LParen) {
+                    let args = self.call_args()?;
+                    e = Expr::MethodCall {
+                        recv: Box::new(e),
+                        method: member,
+                        args,
+                        line,
+                    };
+                } else {
+                    return Err(format!(
+                        "javars: field access `.{member}` is not supported yet (line {})",
+                        self.line()
+                    ));
+                }
+            } else if self.is(&Tok::LBracket) {
+                return Err(format!(
+                    "javars: array indexing is not supported yet (line {})",
+                    self.line()
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -468,12 +598,8 @@ impl Parser {
                     let args = self.call_args()?;
                     return Ok(Expr::Call { name, args, line });
                 }
-                if self.is(&Tok::Dot) {
-                    return Err(format!(
-                        "javars: method/field access on `{name}` is not supported yet (line {})",
-                        self.line()
-                    ));
-                }
+                // A trailing `.` (method/field access) is consumed by the
+                // postfix layer above; a bare identifier is a variable read.
                 Ok(Expr::Var(name))
             }
             other => Err(format!(

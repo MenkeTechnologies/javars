@@ -34,6 +34,12 @@ pub const JFFI_COMPILE: u16 = 703;
 /// the total stack items (`args + 1`). Dispatches through `fusevm::ffi::try_call`
 /// and returns the result.
 pub const JFFI_CALL: u16 = 704;
+/// Builtin id for an instance method call on a `String` receiver. The stack
+/// holds `[recv, arg0, …, argN, methodName]` (the method name — a `Str` — on
+/// top); `argc` counts every one of those items (`recv + args + name`).
+/// Dispatches through [`b_str_dispatch`] to the `java.lang.String` method of
+/// that name, returning its result.
+pub const JSTR_DISPATCH: u16 = 705;
 
 thread_local! {
     /// Set by an inline-Rust FFI fault (compile error, call error, or an
@@ -62,6 +68,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JPRINT, b_print);
     vm.register_builtin(JFFI_COMPILE, b_ffi_compile);
     vm.register_builtin(JFFI_CALL, b_ffi_call);
+    vm.register_builtin(JSTR_DISPATCH, b_str_dispatch);
 }
 
 /// `__rust_compile("<base64>")` builtin: pop the base64-encoded `rust { ... }`
@@ -105,6 +112,115 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
             ffi_fault(vm, format!("javars: unresolved reference: {name}"));
             Value::Undef
         }
+    }
+}
+
+/// `recv.method(args...)` dispatch builtin for `String` receivers. Pops the
+/// method name (top of stack), its `argc - 2` arguments, and the receiver, then
+/// runs the corresponding `java.lang.String` method. A faulting method (bad
+/// arity, out-of-range index, unknown method) surfaces as a `javars:` error
+/// rather than silently returning a wrong value.
+fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
+    let method = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let n = argc.saturating_sub(2) as usize; // minus receiver and method name
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    let recv = vm.stack.pop().unwrap_or(Value::Undef);
+    let s = recv.as_str_cow().into_owned();
+    match string_method(&s, &method, &args) {
+        Ok(v) => v,
+        Err(e) => {
+            ffi_fault(vm, e);
+            Value::Undef
+        }
+    }
+}
+
+/// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
+/// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
+/// consistent with javars's existing "a `char` literal is a one-character
+/// string" model (astral characters, which Java counts as two UTF-16 units,
+/// count as one here — the same documented simplification). Out-of-range
+/// indices and unknown methods return an `Err` (javars does not model Java's
+/// `StringIndexOutOfBoundsException`).
+fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, String> {
+    let char_len = || s.chars().count() as i64;
+    match (method, args.len()) {
+        ("length", 0) => Ok(Value::Int(char_len())),
+        ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
+        ("charAt", 1) => {
+            let i = args[0].to_int();
+            match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
+                Some(c) => Ok(Value::str(c.to_string())),
+                None => Err(format!(
+                    "javars: String.charAt: index {i} out of range for length {}",
+                    char_len()
+                )),
+            }
+        }
+        ("substring", 1) => substring(s, args[0].to_int(), char_len()),
+        ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),
+        ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &args[0].as_str_cow()))),
+        ("contains", 1) => Ok(Value::bool(s.contains(args[0].as_str_cow().as_ref()))),
+        ("equals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
+        ("equalsIgnoreCase", 1) => {
+            let o = args[0].as_str_cow();
+            Ok(Value::bool(s.to_lowercase() == o.to_lowercase()))
+        }
+        ("toUpperCase", 0) => Ok(Value::str(s.to_uppercase())),
+        ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
+        // Java `trim()` removes leading/trailing chars ≤ U+0020.
+        ("trim", 0) => Ok(Value::str(s.trim_matches(|c: char| c <= ' ').to_string())),
+        ("startsWith", 1) => Ok(Value::bool(s.starts_with(args[0].as_str_cow().as_ref()))),
+        ("endsWith", 1) => Ok(Value::bool(s.ends_with(args[0].as_str_cow().as_ref()))),
+        ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
+        ("replace", 2) => Ok(Value::str(
+            s.replace(args[0].as_str_cow().as_ref(), &args[1].as_str_cow()),
+        )),
+        ("repeat", 1) => {
+            let n = args[0].to_int();
+            if n < 0 {
+                Err(format!("javars: String.repeat: count {n} is negative"))
+            } else {
+                Ok(Value::str(s.repeat(n as usize)))
+            }
+        }
+        _ => Err(format!(
+            "javars: unsupported String method `{method}` with {} argument(s)",
+            args.len()
+        )),
+    }
+}
+
+/// `String.substring(begin, end)` on `char` indices — `[begin, end)`, with
+/// Java's bounds rules (`0 ≤ begin ≤ end ≤ length`).
+fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
+    let len = s.chars().count() as i64;
+    if begin < 0 || end > len || begin > end {
+        return Err(format!(
+            "javars: String.substring: range [{begin}, {end}) out of bounds for length {len}"
+        ));
+    }
+    let sub: String = s
+        .chars()
+        .skip(begin as usize)
+        .take((end - begin) as usize)
+        .collect();
+    Ok(Value::str(sub))
+}
+
+/// `String.indexOf(sub)` returning a `char` index (not a byte offset), or `-1`.
+fn char_index_of(s: &str, needle: &str) -> i64 {
+    match s.find(needle) {
+        Some(byte_pos) => s[..byte_pos].chars().count() as i64,
+        None => -1,
     }
 }
 

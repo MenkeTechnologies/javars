@@ -6,7 +6,8 @@
 //! methods, fields, and multiple classes are parsed no further than the entry
 //! point today (see `BUGS.md`); the AST is shaped to grow into them.
 
-/// A parsed compilation unit: the entry class name and the body of its `main`.
+/// A parsed compilation unit: the entry class name, the body of its `main`, and
+/// any user-defined static helper methods.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// The name of the class that declares `main` (informational; used by the
@@ -14,6 +15,32 @@ pub struct Program {
     pub class_name: String,
     /// The statements of `public static void main(String[] args)`.
     pub main: Vec<Stmt>,
+    /// User-defined `static` methods declared in the class (excluding `main`).
+    pub methods: Vec<Method>,
+}
+
+/// A user-defined `static` method: `static <ret> name(<params>) { <body> }`.
+/// Lowered to a fusevm call-frame subroutine (`Op::Call`); parameters and locals
+/// live in frame slots so recursion is well-behaved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Method {
+    pub name: String,
+    /// Formal parameters in declaration order (bound to slots `0..n`).
+    pub params: Vec<Param>,
+    /// The declared return type (retained for diagnostics and numeric-division
+    /// typing; not otherwise checked).
+    pub ret: String,
+    pub body: Vec<Stmt>,
+    /// 1-based source line the method starts on (for the debug line marker and
+    /// prologue ops).
+    pub line: u32,
+}
+
+/// A method formal parameter: its declared type and name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub ty: String,
+    pub name: String,
 }
 
 /// A Java statement with its 1-based source line (threaded through the parser so
@@ -69,6 +96,10 @@ pub enum StmtKind {
     Break,
     /// `continue;`
     Continue,
+    /// `return;` or `return <expr>;`. In `main` (which is `void`) a bare return
+    /// ends the program and a value return is rejected; in a method it lowers to
+    /// `Op::ReturnValue`.
+    Return(Option<Expr>),
 }
 
 /// Compound-assignment operator. `Assign` is a plain `=`.
@@ -122,6 +153,17 @@ pub enum Expr {
     /// neither, with no FFI block present, is an unresolved reference.
     Call {
         name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// An instance method call `recv.method(args...)`. Slice 1 dispatches these
+    /// on `String` receivers through the [`crate::host`] string builtins
+    /// (`length`, `substring`, `equals`, …); `System.out.print[ln]` keeps its
+    /// dedicated [`Expr::Println`] form. Field access (`arr.length`) and other
+    /// receiver types are parse errors until the object/array model lands.
+    MethodCall {
+        recv: Box<Expr>,
+        method: String,
         args: Vec<Expr>,
         line: u32,
     },

@@ -142,3 +142,140 @@ fn missing_main_is_an_error() {
     let (_out, ok) = run("public class NoMain { int x; }");
     assert!(!ok, "a class with no main should fail to run");
 }
+
+// ── integer vs. floating division (Java binary numeric promotion) ──
+
+#[test]
+fn division_truncates_toward_zero_and_stays_float_when_typed() {
+    // `int/int` truncates toward zero (so a negative quotient rounds up);
+    // a `double` operand keeps the fractional result.
+    let (out, _) = run(&wrap(
+        "System.out.println(-7 / 2); System.out.println(7.0 / 2); System.out.println(9 / 4);",
+    ));
+    assert_eq!(out, "-3\n3.5\n2\n");
+}
+
+#[test]
+fn division_uses_declared_variable_types() {
+    // `x` is a tracked `int`, so `x / 2` truncates; `d` is a `double`, so it
+    // does not. A truncating result must print as an int (`3`, not `3.0`).
+    let (out, _) = run(&wrap(
+        "int x = 7; double d = 7; System.out.println(x / 2); System.out.println(d / 2);",
+    ));
+    assert_eq!(out, "3\n3.5\n");
+}
+
+// ── user-defined static methods (Op::Call frame ABI) ──
+
+#[test]
+fn static_method_with_parameters() {
+    let (out, ok) = run(
+        "public class M { static int add(int a, int b) { return a + b; } \
+         public static void main(String[] args) { System.out.println(add(20, 22)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn recursion_does_not_clobber_frame_locals() {
+    // Recursive factorial: each call must keep its own `n` in a fresh frame
+    // slot. A shared-global lowering would return the wrong product.
+    let (out, ok) = run(
+        "public class F { static int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); } \
+         public static void main(String[] args) { System.out.println(fact(6)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "720\n");
+}
+
+#[test]
+fn mutual_recursion_via_forward_reference() {
+    // `isEven` calls `isOdd`, declared after it — signatures are registered
+    // before any body is lowered, so forward references resolve.
+    let (out, ok) = run(
+        "public class P { \
+         static boolean isEven(int n) { if (n == 0) return true; return isOdd(n - 1); } \
+         static boolean isOdd(int n) { if (n == 0) return false; return isEven(n - 1); } \
+         public static void main(String[] args) { System.out.println(isEven(10)); System.out.println(isOdd(10)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "true\nfalse\n");
+}
+
+#[test]
+fn void_method_with_early_return() {
+    let (out, ok) = run(
+        "public class V { \
+         static void sign(int n) { if (n > 0) { System.out.println(\"pos\"); return; } System.out.println(\"nonpos\"); } \
+         public static void main(String[] args) { sign(3); sign(-2); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "pos\nnonpos\n");
+}
+
+#[test]
+fn method_call_result_feeds_arithmetic() {
+    // A method's return value participates in an expression (and its `int`
+    // return type drives the division truncation).
+    let (out, ok) = run("public class A { static int half(int x) { return x / 2; } \
+         public static void main(String[] args) { System.out.println(half(9) + 1); } }");
+    assert!(ok);
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn wrong_argument_count_is_a_compile_error() {
+    let (_out, ok) = run("public class E { static int f(int a) { return a; } \
+         public static void main(String[] args) { System.out.println(f(1, 2)); } }");
+    assert!(!ok, "calling a method with the wrong arity must fail");
+}
+
+// ── String instance methods (postfix `.` dispatch) ──
+
+#[test]
+fn string_length_case_and_substring() {
+    let (out, _) = run(&wrap(
+        "String s = \"Hello\"; System.out.println(s.length()); \
+         System.out.println(s.toUpperCase()); System.out.println(s.substring(1, 4));",
+    ));
+    assert_eq!(out, "5\nHELLO\nell\n");
+}
+
+#[test]
+fn string_search_and_predicates() {
+    let (out, _) = run(&wrap(
+        "String s = \"banana\"; System.out.println(s.indexOf(\"na\")); \
+         System.out.println(s.contains(\"nan\")); System.out.println(s.startsWith(\"ba\")); \
+         System.out.println(s.charAt(0));",
+    ));
+    assert_eq!(out, "2\ntrue\ntrue\nb\n");
+}
+
+#[test]
+fn string_equals_and_transform() {
+    let (out, _) = run(&wrap(
+        "String s = \"abc\"; System.out.println(s.equals(\"abc\")); \
+         System.out.println(s.equalsIgnoreCase(\"ABC\")); System.out.println(s.replace(\"b\", \"X\")); \
+         System.out.println(\"ab\".repeat(3));",
+    ));
+    assert_eq!(out, "true\ntrue\naXc\nababab\n");
+}
+
+#[test]
+fn chained_string_calls() {
+    // Postfix dispatch chains: substring's result receives another call.
+    let (out, _) = run(&wrap(
+        "System.out.println(\"  Hello World  \".trim().substring(0, 5).toUpperCase());",
+    ));
+    assert_eq!(out, "HELLO\n");
+}
+
+#[test]
+fn string_index_out_of_range_is_an_error() {
+    let (_out, ok) = run(&wrap("System.out.println(\"hi\".charAt(9));"));
+    assert!(
+        !ok,
+        "an out-of-range charAt must surface an error, not a wrong value"
+    );
+}
