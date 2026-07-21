@@ -270,8 +270,7 @@ fn launch(program: &str) {
 /// tracing JIT, so markers always fire). The `DBG_LINE` builtin drives the pause
 /// loop via [`on_debug_line`].
 fn run_debug(path: &str) -> Result<(), String> {
-    let src =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let prog = crate::parse(&src)?;
     let chunk = crate::compiler::compile_debug(&prog)?;
     let mut vm = VM::new(chunk);

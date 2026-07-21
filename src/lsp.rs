@@ -455,7 +455,10 @@ fn parse_error_line(e: &str) -> u32 {
         .map(|(_, rest)| rest)
         .or_else(|| e.rsplit_once("(line ").map(|(_, rest)| rest));
     after
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty()))
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+        })
         .and_then(|n| n.parse().ok())
         .unwrap_or(1)
 }

@@ -344,7 +344,8 @@ impl Compiler {
             // the builtin does not need.
             if let Some(body) = args.first() {
                 self.expr(body)?;
-                self.b.emit(Op::CallBuiltin(crate::host::JFFI_COMPILE, 1), line);
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::JFFI_COMPILE, 1), line);
             } else {
                 self.b.emit(Op::LoadUndef, line);
             }
@@ -356,8 +357,10 @@ impl Compiler {
             }
             let c = self.b.add_constant(Value::str(name.to_string()));
             self.b.emit(Op::LoadConst(c), line);
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JFFI_CALL, args.len() as u8 + 1), line);
+            self.b.emit(
+                Op::CallBuiltin(crate::host::JFFI_CALL, args.len() as u8 + 1),
+                line,
+            );
             return Ok(());
         }
         Err(format!(
@@ -428,7 +431,8 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
             update,
             body,
         } => {
-            init.as_deref().is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+            init.as_deref()
+                .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
                 || cond.as_ref().is_some_and(expr_has_ffi)
                 || update
                     .as_deref()
@@ -445,7 +449,11 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
-        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Var(_)
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Var(_)
         | Expr::PostIncDec { .. } => false,
     }
 }
