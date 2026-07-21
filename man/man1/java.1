@@ -1,0 +1,96 @@
+.\" Manpage for javars (the `java` binary).
+.\" Contact https://github.com/MenkeTechnologies/javars to correct errors or omissions.
+.TH JAVA 1 "2026-07-20" "javars 0.1.0" "User Commands"
+.SH NAME
+java \- Java on fusevm, a Java frontend lowered to bytecode and run on a Cranelift JIT (no JVM)
+.SH SYNOPSIS
+.B java
+[\fIOPTIONS\fR] \fIFILE.java\fR [\fIARGS\fR...]
+.br
+.B java
+\fB\-\-lsp\fR | \fB\-\-dap\fR
+.SH DESCRIPTION
+.B javars
+lexes and parses Java source and lowers it to
+.B fusevm
+bytecode executed on a three\-tier Cranelift JIT \(em the same shared engine
+behind
+.BR zshrs ,
+.BR stryke ,
+.BR awkrs ,
+elisp, and ruby. There is no bespoke VM and no JVM; execution and codegen live
+in fusevm, and there are no
+.I .class
+files.
+.PP
+The current slice runs a single entry class: javars locates
+.B public static void main(String[] args)
+in the given file and executes its body. Statements cover local declarations,
+assignment and compound assignment, C\-style
+.BR if / while / for ,
+.BR break / continue ,
+post\-increment/decrement, and
+.BR System.out.print / println .
+Java's
+.B +
+is string concatenation when either operand is a
+.BR String .
+.SH OPTIONS
+.TP
+.BR \-\-version ", " \-version
+Print the version banner and exit.
+.TP
+.BR \-h ", " \-\-help ", " \-help ", " \-?
+Print usage and exit.
+.TP
+.B \-\-dump\-tokens
+Print the lexer token stream for the file and exit.
+.TP
+.B \-\-dump\-ast
+Print the parsed AST for the file and exit.
+.TP
+.B \-\-disasm
+Print a fusevm bytecode disassembly listing for the file and exit.
+.TP
+.B \-\-lsp
+Speak the Language Server Protocol over stdio (completion, hover, and
+diagnostics from the same parser the runtime uses).
+.TP
+.B \-\-dap
+Speak the Debug Adapter Protocol over stdio (breakpoints, single\-stepping, and
+local\-variable inspection over the running program).
+.SH EXIT STATUS
+.B java
+exits 0 on success and 1 on a lex/parse/compile error or an I/O failure. Errors
+are written to standard error in the terse form
+.IR "java: <reason>" .
+.SH EXAMPLES
+Run a program:
+.RS 4
+.EX
+java Hello.java
+.EE
+.RE
+.PP
+Inspect the lowered bytecode:
+.RS 4
+.EX
+java \-\-disasm Fib.java
+.EE
+.RE
+.PP
+Debug a program from an editor (DAP over stdio):
+.RS 4
+.EX
+java \-\-dap
+.EE
+.RE
+.SH SEE ALSO
+.BR javaall (1),
+.BR java (1)
+(the reference JDK launcher).
+The comprehensive javars reference is
+.BR javaall (1).
+.SH AUTHOR
+Part of the fusevm language family. Source:
+https://github.com/MenkeTechnologies/javars

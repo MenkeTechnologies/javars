@@ -1,0 +1,167 @@
+.\" javaall(1) — comprehensive all-in-one man page for javars.
+.\" Modeled after zshall(1): every section of the reference in one document.
+.\" Render with:  man -l man/man1/javaall.1
+.\" Install:      cp man/man1/javaall.1 /usr/local/share/man/man1/
+.TH JAVAALL 1 "2026-07-20" "javars 0.1.0" "User Commands"
+.SH NAME
+javaall \- the javars comprehensive reference (invocation, language subset,
+architecture, bytecode VM + Cranelift JIT, LSP, DAP)
+.SH OVERVIEW
+This is the all\-in\-one
+.B javars
+manual, modeled on
+.BR zshall (1).
+It concatenates the major sections of the javars reference into a single page so
+you can grep with `/`:
+.RS 2
+.PP
+.B 1.  INVOCATION
+.RB "\(em " "flags, files, exit status"
+.br
+.B 2.  LANGUAGE SUBSET
+.RB "\(em " "the Java the current slice parses and runs"
+.br
+.B 3.  ARCHITECTURE
+.RB "\(em " "lex \[->] parse \[->] lower \[->] fusevm VM + JIT"
+.br
+.B 4.  TOOLING
+.RB "\(em " "\-\-lsp language server, \-\-dap debugger, dumps"
+.br
+.B 5.  DIAGNOSTICS
+.RB "\(em " "error format and common messages"
+.RE
+.SH 1. INVOCATION
+.B java
+[\fIOPTIONS\fR] \fIFILE.java\fR runs the
+.B main
+of the entry class in
+.IR FILE.java .
+The introspection flags
+.RB ( \-\-dump\-tokens ", " \-\-dump\-ast ", " \-\-disasm )
+print an artifact and exit without running.
+.B \-\-lsp
+and
+.B \-\-dap
+speak their protocols over stdio and take no file.
+See
+.BR java (1)
+for the per\-flag table.
+.SH 2. LANGUAGE SUBSET
+The current slice is a single\-class, single\-\fBmain\fR subset. A compilation unit
+is
+.RB ` "public class Name { ... }" ';
+javars finds
+.B public static void main(String[] args)
+and parses its body. Other members (fields, helper methods) are skipped by brace
+matching, and leading
+.BR package / import
+lines are tolerated.
+.SS Types
+Local declarations accept the built\-in type names
+.BR int ", " long ", " short ", " byte ", " double ", " float ", " boolean ", " char ", " String ", and " var .
+The runtime is dynamically typed on the fusevm value model, so the annotation is
+retained for diagnostics but does not gate execution yet.
+.SS Statements
+Local declarations
+.RB ( "int x = e;" ),
+plain and compound assignment
+.RB ( "x = e;" ", " "x += e;" ),
+.BR if / else ,
+.BR while ,
+the C\-style
+.B for
+.RB ( "for (init; cond; update) { ... }" ),
+.BR break ,
+.BR continue ,
+a bare
+.B return;
+(ends
+.BR main ),
+post\-increment/decrement
+.RB ( "i++" ", " "i--" ),
+and
+.B System.out.print / println
+calls.
+.SS Expressions
+Integer, floating, boolean, string, and char literals (a char literal is modeled
+as a one\-character string); variable reads; the unary
+.BR \- " and " ! ;
+and the binary operators
+.BR + " " \- " " * " " / " " % ,
+comparisons
+.BR == " " != " " < " " > " " <= " " >= ,
+and the short\-circuiting
+.BR && " and " || .
+Java's
+.B +
+concatenates when either operand is a
+.BR String ,
+via the host numeric hook; whole
+.B double
+values print with a trailing
+.B .0
+to match
+.BR java .
+.SH 3. ARCHITECTURE
+.EX
+Java source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] fusevm VM + Cranelift JIT
+.EE
+.PP
+There is no local
+.I vm.rs
+or
+.IR jit.rs .
+Arithmetic and comparisons lower to native fusevm ops so the tracing JIT can
+compile hot loops; Java\-specific behaviour (the
+.B String
+.B +
+overload, Java\-flavoured value formatting) is supplied by the host numeric hook
+and the print builtins. The same fusevm engine hosts zshrs, stryke, awkrs, elisp,
+and ruby, so JIT and VM improvements benefit all of them at once.
+.SH 4. TOOLING
+.SS Language server (\-\-lsp)
+.B java \-\-lsp
+speaks LSP over stdio: completion and hover from the keyword / type / IO corpus
+(the same table that generates
+.IR docs/reference.html ),
+and diagnostics from the runtime's own parser \(em a syntax error maps to a
+diagnostic on the reported line. It is read\-only; no output reaches the terminal.
+.SS Debugger (\-\-dap)
+.B java \-\-dap
+speaks the Debug Adapter Protocol over stdio. The program is compiled with
+per\-statement line markers (only in this mode) and run on the pure interpreter so
+the markers always fire. Supported: line breakpoints, single\-stepping
+.RB ( next / stepIn / stepOut ,
+which all advance to the next statement in the single
+.B main
+frame), a
+.B stackTrace
+of the current frame, and
+.B variables
+inspection of
+.BR main 's
+locals. Program output
+.RB ( System.out )
+is captured and forwarded as
+.B output
+events so it never corrupts the protocol channel.
+.SS Dumps
+.B \-\-dump\-tokens
+prints the token stream,
+.B \-\-dump\-ast
+the parsed AST, and
+.B \-\-disasm
+a fusevm bytecode disassembly \(em each then exits.
+.SH 5. DIAGNOSTICS
+Errors are written to standard error in the form
+.IR "java: <reason>" ,
+for example an unterminated string literal, an unexpected token, or an
+unsupported construct
+.RB ( "method/field access on X is not supported yet" ).
+The process exits 1 on any error and 0 on success.
+.SH SEE ALSO
+.BR java (1)
+The focused invocation page. Source and issue tracker:
+https://github.com/MenkeTechnologies/javars
+.SH AUTHOR
+Part of the fusevm language family.
