@@ -136,7 +136,7 @@ pub const JEXC_CUT: u16 = 724;
 /// the process exits non-zero the way `java` does.
 pub const JEXC_ABORT: u16 = 725;
 /// Raise a runtime fault the compiler detected inline (`int / 0`). Stack
-/// `[className, message]`; `argc == 2`. Goes through the same [`raise`] path a
+/// `[className, message]`; `argc == 2`. Goes through the same `raise` path a
 /// host-detected fault does, so the throwable is catchable.
 pub const JFAULT: u16 = 726;
 
