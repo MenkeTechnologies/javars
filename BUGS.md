@@ -220,6 +220,19 @@ at the bottom, and are summarized in the section right after this one.
   `Arrays.asList` is fixed-size and `List.of` immutable, so a structural write
   to either throws `UnsupportedOperationException` exactly as Java's does, and an
   out-of-range `get` throws `IndexOutOfBoundsException` with Java's message.
+- **Arrow `switch`, as an expression and as a statement.**
+  `int r = switch (x) { case 1, 2 -> 10; default -> { … yield v; } };` and the
+  statement form `switch (x) { case 1 -> …; default -> …; }`, which is the same
+  construct with its value discarded — one parser, one lowering. Arms do not
+  fall through and exactly one runs, so it lowers to a `?:`-style chain rather
+  than the classic form's laid-out group bodies: multi-label arms
+  (`case A, B ->`), an `enum` discriminant with unqualified labels, a `String`
+  or `int` discriminant, a `default` written anywhere among the arms (it is laid
+  out last, so an arm after it still matches), a `throw` arm, and a block arm
+  whose `yield` supplies the value — running any `finally` it leaves on the way
+  out, exactly as `return` does. `yield` is a keyword only inside an arm body,
+  so a variable or method named `yield` still works. The classic colon form,
+  with its fall-through, is untouched.
 - **`String.compareTo` / `compareToIgnoreCase`**, returning Java's *difference*
   (the first differing `char`, else the length difference) rather than only its
   sign — programs print the number, so the sign alone would be wrong.
@@ -267,8 +280,9 @@ known.
   no I/O.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
-- **Arrow `switch` expressions** and `switch` patterns. (The classic
-  `switch` *statement* on an enum works.)
+- **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
+  `when` clauses). The arrow form itself is implemented (above); it is pattern
+  labels that are not.
 - **`Enum.compareTo`, `EnumSet`, `EnumMap`.**
 - **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
   no single `|` token, so it fails lexically).

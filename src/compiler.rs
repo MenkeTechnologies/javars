@@ -331,6 +331,12 @@ struct Compiler {
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
+    /// `yield` jumps of the arrow-`switch` arm body being lowered, patched to
+    /// the arm's exit once it is laid out.
+    yield_ops: Vec<usize>,
+    /// `finallys.len()` when the current arm body was entered — a `yield` runs
+    /// exactly the cleanup blocks opened inside the arm, and no more.
+    yield_finally_depth: usize,
 }
 
 /// A lambda body waiting to be emitted as a subroutine.
@@ -419,6 +425,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_counter: 0,
         lambda_target: None,
         current_ret: None,
+        yield_ops: Vec::new(),
+        yield_finally_depth: 0,
     };
     // ── main body (global scope) ──
     // Class-level state exists before any user code runs, in Java's order:
@@ -1227,6 +1235,10 @@ impl Compiler {
                 "[]".repeat(sizes.len() + extra_dims)
             )),
             Expr::InstanceOf { .. } => Some("boolean".to_string()),
+            Expr::SwitchExpr { arms, .. } => arms.iter().find_map(|a| match &a.body {
+                SwitchArmBody::Expr(e) => self.expr_java_type(e),
+                SwitchArmBody::Block(_) => None,
+            }),
             Expr::PostIncDec { name, .. } => self.bare_var_type(name),
             Expr::Call { name, args, .. } => {
                 let arg_tys: Vec<Option<String>> =
@@ -1973,6 +1985,16 @@ impl Compiler {
             | Expr::Lambda { .. }
             | Expr::MethodRef { .. }
             | Expr::This => NumType::Other,
+            // An arrow `switch`'s type is its arms' common type; taking the
+            // first expression arm's is enough, because `javac` has already
+            // checked they agree.
+            Expr::SwitchExpr { arms, .. } => arms
+                .iter()
+                .find_map(|a| match &a.body {
+                    SwitchArmBody::Expr(e) => Some(self.expr_type(e)),
+                    SwitchArmBody::Block(_) => None,
+                })
+                .unwrap_or(NumType::Other),
         }
     }
 
@@ -2649,6 +2671,17 @@ impl Compiler {
                 finally_body,
             } => self.try_stmt(body, catches, finally_body, line),
             StmtKind::Throw(e) => self.throw_stmt(e, line),
+            // `yield v;` — leave the value on the stack (running any cleanup
+            // block opened inside this arm first, exactly as `return` does),
+            // then jump to the arm's exit.
+            StmtKind::Yield(e) => {
+                self.expr(e)?;
+                let keep = self.yield_finally_depth;
+                self.emit_finallys_down_to(keep)?;
+                let j = self.b.emit(Op::Jump(0), line);
+                self.yield_ops.push(j);
+                Ok(())
+            }
             StmtKind::Break(label) => self.break_stmt(label.as_deref(), line),
             StmtKind::Continue(label) => self.continue_stmt(label.as_deref(), line),
             StmtKind::Return(val) => {
@@ -3171,6 +3204,115 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower an arrow `switch` expression:
+    /// `switch (d) { case A, B -> e; default -> { … yield v; } }`.
+    ///
+    /// Arms do not fall through, so this is a `?:` chain rather than the classic
+    /// `switch`'s laid-out group bodies: the discriminant is evaluated once into
+    /// a temp, each arm's labels are compared against it, and the matching arm's
+    /// value is left on the stack before a jump to the end. Exactly one arm runs,
+    /// which is what makes the construct an expression at all.
+    ///
+    /// A block arm's value comes from its `yield`, which is compiled as "leave
+    /// the value on the stack, then jump to the end" — the same shape a matching
+    /// expression arm produces, so the two are indistinguishable downstream.
+    fn switch_expr(&mut self, disc: &Expr, arms: &[SwitchArm], line: u32) -> Result<(), String> {
+        // Java writes `case RED ->` unqualified when switching on an enum; the
+        // label's meaning comes from the discriminant's static type.
+        let enum_disc = self
+            .expr_java_type(disc)
+            .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
+        let disc_t = self.temp();
+        self.expr(disc)?;
+        self.emit_set(&disc_t, line);
+
+        let mut end_jumps: Vec<usize> = Vec::new();
+        let mut default_arm: Option<&SwitchArm> = None;
+        for arm in arms {
+            if arm.is_default {
+                // `default` is laid out last whatever its source position, so an
+                // arm written before it still gets to match.
+                default_arm = Some(arm);
+                continue;
+            }
+            // if (disc == L1 || disc == L2 …) { <arm>; jump end }
+            let mut hits: Vec<usize> = Vec::new();
+            let mut miss: Vec<usize> = Vec::new();
+            for (i, label) in arm.labels.iter().enumerate() {
+                self.emit_get(&disc_t, line);
+                match (&enum_disc, label) {
+                    (Some(class), Expr::Var(c)) => {
+                        let g = enum_global(class, c);
+                        self.emit_global_get(&g, line);
+                    }
+                    _ => self.expr(label)?,
+                }
+                // The same `NumEq` the classic `switch` uses: value equality for
+                // `int`/`String` and handle identity for an enum singleton.
+                self.b.emit(Op::NumEq, line);
+                if i + 1 == arm.labels.len() {
+                    miss.push(self.b.emit(Op::JumpIfFalse(0), line));
+                } else {
+                    hits.push(self.b.emit(Op::JumpIfTrue(0), line));
+                }
+            }
+            let body_at = self.b.current_pos();
+            for j in hits {
+                self.b.patch_jump(j, body_at);
+            }
+            self.emit_switch_arm_body(&arm.body, line)?;
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            for j in miss {
+                self.b.patch_jump(j, next);
+            }
+        }
+        match default_arm {
+            Some(arm) => self.emit_switch_arm_body(&arm.body, line)?,
+            // No `default`: `javac` only accepts that for an exhaustive `enum`
+            // switch, so no value can be missing in a program it compiled. The
+            // placeholder keeps the stack balanced if one somehow is.
+            None => {
+                self.b.emit(Op::LoadUndef, line);
+            }
+        }
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Emit one arrow arm's body so that it leaves exactly one value on the
+    /// stack. An expression arm is that expression; a block arm runs its
+    /// statements and takes its value from `yield` (or `null` on fall-off, which
+    /// is what an arrow-`switch` *statement*'s arms all do).
+    fn emit_switch_arm_body(&mut self, body: &SwitchArmBody, line: u32) -> Result<(), String> {
+        match body {
+            SwitchArmBody::Expr(e) => self.expr(e),
+            SwitchArmBody::Block(stmts) => {
+                let outer = std::mem::take(&mut self.yield_ops);
+                let outer_depth =
+                    std::mem::replace(&mut self.yield_finally_depth, self.finallys.len());
+                for s in stmts {
+                    self.stmt(s)?;
+                }
+                // Falling off the end of the block pushes `null` — which is what
+                // an arrow-`switch` *statement*'s arms all do, and what a
+                // value-producing arm never reaches because its `yield` jumped
+                // straight past this instruction.
+                self.b.emit(Op::LoadUndef, line);
+                self.yield_finally_depth = outer_depth;
+                let yields = std::mem::replace(&mut self.yield_ops, outer);
+                let end = self.b.current_pos();
+                for j in yields {
+                    self.b.patch_jump(j, end);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Lower a classic `switch`. The discriminant is evaluated once into an
     /// internal temp, then a dispatch chain compares it (via `==`, matching
     /// javars's value-equality model for both `int` and `String`) against each
@@ -3579,6 +3721,7 @@ impl Compiler {
                 args,
                 line,
             } => self.method_call(recv, method, args, *line)?,
+            Expr::SwitchExpr { disc, arms, line } => self.switch_expr(disc, arms, *line)?,
             Expr::Lambda { params, body, line } => self.compile_lambda(params, body, *line)?,
             Expr::MethodRef { recv, method, line } => {
                 let lambda = self.desugar_method_ref(recv, method, *line)?;
@@ -4246,7 +4389,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                 || catches.iter().any(|c| body_has_ffi(&c.body))
                 || body_has_ffi(finally_body)
         }
-        StmtKind::Throw(e) => expr_has_ffi(e),
+        StmtKind::Throw(e) | StmtKind::Yield(e) => expr_has_ffi(e),
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
     })
 }
@@ -4272,6 +4415,16 @@ fn expr_has_ffi(e: &Expr) -> bool {
             LambdaBody::Block(b) => body_has_ffi(b),
         },
         Expr::MethodRef { recv, .. } => expr_has_ffi(recv),
+        Expr::SwitchExpr { disc, arms, .. } => {
+            expr_has_ffi(disc)
+                || arms.iter().any(|a| {
+                    a.labels.iter().any(expr_has_ffi)
+                        || match &a.body {
+                            SwitchArmBody::Expr(e) => expr_has_ffi(e),
+                            SwitchArmBody::Block(b) => body_has_ffi(b),
+                        }
+                })
+        }
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)

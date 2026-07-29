@@ -177,9 +177,14 @@ Implemented and checked against the reference `java`:
   binary operators `+ - * / %`, `== != < > <= >=`, `&& ||` (short-circuiting);
   unary `-` and `!`; parenthesised grouping; Java's `+` string concatenation.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
-  `for (init; cond; update)`, the enhanced `for (T x : arr)`, `break`,
-  `continue`, and `return` (a bare `return;` ends `main`; `return <expr>;`
-  returns a value from a method).
+  `for (init; cond; update)`, the enhanced `for (T x : arr)` (over an array or a
+  collection), `break`, `continue`, and `return` (a bare `return;` ends `main`;
+  `return <expr>;` returns a value from a method).
+- **Arrow `switch`** — as an expression
+  (`int r = switch (x) { case 1, 2 -> 10; default -> { … yield v; } };`) and as
+  a statement. Multi-label arms, `enum`/`String`/`int` discriminants, a `throw`
+  arm, and a block arm whose `yield` runs any `finally` it leaves. The classic
+  colon form, with its fall-through, still works unchanged.
 - **Exceptions** — `throw`, `try` / `catch` / `finally`, try-with-resources,
   multiple `catch` arms matched by class, and the modeled `java.lang` throwable
   hierarchy (`RuntimeException`, `IllegalArgumentException`,
@@ -348,8 +353,9 @@ types** with their derived accessors / `toString` / `equals`, **abstract
 classes**, **`enum` constants carrying state or bodies**, and **lambdas +
 method references** (heap closures capturing by value, dispatched through any
 single-abstract-method interface), and the **`java.util` collections**
-(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order) — all
-verified byte-for-byte against OpenJDK.
+(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order), and
+**arrow `switch` expressions** with `yield` — all verified byte-for-byte against
+OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
@@ -362,9 +368,9 @@ Next waves, in priority order:
    `.stream().map(…).filter(…)`, `Function.andThen`, `Predicate.negate`,
    `Comparator.reversed`. The lambdas they take already work; what is missing is
    the library on top of them.
-2. **Arrow `switch` expressions** (`case A -> …`, `yield`), `Iterator`/
-   `entrySet`, and wider stdlib coverage (more `Math`/`Integer` statics, more
-   `String` methods, `hashCode`).
+2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
+   `Iterator`/`entrySet`, and wider stdlib coverage (more `Math`/`Integer`
+   statics, more `String` methods, `hashCode`).
 3. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 

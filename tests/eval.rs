@@ -1701,3 +1701,60 @@ fn string_compare_to_returns_javas_difference_not_just_its_sign() {
     assert!(ok);
     assert_eq!(out, "-1 1 0 1\n");
 }
+
+#[test]
+fn arrow_switch_expressions_yield_a_value() {
+    // The arrow form has no fall-through and exactly one arm runs, so it is
+    // lowered as a `?:` chain rather than as laid-out group bodies. Covers
+    // multi-label arms, a block arm's `yield`, an `enum` discriminant with
+    // unqualified labels, a `String` discriminant, a `default` written *before*
+    // a matching arm (which must not shadow it), and the result feeding `/`
+    // typing — which only truncates if the arm's static type survives the
+    // switch. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         enum Day { MON, TUE, SAT, SUN }\
+         static String kind(Day d) { return switch (d) { case SAT, SUN -> \"weekend\"; case MON -> \"start\"; default -> \"mid\"; }; }\
+         static int score(int n) { return switch (n) { case 1 -> 10; case 2, 3 -> 20; default -> { int t = n * 2; yield t + 1; } }; }\
+         public static void main(String[] a) {\
+         for (Day d : Day.values()) { System.out.print(kind(d) + \",\"); }\
+         System.out.println();\
+         for (int i = 0; i < 5; i++) { System.out.print(score(i) + \",\"); }\
+         System.out.println();\
+         String s = \"b\";\
+         System.out.println(switch (s) { case \"a\" -> 1; case \"b\" -> 2; default -> 3; });\
+         int k = 2;\
+         System.out.println(switch (k) { case 2 -> 7; default -> 9; } / 2);\
+         System.out.println(1 + switch (k) { case 2 -> 20; default -> 0; } + 300);\
+         System.out.println(switch (k) { default -> \"d\"; case 2 -> \"two\"; });\
+         System.out.println(switch (k) { case 2 -> { if (k > 1) { yield \"big\"; } yield \"small\"; } default -> \"n\"; }); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "start,mid,weekend,weekend,\n1,10,20,20,9,\n2\n3\n321\ntwo\nbig\n"
+    );
+}
+
+#[test]
+fn arrow_switch_statements_and_arms_that_leave_the_switch() {
+    // An arrow `switch` used as a statement is the expression form with its
+    // value discarded — no `break` and no fall-through. Also pins the two arms
+    // that do not produce a value normally: one that throws, and one whose
+    // `yield` has to run a `finally` it is leaving. And `yield` stays an
+    // ordinary identifier outside an arm, which is Java's contextual rule.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         int x = 2;\
+         switch (x) { case 1 -> System.out.println(\"one\"); case 2 -> System.out.println(\"two\"); default -> System.out.println(\"other\"); }\
+         switch (x) { case 1: case 2: System.out.println(\"1or2\"); default: System.out.println(\"fell\"); }\
+         System.out.println(switch (x) { case 2 -> { try { yield \"y\"; } finally { System.out.println(\"fin\"); } } default -> \"n\"; });\
+         try { int bad = switch (x) { case 2 -> throw new IllegalStateException(\"nope\"); default -> 0; }; System.out.println(bad); }\
+         catch (IllegalStateException e) { System.out.println(\"caught \" + e.getMessage()); }\
+         int yield = 5;\
+         System.out.println(yield + 1); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "two\n1or2\nfell\nfin\ny\ncaught nope\n6\n");
+}

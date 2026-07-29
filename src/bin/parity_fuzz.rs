@@ -663,6 +663,51 @@ fn g_collection(r: &mut Rng) -> String {
     }
 }
 
+/// Arrow `switch` expressions and statements: multi-label arms, a `default`
+/// (including one written before a matching arm, which must not shadow it),
+/// block arms with `yield`, an `enum` discriminant with unqualified labels, a
+/// `String` discriminant, a `throw` arm, and the result feeding `/` typing —
+/// which only truncates if the expression's static type survives the switch.
+fn g_switchexpr(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let s = pick(r, STRS);
+    match r.below(10) {
+        0 => format!(
+            "{{ int v = {a}; System.out.println(switch (v) {{ case 0 -> \"zero\"; case 1, 2 -> \"low\"; default -> \"other\"; }}); }}"
+        ),
+        1 => format!(
+            "{{ int v = {a}; System.out.println(switch (v) {{ case 0 -> 100; default -> {{ int t = v * 2; yield t + 1; }} }}); }}"
+        ),
+        2 => format!(
+            "{{ int v = {a}; switch (v) {{ case 0 -> System.out.println(\"z\"); case 1 -> System.out.println(\"o\"); default -> System.out.println(\"d\"); }} }}"
+        ),
+        3 => format!(
+            "{{ Color c = {}; System.out.println(switch (c) {{ case RED -> \"r\"; case GREEN -> \"g\"; default -> \"b\"; }}); }}",
+            pick(r, &["Color.RED", "Color.GREEN", "Color.BLUE", "next(Color.BLUE)"])
+        ),
+        4 => format!(
+            "{{ String t = {s}; System.out.println(switch (t) {{ case \"\" -> \"empty\"; case \"a\", \"abc\" -> \"hit\"; default -> \"miss\"; }}); }}"
+        ),
+        5 => format!(
+            "{{ int v = {a}; System.out.println(switch (v) {{ default -> \"d\"; case 0 -> \"zero\"; }}); }}"
+        ),
+        6 => format!(
+            "{{ int v = {a}; System.out.println(switch (v) {{ case 0 -> 8; default -> 7; }} / 2); }}"
+        ),
+        7 => format!(
+            "{{ int v = {a}; System.out.println({b} + switch (v) {{ case 0 -> 20; default -> 3; }} + 300); }}"
+        ),
+        8 => format!(
+            "{{ int v = {a}; try {{ System.out.println(switch (v) {{ case 0 -> throw new IllegalStateException(\"z\"); default -> \"ok\"; }}); }} catch (IllegalStateException e) {{ System.out.println(\"c \" + e.getMessage()); }} }}"
+        ),
+        _ => format!(
+            "{{ Op o = {}; System.out.println(switch (o) {{ case ADD -> o.apply({a}, {b}); case SUB -> o.apply({b}, {a}); default -> 0; }}); }}",
+            pick(r, &["Op.ADD", "Op.SUB", "Op.MUL"])
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -763,6 +808,7 @@ enum Mode {
     Record,
     Lambda,
     Collection,
+    SwitchExpr,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -793,6 +839,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Record,
     Mode::Lambda,
     Mode::Collection,
+    Mode::SwitchExpr,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -825,6 +872,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Record => "record",
         Mode::Lambda => "lambda",
         Mode::Collection => "collection",
+        Mode::SwitchExpr => "switchexpr",
     }
 }
 
@@ -869,6 +917,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Record => g_record(r),
         Mode::Lambda => g_lambda(r),
         Mode::Collection => g_collection(r),
+        Mode::SwitchExpr => g_switchexpr(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

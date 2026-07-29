@@ -19,6 +19,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         pos: 0,
         uses_exceptions: false,
         uses_functional: false,
+        switch_expr_depth: 0,
     };
     p.program()
 }
@@ -53,6 +54,11 @@ struct Parser {
     /// functional-interface prelude (see
     /// [`crate::ast::Program::uses_functional`]).
     uses_functional: bool,
+    /// How many arrow-`switch` arm bodies enclose the cursor. `yield` is a
+    /// keyword only inside one; everywhere else it is an ordinary identifier,
+    /// which is Java's contextual rule (a variable or method named `yield`
+    /// predates the keyword and must keep working).
+    switch_expr_depth: usize,
 }
 
 impl Parser {
@@ -1088,6 +1094,15 @@ impl Parser {
         if let Tok::Ident(w) = self.peek() {
             match w.as_str() {
                 "try" => return self.try_stmt(),
+                // `yield <expr>;` is a keyword only inside an arrow-`switch`
+                // arm body — Java's contextual rule, which keeps a variable or
+                // method named `yield` working everywhere else.
+                "yield" if self.switch_expr_depth > 0 => {
+                    self.advance();
+                    let e = self.expression()?;
+                    self.eat(&Tok::Semi)?;
+                    return Ok(StmtKind::Yield(e));
+                }
                 "throw" => {
                     self.uses_exceptions = true;
                     self.advance();
@@ -1613,6 +1628,12 @@ impl Parser {
     /// `case`/`default` labels with no statements between them share the body
     /// that follows (`case 1: case 2: body`), forming one [`SwitchGroup`].
     fn switch_stmt(&mut self) -> Result<StmtKind, String> {
+        // An arrow `switch` used as a *statement* is the expression form with
+        // its value discarded, and that is exactly how it is lowered: one shared
+        // parser, one shared lowering, no fall-through logic to keep in step.
+        if self.at_arrow_switch() {
+            return Ok(StmtKind::Expr(self.switch_expr()?));
+        }
         self.eat(&Tok::Switch)?;
         self.eat(&Tok::LParen)?;
         let disc = self.expression()?;
@@ -1661,6 +1682,110 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok(StmtKind::Switch { disc, groups })
+    }
+
+    /// True when the `switch` at the cursor uses the arrow form. The two forms
+    /// differ only at the first label's terminator (`->` vs `:`), so the decision
+    /// needs a scan past the discriminant's parentheses to that token.
+    fn at_arrow_switch(&self) -> bool {
+        if !self.is(&Tok::Switch) {
+            return false;
+        }
+        let mut j = self.pos + 1;
+        let mut depth = 0usize;
+        // Skip `( disc )`.
+        loop {
+            match self.toks.get(j).map(|t| &t.kind) {
+                Some(Tok::LParen) => depth += 1,
+                Some(Tok::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                Some(Tok::Eof) | None => return false,
+                _ => {}
+            }
+            j += 1;
+        }
+        // `{ case <labels> ->` / `{ default ->`.
+        if !matches!(self.toks.get(j).map(|t| &t.kind), Some(Tok::LBrace)) {
+            return false;
+        }
+        j += 1;
+        let mut depth = 0usize;
+        loop {
+            match self.toks.get(j).map(|t| &t.kind) {
+                Some(Tok::Arrow) if depth == 0 => return true,
+                Some(Tok::Colon) if depth == 0 => return false,
+                // A label may itself contain parentheses; only a top-level
+                // terminator decides the form.
+                Some(Tok::LParen) => depth += 1,
+                Some(Tok::RParen) => depth = depth.saturating_sub(1),
+                Some(Tok::RBrace) | Some(Tok::Eof) | None => return false,
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
+    /// Parse an arrow `switch` expression, the cursor on `switch`.
+    fn switch_expr(&mut self) -> Result<Expr, String> {
+        let line = self.line();
+        self.eat(&Tok::Switch)?;
+        self.eat(&Tok::LParen)?;
+        let disc = self.expression()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::LBrace)?;
+        let mut arms = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            let mut labels = Vec::new();
+            let mut is_default = false;
+            if self.is(&Tok::Default) {
+                self.advance();
+                is_default = true;
+            } else {
+                self.eat(&Tok::Case)?;
+                loop {
+                    // Below the ternary, so the arm's `->` is not swallowed.
+                    labels.push(self.binary(0)?);
+                    if self.is(&Tok::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::Arrow)?;
+            // Inside an arm body `yield` is a keyword; outside it stays an
+            // ordinary identifier, which is what Java's contextual rule says.
+            self.switch_expr_depth += 1;
+            let body = if self.is(&Tok::LBrace) {
+                self.advance();
+                SwitchArmBody::Block(self.block()?)
+            } else if matches!(self.peek(), Tok::Ident(w) if w == "throw") {
+                // `case X -> throw new Foo();` — the one statement form an
+                // unbraced arm may take. It never produces a value.
+                SwitchArmBody::Block(vec![self.statement()?])
+            } else {
+                let e = self.expression()?;
+                self.eat(&Tok::Semi)?;
+                SwitchArmBody::Expr(Box::new(e))
+            };
+            self.switch_expr_depth -= 1;
+            arms.push(SwitchArm {
+                labels,
+                is_default,
+                body,
+            });
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Expr::SwitchExpr {
+            disc: Box::new(disc),
+            arms,
+            line,
+        })
     }
 
     // ── expressions (precedence climbing) ─────────────────────────────────
@@ -1913,6 +2038,8 @@ impl Parser {
                 Ok(e)
             }
             Tok::New => self.new_expr(),
+            // A `switch` *expression* — only the arrow form has one.
+            Tok::Switch => self.switch_expr(),
             Tok::Ident(name) if name == "this" => {
                 self.advance();
                 Ok(Expr::This)

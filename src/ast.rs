@@ -280,6 +280,10 @@ pub enum StmtKind {
     },
     /// `throw <expr>;` — raise the (already-constructed) throwable.
     Throw(Expr),
+    /// `yield <expr>;` — supply the value of the enclosing arrow-`switch`
+    /// *expression* from inside a block arm. Parsed as a keyword only inside
+    /// such a block, because `yield` is a contextual keyword everywhere else.
+    Yield(Expr),
     /// `break;` or `break label;`.
     Break(Option<String>),
     /// `continue;` or `continue label;`.
@@ -461,6 +465,33 @@ pub enum Expr {
         method: String,
         line: u32,
     },
+    /// A `switch` *expression* in the arrow form:
+    /// `int r = switch (x) { case 1, 2 -> 10; default -> 0; };`. Arms do not
+    /// fall through, exactly one runs, and its value is the expression's value.
+    SwitchExpr {
+        disc: Box<Expr>,
+        arms: Vec<SwitchArm>,
+        line: u32,
+    },
+}
+
+/// One arm of an arrow `switch`: `case A, B -> body` or `default -> body`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchArm {
+    /// The `case` label constant expressions selecting this arm.
+    pub labels: Vec<Expr>,
+    /// True when this arm carries `default`.
+    pub is_default: bool,
+    pub body: SwitchArmBody,
+}
+
+/// An arrow arm's right-hand side.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwitchArmBody {
+    /// `case 1 -> expr;` — the expression is the arm's value.
+    Expr(Box<Expr>),
+    /// `case 1 -> { … yield v; }` — a block whose `yield` supplies the value.
+    Block(Vec<Stmt>),
 }
 
 /// A lambda's body: a single expression (whose value is the result) or a block.
