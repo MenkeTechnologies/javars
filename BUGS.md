@@ -1,8 +1,8 @@
 # Known gaps
 
-An honest list of what javars does **not** do yet. Unsupported constructs are
-reported as parse errors, with one known exception: a `static` field parses and
-then runs wrong (see below).
+An honest list of what javars does **not** do yet. Every unsupported construct
+is reported as a parse or compile error rather than being run with the wrong
+meaning — there is no construct javars accepts and then mis-runs.
 
 ## Implemented
 
@@ -48,6 +48,32 @@ then runs wrong (see below).
   instance methods, `this`, `new C(…)`, field access (`obj.f`, `obj.f = v`), and
   implicit-`this` field/method access. Multiple classes per file, including nested
   `static` classes. Instances are heap objects with reference/aliasing semantics.
+- **`static` fields and `static { }` blocks.** A `static` field is one cell per
+  class, stored in a compiler-minted global (`#static#C#n`), seeded with its
+  declared type's default before any user code runs and then initialized — field
+  initializers and `static { … }` blocks together, in textual order — ahead of
+  `main`. Read and written unqualified inside the declaring class (from `main`,
+  a `static` method, an instance method, or a constructor), qualified as `C.n`
+  from anywhere, and through an inheriting class (`Sub.n` names the base's cell).
+  Plain, compound (`C.n += 3`), and `++`/`--` forms all write the one cell, and
+  the field's declared type drives `/`-truncation and the 32-bit `int` wrap the
+  same way a local's does. `C.staticMethod(args)` resolves too.
+- **`main`'s `args`.** `public static void main(String[] args)` binds `args` to
+  the real program arguments — `java Prog.java a b` gives a length-2 `String[]`
+  — and to a zero-length array (never `null`) when none are passed. The `String...`
+  varargs spelling is accepted, and a `main()` with no parameter is left alone.
+- **`record` types.** `record Pt(int x, int y) { … }` — the components become
+  final instance fields plus the canonical constructor, one accessor each
+  (`p.x()`), a `toString()` in Java's `Pt[x=1, y=2]` form, and a component-wise
+  `equals`. A compact constructor (`Pt { if (…) throw …; }`) runs its validation
+  before the fields are assigned. The body may add methods, `static` members, and
+  `implements`; anything it declares itself (its own `toString()`, its own
+  accessor) wins over the derived member. Records nest inside a class or stand at
+  top level, and `record` stays usable as an ordinary identifier.
+- **Abstract classes.** `abstract class Shape { abstract double area(); … }` with
+  a constructor chained by `super(…)`, concrete methods that call the abstract
+  one (resolved to the subclass's override), and dispatch through a variable,
+  parameter, or array of the abstract type.
 - **Instance-method dispatch.** `recv.method(args)` on a user class dispatches to
   the mangled `Class#method#argc` subroutine over fusevm's `Op::Call` frame ABI
   (`this` in slot 0). When a method is overridden in a subclass, dispatch is
@@ -132,6 +158,13 @@ then runs wrong (see below).
   `IllegalArgumentException: No enum constant Color.PINK` on a miss.
   `switch (c) { case RED: … }` takes the unqualified label, and a bare constant
   name resolves inside the enum's own body (`this == MUL`).
+- **Enum constants with state and bodies.** `EARTH(5.97e24)` runs the enum's own
+  constructor with those arguments, so each constant keeps its own field values.
+  A constant with a body (`PLUS { int apply(int a, int b) { … } }`) is compiled
+  to a real synthetic subclass of the enum, which is exactly what Java specifies
+  it as — so its overrides are reached by the ordinary runtime-class virtual
+  dispatch, an `abstract` method on the enum resolves to the per-constant body,
+  and a constant that declares no override inherits the enum's own.
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -139,26 +172,22 @@ then runs wrong (see below).
 
 ## Runs wrong rather than being rejected
 
-- **`static` fields.** `static int n = 0;` inside a class parses as an *instance*
-  field, so the class-level name never exists: reading `n` (or `C.n`) yields
-  `null` and a write goes nowhere. `static int n = 5; System.out.println(n);`
-  prints `null` where `java` prints `5`. This is the only construct javars
-  accepts and then runs wrong, and it is the reason `enum` is not implemented
-  yet — enum constants are `static` fields.
-- **`main`'s `String[] args` parameter is unbound.** `args` reads as `null`, so
-  `args.length` raises a `NullPointerException` instead of printing `0`. Program
-  arguments after the file name are collected by the CLI (`cli.argv`) but never
-  reach the program.
+Nothing. Every construct javars accepts runs with Java's meaning; the
+simplifications it *does* make are listed at the bottom and are all cases where
+javars deliberately models less, not cases where it computes a wrong answer for
+a program `javac` accepts.
 
-## Not implemented (parse errors today)
+## Not implemented (parse or compile errors today)
 
-- **Abstract classes and records.** (Interface abstract methods and `abstract`
-  method *signatures* parse; a standalone `abstract class` body is not specially
-  modeled.)
-- **An `enum` constant with arguments or a body** (`EARTH(5.97)`,
-  `A { int v() { … } }`) — rejected rather than run as a bare constant, which
-  would silently drop the per-constant state javars does not model. Everything
-  else about enums works (see above).
+- **Lambdas and method references** (`() -> …`, `x -> x + 1`, `String::length`)
+  and therefore the functional interfaces (`Runnable`, `Function`,
+  `Comparator`) and streams. Rejected by the parser. javars has no closure model
+  — a lambda captures enclosing locals, and every javars frame's locals live in
+  fusevm call-frame slots that do not outlive the call — so this needs a capture
+  environment before it needs syntax.
+- **`hashCode()`**, including a `record`'s derived one. A record supplies its
+  accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
+  ("class `Pt` has no method `hashCode`") rather than a wrong number.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
   `String`/`Arrays` statics listed above and the `String` instance methods are
   the whole library surface — no `java.util.*` collections, no `Math` constants
@@ -167,10 +196,11 @@ then runs wrong (see below).
   (which ends the program) is accepted there. Value returns work in methods.
 - **Arrow `switch` expressions** and `switch` patterns. (The classic
   `switch` *statement* on an enum works.)
-- **`Enum.compareTo`/`hashCode`, `EnumSet`, `EnumMap`.**
+- **`Enum.compareTo`, `EnumSet`, `EnumMap`.**
 - **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
   no single `|` token, so it fails lexically).
-- **Lambdas, streams, `var` type inference beyond storage.**
+- **Sealed types, inner (non-`static`) classes, anonymous classes** other than
+  the enum-constant body form, and **`var` type inference beyond storage**.
 
 ## Modeled with a documented simplification
 
@@ -178,6 +208,26 @@ then runs wrong (see below).
   diagnostics and for overload resolution / `/`-truncation typing, but do not gate
   execution — the runtime is dynamically typed on the fusevm value model.
   Definite-assignment and type errors that `javac` would reject may run.
+- **Class initialization is eager, not lazy.** Java initializes a class the
+  first time it is used; javars runs *every* class's `static` field initializers
+  and `static { … }` blocks once, before `main`, in source-declaration order
+  (after seeding every static with its type's default, and after building the
+  enum constants). The two differ only when one class's initializer reads
+  another's static: Java would force that class's initialization first, javars
+  gives whatever the declaration order already produced (the default value if
+  the other class is declared later). A `static` initializer with an observable
+  side effect (printing) also runs in a program that never touches its class.
+- **A `record`'s `equals` compares components with javars's `==`.** Java's
+  derived `equals` uses `Objects.equals` for a reference component; javars emits
+  `==`, which is value equality for a `String` component (so those agree) but
+  reference identity for a user-class or array component (where Java would call
+  the component's own `equals`).
+- **An unqualified name that is another class's `static` field is unbound**
+  rather than a compile error. `javac` rejects reading `v` from outside the
+  class declaring `static int v`; javars resolves an unqualified static only
+  against the enclosing class and its ancestors, and an unresolved name reads as
+  `null` (the same behaviour as an uninitialized local, below). `C.v` is the
+  spelling that works, and it is the only one valid Java uses.
 - **No widening *value* conversion.** Overload *resolution* uses static types
   (so `f(int)` vs `f(double)` picks correctly), but the argument value is not
   coerced: an `int` bound to a `double` parameter (or `double d = 7;`) keeps its

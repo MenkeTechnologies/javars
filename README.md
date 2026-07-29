@@ -79,10 +79,12 @@ X>`, the diamond, erased library type args) all run. `String.format` (a
 `Formatter` subset) and `Arrays.toString` round out the stdlib essentials; the
 wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). **Exceptions**
 (`throw`/`try`/`catch`/`finally`, try-with-resources, and javars's own runtime
-faults raised as catchable throwables) and **`enum` types** run too. An
-unsupported construct is a parse error rather than a silent mis-run, with one
-documented exception — a `static` field, which parses and then reads as `null`
-(see [`BUGS.md`](BUGS.md)).
+faults raised as catchable throwables), **`static` fields and `static { }`
+blocks**, **`record` types**, **abstract classes**, and **`enum` types** — down
+to per-constant state (`EARTH(5.97e24)`) and per-constant bodies — run too, and
+`main`'s `args` carries the real program arguments. An unsupported construct is
+a parse or compile error rather than a silent mis-run: there is no construct
+javars accepts and then runs with the wrong meaning (see [`BUGS.md`](BUGS.md)).
 
 ---
 
@@ -149,9 +151,24 @@ Buzz
 Implemented and checked against the reference `java`:
 
 - **Entry point** — `public class Name { public static void main(String[] args) { … } }`.
-  Every other member — `static` helpers, instance fields, constructors, instance
-  methods — is compiled too; only `static` fields are still a gap. `main`'s
-  `args` parameter is unbound (see [`BUGS.md`](BUGS.md)).
+  Every other member — `static` helpers, `static` fields, instance fields,
+  constructors, instance methods — is compiled too. `args` is bound to the real
+  program arguments (`java Prog.java a b`), and to a zero-length `String[]`
+  (never `null`) when none are passed.
+- **`static` fields** — one cell per class, seeded with the declared type's
+  default and then initialized by the field initializers and `static { … }`
+  blocks in textual order, all before `main`. Reached unqualified inside the
+  declaring class, as `C.n` from anywhere, and through an inheriting class;
+  compound assignment and `++`/`--` write the same cell, and the field's
+  declared type drives `/`-truncation and the 32-bit `int` wrap.
+- **`record` types** — `record Pt(int x, int y) { … }` derives the final fields,
+  the canonical constructor, an accessor per component, `toString()` in Java's
+  `Pt[x=1, y=2]` form, and a component-wise `equals`. A compact constructor
+  validates before the fields are assigned; a member the body declares itself
+  wins over the derived one.
+- **Abstract classes** — `abstract class Shape { abstract double area(); … }`,
+  with `super(…)` chaining and concrete methods that call the abstract one
+  (resolved to the subclass's override at runtime).
 - **Locals** — `int` / `long` / `double` / `boolean` / `String` / `var`
   declarations with optional initializers; plain and compound assignment
   (`=`, `+=`, `-=`, `*=`, `/=`, `%=`); post-increment / post-decrement
@@ -172,7 +189,11 @@ Implemented and checked against the reference `java`:
   `finally` on its way out, and so does an exception raised inside a `catch` arm.
 - **`enum` types** — constants as singletons with reference identity,
   `name()`/`ordinal()`/`toString()`/`equals`, `values()`/`valueOf`, unqualified
-  `switch` labels, enum bodies with their own methods, and `implements`.
+  `switch` labels, enum bodies with their own methods, and `implements`. A
+  constant may carry constructor arguments (`EARTH(5.97e24)`) for per-constant
+  state, or a body (`PLUS { int apply(int a, int b) { … } }`) — compiled to the
+  synthetic subclass Java specifies it as, so its override (including of the
+  enum's own `abstract` method) dispatches on the runtime class.
 - **Catchable runtime faults** — javars's own faults are Java exceptions rather
   than aborts: an out-of-range array index, a null receiver, `Integer.parseInt`
   on junk, integral `/ 0` and `% 0`, a negative array size, and the `String`
@@ -296,9 +317,12 @@ and `super(…)`, `instanceof`, runtime-class virtual dispatch for overrides, an
 `toString()` overrides honoured by `println`), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic
 dispatch through an interface type), **method overloading by parameter type**
-(most-specific resolution for methods and constructors), and **type-erased
-generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the diamond)
-— all verified byte-for-byte against OpenJDK.
+(most-specific resolution for methods and constructors), **type-erased
+generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
+diamond), **`static` fields** with `static { }` initializer blocks, **`record`
+types** with their derived accessors / `toString` / `equals`, **abstract
+classes**, and **`enum` constants carrying state or bodies** — all verified
+byte-for-byte against OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
@@ -307,13 +331,14 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **`static` fields** — `static int n = 0;` parses but is not modeled: the name
-   reads as `null` instead of its initializer. The highest-priority gap, because
-   it is the one construct that runs wrong rather than being rejected.
-2. **Object-model depth** — records, abstract classes, and the enum forms that
-   carry per-constant state (`EARTH(5.97)`), which need `static` fields first.
-3. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
-   collections, more `String` methods, and arrow-`switch` expressions.
+1. **Lambdas and functional interfaces** — `() -> …`, `x -> x + 1`,
+   `String::length`, and the `Runnable`/`Function`/`Comparator` shapes that use
+   them. The blocker is a capture environment: a lambda outlives the frame it
+   was written in, and javars locals live in fusevm call-frame slots that do not.
+2. **Wider standard library** — `java.util` collections, more `Math`/`Integer`
+   statics, more `String` methods, `hashCode`, and arrow-`switch` expressions.
+3. **Lazy class initialization** — javars runs every class's `static`
+   initializers before `main`; Java runs each class's on first use.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

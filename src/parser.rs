@@ -31,6 +31,14 @@ struct Resource {
     line: u32,
 }
 
+/// The located entry point: the class declaring `main`, its body, and the name
+/// it gives its `String[]` parameter (if it declares one).
+struct Entry {
+    class_name: String,
+    body: Vec<Stmt>,
+    param: Option<String>,
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -92,7 +100,7 @@ impl Parser {
                 _ => break,
             }
         }
-        let mut entry: Option<(String, Vec<Stmt>)> = None;
+        let mut entry: Option<Entry> = None;
         let mut methods = Vec::new();
         let mut classes = Vec::new();
         // Top-level type declarations, in sequence.
@@ -100,9 +108,10 @@ impl Parser {
             self.parse_class(&mut entry, &mut methods, &mut classes)?;
         }
         match entry {
-            Some((class_name, main)) => Ok(Program {
-                class_name,
-                main,
+            Some(entry) => Ok(Program {
+                class_name: entry.class_name,
+                main: entry.body,
+                main_param: entry.param,
                 methods,
                 classes,
                 uses_exceptions: self.uses_exceptions,
@@ -120,7 +129,7 @@ impl Parser {
     /// the same three sinks (flattened namespace).
     fn parse_class(
         &mut self,
-        entry: &mut Option<(String, Vec<Stmt>)>,
+        entry: &mut Option<Entry>,
         methods: &mut Vec<Method>,
         classes: &mut Vec<Class>,
     ) -> Result<(), String> {
@@ -136,7 +145,8 @@ impl Parser {
         // name here.
         let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
         let is_enum = matches!(self.peek(), Tok::Ident(w) if w == "enum");
-        if is_interface || is_enum {
+        let is_record = self.at_record();
+        if is_interface || is_enum || is_record {
             self.advance();
         } else {
             self.eat(&Tok::Class)?;
@@ -145,6 +155,15 @@ impl Parser {
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
         // `<K, V>` — erased (parsed and discarded).
         self.skip_generics();
+        // A record's header carries its components: `record Point(int x, int y)`.
+        let components = if is_record {
+            self.eat(&Tok::LParen)?;
+            let ps = self.params()?;
+            self.eat(&Tok::RParen)?;
+            ps
+        } else {
+            Vec::new()
+        };
         // `extends`: a class has a single superclass; an interface may extend
         // several interfaces (collected as `interfaces`).
         let mut superclass = None;
@@ -180,37 +199,60 @@ impl Parser {
         self.eat(&Tok::LBrace)?;
 
         let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut static_init = Vec::new();
         let mut ctors = Vec::new();
         let mut inst_methods = Vec::new();
         // An `enum` body opens with its constant list; the ordinary members (if
         // any) follow the `;` that terminates it.
         let enum_constants = if is_enum {
-            self.enum_constants(&name)?
+            self.enum_constants(&name, classes)?
         } else {
             Vec::new()
         };
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
-            if let Some(body) = self.try_main()? {
-                *entry = Some((name.clone(), body));
+            if let Some(body) = self.try_static_block()? {
+                static_init.extend(body);
+            } else if let Some(found) = self.try_main()? {
+                *entry = Some(Entry {
+                    class_name: name.clone(),
+                    ..found
+                });
             } else if self.at_nested_class() {
                 self.parse_class(entry, methods, classes)?;
+            } else if let Some(c) = self.try_compact_ctor(&name, is_record, &components)? {
+                ctors.push(c);
             } else if let Some(c) = self.try_ctor(&name)? {
                 ctors.push(c);
-            } else if let Some((m, is_static)) = self.try_any_method()? {
+            } else if let Some((m, is_static)) = self.try_any_method(&name)? {
                 if is_static {
                     methods.push(m);
                 } else {
                     inst_methods.push(m);
                 }
-            } else if let Some(fs) = self.try_fields()? {
-                fields.extend(fs);
+            } else if let Some((fs, is_static)) = self.try_fields()? {
+                if is_static {
+                    static_declaration(line, fs, &mut static_fields, &mut static_init);
+                } else {
+                    fields.extend(fs);
+                }
             } else {
                 self.skip_member()?;
             }
         }
         self.eat(&Tok::RBrace)?;
         if is_enum {
-            enum_members(line, &mut fields, &mut inst_methods);
+            enum_members(line, &name, &mut fields, &mut inst_methods);
+        }
+        if is_record {
+            record_members(
+                line,
+                &name,
+                &components,
+                &mut fields,
+                &mut ctors,
+                &mut inst_methods,
+            );
         }
         classes.push(Class {
             name,
@@ -220,11 +262,26 @@ impl Parser {
             is_enum,
             enum_constants,
             fields,
+            static_fields,
+            static_init,
             ctors,
             methods: inst_methods,
             line,
         });
         Ok(())
+    }
+
+    /// Parse a `static { … }` initializer block, returning its statements. The
+    /// cursor is restored and `None` returned when the member is something else.
+    fn try_static_block(&mut self) -> Result<Option<Vec<Stmt>>, String> {
+        if !(matches!(self.peek(), Tok::Static)
+            && matches!(self.toks[self.pos + 1].kind, Tok::LBrace))
+        {
+            return Ok(None);
+        }
+        self.advance(); // static
+        self.advance(); // {
+        Ok(Some(self.block()?))
     }
 
     /// Parse an `enum` body's constant list (the cursor just past `{`), and give
@@ -238,20 +295,39 @@ impl Parser {
     /// everything else (virtual dispatch, `instanceof`, reference `==`, arrays)
     /// applies unchanged.
     ///
-    /// A constant carrying an argument list or a class body is rejected rather
-    /// than parsed with the extra dropped: javars has no per-constant state, and
-    /// running `EARTH(5.97)` as a bare `EARTH` would silently lose the mass.
-    fn enum_constants(&mut self, name: &str) -> Result<Vec<String>, String> {
+    /// A constant may carry constructor arguments (`EARTH(5.97e24)`), a class
+    /// body (`PLUS { int apply(…) { … } }`), or both. Java specifies a constant
+    /// with a body as an anonymous *subclass* of the enum, so the body is
+    /// parsed into a real synthetic class pushed onto `classes`; its overrides
+    /// are then reached by the same virtual dispatch every other subclass uses.
+    fn enum_constants(
+        &mut self,
+        name: &str,
+        classes: &mut Vec<Class>,
+    ) -> Result<Vec<EnumConstant>, String> {
         let mut constants = Vec::new();
         while matches!(self.peek(), Tok::Ident(_)) {
             let line = self.line();
             let c = self.ident()?;
-            if self.is(&Tok::LParen) || self.is(&Tok::LBrace) {
-                return Err(format!(
-                    "javars: enum constant `{name}.{c}` with arguments or a body is not supported (line {line})"
-                ));
-            }
-            constants.push(c);
+            let args = if self.is(&Tok::LParen) {
+                self.call_args()?
+            } else {
+                Vec::new()
+            };
+            let body_class = if self.is(&Tok::LBrace) {
+                self.advance();
+                let cl = self.enum_constant_body(name, &c, line)?;
+                let cname = cl.name.clone();
+                classes.push(cl);
+                Some(cname)
+            } else {
+                None
+            };
+            constants.push(EnumConstant {
+                name: c,
+                args,
+                body_class,
+            });
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {
@@ -264,12 +340,263 @@ impl Parser {
         }
         Ok(constants)
     }
+
+    /// Parse an enum constant's `{ … }` body (the cursor just past the `{`) into
+    /// the synthetic subclass that models it. A constant body may declare fields
+    /// and methods but no constructor — the enum's own constructor runs against
+    /// the arguments the constant supplied.
+    fn enum_constant_body(
+        &mut self,
+        enum_name: &str,
+        constant: &str,
+        line: u32,
+    ) -> Result<Class, String> {
+        let name = enum_body_class(enum_name, constant);
+        let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut static_init = Vec::new();
+        let mut methods = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            if let Some((m, _)) = self.try_any_method(&name)? {
+                methods.push(m);
+            } else if let Some((fs, is_static)) = self.try_fields()? {
+                if is_static {
+                    static_declaration(line, fs, &mut static_fields, &mut static_init);
+                } else {
+                    fields.extend(fs);
+                }
+            } else {
+                return Err(format!(
+                    "javars: unsupported member in the body of enum constant `{enum_name}.{constant}` (line {})",
+                    self.line()
+                ));
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Class {
+            name,
+            superclass: Some(enum_name.to_string()),
+            interfaces: Vec::new(),
+            is_interface: false,
+            is_enum: false,
+            enum_constants: Vec::new(),
+            fields,
+            static_fields,
+            static_init,
+            ctors: Vec::new(),
+            methods,
+            line,
+        })
+    }
+}
+
+/// True when `toks[j]` starts a `record Name(` header.
+fn record_at(toks: &[Token], j: usize) -> bool {
+    matches!(&toks[j].kind, Tok::Ident(w) if w == "record")
+        && matches!(toks.get(j + 1).map(|t| &t.kind), Some(Tok::Ident(_)))
+        && matches!(
+            toks.get(j + 2).map(|t| &t.kind),
+            Some(Tok::LParen | Tok::Lt)
+        )
+}
+
+/// Give a `record` the members Java derives from its component list: one final
+/// field per component, the canonical constructor, the component accessors, and
+/// `toString`/`equals`. Anything the body declares itself wins — a record that
+/// writes its own `toString()` keeps it.
+///
+/// Called once per record declaration, after its own members are parsed.
+fn record_members(
+    line: u32,
+    name: &str,
+    components: &[Param],
+    fields: &mut Vec<FieldDecl>,
+    ctors: &mut Vec<Ctor>,
+    methods: &mut Vec<Method>,
+) {
+    for c in components {
+        fields.push(FieldDecl {
+            ty: c.ty.clone(),
+            name: c.name.clone(),
+            init: None,
+        });
+    }
+    // The canonical constructor assigns each component to its field. A compact
+    // constructor already contributed its validation body under the same
+    // parameter list, so the assignments are appended to it — Java's order.
+    let assigns: Vec<Stmt> = components
+        .iter()
+        .map(|c| {
+            Stmt::new(
+                line,
+                StmtKind::FieldAssign {
+                    recv: Expr::This,
+                    name: c.name.clone(),
+                    op: AssignOp::Assign,
+                    value: Expr::Var(c.name.clone()),
+                },
+            )
+        })
+        .collect();
+    let param_tys: Vec<&str> = components.iter().map(|c| c.ty.as_str()).collect();
+    match ctors.iter_mut().find(|c| {
+        c.params
+            .iter()
+            .map(|p| p.ty.as_str())
+            .eq(param_tys.iter().copied())
+    }) {
+        Some(canonical) => canonical.body.extend(assigns),
+        None => ctors.push(Ctor {
+            params: components.to_vec(),
+            body: assigns,
+            line,
+        }),
+    }
+    // One accessor per component.
+    for c in components {
+        if methods
+            .iter()
+            .any(|m| m.name == c.name && m.params.is_empty())
+        {
+            continue;
+        }
+        methods.push(Method {
+            name: c.name.clone(),
+            owner: name.to_string(),
+            params: Vec::new(),
+            ret: c.ty.clone(),
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::Field {
+                    recv: Box::new(Expr::This),
+                    name: c.name.clone(),
+                })),
+            )],
+            is_abstract: false,
+            line,
+        });
+    }
+    // `toString()` → `Point[x=1, y=2]`.
+    if !methods
+        .iter()
+        .any(|m| m.name == "toString" && m.params.is_empty())
+    {
+        let mut text = Expr::Str(format!("{name}["));
+        for (i, c) in components.iter().enumerate() {
+            let sep = if i == 0 { "" } else { ", " };
+            text = concat(text, Expr::Str(format!("{sep}{}=", c.name)));
+            text = concat(
+                text,
+                Expr::Field {
+                    recv: Box::new(Expr::This),
+                    name: c.name.clone(),
+                },
+            );
+        }
+        text = concat(text, Expr::Str("]".to_string()));
+        methods.push(Method {
+            name: "toString".to_string(),
+            owner: name.to_string(),
+            params: Vec::new(),
+            ret: "String".to_string(),
+            body: vec![Stmt::new(line, StmtKind::Return(Some(text)))],
+            is_abstract: false,
+            line,
+        });
+    }
+    // `equals(Object)` — component-wise, guarded by the type test.
+    if !methods
+        .iter()
+        .any(|m| m.name == "equals" && m.params.len() == 1)
+    {
+        let other = "#other";
+        let mut cond = Expr::Bool(true);
+        for c in components {
+            cond = Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(cond),
+                rhs: Box::new(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Field {
+                        recv: Box::new(Expr::This),
+                        name: c.name.clone(),
+                    }),
+                    rhs: Box::new(Expr::Field {
+                        recv: Box::new(Expr::Var(other.to_string())),
+                        name: c.name.clone(),
+                    }),
+                }),
+            };
+        }
+        methods.push(Method {
+            name: "equals".to_string(),
+            owner: name.to_string(),
+            params: vec![Param {
+                ty: "Object".to_string(),
+                name: other.to_string(),
+            }],
+            ret: "boolean".to_string(),
+            body: vec![
+                Stmt::new(
+                    line,
+                    StmtKind::If {
+                        cond: Expr::Unary {
+                            op: UnOp::Not,
+                            rhs: Box::new(Expr::InstanceOf {
+                                expr: Box::new(Expr::Var(other.to_string())),
+                                class: name.to_string(),
+                            }),
+                        },
+                        then: vec![Stmt::new(line, StmtKind::Return(Some(Expr::Bool(false))))],
+                        els: Vec::new(),
+                    },
+                ),
+                Stmt::new(line, StmtKind::Return(Some(cond))),
+            ],
+            is_abstract: false,
+            line,
+        });
+    }
+}
+
+/// `lhs + rhs` — the string-concatenation node the synthesized `toString`
+/// bodies are built from.
+fn concat(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
+/// Split a `static` field declaration into its storage (one cell per field,
+/// seeded with the type's default) and its initialization (an assignment run at
+/// class-init time, in textual order with the `static { … }` blocks).
+fn static_declaration(
+    line: u32,
+    decls: Vec<FieldDecl>,
+    fields: &mut Vec<FieldDecl>,
+    init: &mut Vec<Stmt>,
+) {
+    for f in decls {
+        if let Some(value) = f.init.clone() {
+            init.push(Stmt::new(
+                line,
+                StmtKind::Assign {
+                    name: f.name.clone(),
+                    op: AssignOp::Assign,
+                    value,
+                },
+            ));
+        }
+        fields.push(FieldDecl { init: None, ..f });
+    }
 }
 
 /// Give an `enum` its synthesized state and accessors, after its own members
 /// have been parsed so a user-declared `toString()`/`name()`/`ordinal()` is left
 /// alone. Called once per enum declaration.
-fn enum_members(line: u32, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method>) {
+fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method>) {
     fields.push(FieldDecl {
         ty: "String".to_string(),
         name: ENUM_NAME.to_string(),
@@ -282,6 +609,7 @@ fn enum_members(line: u32, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
         name: method.to_string(),
+        owner: owner.to_string(),
         params: Vec::new(),
         ret: ret.to_string(),
         body: vec![Stmt::new(
@@ -316,6 +644,7 @@ fn enum_members(line: u32, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method
     {
         methods.push(Method {
             name: "equals".to_string(),
+            owner: owner.to_string(),
             params: vec![Param {
                 ty: "Object".to_string(),
                 name: "other".to_string(),
@@ -364,7 +693,7 @@ impl Parser {
     }
 
     /// True when the member at the cursor is a (possibly modifier-prefixed)
-    /// nested `class` declaration.
+    /// nested `class`, `interface`, `enum`, or `record` declaration.
     fn at_nested_class(&self) -> bool {
         let mut j = self.pos;
         while matches!(self.toks[j].kind, Tok::Public | Tok::Static)
@@ -373,7 +702,42 @@ impl Parser {
             j += 1;
         }
         matches!(self.toks[j].kind, Tok::Class)
-            || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "interface")
+            || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "interface" || w == "enum")
+            || record_at(&self.toks, j)
+    }
+
+    /// True when the cursor is on a `record Name(` header. `record` is a
+    /// contextual keyword in Java, so the shape — not the word alone — is what
+    /// makes it one; a variable or method named `record` still parses.
+    fn at_record(&self) -> bool {
+        record_at(&self.toks, self.pos)
+    }
+
+    /// A record's *compact* constructor — `Point { … }`, no parameter list. Its
+    /// body validates/normalizes the components; the field assignments Java
+    /// appends afterwards are supplied by [`record_members`], so the canonical
+    /// constructor synthesized here already carries the component parameters.
+    fn try_compact_ctor(
+        &mut self,
+        class_name: &str,
+        is_record: bool,
+        components: &[Param],
+    ) -> Result<Option<Ctor>, String> {
+        if !is_record
+            || !(matches!(self.peek(), Tok::Ident(n) if n == class_name)
+                && matches!(self.toks[self.pos + 1].kind, Tok::LBrace))
+        {
+            return Ok(None);
+        }
+        let line = self.line();
+        self.advance(); // class name
+        self.advance(); // {
+        let body = self.block()?;
+        Ok(Some(Ctor {
+            params: components.to_vec(),
+            body,
+            line,
+        }))
     }
 
     /// If the cursor is at a constructor (`[public] Name(<params>) { ... }` where
@@ -404,16 +768,21 @@ impl Parser {
         Ok(Some(Ctor { params, body, line }))
     }
 
-    /// Parse one or more instance-field declarations sharing a type
-    /// (`int x, y = 3;`). Restores and returns `None` if the member is not a
-    /// field (e.g. a method the earlier probes already rejected — a `type name (`
-    /// shape). `static` fields are accepted but treated as instance fields
-    /// (javars has no per-class statics yet).
-    fn try_fields(&mut self) -> Result<Option<Vec<FieldDecl>>, String> {
+    /// Parse one or more field declarations sharing a type (`int x, y = 3;`).
+    /// Restores and returns `None` if the member is not a field (e.g. a method
+    /// the earlier probes already rejected — a `type name (` shape). The `bool`
+    /// of the result reports whether the declaration carried `static`: a
+    /// `static` field is one shared cell per class and an instance field is one
+    /// per object, so the caller routes them to different sinks.
+    fn try_fields(&mut self) -> Result<Option<(Vec<FieldDecl>, bool)>, String> {
         let save = self.pos;
+        let mut saw_static = false;
         while matches!(self.peek(), Tok::Public | Tok::Static)
             || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "private" || w == "protected" || w == "volatile" || w == "transient")
         {
+            if matches!(self.peek(), Tok::Static) {
+                saw_static = true;
+            }
             self.advance();
         }
         if !self.at_type() {
@@ -450,7 +819,7 @@ impl Parser {
             }
         }
         self.eat(&Tok::Semi)?;
-        Ok(Some(out))
+        Ok(Some((out, saw_static)))
     }
 
     /// If the cursor is at a method (`[modifiers] <ret> name(<params>) { ... }`),
@@ -458,7 +827,7 @@ impl Parser {
     /// and return `None` (fields and constructors are handled by their own
     /// probes). `main` is matched earlier by [`Parser::try_main`], so it never
     /// reaches here.
-    fn try_any_method(&mut self) -> Result<Option<(Method, bool)>, String> {
+    fn try_any_method(&mut self, owner: &str) -> Result<Option<(Method, bool)>, String> {
         let save = self.pos;
         let mut saw_static = false;
         // Modifiers, including interface method modifiers (`default`, `abstract`)
@@ -508,6 +877,7 @@ impl Parser {
         Ok(Some((
             Method {
                 name,
+                owner: owner.to_string(),
                 params,
                 ret,
                 body,
@@ -545,7 +915,15 @@ impl Parser {
             return Ok(out);
         }
         loop {
-            let ty = self.type_name()?;
+            let mut ty = self.type_name()?;
+            // A varargs parameter (`String... args`) is an array parameter; the
+            // three dots carry no further meaning here.
+            if self.is(&Tok::Dot) && matches!(self.toks[self.pos + 1].kind, Tok::Dot) {
+                self.advance();
+                self.advance();
+                self.eat(&Tok::Dot)?;
+                ty.push_str("[]");
+            }
             let name = self.ident()?;
             out.push(Param { ty, name });
             if self.is(&Tok::Comma) {
@@ -579,8 +957,10 @@ impl Parser {
     }
 
     /// If the cursor is at `public static void main(String[] args)`, parse its
-    /// body and return it. Otherwise leave the cursor untouched and return None.
-    fn try_main(&mut self) -> Result<Option<Vec<Stmt>>, String> {
+    /// body and the name it gives its parameter. Otherwise leave the cursor
+    /// untouched and return None. The enclosing class name is the caller's, so
+    /// the returned [`Entry`] carries an empty one for it to fill in.
+    fn try_main(&mut self) -> Result<Option<Entry>, String> {
         let save = self.pos;
         // modifiers in any order
         let mut saw_static = false;
@@ -600,19 +980,19 @@ impl Parser {
         self.eat(&Tok::Void)?; // void
         self.ident()?; // main
         self.eat(&Tok::LParen)?;
-        // skip the parameter list — slice 1 ignores argv
-        let mut depth = 1;
-        while depth > 0 && !self.is(&Tok::Eof) {
-            match self.advance() {
-                Tok::LParen => depth += 1,
-                Tok::RParen => depth -= 1,
-                _ => {}
-            }
-        }
+        // `main` takes `String[] args` (or `String... args`, or nothing). The
+        // name is what the compiler binds the real program arguments to.
+        let params = self.params()?;
+        self.eat(&Tok::RParen)?;
+        let param = params.into_iter().next().map(|p| p.name);
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
         let body = self.block()?;
-        Ok(Some(body))
+        Ok(Some(Entry {
+            class_name: String::new(),
+            body,
+            param,
+        }))
     }
 
     /// Skip a non-`main` member by matching its braces (or a field `;`).

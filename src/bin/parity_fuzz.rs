@@ -18,9 +18,11 @@
 //! decimal/scientific threshold), `String.format`, the `String` instance methods,
 //! `Math` overload result typing, the runtime faults javars raises itself
 //! (`fault`), the cleanup blocks a jump has to run (`finally`),
-//! try-with-resources close ordering (`resource`), and `enum` identity and
-//! ordering (`enum`). Pure random bytes only produce mutual parse errors that
-//! agree on both sides and teach nothing.
+//! try-with-resources close ordering (`resource`), `enum` identity, ordering,
+//! per-constant state and constant bodies (`enum`), class-level `static` field
+//! storage and initialization order (`static`), and the members a `record`
+//! derives from its components (`record`). Pure random bytes only produce
+//! mutual parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
@@ -477,7 +479,7 @@ fn g_resource(r: &mut Rng) -> String {
 /// enum with a body of its own.
 fn g_enum(r: &mut Rng) -> String {
     let c = pick(r, &["RED", "GREEN", "BLUE"]);
-    match r.below(7) {
+    match r.below(10) {
         0 => format!(
             "{{ Color e = Color.{c}; System.out.println(e + \",\" + e.name() + \",\" + e.ordinal()); }}"
         ),
@@ -496,11 +498,72 @@ fn g_enum(r: &mut Rng) -> String {
             "{{ Color e = Color.{c}; switch (e) {{ case RED: System.out.println(\"r\"); break; case GREEN: System.out.println(\"g\"); break; default: System.out.println(\"d\"); }} }}"
         ),
         5 => format!("{{ System.out.println(shout(Color.{c}) + \" \" + next(Color.{c})); }}"),
-        _ => format!(
+        6 => format!(
             "{{ Op o = Op.{}; System.out.println(o.apply({}, {}) + \" \" + o.isMul() + \" \" + o); }}",
             pick(r, &["ADD", "SUB", "MUL"]),
             pick(r, INTS),
             pick(r, DIVS)
+        ),
+        // A constant carrying constructor arguments — per-constant state.
+        7 => format!(
+            "{{ Planet pl = Planet.{}; System.out.println(pl + \",\" + pl.mass() + \",\" + pl.heavy() + \",\" + pl.ordinal()); }}",
+            pick(r, &["MERCURY", "EARTH", "JUPITER"])
+        ),
+        8 => "{ for (Planet pl : Planet.values()) { System.out.print(pl.mass() + \" \"); } System.out.println(); }"
+            .to_string(),
+        // A constant with a *body* — an anonymous subclass whose override the
+        // enum's own abstract method dispatches to.
+        _ => format!(
+            "{{ Ops o = Ops.{}; System.out.println(o.apply({}, {}) + \",\" + o.label() + \",\" + o); }}",
+            pick(r, &["PLUS", "MINUS", "TIMES"]),
+            pick(r, INTS),
+            pick(r, DIVS)
+        ),
+    }
+}
+
+/// `static` fields: class-level storage that outlives every instance, reached
+/// both qualified (`St.n`) and through an inheriting class (`Sub2.n`), plus the
+/// `static { … }` block and static-field initializers that seed it before
+/// `main` runs. Every probe assigns before it reads, so a probe's output does
+/// not depend on which other probes ran first.
+fn g_static(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    match r.below(6) {
+        0 => format!("{{ St.n = {a}; System.out.println(St.n + \",\" + St.get()); }}"),
+        1 => format!("{{ St.n = {a}; St.bump(); St.n += 3; System.out.println(St.n); }}"),
+        2 => "{ System.out.println(St.LABEL + St.SIZE + \",\" + St.INIT); }".to_string(),
+        3 => format!("{{ St.n = {a}; System.out.println(St.n / 2 + \",\" + St.n % 3); }}"),
+        4 => format!(
+            "{{ St.arr[1] = {a}; System.out.println(St.arr[0] + \",\" + St.arr[1] + \",\" + St.arr.length); }}"
+        ),
+        _ => format!("{{ St.n = {a}; St.n++; System.out.println(St.n + \",\" + Sub2.n); }}"),
+    }
+}
+
+/// `record` types: the derived accessors, `toString`, component-wise `equals`,
+/// a compact constructor's validation, and a user-declared extra method.
+fn g_record(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(6) {
+        0 => format!("{{ System.out.println(new Pt({a}, {b})); }}"),
+        1 => format!(
+            "{{ Pt p = new Pt({a}, {b}); System.out.println(p.x() + \",\" + p.y() + \",\" + p.sum()); }}"
+        ),
+        2 => format!(
+            "{{ System.out.println(new Pt({a}, {b}).equals(new Pt({a}, {b})) + \",\" + new Pt({a}, {b}).equals(new Pt({b}, {a}))); }}"
+        ),
+        3 => format!(
+            "{{ Tag t = new Tag({}, {}); System.out.println(t + \" \" + t.tag().length()); }}",
+            pick(r, STRS),
+            pick(r, DBLS)
+        ),
+        4 => format!(
+            "{{ Pt[] ps = {{ new Pt({a}, {b}), new Pt(0, 0) }}; for (Pt q : ps) {{ System.out.print(q + \";\"); }} System.out.println(); }}"
+        ),
+        _ => format!(
+            "{{ try {{ System.out.println(new Ord({a}, {b})); }} catch (IllegalArgumentException e) {{ System.out.println(\"bad \" + e.getMessage()); }} }}"
         ),
     }
 }
@@ -516,13 +579,48 @@ const SUPPORT: &str = concat!(
     "    static Color next(Color c) { return c == Color.BLUE ? Color.RED : Color.values()[c.ordinal() + 1]; }\n",
 );
 
-/// The `AutoCloseable` the resource probes open and close.
+/// The types the probes construct: the `AutoCloseable` the resource probes open
+/// and close, the enums (bare, stateful, and body-carrying), the class holding
+/// the `static` fields, and the records.
 const SUPPORT_CLASS: &str = concat!(
     "enum Color { RED, GREEN, BLUE }\n",
     "enum Op {\n",
     "    ADD, SUB, MUL;\n",
     "    int apply(int a, int b) { switch (this) { case ADD: return a + b; case SUB: return a - b; default: return a * b; } }\n",
     "    boolean isMul() { return this == MUL; }\n",
+    "}\n",
+    // An enum whose constants carry constructor arguments (per-constant state).
+    "enum Planet {\n",
+    "    MERCURY(3.3), EARTH(5.97), JUPITER(1898.0);\n",
+    "    private final double mass;\n",
+    "    Planet(double m) { this.mass = m; }\n",
+    "    double mass() { return mass; }\n",
+    "    boolean heavy() { return mass > 100.0; }\n",
+    "}\n",
+    // An enum whose constants carry bodies — anonymous subclasses overriding an
+    // abstract method (and, for one of them, a concrete one).
+    "enum Ops {\n",
+    "    PLUS { int apply(int a, int b) { return a + b; } },\n",
+    "    MINUS { int apply(int a, int b) { return a - b; } },\n",
+    "    TIMES { int apply(int a, int b) { return a * b; } String label() { return \"x\"; } };\n",
+    "    abstract int apply(int a, int b);\n",
+    "    String label() { return name().toLowerCase(); }\n",
+    "}\n",
+    "class St {\n",
+    "    static int n = 1;\n",
+    "    static final String LABEL = \"L\";\n",
+    "    static int SIZE = 2 + 3;\n",
+    "    static int INIT;\n",
+    "    static int[] arr = {7, 8};\n",
+    "    static { INIT = SIZE * 2; }\n",
+    "    static int get() { return n; }\n",
+    "    static void bump() { n = n * 2; }\n",
+    "}\n",
+    "class Sub2 extends St { }\n",
+    "record Pt(int x, int y) { int sum() { return x + y; } }\n",
+    "record Tag(String tag, double weight) { }\n",
+    "record Ord(int lo, int hi) {\n",
+    "    Ord { if (lo > hi) { throw new IllegalArgumentException(lo + \">\" + hi); } }\n",
     "}\n",
     "class Res implements AutoCloseable {\n",
     "    String n;\n",
@@ -557,6 +655,8 @@ enum Mode {
     Finally,
     Resource,
     Enum,
+    Static,
+    Record,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -583,6 +683,8 @@ const CONCRETE: &[Mode] = &[
     Mode::Finally,
     Mode::Resource,
     Mode::Enum,
+    Mode::Static,
+    Mode::Record,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -611,6 +713,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Finally => "finally",
         Mode::Resource => "resource",
         Mode::Enum => "enum",
+        Mode::Static => "static",
+        Mode::Record => "record",
     }
 }
 
@@ -651,6 +755,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Finally => g_finally(r),
         Mode::Resource => g_resource(r),
         Mode::Enum => g_enum(r),
+        Mode::Static => g_static(r),
+        Mode::Record => g_record(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

@@ -88,6 +88,11 @@ struct ClassInfo {
     fields: Vec<FieldInit>,
     /// Declared type of every field (own + inherited), for static typing.
     field_types: HashMap<String, String>,
+    /// Declared type of every `static` field visible on this class — its own
+    /// plus every ancestor's, because Java inherits statics by name. Maps the
+    /// field name to `(declaring class, declared type)`; the declaring class is
+    /// what mints the global, so `Sub.count` and `Base.count` name one cell.
+    static_fields: HashMap<String, (String, String)>,
     /// Every method this class can dispatch, keyed by `(name, param_types)` so
     /// same-name overloads differing only in parameter type coexist. Interface
     /// abstract/`default` methods are folded in first, then the class chain
@@ -282,6 +287,11 @@ struct Compiler {
     /// The class of `this` while lowering an instance method or constructor;
     /// `None` in `main` and in `static` methods.
     this_class: Option<String>,
+    /// The class textually enclosing the code being lowered — the one an
+    /// unqualified `static` field name resolves against. Unlike
+    /// [`Compiler::this_class`] it is also set inside a `static` method (to the
+    /// method's declaring class) and inside `main` (to the entry class).
+    current_class: Option<String>,
     /// Counter minting unique internal temp names (`new`/compound-assign temps).
     temp_counter: u32,
     /// True when the program uses exceptions ([`Program::uses_exceptions`]).
@@ -337,15 +347,22 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         global_decl_types: HashMap::new(),
         classes,
         this_class: None,
+        current_class: Some(prog.class_name.clone()),
         temp_counter: 0,
         has_exceptions: prog.uses_exceptions,
         tries: Vec::new(),
         finallys: Vec::new(),
     };
     // ── main body (global scope) ──
-    // Enum constants are singletons that exist before any user code runs, so
-    // their instances are built first.
+    // Class-level state exists before any user code runs, in Java's order:
+    // every `static` field takes its type's default value, enum constants are
+    // constructed (they are the first statics of their type), then the static
+    // initializers and `static { … }` blocks run in textual order.
+    c.emit_static_defaults(prog);
     c.emit_enum_prologue(prog)?;
+    c.emit_static_init(prog)?;
+    // `main`'s `String[]` parameter is the real program arguments.
+    c.bind_main_args(prog);
     for stmt in &prog.main {
         c.stmt(stmt)?;
     }
@@ -457,6 +474,19 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         }
         let mut fields = Vec::new();
         let mut field_types = HashMap::new();
+        // `static` fields, ancestors first so a subclass re-declaration shadows
+        // the inherited one (and interface constants are visible too).
+        let mut static_fields = HashMap::new();
+        for iface in &iface_order {
+            for f in &by_name[iface.as_str()].static_fields {
+                static_fields.insert(f.name.clone(), (iface.clone(), f.ty.clone()));
+            }
+        }
+        for anc_name in &ancestry {
+            for f in &by_name[anc_name.as_str()].static_fields {
+                static_fields.insert(f.name.clone(), (anc_name.clone(), f.ty.clone()));
+            }
+        }
         // Keyed by (name, param_types) so type-overloads coexist while an
         // override (same name + same param types) replaces the inherited entry.
         let mut methods: HashMap<(String, Vec<String>), MethodMeta> = HashMap::new();
@@ -524,9 +554,10 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 supertypes,
                 is_interface: cl.is_interface,
                 is_enum: cl.is_enum,
-                enum_constants: cl.enum_constants.clone(),
+                enum_constants: cl.enum_constants.iter().map(|c| c.name.clone()).collect(),
                 fields,
                 field_types,
+                static_fields,
                 methods,
                 ctors,
             },
@@ -595,13 +626,16 @@ impl Compiler {
         for cl in &prog.classes {
             for (ordinal, constant) in cl.enum_constants.iter().enumerate() {
                 let line = cl.line;
-                // `new C()` runs the field defaults and the (implicit) ctor …
-                self.new_object(&cl.name, &[], line)?;
+                // A constant with a body is an instance of its own synthetic
+                // subclass, but it is the *enum's* constructor that runs — Java
+                // gives an anonymous enum subclass no constructor of its own.
+                let runtime_class = constant.body_class.as_deref().unwrap_or(&cl.name);
+                self.new_object_as(runtime_class, &cl.name, &constant.args, line)?;
                 let obj = self.temp();
                 self.emit_set(&obj, line);
                 // … then the identity every enum constant carries.
                 for (field, value) in [
-                    (ENUM_NAME, Expr::Str(constant.clone())),
+                    (ENUM_NAME, Expr::Str(constant.name.clone())),
                     (ENUM_ORDINAL, Expr::Int(ordinal as i64)),
                 ] {
                     self.emit_get(&obj, line);
@@ -612,9 +646,123 @@ impl Compiler {
                     self.b.emit(Op::Pop, line);
                 }
                 self.emit_get(&obj, line);
-                self.emit_global_set(&enum_global(&cl.name, constant), line);
+                self.emit_global_set(&enum_global(&cl.name, &constant.name), line);
             }
         }
+        Ok(())
+    }
+
+    // ── `static` fields ──────────────────────────────────────────────────
+    //
+    // A `static` field is one cell shared by every instance and readable from
+    // every frame, which is exactly what a fusevm global is (frame slots are
+    // per-call). So each one gets a compiler-minted global — `#static#T#n` —
+    // seeded with the field's default before any user code runs, and both the
+    // qualified (`T.n`) and unqualified (`n`, inside the class) forms lower to
+    // a read/write of that global.
+
+    /// Seed every `static` field with its declared type's default value. Runs
+    /// before any initializer so a field read during another class's static
+    /// initialization sees `0`/`null` rather than nothing — Java's rule.
+    fn emit_static_defaults(&mut self, prog: &Program) {
+        for cl in &prog.classes {
+            for f in &cl.static_fields {
+                self.emit_type_default(&f.ty, cl.line);
+                self.emit_global_set(&static_global(&cl.name, &f.name), cl.line);
+            }
+        }
+    }
+
+    /// Run each class's static initialization — its field initializers and
+    /// `static { … }` blocks, in textual order — with the class in scope so an
+    /// unqualified name resolves to its own statics.
+    fn emit_static_init(&mut self, prog: &Program) -> Result<(), String> {
+        for cl in &prog.classes {
+            if cl.static_init.is_empty() {
+                continue;
+            }
+            let saved = self.current_class.replace(cl.name.clone());
+            let result = cl.static_init.iter().try_for_each(|s| self.stmt(s));
+            self.current_class = saved;
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Bind `main`'s `String[]` parameter to the real program arguments.
+    /// Nothing is emitted for a `main()` that declares no parameter.
+    fn bind_main_args(&mut self, prog: &Program) {
+        let Some(name) = &prog.main_param else {
+            return;
+        };
+        let name = name.clone();
+        self.declare_local(&name, "String[]", NumType::Other);
+        self.b.emit(Op::CallBuiltin(crate::host::JARGV, 0), 0);
+        self.emit_set(&name, 0);
+    }
+
+    /// The class declaring the `static` field an unqualified `name` refers to,
+    /// with its declared type. `None` when `name` is a local/parameter (which
+    /// shadows a field), or when the enclosing class has no such static.
+    fn static_field_owner(&self, name: &str) -> Option<(String, String)> {
+        if self.is_declared_var(name) {
+            return None;
+        }
+        let cur = self.current_class.as_deref()?;
+        self.classes.get(cur)?.static_fields.get(name).cloned()
+    }
+
+    /// When `e` is `ClassName.field` naming a `static` field, its declaring
+    /// class and declared type — the `Expr::Field` shape whose receiver is a
+    /// *type* rather than a value. A declared variable of the same name always
+    /// wins, exactly as it does for an enum constant.
+    fn static_field_ref(&self, e: &Expr) -> Option<(String, String)> {
+        let Expr::Field { recv, name } = e else {
+            return None;
+        };
+        let Expr::Var(class) = recv.as_ref() else {
+            return None;
+        };
+        if self.is_declared_var(class) {
+            return None;
+        }
+        self.classes.get(class)?.static_fields.get(name).cloned()
+    }
+
+    /// The declaring class + declared type of whichever `static` field an
+    /// assignment target names — an unqualified `n` or a qualified `T.n`.
+    fn static_target(&self, recv: &Expr, name: &str) -> Option<(String, String)> {
+        match recv {
+            Expr::This => self.static_field_owner(name),
+            _ => self.static_field_ref(&Expr::Field {
+                recv: Box::new(recv.clone()),
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    /// Lower `<static field> <op>= value` — a read/modify/write of the field's
+    /// global. `=` writes straight through.
+    fn static_assign(
+        &mut self,
+        class: &str,
+        ty: &str,
+        name: &str,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        let global = static_global(class, name);
+        if op == AssignOp::Assign {
+            self.expr(value)?;
+            self.emit_global_set(&global, line);
+            return Ok(());
+        }
+        let target = numtype_of_ty(ty).unwrap_or(NumType::Other);
+        let wrap = self.compound_wraps(Some(ty), value);
+        self.emit_global_get(&global, line);
+        self.emit_compound(op, value, target, wrap, line)?;
+        self.emit_global_set(&global, line);
         Ok(())
     }
 
@@ -663,6 +811,19 @@ impl Compiler {
             ("valueOf", 1) => Some(class),
             _ => None,
         }
+    }
+
+    /// The user class named by a bare receiver (`Counter.reset()`), or `None`
+    /// when the receiver is a value rather than a type name. A declared variable
+    /// of the same name always wins.
+    fn user_class_ref(&self, recv: &Expr) -> Option<String> {
+        let Expr::Var(name) = recv else {
+            return None;
+        };
+        if self.is_declared_var(name) || self.bare_var_type(name).is_some() {
+            return None;
+        }
+        self.classes.contains_key(name).then(|| name.clone())
     }
 
     /// The enum type named by a bare receiver (`Color.values()`), or `None` when
@@ -811,16 +972,13 @@ impl Compiler {
     fn expr_array_type(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Var(name) => {
-                let ty = self.var_decl_type(name)?;
-                if ty.ends_with("[]") {
-                    return Some(ty.to_string());
-                }
-                // A bare field of `this`.
-                let this = self.this_class.as_ref()?;
-                let ft = self.classes.get(this)?.field_types.get(name)?;
-                ft.ends_with("[]").then(|| ft.clone())
+                let ty = self.bare_var_type(name)?;
+                ty.ends_with("[]").then_some(ty)
             }
             Expr::Field { recv, name } => {
+                if let Some((_, ty)) = self.static_field_ref(e) {
+                    return ty.ends_with("[]").then_some(ty);
+                }
                 let rc = self.expr_class(recv)?;
                 let ft = self.classes.get(&rc)?.field_types.get(name)?;
                 ft.ends_with("[]").then(|| ft.clone())
@@ -848,22 +1006,15 @@ impl Compiler {
         match e {
             Expr::This => self.this_class.clone(),
             Expr::Var(name) => {
-                if let Some(ty) = self.var_decl_type(name) {
-                    if self.classes.contains_key(ty) {
-                        return Some(ty.to_string());
-                    }
-                }
-                if let Some(class) = self.enclosing_enum_constant(name) {
-                    return Some(class);
-                }
-                // A bare field reference of `this`.
-                let this = self.this_class.as_ref()?;
-                let ty = self.classes.get(this)?.field_types.get(name)?;
-                self.classes.contains_key(ty).then(|| ty.to_string())
+                let ty = self.bare_var_type(name)?;
+                self.classes.contains_key(&ty).then_some(ty)
             }
             Expr::Field { recv, name } => {
                 if let Some(class) = self.enum_constant_ref(e) {
                     return Some(class);
+                }
+                if let Some((_, ty)) = self.static_field_ref(e) {
+                    return self.classes.contains_key(&ty).then_some(ty);
                 }
                 let rc = self.expr_class(recv)?;
                 let ty = self.classes.get(&rc)?.field_types.get(name)?;
@@ -881,6 +1032,12 @@ impl Compiler {
             } => {
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return self.classes.contains_key(&t).then_some(t);
+                }
+                if self.user_class_ref(recv).is_some() {
+                    let arg_tys: Vec<Option<String>> =
+                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let ret = self.resolve_static_call(method, &arg_tys)?.ret_name;
+                    return self.classes.contains_key(&ret).then_some(ret);
                 }
                 let rc = self.expr_class(recv)?;
                 let arg_tys: Vec<Option<String>> =
@@ -901,8 +1058,17 @@ impl Compiler {
         if let Some(class) = self.enclosing_enum_constant(name) {
             return Some(class);
         }
-        let this = self.this_class.as_ref()?;
-        self.classes.get(this)?.field_types.get(name).cloned()
+        if let Some(this) = self.this_class.as_ref() {
+            if let Some(t) = self
+                .classes
+                .get(this)
+                .and_then(|ci| ci.field_types.get(name))
+            {
+                return Some(t.clone());
+            }
+        }
+        // An unqualified `static` field of the enclosing class.
+        self.static_field_owner(name).map(|(_, ty)| ty)
     }
 
     /// The static Java type-name of an expression (`int`, `double`, `boolean`,
@@ -954,6 +1120,9 @@ impl Compiler {
                 if let Some(class) = self.enum_constant_ref(e) {
                     return Some(class);
                 }
+                if let Some((_, ty)) = self.static_field_ref(e) {
+                    return Some(ty);
+                }
                 let rc = self.expr_class(recv)?;
                 self.classes.get(&rc)?.field_types.get(name).cloned()
             }
@@ -982,6 +1151,15 @@ impl Compiler {
             } => {
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return Some(t);
+                }
+                // `T.helper(x)` — a user class's `static` method, which lives in
+                // the same flat pool a bare `helper(x)` resolves through.
+                if self.user_class_ref(recv).is_some() {
+                    let arg_tys: Vec<Option<String>> =
+                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    return self
+                        .resolve_static_call(method, &arg_tys)
+                        .map(|s| s.ret_name);
                 }
                 // A bare stdlib class receiver (`Integer.parseInt`) is a static
                 // call whose declared return type is known.
@@ -1039,13 +1217,22 @@ impl Compiler {
     }
 
     /// Look up the declared numeric type of `name`, defaulting to `Other` when
-    /// unknown (an undeclared read, or a type javars does not track).
+    /// unknown (an undeclared read, or a type javars does not track). A name
+    /// that is not a local falls back to whatever the enclosing class makes it —
+    /// an instance field of `this` or a `static` field — so a bare `int` field
+    /// truncates its division the same way an `int` local does.
     fn lookup_type(&self, name: &str) -> NumType {
         let map = match &self.scope {
             Some(scope) => &scope.types,
             None => &self.global_types,
         };
-        map.get(name).copied().unwrap_or(NumType::Other)
+        if let Some(nt) = map.get(name) {
+            return *nt;
+        }
+        self.bare_var_type(name)
+            .as_deref()
+            .and_then(numtype_of_ty)
+            .unwrap_or(NumType::Other)
     }
 
     /// Mint a unique internal temp name (`#t0`, `#t1`, …). `#` is not a legal
@@ -1586,6 +1773,15 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                // `T.helper(x)` — the static pool's declared return type.
+                if self.user_class_ref(recv).is_some() {
+                    let arg_tys: Vec<Option<String>> =
+                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    return self
+                        .resolve_static_call(method, &arg_tys)
+                        .map(|s| s.ret)
+                        .unwrap_or(NumType::Other);
+                }
                 // Static stdlib calls that yield an `int` participate in `/`
                 // truncation typing.
                 if let Expr::Var(class) = recv.as_ref() {
@@ -1620,6 +1816,9 @@ impl Compiler {
                 if name == "length" {
                     return NumType::Int;
                 }
+                if let Some((_, ty)) = self.static_field_ref(e) {
+                    return numtype_of_ty(&ty).unwrap_or(NumType::Other);
+                }
                 self.expr_class(recv)
                     .and_then(|rc| {
                         self.classes
@@ -1653,6 +1852,8 @@ impl Compiler {
         let mut scope = MethodScope::new();
         register_params(&mut scope, &m.params);
         self.scope = Some(scope);
+        // A `static` method sees its own class's statics unqualified.
+        let saved_class = self.current_class.replace(m.owner.clone());
 
         // Prologue: pop args into their slots. The last parameter is on top of
         // the stack, so bind slots high-to-low.
@@ -1660,15 +1861,14 @@ impl Compiler {
             self.b.emit(Op::SetSlot(i as u16), m.line);
         }
 
-        for s in &m.body {
-            self.stmt(s)?;
-        }
+        let result = m.body.iter().try_for_each(|s| self.stmt(s));
         // Implicit `return;` on fall-off — `void` methods yield `null`.
         self.b.emit(Op::LoadUndef, m.line);
         self.b.emit(Op::ReturnValue, m.line);
 
         self.scope = None;
-        Ok(())
+        self.current_class = saved_class;
+        result
     }
 
     /// Lower one instance method to a subroutine named `Class#method#argc`. Slot
@@ -1685,20 +1885,20 @@ impl Compiler {
         register_params(&mut scope, &m.params);
         self.scope = Some(scope);
         self.this_class = Some(class.to_string());
+        let saved_class = self.current_class.replace(class.to_string());
 
         // Prologue: bind `this` (slot 0) + params (slots 1..=n), high-to-low.
         for i in (0..=m.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), m.line);
         }
-        for s in &m.body {
-            self.stmt(s)?;
-        }
+        let result = m.body.iter().try_for_each(|s| self.stmt(s));
         self.b.emit(Op::LoadUndef, m.line);
         self.b.emit(Op::ReturnValue, m.line);
 
         self.scope = None;
         self.this_class = None;
-        Ok(())
+        self.current_class = saved_class;
+        result
     }
 
     /// Lower a constructor to a subroutine named `Class#<init>#argc`. Field
@@ -1716,19 +1916,19 @@ impl Compiler {
         register_params(&mut scope, &ctor.params);
         self.scope = Some(scope);
         self.this_class = Some(cl.name.clone());
+        let saved_class = self.current_class.replace(cl.name.clone());
 
         for i in (0..=ctor.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), ctor.line);
         }
-        for s in &ctor.body {
-            self.stmt(s)?;
-        }
+        let result = ctor.body.iter().try_for_each(|s| self.stmt(s));
         self.b.emit(Op::LoadUndef, ctor.line);
         self.b.emit(Op::ReturnValue, ctor.line);
 
         self.scope = None;
         self.this_class = None;
-        Ok(())
+        self.current_class = saved_class;
+        result
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
@@ -1777,6 +1977,11 @@ impl Compiler {
                 if self.implicit_this_field(name).is_some() {
                     let recv = Expr::This;
                     return self.field_assign(&recv, name, *op, value, line);
+                }
+                // A bare name that is a `static` field of the enclosing class
+                // writes that class's shared cell.
+                if let Some((class, ty)) = self.static_field_owner(name) {
+                    return self.static_assign(&class, &ty, name, *op, value, line);
                 }
                 let l = self.lookup_type(name);
                 // A compound assignment back into an `int` variable wraps.
@@ -2551,6 +2756,9 @@ impl Compiler {
         if self.implicit_this_field(name).is_some() {
             return self.field_assign(&Expr::This, name, op, &Expr::Int(1), 0);
         }
+        if let Some((class, ty)) = self.static_field_owner(name) {
+            return self.static_assign(&class, &ty, name, op, &Expr::Int(1), 0);
+        }
         let wrap = self.var_decl_type(name) == Some("int");
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
@@ -2589,12 +2797,78 @@ impl Compiler {
     /// evaluate normally (the host's `java_str` renders the default `Class@hash`
     /// form, which is what `String.valueOf(obj)` still gets — see BUGS.md).
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
-        if let Some(rc) = self.expr_class(e) {
-            if self.has_instance_method(&rc, "toString", 0) {
-                return self.dispatch_instance_method(e, &rc, "toString", &[], 0);
-            }
+        let Some(rc) = self.expr_class(e) else {
+            return self.expr(e);
+        };
+        if self.has_instance_method(&rc, "toString", 0) {
+            return self.dispatch_instance_method(e, &rc, "toString", &[], 0);
         }
-        self.expr(e)
+        // The static type declares no `toString` (an interface, or a base class
+        // that never overrides it) but some subtype does — so the override is
+        // still reachable, keyed on the receiver's runtime class.
+        let overriders = self.to_string_overriders(&rc);
+        if overriders.is_empty() {
+            return self.expr(e);
+        }
+        self.emit_virtual_to_string(e, &overriders)
+    }
+
+    /// Every concrete subtype of `rc` that resolves a no-arg `toString`, as
+    /// `(class, mangled subroutine)`, sorted for deterministic bytecode.
+    fn to_string_overriders(&self, rc: &str) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .classes
+            .iter()
+            .filter(|(_, ci)| !ci.is_interface)
+            .map(|(k, _)| k)
+            .filter(|k| self.is_subclass(k, rc))
+            .filter_map(|k| {
+                self.resolve_instance_sig(k, "toString", &[])
+                    .map(|(m, _)| (k.clone(), m))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Render `e` through whichever `toString` its *runtime* class supplies,
+    /// falling through to the host's default `Class@hash` when it has none. The
+    /// receiver is evaluated exactly once, into a temp.
+    fn emit_virtual_to_string(
+        &mut self,
+        e: &Expr,
+        overriders: &[(String, String)],
+    ) -> Result<(), String> {
+        let recv_t = self.temp();
+        self.expr(e)?;
+        self.emit_set(&recv_t, 0);
+        let class_t = self.temp();
+        self.emit_get(&recv_t, 0);
+        self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), 0);
+        self.emit_set(&class_t, 0);
+
+        let mut end_jumps = Vec::new();
+        for (class, mangled) in overriders {
+            self.emit_get(&class_t, 0);
+            let cc = self.b.add_constant(Value::str(class.clone()));
+            self.b.emit(Op::LoadConst(cc), 0);
+            self.b.emit(Op::StrEq, 0);
+            let skip = self.b.emit(Op::JumpIfFalse(0), 0);
+            self.emit_get(&recv_t, 0);
+            let idx = self.b.add_name(mangled);
+            self.b.emit(Op::Call(idx, 1), 0);
+            self.emit_exc_check(0);
+            end_jumps.push(self.b.emit(Op::Jump(0), 0));
+            let next = self.b.current_pos();
+            self.b.patch_jump(skip, next);
+        }
+        // No override for this runtime class: the value renders itself.
+        self.emit_get(&recv_t, 0);
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
     }
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
@@ -2622,6 +2896,8 @@ impl Compiler {
                 } else if self.implicit_this_field(name).is_some() {
                     self.b.emit(Op::GetSlot(0), 0); // this
                     self.emit_field_get(name, 0);
+                } else if let Some((class, _)) = self.static_field_owner(name) {
+                    self.emit_global_get(&static_global(&class, name), 0);
                 } else {
                     self.emit_get(name, 0);
                 }
@@ -2680,6 +2956,10 @@ impl Compiler {
                 // a value — there is no receiver to evaluate.
                 if let Some(class) = self.enum_constant_ref(e) {
                     self.emit_global_get(&enum_global(&class, name), 0);
+                } else if let Some((class, _)) = self.static_field_ref(e) {
+                    // `T.n` names a `static` field's shared cell — the receiver
+                    // is a type, so there is nothing to evaluate.
+                    self.emit_global_get(&static_global(&class, name), 0);
                 } else {
                     self.expr(recv)?;
                     self.emit_field_get(name, 0);
@@ -2720,6 +3000,8 @@ impl Compiler {
                 if self.implicit_this_field(name).is_some() {
                     self.b.emit(Op::GetSlot(0), 0);
                     self.emit_field_get(name, 0);
+                } else if let Some((class, _)) = self.static_field_owner(name) {
+                    self.emit_global_get(&static_global(&class, name), 0);
                 } else {
                     self.emit_get(name, 0);
                 }
@@ -2771,6 +3053,17 @@ impl Compiler {
                 }
             }
         }
+        // `T.helper(x)` on a user class is a call to that class's `static`
+        // method — javars hoists every static into one flat pool, so it is the
+        // same target a bare `helper(x)` inside `T` resolves to.
+        if let Some(class) = self.user_class_ref(recv) {
+            if self.methods.contains_key(method) {
+                return self.call(method, args, line);
+            }
+            return Err(format!(
+                "javars: class `{class}` has no static method `{method}` (line {line})"
+            ));
+        }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
                 for a in args {
@@ -2818,6 +3111,22 @@ impl Compiler {
     /// (defaults then declared initializers, ancestors first), run the matching
     /// constructor, and leave the instance handle on the stack.
     fn new_object(&mut self, class: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        self.new_object_as(class, class, args, line)
+    }
+
+    /// Lower a construction whose *runtime class* and *constructor* differ.
+    ///
+    /// They coincide for `new C(…)`; an `enum` constant with a body is the one
+    /// case they do not — the instance is of the constant's synthetic subclass
+    /// (so its overrides dispatch) while the constructor that runs is the
+    /// enum's, because Java gives an anonymous enum subclass none of its own.
+    fn new_object_as(
+        &mut self,
+        class: &str,
+        ctor_class: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
         let info = self
             .classes
             .get(class)
@@ -2830,8 +3139,13 @@ impl Compiler {
         // Constructor resolution up front (immutable borrow released before we
         // emit anything mutating `self`). The chosen overload's parameter types
         // mangle the `<init>` target.
-        let has_any_ctor = !info.ctors.is_empty();
-        let ctor_arities: Vec<usize> = info.ctors.iter().map(|c| c.len()).collect();
+        let ctor_info = self
+            .classes
+            .get(ctor_class)
+            .ok_or_else(|| format!("javars: unknown class `{ctor_class}` (line {line})"))?;
+        let has_any_ctor = !ctor_info.ctors.is_empty();
+        let ctor_arities: Vec<usize> = ctor_info.ctors.iter().map(|c| c.len()).collect();
+        let info = &self.classes[class];
         // Field-init plan (name, type, optional init expr), cloned so the
         // ChunkBuilder borrow does not alias `self.classes`.
         let field_plan: Vec<(String, String, Option<Expr>)> = info
@@ -2863,20 +3177,20 @@ impl Compiler {
         // Run the constructor (resolving the overload by argument type). A class
         // with no declared ctor accepts only `new C()`.
         let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
-        let ctor_sig = self.resolve_ctor(class, &arg_tys);
+        let ctor_sig = self.resolve_ctor(ctor_class, &arg_tys);
         if let Some(param_tys) = ctor_sig {
             self.emit_get(&obj, line); // this
             for a in args {
                 self.expr(a)?;
             }
-            let mangled = mangle(class, "<init>", &param_tys);
+            let mangled = mangle(ctor_class, "<init>", &param_tys);
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
             self.emit_exc_check(line);
             self.b.emit(Op::Pop, line); // discard the ctor's (Undef) result
         } else if has_any_ctor || !args.is_empty() {
             return Err(format!(
-                "javars: class `{class}` has no constructor taking {} argument(s) (declared arities: {:?}) (line {line})",
+                "javars: class `{ctor_class}` has no constructor taking {} argument(s) (declared arities: {:?}) (line {line})",
                 args.len(),
                 ctor_arities
             ));
@@ -2950,6 +3264,11 @@ impl Compiler {
         value: &Expr,
         line: u32,
     ) -> Result<(), String> {
+        // `T.n = …` (or a bare `n` naming a static) writes the class's shared
+        // cell, not a field of an object.
+        if let Some((class, ty)) = self.static_target(recv, name) {
+            return self.static_assign(&class, &ty, name, op, value, line);
+        }
         // The field's declared type drives both the compound-`/` truncation and
         // the 32-bit wrap, so it is resolved here rather than at each call site.
         let field_ty_name = self.field_type_name(recv, name);

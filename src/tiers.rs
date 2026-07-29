@@ -234,8 +234,8 @@ fn op_name(op: &Op) -> String {
     }
 }
 
-
 /// The counted loop this module's tests measure, in the frontend's own syntax.
+#[cfg(test)]
 const PROGRAM: &str = "public class Main {\n static int f(int n) { int t = 0; for (int i = 0; i < n; i++) { t += i; } return t; }\n public static void main(String[] a) { f(200000); }\n}";
 
 #[cfg(test)]

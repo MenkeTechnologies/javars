@@ -20,6 +20,24 @@ fn run(src: &str) -> (String, bool) {
     )
 }
 
+/// Run a Java source string with program arguments, returning (stdout, ok) —
+/// the only way to observe `main`'s `String[] args` carrying real values.
+fn run_args(src: &str, args: &[&str]) -> (String, bool) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("javars_test_{}.java", fasthash(src)));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .args(args)
+        .output()
+        .expect("spawn java");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
 /// Run a Java source string and return (stdout, stderr, ok) — for exercising
 /// `System.err`, which the stdout-only [`run`] helper cannot observe.
 fn run_streams(src: &str) -> (String, String, bool) {
@@ -1281,4 +1299,146 @@ fn int_hash_loop_matches_the_jdk() {
          System.out.println(h); } }");
     assert!(ok);
     assert_eq!(out, "-804247707\n-921940528\n");
+}
+
+#[test]
+fn static_fields_are_one_cell_per_class() {
+    // A `static` field is class-level state: it exists before `main`, survives
+    // every instance, and the qualified and unqualified forms name one cell.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int n = 5;\
+         static String label = \"c\";\
+         static int[] arr = {1, 2, 3};\
+         static int derived;\
+         static { derived = n * 4; }\
+         static int bump() { n++; return n; }\
+         public static void main(String[] a) {\
+         System.out.println(n + \",\" + Main.n + \",\" + label + \",\" + derived);\
+         n += 2; Main.n *= 3; n--;\
+         System.out.println(n + \",\" + bump() + \",\" + Main.bump());\
+         arr[1] = 9;\
+         System.out.println(arr[0] + \",\" + arr[1] + \",\" + arr.length);\
+         System.out.println(n / 4 + \",\" + n % 4); } }");
+    assert!(ok);
+    assert_eq!(out, "5,5,c,20\n20,21,22\n1,9,3\n5,2\n");
+}
+
+#[test]
+fn static_fields_are_shared_across_instances_and_subclasses() {
+    // The counter every instance increments is the same cell an inheriting
+    // class reads. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         System.out.println(C.count);\
+         C first = new C(); new C(); new C();\
+         System.out.println(C.count + \",\" + D.count + \",\" + first.id + \",\" + C.describe()); } }\
+         class C { static int count; int id; C() { count++; id = count; }\
+         static String describe() { return \"n=\" + count; } }\
+         class D extends C { }",
+    );
+    assert!(ok);
+    assert_eq!(out, "0\n3,3,1,n=3\n");
+}
+
+#[test]
+fn main_args_carries_the_program_arguments() {
+    // `main`'s `String[]` parameter is the real argv — indexable, iterable, and
+    // zero-length (never null) when none are passed. Verified against OpenJDK 26.
+    let src = "public class Main { public static void main(String[] args) {\
+         System.out.println(args.length);\
+         for (int i = 0; i < args.length; i++) { System.out.println(i + \"=\" + args[i]); }\
+         for (String s : args) { System.out.println(s.toUpperCase()); } } }";
+    let (out, ok) = run_args(src, &["alpha", "b c"]);
+    assert!(ok);
+    assert_eq!(out, "2\n0=alpha\n1=b c\nALPHA\nB C\n");
+    let (out, ok) = run_args(src, &[]);
+    assert!(ok);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn enum_constants_carry_per_constant_state() {
+    // A constant with constructor arguments runs the enum's own constructor, so
+    // each singleton keeps its own field values. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         for (P p : P.values()) { System.out.println(p + \" \" + p.ordinal() + \" \" + p.mass() + \" \" + p.heavy()); }\
+         System.out.println(P.valueOf(\"EARTH\").mass()); } }\
+         enum P { MERCURY(3.3), EARTH(5.97), JUPITER(1898.0);\
+         private final double mass;\
+         P(double m) { this.mass = m; }\
+         double mass() { return mass; }\
+         boolean heavy() { return mass > 100.0; } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "MERCURY 0 3.3 false\nEARTH 1 5.97 false\nJUPITER 2 1898.0 true\n5.97\n"
+    );
+}
+
+#[test]
+fn enum_constants_with_bodies_override_per_constant() {
+    // A constant body is an anonymous subclass: its override is what the enum's
+    // abstract method dispatches to, and a constant that declares no override
+    // inherits the enum's own body. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         for (O o : O.values()) { System.out.println(o + \" \" + o.apply(6, 3) + \" \" + o.label()); }\
+         O o = O.TIMES;\
+         switch (o) { case TIMES: System.out.println(\"times\"); break; default: System.out.println(\"other\"); }\
+         System.out.println((o == O.valueOf(\"TIMES\")) + \" \" + (o instanceof O)); } }\
+         enum O { PLUS { int apply(int x, int y) { return x + y; } },\
+         MINUS { int apply(int x, int y) { return x - y; } },\
+         TIMES { int apply(int x, int y) { return x * y; } String label() { return \"x\"; } };\
+         abstract int apply(int x, int y);\
+         String label() { return name().toLowerCase(); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "PLUS 9 plus\nMINUS 3 minus\nTIMES 18 x\ntimes\ntrue true\n"
+    );
+}
+
+#[test]
+fn records_derive_accessors_tostring_and_equals() {
+    // A record's components become final fields, the canonical constructor, one
+    // accessor each, `toString` in `Name[c=v, …]` form, and a component-wise
+    // `equals`. A compact constructor validates before the fields are assigned.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         record Pt(int x, int y) { int sum() { return x + y; } }\
+         record Tag(String s, double d, boolean b) { }\
+         record Ord(int lo, int hi) { Ord { if (lo > hi) { throw new IllegalArgumentException(lo + \">\" + hi); } } }\
+         public static void main(String[] a) {\
+         Pt p = new Pt(1, 2);\
+         System.out.println(p + \" \" + p.x() + \" \" + p.y() + \" \" + p.sum());\
+         System.out.println(p.equals(new Pt(1, 2)) + \" \" + p.equals(new Pt(2, 1)));\
+         System.out.println(new Tag(\"hi\", 2.5, true));\
+         System.out.println(new Ord(2, 9));\
+         try { new Ord(9, 2); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); } } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Pt[x=1, y=2] 1 2 3\ntrue false\nTag[s=hi, d=2.5, b=true]\nOrd[lo=2, hi=9]\n9>2\n"
+    );
+}
+
+#[test]
+fn tostring_dispatches_through_an_interface_typed_receiver() {
+    // The static type declares no `toString`, but the runtime class does — so
+    // the override still has to be the one that renders. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         S[] xs = { new Cir(2.0), new Sq(3) };\
+         for (S s : xs) { System.out.println(s + \" \" + s.area()); } } }\
+         interface S { double area(); }\
+         record Cir(double r) implements S { public double area() { return 3.0 * r * r; } }\
+         record Sq(int side) implements S { public double area() { return side * 1.0 * side; } }");
+    assert!(ok);
+    assert_eq!(out, "Cir[r=2.0] 12.0\nSq[side=3] 9.0\n");
 }

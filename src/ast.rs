@@ -15,6 +15,10 @@ pub struct Program {
     pub class_name: String,
     /// The statements of `public static void main(String[] args)`.
     pub main: Vec<Stmt>,
+    /// The name `main` gives its `String[]` parameter (`args`), when it declares
+    /// one. Bound to the real program arguments by the compiler's prologue;
+    /// `None` for the (legal) `main()` that declares no parameter.
+    pub main_param: Option<String>,
     /// User-defined `static` methods declared in any class (a flat pool — javars
     /// resolves a bare `name(...)` call to one of these by name). `main` is
     /// excluded (it is the entry [`Program::main`]).
@@ -44,6 +48,17 @@ pub fn enum_global(class: &str, constant: &str) -> String {
     format!("#enum#{class}#{constant}")
 }
 
+/// The global holding `class.field`, a `static` field's one shared cell.
+///
+/// fusevm's `GetVar`/`SetVar` address a flat global table while frame slots are
+/// per-call, so a `static` field — which every frame sees, and which outlives
+/// any one call — is stored as a global rather than a slot. `#` is not a legal
+/// Java identifier character, so the minted name can never collide with a
+/// user-declared variable.
+pub fn static_global(class: &str, field: &str) -> String {
+    format!("#static#{class}#{field}")
+}
+
 /// A user-defined class: its instance fields, constructors, and instance
 /// methods. `static` methods are hoisted into [`Program::methods`]; only the
 /// non-static members live here. Modeled as heap objects ([`crate::host`]
@@ -65,20 +80,49 @@ pub struct Class {
     /// True when this declaration is an `enum`. Distinct from a non-empty
     /// [`Class::enum_constants`] because `enum Empty { }` is legal Java.
     pub is_enum: bool,
-    /// The constant names of an `enum`, in declaration order — the value of
-    /// `ordinal()`. Empty for a `class`/`interface`. An enum is otherwise an
-    /// ordinary class: the parser gives it the `#name`/`#ordinal` fields and the
-    /// `name()`/`ordinal()`/`toString()` bodies that read them, and the compiler
-    /// builds one instance per constant before `main` runs.
-    pub enum_constants: Vec<String>,
+    /// The constants of an `enum`, in declaration order — the index is the
+    /// value of `ordinal()`. Empty for a `class`/`interface`. An enum is
+    /// otherwise an ordinary class: the parser gives it the `#name`/`#ordinal`
+    /// fields and the `name()`/`ordinal()`/`toString()` bodies that read them,
+    /// and the compiler builds one instance per constant before `main` runs.
+    pub enum_constants: Vec<EnumConstant>,
     /// Instance fields in declaration order (name, type, optional initializer).
     pub fields: Vec<FieldDecl>,
+    /// `static` fields in declaration order. Their storage is one global per
+    /// field ([`static_global`]), seeded with the type's default value before
+    /// any user code runs.
+    pub static_fields: Vec<FieldDecl>,
+    /// The class's static initialization, in textual order: each `static` field
+    /// initializer lowered to an assignment, interleaved with the bodies of the
+    /// `static { … }` blocks. Run once, before `main`.
+    pub static_init: Vec<Stmt>,
     /// Declared constructors. Empty means the implicit no-arg default ctor.
     pub ctors: Vec<Ctor>,
     /// Instance (non-static) methods.
     pub methods: Vec<Method>,
     /// 1-based source line the class starts on (diagnostics).
     pub line: u32,
+}
+
+/// One constant of an `enum`: `RED`, `EARTH(5.97e24)`, or `PLUS { … }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumConstant {
+    pub name: String,
+    /// The constructor arguments the constant supplies (`EARTH(5.97e24)`), run
+    /// against the enum's own constructor when its singleton is built.
+    pub args: Vec<Expr>,
+    /// The synthetic subclass a constant *body* (`PLUS { int apply(…) { … } }`)
+    /// is compiled to — Java specifies such a constant as an anonymous subclass
+    /// of the enum, and modeling it as a real class is what makes its overrides
+    /// reachable through ordinary virtual dispatch. `None` for a bare constant.
+    pub body_class: Option<String>,
+}
+
+/// The synthetic subclass name for an `enum` constant that declares a body.
+/// `#` is not a legal Java identifier character, so it cannot collide with a
+/// user-declared class.
+pub fn enum_body_class(enum_name: &str, constant: &str) -> String {
+    format!("{enum_name}#{constant}")
 }
 
 /// An instance field declaration: `int x;` or `String name = "?";`.
@@ -105,6 +149,11 @@ pub struct Ctor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Method {
     pub name: String,
+    /// The class that declares this method. For a `static` method it is the
+    /// class whose `static` fields an unqualified name inside the body resolves
+    /// against (javars hoists statics into one flat pool, so the owner has to
+    /// travel with the method).
+    pub owner: String,
     /// Formal parameters in declaration order (bound to slots `0..n`).
     pub params: Vec<Param>,
     /// The declared return type (retained for diagnostics and numeric-division

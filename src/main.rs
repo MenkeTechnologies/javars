@@ -62,7 +62,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match javars::run_str(&src) {
+    match javars::run_str_args(&src, &cli.argv) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
     }

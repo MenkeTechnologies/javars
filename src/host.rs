@@ -140,6 +140,11 @@ pub const JEXC_ABORT: u16 = 725;
 /// host-detected fault does, so the throwable is catchable.
 pub const JFAULT: u16 = 726;
 
+/// Builtin id for `main`'s `String[] args` — a fresh Java array of the program
+/// arguments the CLI collected. Called once by the compiler's prologue, so the
+/// array the program sees is its own (mutating it cannot affect a later read).
+pub const JARGV: u16 = 727;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -173,6 +178,15 @@ thread_local! {
     /// When false there is no handler anywhere and no check to observe the
     /// pending value, so a runtime fault aborts instead (see [`raise`]).
     static EXC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The program arguments `main`'s `String[]` parameter is bound to — what
+    /// the CLI collected after the file name. Set by [`set_argv`] before the run.
+    static ARGV: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Install the program arguments `main`'s `String[]` parameter will see. Call
+/// before running the chunk.
+pub fn set_argv(argv: Vec<String>) {
+    ARGV.with(|a| *a.borrow_mut() = argv);
 }
 
 /// Clear the object heap (and superclass table stays until reset). Called at the
@@ -182,6 +196,7 @@ pub fn heap_reset() {
     SUPERS.with(|s| s.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
+    ARGV.with(|a| a.borrow_mut().clear());
 }
 
 /// Tell the host whether the compiled program carries the exception machinery.
@@ -343,6 +358,14 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JEXC_CUT, b_exc_cut);
     vm.register_builtin(JEXC_ABORT, b_exc_abort);
     vm.register_builtin(JFAULT, b_fault);
+    vm.register_builtin(JARGV, b_argv);
+}
+
+/// `main`'s `String[] args` — a fresh array of the program arguments.
+fn b_argv(vm: &mut VM, argc: u8) -> Value {
+    pop_args(vm, argc);
+    let elems = ARGV.with(|a| a.borrow().iter().cloned().map(Value::str).collect());
+    Value::Obj(heap_alloc(HostObj::Array(elems)))
 }
 
 /// Raise a compiler-detected runtime fault (stack `[className, message]`) — the

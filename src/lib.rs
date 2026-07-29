@@ -52,11 +52,13 @@ fn run_chunk(
     chunk: fusevm::Chunk,
     supers: std::collections::HashMap<String, Vec<String>>,
     exceptions: bool,
+    argv: &[String],
 ) -> Result<Value, String> {
     // A fresh object heap per run — no handle leaks across programs.
     host::heap_reset();
     host::set_supertypes(supers);
     host::set_exceptions_enabled(exceptions);
+    host::set_argv(argv.to_vec());
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
@@ -79,8 +81,15 @@ fn run_chunk(
     }
 }
 
-/// Compile and run a Java source string; return the last VM value.
+/// Compile and run a Java source string with no program arguments (`args` is a
+/// zero-length `String[]`); return the last VM value.
 pub fn run_str(src: &str) -> Result<Value, String> {
+    run_str_args(src, &[])
+}
+
+/// Compile and run a Java source string, binding `argv` to `main`'s `String[]`
+/// parameter.
+pub fn run_str_args(src: &str, argv: &[String]) -> Result<Value, String> {
     let prog = parse(src)?;
     // The type → direct-supertypes map (superclass + interfaces) drives runtime
     // `instanceof`/`toString`.
@@ -94,7 +103,7 @@ pub fn run_str(src: &str) -> Result<Value, String> {
         })
         .collect();
     let chunk = compiler::compile(&prog)?;
-    run_chunk(chunk, supers, prog.uses_exceptions)
+    run_chunk(chunk, supers, prog.uses_exceptions, argv)
 }
 
 /// Read and run a `.java` file.
