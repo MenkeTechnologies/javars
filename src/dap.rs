@@ -273,6 +273,20 @@ fn run_debug(path: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let prog = crate::parse(&src)?;
     let chunk = crate::compiler::compile_debug(&prog)?;
+    // Same host state a normal run installs: a fresh heap, the supertype table
+    // `instanceof`/`catch` matching walks, and the exception-machinery flag.
+    crate::host::heap_reset();
+    crate::host::set_supertypes(
+        prog.classes
+            .iter()
+            .map(|c| {
+                let mut sups: Vec<String> = c.superclass.clone().into_iter().collect();
+                sups.extend(c.interfaces.iter().cloned());
+                (c.name.clone(), sups)
+            })
+            .collect(),
+    );
+    crate::host::set_exceptions_enabled(prog.uses_exceptions);
     let mut vm = VM::new(chunk);
     crate::host::install_debug(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(crate::host::numeric_hook));

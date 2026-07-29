@@ -43,14 +43,19 @@ pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
 
 /// Register the javars builtins + strict numeric hook on a fresh VM, enable the
 /// tracing JIT, and run the chunk. `supers` is the class → direct-superclass
-/// map (for `instanceof`/`toString`). Returns the last top-of-stack value.
+/// map (for `instanceof`/`toString`); `exceptions` says whether the chunk was
+/// compiled with the exception machinery (so a runtime fault can become a
+/// catchable throwable rather than an abort). Returns the last top-of-stack
+/// value.
 fn run_chunk(
     chunk: fusevm::Chunk,
     supers: std::collections::HashMap<String, Vec<String>>,
+    exceptions: bool,
 ) -> Result<Value, String> {
     // A fresh object heap per run — no handle leaks across programs.
     host::heap_reset();
     host::set_supertypes(supers);
+    host::set_exceptions_enabled(exceptions);
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));
@@ -88,7 +93,7 @@ pub fn run_str(src: &str) -> Result<Value, String> {
         })
         .collect();
     let chunk = compiler::compile(&prog)?;
-    run_chunk(chunk, supers)
+    run_chunk(chunk, supers, prog.uses_exceptions)
 }
 
 /// Read and run a `.java` file.

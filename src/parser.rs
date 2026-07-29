@@ -22,6 +22,15 @@ pub fn parse(src: &str) -> Result<Program, String> {
     p.program()
 }
 
+/// One entry of a try-with-resources header. `decl` is the declared type and
+/// initializer (`Type r = expr`); a bare `try (r)` naming an already-declared
+/// variable carries `None` and only contributes the `close()` call.
+struct Resource {
+    decl: Option<(String, Expr)>,
+    name: String,
+    line: u32,
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -838,22 +847,20 @@ impl Parser {
         })
     }
 
-    /// Parse `try { .. } catch (Type name) { .. }* [finally { .. }]`.
+    /// Parse `try [(resources)] { .. } catch (Type name) { .. }* [finally { .. }]`.
     ///
-    /// Try-with-resources (`try (var r = …)`) is rejected here rather than
-    /// silently parsed as a `try` with a dropped resource clause — javars has no
-    /// `AutoCloseable`, so accepting it would run the body without ever closing.
+    /// Try-with-resources is desugared here (see [`Parser::with_resources`]) so
+    /// the compiler only ever sees the plain `try`/`catch`/`finally` node.
     /// Multi-catch (`catch (A | B e)`) does not reach this point: the lexer has
     /// no single `|` token, so it fails earlier with a lexical error.
     fn try_stmt(&mut self) -> Result<StmtKind, String> {
         self.uses_exceptions = true;
         self.advance(); // `try`
-        if self.is(&Tok::LParen) {
-            return Err(format!(
-                "javars: try-with-resources is not supported (line {})",
-                self.line()
-            ));
-        }
+        let resources = if self.is(&Tok::LParen) {
+            self.resource_spec()?
+        } else {
+            Vec::new()
+        };
         self.eat(&Tok::LBrace)?;
         let body = self.block()?;
         let mut catches = Vec::new();
@@ -882,17 +889,151 @@ impl Parser {
         } else {
             Vec::new()
         };
-        if catches.is_empty() && finally_body.is_empty() {
+        if catches.is_empty() && finally_body.is_empty() && resources.is_empty() {
             return Err(format!(
                 "javars: `try` needs a `catch` or a `finally` (line {})",
                 self.line()
             ));
         }
-        Ok(StmtKind::Try {
+        if resources.is_empty() {
+            return Ok(StmtKind::Try {
+                body,
+                catches,
+                finally_body,
+            });
+        }
+        Ok(Parser::with_resources(
+            resources,
             body,
             catches,
             finally_body,
-        })
+        ))
+    }
+
+    /// Parse a try-with-resources header `( <resource> ; … [;] )`, the cursor on
+    /// the `(`. A resource is `Type name = expr`, `var name = expr`, or (Java 9)
+    /// a bare name already holding an effectively-final reference.
+    fn resource_spec(&mut self) -> Result<Vec<Resource>, String> {
+        self.eat(&Tok::LParen)?;
+        let mut out = Vec::new();
+        loop {
+            if self.is(&Tok::RParen) {
+                self.advance();
+                break;
+            }
+            // `final` on a resource declaration carries no meaning here.
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                self.advance();
+            }
+            let line = self.line();
+            // `try (existing)` — a bare name, no declaration.
+            if matches!(self.peek(), Tok::Ident(_))
+                && matches!(self.toks[self.pos + 1].kind, Tok::RParen | Tok::Semi)
+            {
+                let name = self.ident()?;
+                out.push(Resource {
+                    decl: None,
+                    name,
+                    line,
+                });
+            } else {
+                let ty = self.type_name()?;
+                let name = self.ident()?;
+                self.eat(&Tok::Assign)?;
+                let init = self.expression()?;
+                out.push(Resource {
+                    decl: Some((ty, init)),
+                    name,
+                    line,
+                });
+            }
+            if self.is(&Tok::Semi) {
+                self.advance();
+            }
+        }
+        if out.is_empty() {
+            return Err(format!(
+                "javars: try-with-resources needs at least one resource (line {})",
+                self.line()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Desugar try-with-resources into the plain `try` nodes Java itself
+    /// specifies it as: each resource declaration is followed by a
+    /// `try { … } finally { if (r != null) r.close(); }` wrapping everything
+    /// inside it, so resources close in reverse declaration order and close
+    /// before any `catch`/`finally` of the outer statement runs.
+    ///
+    /// Java additionally records a close-thrown exception as *suppressed* on the
+    /// body's exception; javars has no `addSuppressed`, so a throwing `close`
+    /// replaces it (documented in BUGS.md).
+    fn with_resources(
+        resources: Vec<Resource>,
+        body: Vec<Stmt>,
+        catches: Vec<CatchArm>,
+        finally_body: Vec<Stmt>,
+    ) -> StmtKind {
+        let mut inner = body;
+        for r in resources.into_iter().rev() {
+            let close = Stmt::new(
+                r.line,
+                StmtKind::If {
+                    cond: Expr::Binary {
+                        op: BinOp::Ne,
+                        lhs: Box::new(Expr::Var(r.name.clone())),
+                        rhs: Box::new(Expr::Var("null".to_string())),
+                    },
+                    then: vec![Stmt::new(
+                        r.line,
+                        StmtKind::Expr(Expr::MethodCall {
+                            recv: Box::new(Expr::Var(r.name.clone())),
+                            method: "close".to_string(),
+                            args: Vec::new(),
+                            line: r.line,
+                        }),
+                    )],
+                    els: Vec::new(),
+                },
+            );
+            let guarded = Stmt::new(
+                r.line,
+                StmtKind::Try {
+                    body: inner,
+                    catches: Vec::new(),
+                    finally_body: vec![close],
+                },
+            );
+            inner = match r.decl {
+                Some((ty, init)) => vec![
+                    Stmt::new(
+                        r.line,
+                        StmtKind::Local {
+                            ty,
+                            name: r.name,
+                            init: Some(init),
+                        },
+                    ),
+                    guarded,
+                ],
+                None => vec![guarded],
+            };
+        }
+        if catches.is_empty() && finally_body.is_empty() {
+            // No outer handler: the declarations + guarded body are just a
+            // block, which this parser models as an always-taken `if`.
+            return StmtKind::If {
+                cond: Expr::Bool(true),
+                then: inner,
+                els: Vec::new(),
+            };
+        }
+        StmtKind::Try {
+            body: inner,
+            catches,
+            finally_body,
+        }
     }
 
     /// Probe for an enhanced-`for` header `<type> <name> :`, the cursor sitting

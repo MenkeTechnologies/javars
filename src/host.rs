@@ -135,6 +135,10 @@ pub const JEXC_CUT: u16 = 724;
 /// `Exception in thread "main" <qualified class>: <message>` line and faults, so
 /// the process exits non-zero the way `java` does.
 pub const JEXC_ABORT: u16 = 725;
+/// Raise a runtime fault the compiler detected inline (`int / 0`). Stack
+/// `[className, message]`; `argc == 2`. Goes through the same [`raise`] path a
+/// host-detected fault does, so the throwable is catchable.
+pub const JFAULT: u16 = 726;
 
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
@@ -163,6 +167,12 @@ thread_local! {
     /// value stack because it has to survive the `Op::ReturnValue` that unwinds
     /// each frame between the `throw` and its handler.
     static PENDING: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// True when the running program was compiled with the exception machinery
+    /// (`Program::uses_exceptions`) — i.e. its call and fault sites carry the
+    /// pending-exception check, so a raised throwable will actually be seen.
+    /// When false there is no handler anywhere and no check to observe the
+    /// pending value, so a runtime fault aborts instead (see [`raise`]).
+    static EXC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Clear the object heap (and superclass table stays until reset). Called at the
@@ -171,6 +181,75 @@ pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
+    EXC_ENABLED.with(|e| e.set(false));
+}
+
+/// Tell the host whether the compiled program carries the exception machinery.
+/// Call before running the chunk; drives whether a runtime fault becomes a
+/// catchable throwable or an immediate abort.
+pub fn set_exceptions_enabled(on: bool) {
+    EXC_ENABLED.with(|e| e.set(on));
+}
+
+/// A Java-level fault a host builtin detected: the `java.lang` throwable class
+/// to raise and its `detailMessage`. An empty `class` marks a javars *internal*
+/// error (an unimplemented method, a malformed format string) — those are not
+/// Java exceptions and are never catchable.
+struct Fault {
+    class: &'static str,
+    msg: String,
+}
+
+impl Fault {
+    /// A catchable Java throwable of class `class` carrying `msg`.
+    fn java(class: &'static str, msg: impl Into<String>) -> Self {
+        Fault {
+            class,
+            msg: msg.into(),
+        }
+    }
+
+    /// A javars internal error — reported as `javars: <msg>`, never catchable.
+    fn internal(msg: impl Into<String>) -> Self {
+        Fault {
+            class: "",
+            msg: msg.into(),
+        }
+    }
+}
+
+/// Raise `f` from a builtin.
+///
+/// With the exception machinery compiled in, a Java fault becomes the pending
+/// exception — indistinguishable from a `throw`, so `catch`/`finally` see it and
+/// `getMessage()` works. Without it (a program that never mentions `try` or
+/// `throw`, whose call sites carry no check) nothing would ever observe the
+/// pending value, so the fault aborts the run with the same
+/// `Exception in thread "main" …` line the uncaught path prints. An internal
+/// error always aborts.
+fn raise(vm: &mut VM, f: Fault) -> Value {
+    if f.class.is_empty() {
+        ffi_fault(vm, f.msg);
+        return Value::Undef;
+    }
+    if !EXC_ENABLED.with(|e| e.get()) {
+        ffi_fault(
+            vm,
+            format!(
+                "Exception in thread \"main\" java.lang.{}: {}",
+                f.class, f.msg
+            ),
+        );
+        return Value::Undef;
+    }
+    let mut fields = HashMap::new();
+    fields.insert("detailMessage".to_string(), Value::str(f.msg));
+    let id = heap_alloc(HostObj::Instance {
+        class: f.class.to_string(),
+        fields,
+    });
+    PENDING.with(|p| *p.borrow_mut() = Some(Value::Obj(id)));
+    Value::Undef
 }
 
 /// Install the type → direct-supertypes map for the current program (used by
@@ -263,6 +342,31 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JEXC_DEPTH, b_exc_depth);
     vm.register_builtin(JEXC_CUT, b_exc_cut);
     vm.register_builtin(JEXC_ABORT, b_exc_abort);
+    vm.register_builtin(JFAULT, b_fault);
+}
+
+/// Raise a compiler-detected runtime fault (stack `[className, message]`) — the
+/// integer division-by-zero check emits this.
+fn b_fault(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let class = args
+        .first()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let msg = args
+        .get(1)
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    // Only the modeled `java.lang` throwables are raisable this way, and the
+    // compiler only ever emits one of them; look the name up so `class` can stay
+    // a `&'static str` in [`Fault`].
+    match crate::prelude::THROWABLES.iter().find(|(n, _)| *n == class) {
+        Some((n, _)) => raise(vm, Fault::java(n, msg)),
+        None => raise(
+            vm,
+            Fault::internal(format!("javars: unknown fault `{class}`")),
+        ),
+    }
 }
 
 /// `throw e` — park the throwable as the pending exception.
@@ -383,8 +487,10 @@ fn b_array_new(vm: &mut VM, argc: u8) -> Value {
     let size = args.first().map(|v| v.to_int()).unwrap_or(0);
     let default = args.get(1).cloned().unwrap_or(Value::Undef);
     if size < 0 {
-        ffi_fault(vm, format!("javars: negative array size: {size}"));
-        return Value::Undef;
+        return raise(
+            vm,
+            Fault::java("NegativeArraySizeException", size.to_string()),
+        );
     }
     let arr = vec![default; size as usize];
     Value::Obj(heap_alloc(HostObj::Array(arr)))
@@ -399,19 +505,15 @@ fn b_array_new_multi(vm: &mut VM, argc: u8) -> Value {
     // Last arg is the leaf default; the rest are the dimension sizes.
     let default = args.pop().unwrap_or(Value::Undef);
     let sizes: Vec<i64> = args.iter().map(|v| v.to_int()).collect();
-    if sizes.iter().any(|&s| s < 0) {
-        ffi_fault(vm, "javars: negative array size".to_string());
-        return Value::Undef;
+    if let Some(&n) = sizes.iter().find(|&&s| s < 0) {
+        return raise(vm, Fault::java("NegativeArraySizeException", n.to_string()));
     }
     match build_nested(&sizes, &default) {
         Some(v) => v,
-        None => {
-            ffi_fault(
-                vm,
-                "javars: multi-dimensional array needs a size".to_string(),
-            );
-            Value::Undef
-        }
+        None => raise(
+            vm,
+            Fault::internal("javars: multi-dimensional array needs a size"),
+        ),
     }
 }
 
@@ -437,43 +539,49 @@ fn b_array_lit(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// `a[i]` read (stack `[array, index]`), bounds-checked.
+///
+/// The lookup runs inside the `HEAP` borrow and any fault is raised *after* it
+/// ends — [`raise`] allocates the throwable on that same heap, so raising while
+/// the borrow is live would panic.
 fn b_array_get(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let arr = args.first().cloned().unwrap_or(Value::Undef);
     let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
     let id = match arr {
         Value::Obj(id) => id,
-        _ => {
-            ffi_fault(
-                vm,
-                "javars: NullPointerException: array is null".to_string(),
-            );
-            return Value::Undef;
-        }
+        _ => return raise(vm, Fault::java("NullPointerException", NULL_ARRAY_LOAD)),
     };
-    HEAP.with(|h| {
+    let got = HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
             Some(HostObj::Array(a)) => match usize::try_from(idx).ok().and_then(|i| a.get(i)) {
-                Some(v) => v.clone(),
-                None => {
-                    ffi_fault(
-                        vm,
-                        format!(
-                            "javars: ArrayIndexOutOfBoundsException: Index {idx} out of bounds for length {}",
-                            a.len()
-                        ),
-                    );
-                    Value::Undef
-                }
+                Some(v) => Ok(v.clone()),
+                None => Err(index_fault(idx, a.len())),
             },
-            _ => {
-                ffi_fault(vm, "javars: not an array".to_string());
-                Value::Undef
-            }
+            _ => Err(Fault::internal("javars: not an array")),
         }
-    })
+    });
+    match got {
+        Ok(v) => v,
+        Err(f) => raise(vm, f),
+    }
 }
+
+/// Java's `ArrayIndexOutOfBoundsException` detail message.
+fn index_fault(idx: i64, len: usize) -> Fault {
+    Fault::java(
+        "ArrayIndexOutOfBoundsException",
+        format!("Index {idx} out of bounds for length {len}"),
+    )
+}
+
+// Java's "helpful NullPointerException" messages name the *bytecode local slot*
+// of the null reference (`because "<local3>" is null`), which javars cannot
+// reproduce — it has no javac slot numbering. These keep the operation half of
+// Java's wording and drop the provenance clause (see BUGS.md).
+const NULL_ARRAY_LOAD: &str = "Cannot load from array because the array is null";
+const NULL_ARRAY_STORE: &str = "Cannot store to array because the array is null";
+const NULL_ARRAY_LENGTH: &str = "Cannot read the array length because the array is null";
 
 /// `a[i] = v` write (stack `[array, index, value]`), bounds-checked. Returns `v`.
 fn b_array_set(vm: &mut VM, argc: u8) -> Value {
@@ -483,42 +591,24 @@ fn b_array_set(vm: &mut VM, argc: u8) -> Value {
     let val = args.get(2).cloned().unwrap_or(Value::Undef);
     let id = match arr {
         Value::Obj(id) => id,
-        _ => {
-            ffi_fault(
-                vm,
-                "javars: NullPointerException: array is null".to_string(),
-            );
-            return Value::Undef;
-        }
+        _ => return raise(vm, Fault::java("NullPointerException", NULL_ARRAY_STORE)),
     };
-    let len = HEAP.with(|h| {
+    let stored = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
             Some(HostObj::Array(a)) => match usize::try_from(idx).ok().filter(|&i| i < a.len()) {
                 Some(i) => {
                     a[i] = val.clone();
-                    None
+                    Ok(())
                 }
-                None => Some(a.len()),
+                None => Err(index_fault(idx, a.len())),
             },
-            _ => Some(usize::MAX),
+            _ => Err(Fault::internal("javars: not an array")),
         }
     });
-    match len {
-        None => val,
-        Some(usize::MAX) => {
-            ffi_fault(vm, "javars: not an array".to_string());
-            Value::Undef
-        }
-        Some(n) => {
-            ffi_fault(
-                vm,
-                format!(
-                    "javars: ArrayIndexOutOfBoundsException: Index {idx} out of bounds for length {n}"
-                ),
-            );
-            Value::Undef
-        }
+    match stored {
+        Ok(()) => val,
+        Err(f) => raise(vm, f),
     }
 }
 
@@ -549,26 +639,30 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
-            ffi_fault(
-                vm,
-                format!("javars: NullPointerException: cannot read `{name}` of null"),
-            );
-            return Value::Undef;
+            // `null.length` is Java's array-length NPE; any other name is a
+            // field read.
+            let msg = if name == "length" {
+                NULL_ARRAY_LENGTH.to_string()
+            } else {
+                format!("Cannot read field \"{name}\" because the receiver is null")
+            };
+            return raise(vm, Fault::java("NullPointerException", msg));
         }
     };
-    HEAP.with(|h| {
+    let got = HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Array(a)) if name == "length" => Value::Int(a.len() as i64),
+            Some(HostObj::Array(a)) if name == "length" => Ok(Value::Int(a.len() as i64)),
             Some(HostObj::Instance { fields, .. }) => {
-                fields.get(&name).cloned().unwrap_or(Value::Undef)
+                Ok(fields.get(&name).cloned().unwrap_or(Value::Undef))
             }
-            _ => {
-                ffi_fault(vm, format!("javars: no field `{name}`"));
-                Value::Undef
-            }
+            _ => Err(Fault::internal(format!("javars: no field `{name}`"))),
         }
-    })
+    });
+    match got {
+        Ok(v) => v,
+        Err(f) => raise(vm, f),
+    }
 }
 
 /// `recv.field = v` write (stack `[recv, name, value]`). Returns `v`.
@@ -583,11 +677,13 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
-            ffi_fault(
+            return raise(
                 vm,
-                format!("javars: NullPointerException: cannot assign `{name}` of null"),
-            );
-            return Value::Undef;
+                Fault::java(
+                    "NullPointerException",
+                    format!("Cannot assign field \"{name}\" because the receiver is null"),
+                ),
+            )
         }
     };
     let ok = HEAP.with(|h| {
@@ -603,8 +699,10 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
     if ok {
         val
     } else {
-        ffi_fault(vm, format!("javars: cannot assign field `{name}`"));
-        Value::Undef
+        raise(
+            vm,
+            Fault::internal(format!("javars: cannot assign field `{name}`")),
+        )
     }
 }
 
@@ -696,13 +794,20 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.stack.pop().unwrap_or(Value::Undef);
+    // A method call on a `null` reference is Java's NPE, not an empty string.
+    if matches!(recv, Value::Undef) {
+        return raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                format!("Cannot invoke \"String.{method}()\" because the receiver is null"),
+            ),
+        );
+    }
     let s = recv.as_str_cow().into_owned();
     match string_method(&s, &method, &args) {
         Ok(v) => v,
-        Err(e) => {
-            ffi_fault(vm, e);
-            Value::Undef
-        }
+        Err(f) => raise(vm, f),
     }
 }
 
@@ -710,10 +815,10 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
 /// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
 /// consistent with javars's existing "a `char` literal is a one-character
 /// string" model (astral characters, which Java counts as two UTF-16 units,
-/// count as one here — the same documented simplification). Out-of-range
-/// indices and unknown methods return an `Err` (javars does not model Java's
-/// `StringIndexOutOfBoundsException`).
-fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, String> {
+/// count as one here — the same documented simplification). An out-of-range
+/// index raises Java's `StringIndexOutOfBoundsException` with its exact detail
+/// message; an unknown method is a javars internal error.
+fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
     let char_len = || s.chars().count() as i64;
     match (method, args.len()) {
         ("length", 0) => Ok(Value::Int(char_len())),
@@ -722,9 +827,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, String>
             let i = args[0].to_int();
             match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
                 Some(c) => Ok(Value::str(c.to_string())),
-                None => Err(format!(
-                    "javars: String.charAt: index {i} out of range for length {}",
-                    char_len()
+                None => Err(Fault::java(
+                    "StringIndexOutOfBoundsException",
+                    format!("Index {i} out of bounds for length {}", char_len()),
                 )),
             }
         }
@@ -750,25 +855,30 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, String>
         ("repeat", 1) => {
             let n = args[0].to_int();
             if n < 0 {
-                Err(format!("javars: String.repeat: count {n} is negative"))
+                Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("count is negative: {n}"),
+                ))
             } else {
                 Ok(Value::str(s.repeat(n as usize)))
             }
         }
-        _ => Err(format!(
+        _ => Err(Fault::internal(format!(
             "javars: unsupported String method `{method}` with {} argument(s)",
             args.len()
-        )),
+        ))),
     }
 }
 
 /// `String.substring(begin, end)` on `char` indices — `[begin, end)`, with
-/// Java's bounds rules (`0 ≤ begin ≤ end ≤ length`).
-fn substring(s: &str, begin: i64, end: i64) -> Result<Value, String> {
+/// Java's bounds rules (`0 ≤ begin ≤ end ≤ length`) and its exact
+/// `StringIndexOutOfBoundsException` message.
+fn substring(s: &str, begin: i64, end: i64) -> Result<Value, Fault> {
     let len = s.chars().count() as i64;
     if begin < 0 || end > len || begin > end {
-        return Err(format!(
-            "javars: String.substring: range [{begin}, {end}) out of bounds for length {len}"
+        return Err(Fault::java(
+            "StringIndexOutOfBoundsException",
+            format!("Range [{begin}, {end}) out of bounds for length {len}"),
         ));
     }
     let sub: String = s
@@ -811,10 +921,7 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
     args.reverse();
     match static_method(&class, &method, &args) {
         Ok(v) => v,
-        Err(e) => {
-            ffi_fault(vm, e);
-            Value::Undef
-        }
+        Err(f) => raise(vm, f),
     }
 }
 
@@ -826,7 +933,7 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
 /// `double`; `Math.round` returns an integer (`floor(x + 0.5)`, ties toward
 /// positive infinity). `Integer.parseInt`/`Long.parseLong` reject malformed
 /// input the way `javac`-compiled code would throw `NumberFormatException`.
-fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, String> {
+fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
     let both_int = |a: &Value, b: &Value| matches!(a, Value::Int(_)) && matches!(b, Value::Int(_));
     match (class, method, args.len()) {
         // ── java.lang.Math ──
@@ -853,17 +960,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Str
         ("Math", "round", 1) => Ok(Value::Int((args[0].to_float() + 0.5).floor() as i64)),
 
         // ── java.lang.Integer / Long ──
-        ("Integer", "parseInt", 1) => {
-            parse_int_radix(&args[0].as_str_cow(), 10, "Integer.parseInt")
-        }
+        ("Integer", "parseInt", 1) => parse_int_radix(&args[0].as_str_cow(), 10, true),
         ("Integer", "parseInt", 2) => {
             let radix = args[1].to_int();
-            parse_int_radix(&args[0].as_str_cow(), radix, "Integer.parseInt")
+            parse_int_radix(&args[0].as_str_cow(), radix, true)
         }
-        ("Long", "parseLong", 1) => parse_int_radix(&args[0].as_str_cow(), 10, "Long.parseLong"),
+        ("Long", "parseLong", 1) => parse_int_radix(&args[0].as_str_cow(), 10, false),
         // `Integer.valueOf(String)` parses; `Integer.valueOf(int)` is identity.
         ("Integer", "valueOf", 1) => match &args[0] {
-            Value::Str(s) => parse_int_radix(s, 10, "Integer.valueOf"),
+            Value::Str(s) => parse_int_radix(s, 10, true),
             other => Ok(Value::Int(other.to_int())),
         },
         // `Integer.toString(int)` / `Integer.toString(int, radix)`.
@@ -871,7 +976,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Str
         ("Integer", "toString", 2) => Ok(Value::str(int_to_radix_string(
             args[0].to_int(),
             args[1].to_int(),
-        )?)),
+        ))),
 
         // ── java.lang.Boolean ──
         ("Boolean", "parseBoolean", 1) => Ok(Value::bool(
@@ -891,10 +996,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Str
         // `Arrays.toString(a)` — shallow `[e0, e1, …]` (null → "null").
         ("Arrays", "toString", 1) => Ok(Value::str(arrays_to_string(&args[0]))),
 
-        _ => Err(format!(
+        _ => Err(Fault::internal(format!(
             "javars: unsupported static method `{class}.{method}` with {} argument(s)",
             args.len()
-        )),
+        ))),
     }
 }
 
@@ -923,7 +1028,7 @@ fn arrays_to_string(v: &Value) -> String {
 /// (zero-pad), `+` (leading sign) flags, an optional width, and an optional
 /// `.precision` (decimals for `f`, max length for `s`). Unsupported conversions
 /// surface an error rather than a wrong string.
-fn java_format(fmt: &str, args: &[Value]) -> Result<Value, String> {
+fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     let mut argi = 0usize;
@@ -973,15 +1078,15 @@ fn java_format(fmt: &str, args: &[Value]) -> Result<Value, String> {
         }
         let conv = chars
             .next()
-            .ok_or_else(|| "javars: String.format: dangling `%`".to_string())?;
+            .ok_or_else(|| Fault::internal("javars: String.format: dangling `%`"))?;
         let width_n: Option<usize> = width.parse().ok();
         match conv {
             '%' => out.push('%'),
             'n' => out.push('\n'),
             _ => {
-                let arg = args
-                    .get(argi)
-                    .ok_or_else(|| "javars: String.format: not enough arguments".to_string())?;
+                let arg = args.get(argi).ok_or_else(|| {
+                    Fault::internal("javars: String.format: not enough arguments")
+                })?;
                 argi += 1;
                 let (s, numeric) = format_conversion(conv, arg, prec, plus)?;
                 out.push_str(&pad(&s, width_n, left, zero && numeric));
@@ -998,7 +1103,7 @@ fn format_conversion(
     arg: &Value,
     prec: Option<usize>,
     plus: bool,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), Fault> {
     let sign = |neg: bool| {
         if neg {
             ""
@@ -1041,9 +1146,9 @@ fn format_conversion(
         'X' => Ok((format!("{:X}", arg.to_int()), true)),
         'o' => Ok((format!("{:o}", arg.to_int()), true)),
         'c' => Ok((java_str(arg), false)),
-        other => Err(format!(
+        other => Err(Fault::internal(format!(
             "javars: String.format: unsupported conversion `%{other}`"
-        )),
+        ))),
     }
 }
 
@@ -1084,29 +1189,45 @@ fn pad(s: &str, width: Option<usize>, left: bool, zero: bool) -> String {
     }
 }
 
-/// Parse a signed integer in the given radix, reporting Java's
-/// `NumberFormatException` message shape on failure.
-fn parse_int_radix(s: &str, radix: i64, who: &str) -> Result<Value, String> {
-    if !(2..=36).contains(&radix) {
-        return Err(format!("javars: {who}: radix {radix} out of range"));
+/// Parse a signed integer in the given radix with `java.lang.Integer`'s exact
+/// rules: no surrounding whitespace is tolerated, the radix must be in
+/// `[Character.MIN_RADIX, Character.MAX_RADIX]`, and the value must fit the
+/// target type (`int` for `parseInt`, `long` for `parseLong`) — every failure
+/// carries Java's own `NumberFormatException` detail message.
+fn parse_int_radix(s: &str, radix: i64, int_width: bool) -> Result<Value, Fault> {
+    let nfe = |m: String| Fault::java("NumberFormatException", m);
+    if radix < 2 {
+        return Err(nfe(format!("radix {radix} less than Character.MIN_RADIX")));
     }
-    match i64::from_str_radix(s.trim(), radix as u32) {
-        Ok(n) => Ok(Value::Int(n)),
-        Err(_) => Err(format!(
-            "javars: {who}: NumberFormatException: For input string: \"{s}\""
-        )),
+    if radix > 36 {
+        return Err(nfe(format!(
+            "radix {radix} greater than Character.MAX_RADIX"
+        )));
     }
+    // Java quotes the raw input and, for a non-decimal radix, names it.
+    let bad = || {
+        if radix == 10 {
+            nfe(format!("For input string: \"{s}\""))
+        } else {
+            nfe(format!("For input string: \"{s}\" under radix {radix}"))
+        }
+    };
+    let n = i64::from_str_radix(s, radix as u32).map_err(|_| bad())?;
+    if int_width && i32::try_from(n).is_err() {
+        return Err(bad());
+    }
+    Ok(Value::Int(n))
 }
 
 /// Render `n` in the given radix (2..=36), matching `Integer.toString(i, radix)`.
-fn int_to_radix_string(n: i64, radix: i64) -> Result<String, String> {
+fn int_to_radix_string(n: i64, radix: i64) -> String {
     if !(2..=36).contains(&radix) {
         // Java falls back to radix 10 for an out-of-range radix.
-        return Ok(n.to_string());
+        return n.to_string();
     }
     let radix = radix as u64;
     if n == 0 {
-        return Ok("0".to_string());
+        return "0".to_string();
     }
     let neg = n < 0;
     let mut v = (n as i128).unsigned_abs();
@@ -1119,7 +1240,7 @@ fn int_to_radix_string(n: i64, radix: i64) -> Result<String, String> {
     if neg {
         digits.push('-');
     }
-    Ok(digits.iter().rev().collect())
+    digits.iter().rev().collect()
 }
 
 /// Install the debug line-marker builtin used by `java --dap`. The marker fires

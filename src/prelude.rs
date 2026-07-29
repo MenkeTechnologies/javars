@@ -36,6 +36,7 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("NullPointerException", "RuntimeException"),
     ("ClassCastException", "RuntimeException"),
     ("UnsupportedOperationException", "RuntimeException"),
+    ("NegativeArraySizeException", "RuntimeException"),
     ("IndexOutOfBoundsException", "RuntimeException"),
     (
         "ArrayIndexOutOfBoundsException",

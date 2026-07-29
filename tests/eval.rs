@@ -1096,13 +1096,111 @@ fn throwing_in_a_loop_does_not_grow_the_value_stack() {
 }
 
 #[test]
-fn return_out_of_a_try_with_finally_is_rejected() {
-    // javars would run the jump without the `finally` block, so the program is
-    // refused rather than silently skipping the cleanup.
-    let (_, ok) = run("public class Main {\
-         static int f() { try { return 1; } finally { System.out.println(\"fin\"); } }\
-         public static void main(String[] a) { System.out.println(f()); } }");
+fn a_runtime_fault_is_a_catchable_exception() {
+    // javars's own faults — array index, `Integer.parseInt`, integral `/ 0`,
+    // a negative array size, a `String` index — raise the throwable Java raises,
+    // with Java's detail message, catchable by any supertype and observable
+    // through `getMessage()`/`toString()`. Outputs verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int deep(int[] q, int i) { return q[i] * 2; }\
+         public static void main(String[] a) {\
+         int[] q = {1, 2, 3}; int[] empty = {};\
+         try { System.out.println(q[5]); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }\
+         try { Integer.parseInt(\"abc\"); } catch (NumberFormatException e) { System.out.println(e.getMessage()); }\
+         try { System.out.println(5 / empty.length); } catch (ArithmeticException e) { System.out.println(e); }\
+         try { System.out.println(5 % empty.length); } catch (ArithmeticException e) { System.out.println(e.getMessage()); }\
+         try { int[] neg = new int[empty.length - 2]; } catch (NegativeArraySizeException e) { System.out.println(e.getMessage()); }\
+         try { \"abcd\".charAt(9); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }\
+         try { deep(q, 9); } catch (RuntimeException e) { System.out.println(\"deep \" + e); } } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "Index 5 out of bounds for length 3\n\
+         For input string: \"abc\"\n\
+         java.lang.ArithmeticException: / by zero\n\
+         / by zero\n\
+         -2\n\
+         Index 9 out of bounds for length 4\n\
+         deep java.lang.ArrayIndexOutOfBoundsException: Index 9 out of bounds for length 3\n"
+    );
+}
+
+#[test]
+fn an_uncaught_runtime_fault_exits_non_zero() {
+    // With no handler anywhere the fault still ends the program the way `java`
+    // does: the output written before it survives, the rest never runs, and the
+    // exit status is non-zero.
+    let (out, ok) = run("public class Main {\
+         public static void main(String[] a) {\
+         int[] q = {1, 2, 3};\
+         System.out.println(\"before\");\
+         System.out.println(q[9]);\
+         System.out.println(\"after\"); } }");
     assert!(!ok);
+    assert_eq!(out, "before\n");
+}
+
+#[test]
+fn try_with_resources_closes_in_reverse_order() {
+    // The resources close in reverse declaration order, before the outer
+    // `catch`/`finally` runs, on both the normal and the exceptional path — and
+    // a `return` out of the block closes them too. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int f() { try (Res r = new Res(\"r\")) { return 7; } }\
+         public static void main(String[] a) {\
+         try (Res x = new Res(\"a\"); Res y = new Res(\"b\")) { System.out.println(\"body\"); }\
+         try (Res x = new Res(\"c\")) { throw new IllegalStateException(\"boom\"); }\
+         catch (IllegalStateException e) { System.out.println(\"caught \" + e.getMessage()); }\
+         System.out.println(f()); } }\
+         class Res implements AutoCloseable {\
+         String n;\
+         Res(String n) { this.n = n; System.out.println(\"open \" + n); }\
+         public void close() { System.out.println(\"close \" + n); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "open a\nopen b\nbody\nclose b\nclose a\n\
+         open c\nclose c\ncaught boom\n\
+         open r\nclose r\n7\n"
+    );
+}
+
+#[test]
+fn a_jump_out_of_a_try_runs_its_finally_first() {
+    // `return`/`break`/`continue` leaving a guarded region each emit the
+    // cleanup block before taking the jump — innermost first, and only for the
+    // blocks actually being left (`brk`'s `finally` is inside the loop, so it
+    // runs on every iteration up to the `break`). The returned value is fixed
+    // before the cleanup runs, so `keep`'s reassignment cannot change it.
+    // Outputs verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int ret() { try { return 1; } finally { System.out.println(\"fin\"); } }\
+         static int keep() { int x = 5; try { return x; } finally { x = 99; } }\
+         static int nest() { try { try { return 3; } finally { System.out.println(\"in\"); } } finally { System.out.println(\"out\"); } }\
+         static int brk() { int t = 0; for (int i = 0; i < 4; i++) { try { if (i == 2) { break; } t += i; } finally { System.out.println(\"b\" + i); } } return t; }\
+         static int over() { try { return 6; } finally { return 66; } }\
+         public static void main(String[] a) {\
+         System.out.println(ret()); System.out.println(keep());\
+         System.out.println(nest()); System.out.println(brk());\
+         System.out.println(over()); } }");
+    assert!(ok);
+    assert_eq!(out, "fin\n1\n5\nin\nout\n3\nb0\nb1\nb2\n1\n66\n");
+}
+
+#[test]
+fn a_throw_from_a_catch_arm_still_runs_the_finally() {
+    // The cleanup block guards the catch arms too: an exception raised inside a
+    // handler runs the `finally` on its way out, and reaches the *enclosing*
+    // handler — not this try's own arms. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         public static void main(String[] a) {\
+         try {\
+           try { throw new IllegalStateException(\"one\"); }\
+           catch (IllegalStateException e) { throw new RuntimeException(\"two\"); }\
+           finally { System.out.println(\"fin\"); }\
+         } catch (RuntimeException e) { System.out.println(\"outer \" + e.getMessage()); } } }");
+    assert!(ok);
+    assert_eq!(out, "fin\nouter two\n");
 }
 
 #[test]

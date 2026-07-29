@@ -16,8 +16,10 @@
 //! Java frontend: `int`-vs-`double` division dispatch (`7/2==3`, `7/2.0==3.5`),
 //! `+` string-concatenation coercion, `Double.toString` notation (the
 //! decimal/scientific threshold), `String.format`, the `String` instance methods,
-//! and `Math` overload result typing. Pure random bytes only produce mutual parse
-//! errors that agree on both sides and teach nothing.
+//! `Math` overload result typing, the runtime faults javars raises itself
+//! (`fault`), the cleanup blocks a jump has to run (`finally`), and
+//! try-with-resources close ordering (`resource`). Pure random bytes only produce
+//! mutual parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
@@ -27,7 +29,9 @@
 //!     function of its source.
 //!   * Documented `BUGS.md` simplifications are NOT generated, because they would
 //!     only reproduce known entries rather than find anything:
-//!       - integer division/modulo by zero (divisors are always non-zero),
+//!       - `NullPointerException` detail messages (Java's helpful NPE names the
+//!         javac local slot, which javars cannot reproduce — the `fault` mode
+//!         raises every *other* runtime fault and prints its message),
 //!       - widening *value* conversion (`double d = 7;` printing `7` not `7.0`),
 //!       - `char` as a one-character string,
 //!       - `==` identity on non-string objects,
@@ -351,6 +355,139 @@ fn g_exception(r: &mut Rng) -> String {
     }
 }
 
+/// Catchable *runtime* faults — the ones javars raises itself rather than a
+/// `throw`: an out-of-range array index, `Integer.parseInt` on junk, integral
+/// `/ 0` and `% 0`, a negative array size, and the `String` index/argument
+/// faults. Each probe both catches the fault and prints its `getMessage()`/
+/// `toString()`, so a wrong exception *type* and a wrong detail message are
+/// both divergences.
+///
+/// Divisors and indices come from computed values (`arr.length - 3`), never
+/// literals, so the compile-time constant-divisor path cannot mask the check.
+/// `NullPointerException` messages are deliberately not printed: Java's helpful
+/// NPE names the javac local slot (`because "<local3>" is null`), which javars
+/// cannot reproduce (see BUGS.md).
+fn g_fault(r: &mut Rng) -> String {
+    let catch_as = pick(
+        r,
+        &[
+            "RuntimeException",
+            "Exception",
+            "Throwable",
+            "IndexOutOfBoundsException",
+        ],
+    );
+    match r.below(9) {
+        0 => format!(
+            "{{ int[] fa = {{1, 2, 3}}; int fi = fa.length + {}; try {{ System.out.println(fa[fi]); }} catch (ArrayIndexOutOfBoundsException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["0", "2", "-7", "-4"])
+        ),
+        1 => format!(
+            "{{ int[] fa = new int[2]; int fi = {}; try {{ fa[fi] = 1; }} catch (ArrayIndexOutOfBoundsException e) {{ System.out.println(e); }} System.out.println(fa[0]); }}",
+            pick(r, &["2", "-1", "9"])
+        ),
+        2 => format!(
+            "{{ try {{ System.out.println(Integer.parseInt(\"{}\")); }} catch (NumberFormatException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["abc", "", " 7 ", "1x", "99999999999", "-", "+"])
+        ),
+        3 => format!(
+            "{{ int fz = {} - {}; try {{ System.out.println(7 {} fz); }} catch (ArithmeticException e) {{ System.out.println(e); }} }}",
+            pick(r, &["1", "3", "5"]),
+            pick(r, &["1", "3", "5"]),
+            if r.below(2) == 0 { "/" } else { "%" }
+        ),
+        4 => format!(
+            "{{ int fn = {}; try {{ int[] fq = new int[fn]; System.out.println(fq.length); }} catch (NegativeArraySizeException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["-1", "-9", "2"])
+        ),
+        5 => format!(
+            "{{ String fs = \"abcd\"; int fi = {}; try {{ System.out.println(fs.charAt(fi)); }} catch (StringIndexOutOfBoundsException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["1", "4", "-1", "9"])
+        ),
+        6 => format!(
+            "{{ String fs = \"abcd\"; int fi = {}; try {{ System.out.println(fs.substring(fi, 3)); }} catch (StringIndexOutOfBoundsException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["0", "5", "-2"])
+        ),
+        7 => format!(
+            "{{ int fc = {}; try {{ System.out.println(\"ab\".repeat(fc)); }} catch (IllegalArgumentException e) {{ System.out.println(e.getMessage()); }} }}",
+            pick(r, &["-1", "-3", "2"])
+        ),
+        // The fault must propagate out of a call frame and be catchable by any
+        // supertype of its class.
+        _ => format!(
+            "{{ int[] fa = {{4, 5}}; try {{ System.out.println(fa[fa.length + 1] + Integer.parseInt(\"z\")); }} catch ({catch_as} e) {{ System.out.println(\"c:\" + e); }} }}"
+        ),
+    }
+}
+
+/// `finally` interaction with the jumps that leave it — `return`, `break`,
+/// `continue`, labeled forms, nesting, and an exception raised inside a `catch`
+/// arm (which must still run the cleanup on its way out).
+fn g_finally(r: &mut Rng) -> String {
+    match r.below(6) {
+        0 => format!(
+            "{{ int fv = {}; System.out.println(fv); }}",
+            pick(
+                r,
+                &[
+                    "fin1()",
+                    "fin2()",
+                    "fin3()"
+                ]
+            )
+        ),
+        1 => "{ int t = 0; for (int i = 0; i < 4; i++) { try { if (i == 2) { break; } t += i; } finally { System.out.println(\"b\" + i); } } System.out.println(t); }"
+            .to_string(),
+        2 => "{ int t = 0; for (int i = 0; i < 4; i++) { try { if (i % 2 == 0) { continue; } t += i; } finally { System.out.println(\"c\" + i); } } System.out.println(t); }"
+            .to_string(),
+        3 => "{ int t = 0; outer: for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) { try { if (j == 1) { continue outer; } if (i == 2) { break outer; } t++; } finally { System.out.println(\"l\" + i + j); } } } System.out.println(t); }"
+            .to_string(),
+        4 => format!(
+            "{{ try {{ try {{ throw new IllegalStateException(\"a\"); }} catch (IllegalStateException e) {{ throw new RuntimeException(\"{}\"); }} finally {{ System.out.println(\"fin\"); }} }} catch (RuntimeException e) {{ System.out.println(\"out \" + e.getMessage()); }} }}",
+            pick(r, &["b", "c"])
+        ),
+        _ => "{ try { try { int[] z = new int[1]; System.out.println(z[3]); } catch (NumberFormatException e) { System.out.println(\"no\"); } finally { System.out.println(\"fin2\"); } } catch (RuntimeException e) { System.out.println(\"out2 \" + e.getMessage()); } }"
+            .to_string(),
+    }
+}
+
+/// Try-with-resources: close order (reverse of declaration), closing before the
+/// outer `catch`/`finally` runs, the exceptional path, a `return` out of the
+/// block, and the Java 9 bare-name form.
+fn g_resource(r: &mut Rng) -> String {
+    match r.below(5) {
+        0 => "{ try (Res a = new Res(\"a\")) { System.out.println(\"body\"); } }".to_string(),
+        1 => "{ try (Res a = new Res(\"a\"); Res b = new Res(\"b\")) { System.out.println(\"body\"); } }"
+            .to_string(),
+        2 => format!(
+            "{{ try (Res a = new Res(\"a\"); Res b = new Res(\"b\")) {{ throw new IllegalStateException(\"{}\"); }} catch (IllegalStateException e) {{ System.out.println(\"c \" + e.getMessage()); }} finally {{ System.out.println(\"fin\"); }} }}",
+            pick(r, &["x", "y"])
+        ),
+        3 => "{ try (Res a = new Res(\"a\")) { int[] q = {1}; System.out.println(q[4]); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(e.getMessage()); } }"
+            .to_string(),
+        _ => "{ Res h = new Res(\"h\"); try (h) { System.out.println(\"body\"); } System.out.println(resret()); }"
+            .to_string(),
+    }
+}
+
+/// Helper declarations the `finally`/`resource` probes call. Emitted into every
+/// generated program (they are inert when unused).
+const SUPPORT: &str = concat!(
+    "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
+    "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
+    "    static int fin3() { try { return 6; } finally { return 66; } }\n",
+    "    static int resret() { try (Res a = new Res(\"r\")) { return 7; } }\n",
+);
+
+/// The `AutoCloseable` the resource probes open and close.
+const SUPPORT_CLASS: &str = concat!(
+    "class Res implements AutoCloseable {\n",
+    "    String n;\n",
+    "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
+    "    public void close() { System.out.println(\"close \" + n); }\n",
+    "}\n",
+);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -373,6 +510,9 @@ enum Mode {
     Overflow,
     ForEach,
     Exception,
+    Fault,
+    Finally,
+    Resource,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -395,6 +535,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Overflow,
     Mode::ForEach,
     Mode::Exception,
+    Mode::Fault,
+    Mode::Finally,
+    Mode::Resource,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -419,6 +562,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Overflow => "overflow",
         Mode::ForEach => "foreach",
         Mode::Exception => "exception",
+        Mode::Fault => "fault",
+        Mode::Finally => "finally",
+        Mode::Resource => "resource",
     }
 }
 
@@ -455,6 +601,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Overflow => g_overflow(r),
         Mode::ForEach => g_foreach(r),
         Mode::Exception => g_exception(r),
+        Mode::Fault => g_fault(r),
+        Mode::Finally => g_finally(r),
+        Mode::Resource => g_resource(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -473,7 +622,10 @@ fn build_program(probes: &[String]) -> String {
         s.push_str(probe);
         s.push('\n');
     }
-    s.push_str("    }\n}\n");
+    s.push_str("    }\n");
+    s.push_str(SUPPORT);
+    s.push_str("}\n");
+    s.push_str(SUPPORT_CLASS);
     s
 }
 

@@ -219,6 +219,21 @@ struct TryScope {
     unwind_ops: Vec<usize>,
 }
 
+/// One enclosing `finally` block of the *current frame*, innermost last.
+///
+/// A `return`/`break`/`continue` that leaves the guarded region has to run every
+/// `finally` it jumps out of, innermost first, before taking the jump. javars
+/// duplicates the block at each exit (as `javac` does since `jsr`/`ret` were
+/// dropped), so the exit sites need the source back — hence the body is kept
+/// here rather than a code address.
+struct FinallyScope {
+    body: Vec<Stmt>,
+    /// `Compiler::scopes.len()` when the `try` was entered. A `break`/`continue`
+    /// targeting scope index `i` must run exactly the finallys entered *inside*
+    /// that construct — the ones whose depth is greater than `i`.
+    scope_depth: usize,
+}
+
 struct Compiler {
     b: ChunkBuilder,
     /// The stack of enclosing breakable constructs (loops and `switch`es),
@@ -271,6 +286,9 @@ struct Compiler {
     /// frame with no active try, which makes an unwind a plain "return out of
     /// this frame and let the caller's check see it".
     tries: Vec<TryScope>,
+    /// Enclosing `finally` blocks of the current frame, innermost last. A jump
+    /// that leaves them (`return`/`break`/`continue`) emits their bodies first.
+    finallys: Vec<FinallyScope>,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
@@ -316,6 +334,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         temp_counter: 0,
         has_exceptions: prog.uses_exceptions,
         tries: Vec::new(),
+        finallys: Vec::new(),
     };
     // ── main body (global scope) ──
     for stmt in &prog.main {
@@ -1571,7 +1590,7 @@ impl Compiler {
                         self.emit_get(name, line);
                         let r = self.expr_type(value);
                         self.expr(value)?;
-                        self.emit_div(l, r, line);
+                        self.emit_div(l, r, value, line);
                     }
                     _ => {
                         // `x <op>= e` → x = x <op> e. `+=` onto a String
@@ -1581,6 +1600,13 @@ impl Compiler {
                             self.emit_stringified(value)?;
                         } else {
                             self.expr(value)?;
+                        }
+                        // `x %= 0` throws, exactly like `x / 0`.
+                        if *op == AssignOp::Mod
+                            && l == NumType::Int
+                            && self.expr_type(value) == NumType::Int
+                        {
+                            self.emit_zero_divisor_check(value, line);
                         }
                         self.b.emit(compound_op(*op), line);
                     }
@@ -1666,12 +1692,16 @@ impl Compiler {
             StmtKind::Return(val) => {
                 if self.scope.is_some() {
                     // In a method: return a value (or `null` for `void`).
+                    // Java evaluates the returned expression *before* running
+                    // the cleanup blocks, so a `finally` that reassigns the
+                    // variable cannot change the value already computed.
                     match val {
                         Some(e) => self.expr(e)?,
                         None => {
                             self.b.emit(Op::LoadUndef, line);
                         }
                     }
+                    self.emit_finallys_down_to(0)?;
                     self.b.emit(Op::ReturnValue, line);
                 } else {
                     // In `main` (void): a bare `return;` ends the program; a
@@ -1681,6 +1711,7 @@ impl Compiler {
                             "javars: `return <value>` from void main is not supported (line {line})"
                         ));
                     }
+                    self.emit_finallys_down_to(0)?;
                     let op = self.b.emit(Op::Jump(0), line);
                     self.exit_ops.push(op);
                 }
@@ -1857,6 +1888,31 @@ impl Compiler {
         self.b.patch_jump(jf, after);
     }
 
+    /// Emit a call to a builtin that can raise a Java exception (an array index,
+    /// a null receiver, `Integer.parseInt`, …), followed by the pending check.
+    ///
+    /// Every raising builtin is emitted through here rather than by a bare
+    /// `Op::CallBuiltin`, because a fault site that skips the check would leave
+    /// the throwable parked forever: the `Undef` the builtin returned would flow
+    /// on as a value and the program would keep running past the exception.
+    fn emit_raising_builtin(&mut self, id: u16, argc: u8, line: u32) {
+        self.b.emit(Op::CallBuiltin(id, argc), line);
+        self.emit_exc_check(line);
+    }
+
+    /// Raise a `java.lang` throwable from compiler-emitted code and unwind — the
+    /// integer division-by-zero path, where the fault is visible statically but
+    /// only the runtime knows the divisor.
+    fn emit_fault(&mut self, class: &str, msg: &str, line: u32) {
+        let c = self.b.add_constant(Value::str(class.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        let m = self.b.add_constant(Value::str(msg.to_string()));
+        self.b.emit(Op::LoadConst(m), line);
+        self.b.emit(Op::CallBuiltin(crate::host::JFAULT, 2), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_unwind(line);
+    }
+
     /// Emit the end-of-`main` uncaught-exception report: an exception that no
     /// handler claimed prints Java's `Exception in thread "main" …` line and
     /// exits non-zero.
@@ -1892,7 +1948,11 @@ impl Compiler {
     ///   JEXC_CUT(depth); exc = JEXC_TAKE
     ///   if (exc instanceof E1) { e1 = exc; <catch 1>; Jump normal }
     ///   …
-    ///   <finally>                   ; unmatched: finally still runs …
+    ///   Jump rethrow                ; no arm matched — `exc` continues outward
+    /// pad:                          ; a catch arm threw: same treatment, but the
+    ///   JEXC_CUT(depth); exc = JEXC_TAKE   ; NEW exception replaces `exc`
+    /// rethrow:
+    ///   <finally>                   ; the cleanup still runs …
     ///   JTHROW(exc); <unwind>       ; … then the exception continues outward
     /// normal:
     ///   <finally>
@@ -1901,12 +1961,13 @@ impl Compiler {
     /// The `finally` body is emitted twice — once per path — rather than shared
     /// through a subroutine, because a shared copy would need a return address
     /// and fusevm's frames are for calls, not for local jumps. Duplication is
-    /// what `javac` itself did before `jsr`/`ret` were dropped.
+    /// what `javac` itself did before `jsr`/`ret` were dropped, and it is why a
+    /// `return`/`break`/`continue` leaving the block emits its own copy (see
+    /// [`Compiler::emit_finallys_down_to`]).
     ///
-    /// A `return`/`break`/`continue` that would leave a `try` with a `finally`
-    /// is rejected at compile time (see [`escapes_body`]): javars would run the
-    /// jump without the `finally`, and silently skipping a cleanup block is
-    /// worse than not accepting the program.
+    /// The exception is parked back into the pending slot only *after* the
+    /// `finally` has run: leaving it in flight would make the cleanup block's
+    /// own post-call checks fire immediately and skip it.
     fn try_stmt(
         &mut self,
         body: &[Stmt],
@@ -1914,19 +1975,22 @@ impl Compiler {
         finally_body: &[Stmt],
         line: u32,
     ) -> Result<(), String> {
-        if !finally_body.is_empty()
-            && (escapes_body(body) || catches.iter().any(|c| escapes_body(&c.body)))
-        {
-            return Err(format!(
-                "javars: `return`/`break`/`continue` out of a `try` with a `finally` is not supported (line {line})"
-            ));
-        }
         // Record the stack depth so the handler can discard whatever the
         // abandoned expression had already pushed.
         let depth_t = self.temp();
         self.b
             .emit(Op::CallBuiltin(crate::host::JEXC_DEPTH, 0), line);
         self.emit_set(&depth_t, line);
+
+        // The cleanup block is in scope for the try body AND for every catch
+        // arm — a `return` from either runs it.
+        let has_finally = !finally_body.is_empty();
+        if has_finally {
+            self.finallys.push(FinallyScope {
+                body: finally_body.to_vec(),
+                scope_depth: self.scopes.len(),
+            });
+        }
 
         self.tries.push(TryScope {
             unwind_ops: Vec::new(),
@@ -1942,15 +2006,15 @@ impl Compiler {
         for op in scope.unwind_ops {
             self.b.patch_jump(op, handler);
         }
-        self.emit_get(&depth_t, line);
-        self.b.emit(Op::CallBuiltin(crate::host::JEXC_CUT, 1), line);
-        self.b.emit(Op::Pop, line);
         let exc_t = self.temp();
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JEXC_TAKE, 0), line);
-        self.emit_set(&exc_t, line);
+        self.emit_claim_exception(&depth_t, &exc_t, line);
 
-        // `catch` arms, in source order — the first type match wins.
+        // `catch` arms, in source order — the first type match wins. An unwind
+        // raised *inside* an arm belongs to the enclosing try, but must still
+        // run this `finally`, so the arms get their own landing pad.
+        self.tries.push(TryScope {
+            unwind_ops: Vec::new(),
+        });
         let mut matched_jumps = Vec::new();
         for arm in catches {
             self.emit_get(&exc_t, line);
@@ -1969,7 +2033,27 @@ impl Compiler {
             let next = self.b.current_pos();
             self.b.patch_jump(jf, next);
         }
-        // No arm matched: run `finally`, then let the exception continue outward.
+        let catch_scope = self.tries.pop().unwrap();
+
+        // Falling out of the arm chain means no arm matched: `exc_t` already
+        // holds the exception, so skip the pad that re-reads a new one.
+        let skip_pad = (!catch_scope.unwind_ops.is_empty()).then(|| self.b.emit(Op::Jump(0), line));
+        if !catch_scope.unwind_ops.is_empty() {
+            let pad = self.b.current_pos();
+            for op in catch_scope.unwind_ops {
+                self.b.patch_jump(op, pad);
+            }
+            self.emit_claim_exception(&depth_t, &exc_t, line);
+        }
+
+        // Either way the cleanup runs, then the exception continues outward.
+        let rethrow = self.b.current_pos();
+        if let Some(j) = skip_pad {
+            self.b.patch_jump(j, rethrow);
+        }
+        if has_finally {
+            self.finallys.pop();
+        }
         for s in finally_body {
             self.stmt(s)?;
         }
@@ -1988,6 +2072,51 @@ impl Compiler {
             self.stmt(s)?;
         }
         Ok(())
+    }
+
+    /// Take the in-flight exception into `exc_t` and drop the operands the
+    /// abandoned expression left behind (back to the depth recorded in
+    /// `depth_t`). Both handler entry points start with exactly this.
+    fn emit_claim_exception(&mut self, depth_t: &str, exc_t: &str, line: u32) {
+        self.emit_get(depth_t, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JEXC_CUT, 1), line);
+        self.b.emit(Op::Pop, line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JEXC_TAKE, 0), line);
+        self.emit_set(exc_t, line);
+    }
+
+    /// Emit the `finally` blocks a jump is about to leave, innermost first,
+    /// down to `keep` remaining. The stack is temporarily shortened while a body
+    /// is lowered so a `return` *inside* a cleanup block does not re-emit that
+    /// same block, then restored — the statements after the jump are still
+    /// inside the same `try`.
+    fn emit_finallys_down_to(&mut self, keep: usize) -> Result<(), String> {
+        if self.finallys.len() <= keep {
+            return Ok(());
+        }
+        let pending = self.finallys.split_off(keep);
+        let mut result = Ok(());
+        'outer: for f in pending.iter().rev() {
+            for s in &f.body {
+                if let Err(e) = self.stmt(s) {
+                    result = Err(e);
+                    break 'outer;
+                }
+            }
+        }
+        self.finallys.extend(pending);
+        result
+    }
+
+    /// The number of enclosing `finally` blocks that stay in scope when a jump
+    /// targets breakable scope `idx` — the ones entered *outside* it. A jump
+    /// leaving the frame entirely (`return`) keeps none.
+    fn finallys_outside(&self, idx: usize) -> usize {
+        self.finallys
+            .iter()
+            .take_while(|f| f.scope_depth <= idx)
+            .count()
     }
 
     /// Lower the enhanced `for (T x : arr) { … }` over an array.
@@ -2043,8 +2172,7 @@ impl Compiler {
         // iteration, before the body runs.
         self.emit_get(&arr_t, line);
         self.emit_get(&idx_t, line);
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), line);
+        self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
         self.emit_set(name, line);
 
         self.scopes.push(BreakScope::loop_scope(label));
@@ -2141,15 +2269,22 @@ impl Compiler {
     /// Lower `break;` / `break label;`. An unlabeled break targets the innermost
     /// loop or `switch`; a labeled break targets the matching named construct.
     fn break_stmt(&mut self, label: Option<&str>, line: u32) -> Result<(), String> {
-        let op = self.b.emit(Op::Jump(0), line);
+        // The target is resolved first: the `finally` blocks the jump leaves are
+        // exactly those entered inside the targeted construct, and their bodies
+        // have to be emitted *before* the jump itself.
         match self.find_scope(label, |_| true) {
             Some(idx) => {
+                let keep = self.finallys_outside(idx);
+                self.emit_finallys_down_to(keep)?;
+                let op = self.b.emit(Op::Jump(0), line);
                 self.scopes[idx].break_ops.push(op);
                 Ok(())
             }
             None if label.is_none() => {
                 // A top-level `break` (no enclosing construct) ends the program,
                 // preserving javars's existing behavior.
+                self.emit_finallys_down_to(0)?;
+                let op = self.b.emit(Op::Jump(0), line);
                 self.exit_ops.push(op);
                 Ok(())
             }
@@ -2163,9 +2298,11 @@ impl Compiler {
     /// Lower `continue;` / `continue label;`. Targets the innermost enclosing
     /// loop (skipping `switch` scopes), or the named loop for a labeled form.
     fn continue_stmt(&mut self, label: Option<&str>, line: u32) -> Result<(), String> {
-        let op = self.b.emit(Op::Jump(0), line);
         match self.find_scope(label, |s| s.kind == ScopeKind::Loop) {
             Some(idx) => {
+                let keep = self.finallys_outside(idx);
+                self.emit_finallys_down_to(keep)?;
+                let op = self.b.emit(Op::Jump(0), line);
                 self.scopes[idx].continue_ops.push(op);
                 Ok(())
             }
@@ -2288,7 +2425,7 @@ impl Compiler {
                     // Single dimension — the direct allocate builtin.
                     self.expr(&sizes[0])?;
                     self.emit_type_default(elem_ty, 0);
-                    self.b.emit(Op::CallBuiltin(crate::host::JARRAY_NEW, 2), 0);
+                    self.emit_raising_builtin(crate::host::JARRAY_NEW, 2, 0);
                 } else {
                     // Multi-dimensional: push each sized dimension, then the leaf
                     // default (the element-type default when fully sized, else
@@ -2301,8 +2438,9 @@ impl Compiler {
                     } else {
                         self.emit_type_default(elem_ty, 0);
                     }
-                    self.b.emit(
-                        Op::CallBuiltin(crate::host::JARRAY_NEW_MULTI, sizes.len() as u8 + 1),
+                    self.emit_raising_builtin(
+                        crate::host::JARRAY_NEW_MULTI,
+                        sizes.len() as u8 + 1,
                         0,
                     );
                 }
@@ -2319,7 +2457,7 @@ impl Compiler {
             Expr::Index { array, index } => {
                 self.expr(array)?;
                 self.expr(index)?;
-                self.b.emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), 0);
+                self.emit_raising_builtin(crate::host::JARRAY_GET, 2, 0);
             }
             Expr::Field { recv, name } => {
                 self.expr(recv)?;
@@ -2403,8 +2541,9 @@ impl Compiler {
                 let method_c = self.b.add_constant(Value::str(method.to_string()));
                 self.b.emit(Op::LoadConst(method_c), line);
                 // argc counts the args plus the class-name and method-name strings.
-                self.b.emit(
-                    Op::CallBuiltin(crate::host::JSTATIC_DISPATCH, args.len() as u8 + 2),
+                self.emit_raising_builtin(
+                    crate::host::JSTATIC_DISPATCH,
+                    args.len() as u8 + 2,
                     line,
                 );
                 return Ok(());
@@ -2423,10 +2562,7 @@ impl Compiler {
         let name_c = self.b.add_constant(Value::str(method.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
         // argc counts the receiver, the arguments, and the method-name string.
-        self.b.emit(
-            Op::CallBuiltin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2),
-            line,
-        );
+        self.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
         Ok(())
     }
 
@@ -2435,8 +2571,7 @@ impl Compiler {
     fn emit_field_get(&mut self, name: &str, line: u32) {
         let name_c = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JFIELD_GET, 2), line);
+        self.emit_raising_builtin(crate::host::JFIELD_GET, 2, line);
     }
 
     /// Lower `new ClassName(args...)`: allocate the instance, seed its fields
@@ -2481,8 +2616,7 @@ impl Compiler {
                 Some(e) => self.expr(e)?,
                 None => self.emit_type_default(fty, line),
             }
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+            self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
             self.b.emit(Op::Pop, line);
         }
 
@@ -2528,8 +2662,7 @@ impl Compiler {
             self.expr(array)?;
             self.expr(index)?;
             self.expr(value)?;
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JARRAY_SET, 3), line);
+            self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
             self.b.emit(Op::Pop, line);
             return Ok(());
         }
@@ -2543,8 +2676,7 @@ impl Compiler {
         // old element
         self.emit_get(&arr_t, line);
         self.emit_get(&idx_t, line);
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), line);
+        self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
         // combine with value: the element's declared type decides both the
         // compound-`/` truncation and the 32-bit wrap.
         let elem_ty = self
@@ -2562,8 +2694,7 @@ impl Compiler {
         self.emit_get(&arr_t, line);
         self.emit_get(&idx_t, line);
         self.emit_get(&new_t, line);
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JARRAY_SET, 3), line);
+        self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
         self.b.emit(Op::Pop, line);
         Ok(())
     }
@@ -2592,8 +2723,7 @@ impl Compiler {
             let name_c = self.b.add_constant(Value::str(name.to_string()));
             self.b.emit(Op::LoadConst(name_c), line);
             self.expr(value)?;
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+            self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
             self.b.emit(Op::Pop, line);
             return Ok(());
         }
@@ -2611,8 +2741,7 @@ impl Compiler {
         let name_c = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
         self.emit_get(&new_t, line);
-        self.b
-            .emit(Op::CallBuiltin(crate::host::JFIELD_SET, 3), line);
+        self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
         self.b.emit(Op::Pop, line);
         Ok(())
     }
@@ -2631,12 +2760,19 @@ impl Compiler {
         if op == AssignOp::Div {
             let r = self.expr_type(value);
             self.expr(value)?;
-            self.emit_div(target, r, line);
+            self.emit_div(target, r, value, line);
         } else {
             if op == AssignOp::Add {
                 self.emit_stringified(value)?;
             } else {
                 self.expr(value)?;
+            }
+            // `x %= 0` throws the same `ArithmeticException` as `x / 0`.
+            if op == AssignOp::Mod
+                && target == NumType::Int
+                && self.expr_type(value) == NumType::Int
+            {
+                self.emit_zero_divisor_check(value, line);
             }
             self.b.emit(compound_op(op), line);
         }
@@ -2792,7 +2928,7 @@ impl Compiler {
             let wrap = self.operands_are_int(lhs, rhs);
             self.expr(lhs)?;
             self.expr(rhs)?;
-            self.emit_div(l, r, 0);
+            self.emit_div(l, r, rhs, 0);
             // `Integer.MIN_VALUE / -1` is the one division that overflows.
             if wrap {
                 self.emit_wrap32(0);
@@ -2809,6 +2945,14 @@ impl Compiler {
         } else {
             self.expr(lhs)?;
             self.expr(rhs)?;
+        }
+        // Integral `%` by zero throws `ArithmeticException` in Java, exactly as
+        // `/` does; the floating `%` yields NaN and needs no check.
+        if op == BinOp::Mod
+            && self.expr_type(lhs) == NumType::Int
+            && self.expr_type(rhs) == NumType::Int
+        {
+            self.emit_zero_divisor_check(rhs, 0);
         }
         let vop = match op {
             BinOp::Add => Op::Add,
@@ -2846,13 +2990,40 @@ impl Compiler {
     /// not statically known — routes through the `JDIV` builtin, because Java
     /// floating division is IEEE-754: `x / 0.0` is a signed infinity and
     /// `0.0 / 0.0` is NaN, where the native op yields `Undef`.
-    fn emit_div(&mut self, l: NumType, r: NumType, line: u32) {
+    fn emit_div(&mut self, l: NumType, r: NumType, divisor: &Expr, line: u32) {
         if l == NumType::Int && r == NumType::Int {
+            self.emit_zero_divisor_check(divisor, line);
             self.b.emit(Op::Div, line);
             self.b.emit(Op::TruncInt, line);
         } else {
             self.b.emit(Op::CallBuiltin(crate::host::JDIV, 2), line);
         }
+    }
+
+    /// Emit Java's integral division-by-zero check for the divisor already on
+    /// top of the stack: `int / 0` and `int % 0` throw `ArithmeticException`,
+    /// where fusevm's native `Div`/`Mod` (shell/awk flavoured, with no
+    /// infinities) yield `Undef`. The floating path needs no check — IEEE-754
+    /// division by zero is an infinity, which `JDIV` already produces.
+    ///
+    /// A literal non-zero divisor is checked at compile time and emits nothing,
+    /// so `x / 2` and every constant-divisor loop keep the bare native op pair
+    /// and stay JIT-traceable.
+    fn emit_zero_divisor_check(&mut self, divisor: &Expr, line: u32) {
+        if let Expr::Int(n) = divisor {
+            if *n != 0 {
+                return;
+            }
+        }
+        self.b.emit(Op::Dup, line);
+        self.b.emit(Op::LoadInt(0), line);
+        self.b.emit(Op::NumEq, line);
+        let jf = self.b.emit(Op::JumpIfFalse(0), line);
+        // The unwind abandons both operands; the handler's `JEXC_CUT` (or the
+        // frame's `ReturnValue`) drops them.
+        self.emit_fault("ArithmeticException", "/ by zero", line);
+        let after = self.b.current_pos();
+        self.b.patch_jump(jf, after);
     }
 }
 
@@ -2911,66 +3082,6 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         }
         StmtKind::Throw(e) => expr_has_ffi(e),
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
-    })
-}
-
-/// True when `body` contains a jump that would leave it — a `return`, or a
-/// `break`/`continue` not answered by a loop/`switch` inside `body` itself.
-/// Used to reject the one `finally` shape javars cannot honour: a `finally`
-/// whose block is skipped by a jump out of the guarded region.
-///
-/// A labeled `break`/`continue` always counts as escaping, because its target
-/// is by definition named outside the statement it appears in.
-fn escapes_body(body: &[Stmt]) -> bool {
-    body.iter().any(|s| match &s.kind {
-        StmtKind::Return(_) => true,
-        StmtKind::Break(label) | StmtKind::Continue(label) => label.is_some(),
-        StmtKind::If { then, els, .. } => escapes_body(then) || escapes_body(els),
-        StmtKind::Labeled { body, .. } => escapes_body(std::slice::from_ref(body)),
-        StmtKind::Try {
-            body,
-            catches,
-            finally_body,
-        } => {
-            escapes_body(body)
-                || catches.iter().any(|c| escapes_body(&c.body))
-                || escapes_body(finally_body)
-        }
-        // A loop or `switch` answers its own unlabeled `break`/`continue`, so
-        // only a `return` (or a labeled jump) inside it escapes.
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::For { body, .. }
-        | StmtKind::ForEach { body, .. } => body_returns(body),
-        StmtKind::Switch { groups, .. } => groups.iter().any(|g| body_returns(&g.body)),
-        _ => false,
-    })
-}
-
-/// True when `body` contains a `return` or a labeled jump anywhere inside it
-/// (including nested loops) — the part of [`escapes_body`] that a surrounding
-/// loop cannot absorb.
-fn body_returns(body: &[Stmt]) -> bool {
-    body.iter().any(|s| match &s.kind {
-        StmtKind::Return(_) => true,
-        StmtKind::Break(label) | StmtKind::Continue(label) => label.is_some(),
-        StmtKind::If { then, els, .. } => body_returns(then) || body_returns(els),
-        StmtKind::Labeled { body, .. } => body_returns(std::slice::from_ref(body)),
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::For { body, .. }
-        | StmtKind::ForEach { body, .. } => body_returns(body),
-        StmtKind::Switch { groups, .. } => groups.iter().any(|g| body_returns(&g.body)),
-        StmtKind::Try {
-            body,
-            catches,
-            finally_body,
-        } => {
-            body_returns(body)
-                || catches.iter().any(|c| body_returns(&c.body))
-                || body_returns(finally_body)
-        }
-        _ => false,
     })
 }
 

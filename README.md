@@ -158,11 +158,18 @@ Implemented and checked against the reference `java`:
   `for (init; cond; update)`, the enhanced `for (T x : arr)`, `break`,
   `continue`, and `return` (a bare `return;` ends `main`; `return <expr>;`
   returns a value from a method).
-- **Exceptions** — `throw`, `try` / `catch` / `finally`, multiple `catch` arms
-  matched by class, and the modeled `java.lang` throwable hierarchy
-  (`RuntimeException`, `IllegalArgumentException`, `NumberFormatException`, …)
-  supplied as an implicit prelude. A throw unwinds real fusevm call frames into
-  the caller's handler; an uncaught one reports and exits non-zero.
+- **Exceptions** — `throw`, `try` / `catch` / `finally`, try-with-resources,
+  multiple `catch` arms matched by class, and the modeled `java.lang` throwable
+  hierarchy (`RuntimeException`, `IllegalArgumentException`,
+  `NumberFormatException`, …) supplied as an implicit prelude. A throw unwinds
+  real fusevm call frames into the caller's handler; an uncaught one reports and
+  exits non-zero. A `return`/`break`/`continue` leaving a guarded block runs the
+  `finally` on its way out, and so does an exception raised inside a `catch` arm.
+- **Catchable runtime faults** — javars's own faults are Java exceptions rather
+  than aborts: an out-of-range array index, a null receiver, `Integer.parseInt`
+  on junk, integral `/ 0` and `% 0`, a negative array size, and the `String`
+  index/argument faults all raise the throwable Java raises, with Java's detail
+  message, catchable by any supertype.
 - **`int` width** — Java's 32-bit `int` wrapping, for operations whose operand
   types are statically `int`; `long` stays 64-bit.
 - **Division** — Java's binary numeric promotion: `int / int` truncates toward
@@ -291,12 +298,13 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
+1. **`static` fields** — `static int n = 0;` parses but is not modeled: the name
+   reads as `null` instead of its initializer. The highest-priority gap, because
+   it is the one construct that runs wrong rather than being rejected.
+2. **Object-model depth** — enums, records, and abstract classes (enums need
+   `static` fields first).
+3. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
    collections, more `String` methods, and arrow-`switch` expressions.
-2. **Object-model depth** — enums, records, and abstract classes.
-3. **Catchable runtime faults** — an out-of-range index or a malformed
-   `Integer.parseInt` still aborts instead of raising a catchable
-   `ArrayIndexOutOfBoundsException` / `NumberFormatException`.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

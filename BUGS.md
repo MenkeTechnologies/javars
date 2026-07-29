@@ -1,7 +1,8 @@
 # Known gaps
 
 An honest list of what javars does **not** do yet. Unsupported constructs are
-reported as parse errors, never silently mis-run.
+reported as parse errors, with one known exception: a `static` field parses and
+then runs wrong (see below).
 
 ## Implemented
 
@@ -81,17 +82,62 @@ reported as parse errors, never silently mis-run.
   `java.lang` throwable hierarchy from `Throwable` down through `Exception`/
   `RuntimeException` to `IllegalArgumentException`, `NumberFormatException`,
   `IllegalStateException`, `ArithmeticException`, `NullPointerException`,
-  `ClassCastException`, `UnsupportedOperationException`, and the
-  `IndexOutOfBounds` pair is supplied as an implicit prelude (`src/prelude.rs`),
-  so `catch (Exception e)` matches a thrown `NumberFormatException`,
-  `e.getMessage()` works, and `System.out.println(e)` prints
-  `java.lang.Foo: message`. A user class may `extend` any of them. An exception
-  no handler claims reports Java's `Exception in thread "main" …` line on stderr
-  and exits non-zero.
+  `ClassCastException`, `UnsupportedOperationException`,
+  `NegativeArraySizeException`, and the `IndexOutOfBounds` pair is supplied as an
+  implicit prelude (`src/prelude.rs`), so `catch (Exception e)` matches a thrown
+  `NumberFormatException`, `e.getMessage()` works, and `System.out.println(e)`
+  prints `java.lang.Foo: message`. A user class may `extend` any of them. An
+  exception no handler claims reports Java's `Exception in thread "main" …` line
+  on stderr and exits non-zero.
+- **Runtime faults are catchable exceptions.** javars's own faults raise the
+  throwable Java raises, carrying Java's exact detail message, so they are
+  caught, typed, and re-thrown like any other: an out-of-range array index
+  (`ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 3`), a null
+  array/receiver (`NullPointerException`), `Integer.parseInt`/`valueOf`/
+  `Long.parseLong` on malformed, whitespace-padded, out-of-range, or bad-radix
+  input (`NumberFormatException: For input string: "abc"`, `… under radix 16`),
+  integral `/ 0` and `% 0` (`ArithmeticException: / by zero`), a negative array
+  size (`NegativeArraySizeException: -1`), `String.charAt`/`substring` out of
+  range (`StringIndexOutOfBoundsException: Range [2, 9) out of bounds for length
+  3`), and `String.repeat` with a negative count (`IllegalArgumentException:
+  count is negative: -1`). A fault raised inside a called method unwinds to the
+  caller's handler like a `throw`; one no handler claims still prints Java's
+  uncaught line and exits non-zero. The `/ 0` check is emitted inline (`Dup`,
+  compare, branch) and is skipped entirely for a literal non-zero divisor, so
+  constant-divisor loops keep the bare native op pair and stay JIT-traceable.
+- **A jump out of a `try` runs its `finally` first.** `return`, `break`,
+  `continue`, and their labeled forms emit every cleanup block they leave,
+  innermost first, before taking the jump — including a `break`/`continue` that
+  crosses several `try`s inside the targeted loop. The returned value is fixed
+  before the cleanup runs (a `finally` that reassigns the variable cannot change
+  it), and a `return` inside a `finally` replaces the pending one, both like
+  Java. An exception raised inside a `catch` arm also runs the `finally` on its
+  way out to the enclosing handler.
+- **Try-with-resources.** `try (T r = e; U s = f) { … }` — with or without
+  `catch`/`finally` arms, and the Java 9 bare-name form `try (existing)`.
+  Desugared into the nested `try`/`finally` shape Java specifies it as, so
+  resources close in reverse declaration order, close before any `catch`/
+  `finally` of the outer statement runs, and close on the exceptional path and on
+  a `return` out of the block. `close()` is called on the declared type through
+  ordinary dispatch; javars has no `java.lang.AutoCloseable`, so implementing it
+  is optional (an unknown interface name is inert).
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
   so aliasing holds.
+
+## Runs wrong rather than being rejected
+
+- **`static` fields.** `static int n = 0;` inside a class parses as an *instance*
+  field, so the class-level name never exists: reading `n` (or `C.n`) yields
+  `null` and a write goes nowhere. `static int n = 5; System.out.println(n);`
+  prints `null` where `java` prints `5`. This is the only construct javars
+  accepts and then runs wrong, and it is the reason `enum` is not implemented
+  yet — enum constants are `static` fields.
+- **`main`'s `String[] args` parameter is unbound.** `args` reads as `null`, so
+  `args.length` raises a `NullPointerException` instead of printing `0`. Program
+  arguments after the file name are collected by the CLI (`cli.argv`) but never
+  reach the program.
 
 ## Not implemented (parse errors today)
 
@@ -105,15 +151,8 @@ reported as parse errors, never silently mis-run.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **Arrow `switch` expressions**, `switch` on enums/patterns.
-- **Try-with-resources** (`try (var r = …)`) and **multi-catch**
-  (`catch (A | B e)`) — both are rejected, not mis-parsed.
-- **A `return`/`break`/`continue` that leaves a `try` with a `finally`.**
-  javars would take the jump without running the `finally`, so the program is
-  rejected at compile time instead. Without a `finally`, all three work.
-- **Catching a runtime fault.** `catch` only sees objects a `throw` raised.
-  javars's own faults — an out-of-range array index, a `NumberFormatException`
-  from `Integer.parseInt`, integer division by zero — still abort the program
-  with a `javars:` message instead of being catchable exceptions.
+- **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
+  no single `|` token, so it fails lexically).
 - **Lambdas, streams, `var` type inference beyond storage.**
 
 ## Modeled with a documented simplification
@@ -150,3 +189,15 @@ reported as parse errors, never silently mis-run.
   keep their JIT trace.
 - **Uninitialized locals are unbound** rather than rejected; reading one before
   assignment yields `null` instead of a compile error.
+- **`NullPointerException` detail messages drop the provenance clause.** Java's
+  "helpful NPE" names the *bytecode local slot* of the null reference — `Cannot
+  read field "x" because "<local4>" is null` — which javars cannot reproduce: it
+  has no `javac` slot numbering. javars keeps the operation half of the wording
+  and ends there (`Cannot read field "x" because the receiver is null`). The
+  exception *class* is right, so `catch (NullPointerException e)` behaves
+  identically; only `e.getMessage()`/`e.toString()` text differs. A method call
+  on a null user-class receiver reports the first field access that fails inside
+  the callee rather than Java's `Cannot invoke "P.get()"`.
+- **A throwing `close()` replaces the body's exception rather than being
+  suppressed.** Java records it via `Throwable.addSuppressed`; javars has no
+  suppression list, so the later exception wins.
