@@ -1279,9 +1279,23 @@ impl Compiler {
                         return Some(ret_name);
                     }
                 }
+                // A collection receiver's known return types.
+                if let Some(kind) = self
+                    .expr_java_type(recv)
+                    .as_deref()
+                    .and_then(collection_kind)
+                {
+                    if let Some(t) = collection_call_java_type(kind, method, args.len()) {
+                        return Some(t.to_string());
+                    }
+                    return None;
+                }
                 // A `String` receiver's known return types.
                 match (method.as_str(), args.len()) {
-                    ("length", 0) | ("indexOf", 1) => Some("int".to_string()),
+                    ("length", 0)
+                    | ("indexOf", 1)
+                    | ("compareTo", 1)
+                    | ("compareToIgnoreCase", 1) => Some("int".to_string()),
                     ("isEmpty", 0)
                     | ("contains", 1)
                     | ("equals", 1)
@@ -3103,9 +3117,16 @@ impl Compiler {
         let nt = numtype_of_ty(&elem_ty).unwrap_or(NumType::Other);
         self.declare_local(name, &elem_ty, nt);
 
-        // The array and the index cursor, evaluated/initialised once.
+        // The array and the index cursor, evaluated/initialised once. When the
+        // iterable is not *statically* an array it goes through `JITER_ARRAY`,
+        // which returns an array handle unchanged and snapshots a collection
+        // into a fresh one — so `for (String s : list)` works and an array loop
+        // emits exactly the ops it did before.
         let arr_t = self.temp();
         self.expr(iter)?;
+        if self.expr_array_type(iter).is_none() {
+            self.emit_raising_builtin(crate::host::JITER_ARRAY, 1, line);
+        }
         self.emit_set(&arr_t, line);
         let idx_t = self.temp();
         self.b.emit(Op::LoadInt(0), line);
@@ -3636,6 +3657,25 @@ impl Compiler {
         if let Some(rc) = self.expr_class(recv) {
             return self.dispatch_instance_method(recv, &rc, method, args, line);
         }
+        // A `java.util` collection receiver. The runtime path in `b_str_dispatch`
+        // catches a collection whose static type javars could not determine
+        // (an erased `Map.get` result), so this is a diagnostics-and-clarity
+        // shortcut rather than the only route.
+        if self
+            .expr_java_type(recv)
+            .as_deref()
+            .and_then(collection_kind)
+            .is_some()
+        {
+            self.expr(recv)?;
+            for a in args {
+                self.expr(a)?;
+            }
+            let name_c = self.b.add_constant(Value::str(method.to_string()));
+            self.b.emit(Op::LoadConst(name_c), line);
+            self.emit_raising_builtin(crate::host::JCOLL_DISPATCH, args.len() as u8 + 2, line);
+            return Ok(());
+        }
         // Otherwise a `String` method.
         self.expr(recv)?;
         for a in args {
@@ -3676,6 +3716,30 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        // `new ArrayList<>()` / `new HashMap<>(other)` — a `java.util`
+        // collection, allocated by the host rather than laid out as an instance.
+        // A user class of the same name wins, because `self.classes` is checked
+        // by the branch below only after this one declines.
+        if !self.classes.contains_key(class) && is_concrete_collection(class) {
+            if args.len() > 1 {
+                return Err(format!(
+                    "javars: `new {class}(…)` takes no argument or one collection (line {line})"
+                ));
+            }
+            let kind_c = self.b.add_constant(Value::str(class.to_string()));
+            self.b.emit(Op::LoadConst(kind_c), line);
+            match args.first() {
+                // `new ArrayList<>(other)` copies; `new ArrayList<>(16)` is a
+                // capacity hint with no observable effect, so an integral
+                // argument seeds nothing.
+                Some(a) if self.expr_java_type(a).as_deref() != Some("int") => self.expr(a)?,
+                _ => {
+                    self.b.emit(Op::LoadUndef, line);
+                }
+            }
+            self.emit_raising_builtin(crate::host::JCOLL_NEW, 2, line);
+            return Ok(());
+        }
         let info = self
             .classes
             .get(class)
@@ -4298,7 +4362,17 @@ fn array_elem_numtype(array_ty: &str) -> NumType {
 fn is_static_class(name: &str) -> bool {
     matches!(
         name,
-        "Math" | "Integer" | "Long" | "Double" | "Boolean" | "String" | "Character" | "Arrays"
+        "Math"
+            | "Integer"
+            | "Long"
+            | "Double"
+            | "Boolean"
+            | "String"
+            | "Character"
+            | "Arrays"
+            | "Collections"
+            | "List"
+            | "Set"
     )
 }
 
@@ -4335,6 +4409,51 @@ fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
     }
 }
 
+/// The `java.util` collection types javars models, mapped to the collection
+/// *shape* the host allocates. A user class of the same name wins (the compiler
+/// checks `self.classes` first), so declaring your own `List` is still legal.
+fn collection_kind(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "ArrayList" | "LinkedList" => "list",
+        "List" | "Collection" | "Iterable" => "list",
+        "HashMap" | "LinkedHashMap" | "TreeMap" | "Map" => "map",
+        "HashSet" | "LinkedHashSet" | "TreeSet" | "Set" => "set",
+        _ => return None,
+    })
+}
+
+/// True when `ty` names a collection *implementation* — the types `new` can
+/// construct. The interfaces (`List`, `Map`, `Set`) are declaration-only.
+fn is_concrete_collection(ty: &str) -> bool {
+    matches!(
+        ty,
+        "ArrayList"
+            | "LinkedList"
+            | "HashMap"
+            | "LinkedHashMap"
+            | "TreeMap"
+            | "HashSet"
+            | "LinkedHashSet"
+            | "TreeSet"
+    )
+}
+
+/// The declared Java return type of a collection method, for the ones whose
+/// result javars can type statically. `get`/`put`/`remove` return the erased
+/// element type, which javars does not track, so they stay unknown.
+fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'static str> {
+    Some(match (method, argc) {
+        ("size", 0) | ("indexOf", 1) | ("lastIndexOf", 1) => "int",
+        ("isEmpty", 0) | ("contains", 1) | ("containsKey", 1) | ("containsValue", 1) => "boolean",
+        ("add", 1) | ("addAll", 1) | ("equals", 1) => "boolean",
+        ("remove", 1) if kind == "set" => "boolean",
+        ("toString", 0) => "String",
+        ("keySet", 0) => "Set",
+        ("values", 0) => "List",
+        _ => return None,
+    })
+}
+
 /// The parameter count of a modeled stdlib static a method reference can name.
 ///
 /// Only the single-arity entries are listed: `Integer.toString` and
@@ -4362,8 +4481,16 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
 fn string_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
         "length" | "isEmpty" | "toUpperCase" | "toLowerCase" | "trim" => 0,
-        "charAt" | "contains" | "startsWith" | "endsWith" | "equals" | "equalsIgnoreCase"
-        | "concat" | "repeat" => 1,
+        "charAt"
+        | "contains"
+        | "startsWith"
+        | "endsWith"
+        | "equals"
+        | "equalsIgnoreCase"
+        | "concat"
+        | "repeat"
+        | "compareTo"
+        | "compareToIgnoreCase" => 1,
         "replace" => 2,
         _ => return None,
     })

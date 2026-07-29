@@ -2,7 +2,9 @@
 
 An honest list of what javars does **not** do yet. Every unsupported construct
 is reported as a parse or compile error rather than being run with the wrong
-meaning — there is no construct javars accepts and then mis-runs.
+meaning; the handful of places where an *accepted* construct computes something
+other than Java are all named under "Modeled with a documented simplification"
+at the bottom, and are summarized in the section right after this one.
 
 ## Implemented
 
@@ -14,10 +16,13 @@ meaning — there is no construct javars accepts and then mis-runs.
   — a labeled `break` exits the named loop/`switch`, a labeled `continue` steps
   the named loop.
 - **The enhanced `for`** (`for (String s : arr)`, `for (var v : arr)`) over an
-  array — including a `T[][]` row (`for (int[] row : grid)`), an empty array, and
-  labeled `break`/`continue`. The array expression is evaluated exactly once, and
-  the element type drives `/` typing the same way a declared local does. There
-  are no collections yet, so an array is the only thing it can iterate.
+  array or a collection — including a `T[][]` row (`for (int[] row : grid)`), an
+  empty array, a `List`/`Set`/`keySet()`/`values()`, and labeled
+  `break`/`continue`. The iterable expression is evaluated exactly once, and the
+  element type drives `/` typing the same way a declared local does. An array
+  iterable emits exactly the ops it always did; a collection is snapshotted into
+  an array first, which is also what makes the loop safe against a body that
+  mutates the collection.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
   `ceil`/`round` (with Java's int-vs-double overload result typing),
   `Integer.parseInt` (with radix)/`valueOf`/`toString` (with radix),
@@ -196,6 +201,28 @@ meaning — there is no construct javars accepts and then mis-runs.
   an overloaded name with a diagnostic rather than guessing an overload.
 - **`final` on a local or enhanced-`for` variable.** Parsed and dropped: it
   constrains reassignment, which `javac` has already checked.
+- **`java.util` collections.** `List`/`ArrayList`/`LinkedList`,
+  `Map`/`HashMap`/`LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/
+  `TreeSet`, the copy constructors (`new ArrayList<>(other)`), `Arrays.asList`,
+  `List.of`/`Set.of`, and `Collections.sort`/`reverse`/`max`/`min`. Collections
+  are heap objects like arrays and instances, so passing one to a method and
+  mutating it is visible to the caller. The enhanced `for` iterates them (the
+  compiler routes a non-array iterable through a snapshot builtin, so an array
+  loop still emits exactly the ops it did before), `keySet()`/`values()` are
+  views in the map's own order, and `sort`/`forEach` take a lambda.
+  **`HashMap`/`HashSet` iterate in Java's real bucket order**, not insertion
+  order: Java indexes a power-of-two table with `(capacity - 1) & (h ^ (h >>> 16))`,
+  appends within a bucket, and preserves relative order across a resize, so the
+  order is a stable sort of the insertion sequence by bucket index — reproduced
+  exactly, and checked against OpenJDK for `String` and `Integer` keys including
+  across the resize at 13 entries. `LinkedHashMap`/`LinkedHashSet` keep insertion
+  order and `TreeMap`/`TreeSet` sort, each because Java does, not by default.
+  `Arrays.asList` is fixed-size and `List.of` immutable, so a structural write
+  to either throws `UnsupportedOperationException` exactly as Java's does, and an
+  out-of-range `get` throws `IndexOutOfBoundsException` with Java's message.
+- **`String.compareTo` / `compareToIgnoreCase`**, returning Java's *difference*
+  (the first differing `char`, else the length difference) rather than only its
+  sign — programs print the number, so the sign alone would be wrong.
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -233,9 +260,11 @@ known.
   accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
   ("class `Pt` has no method `hashCode`") rather than a wrong number.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
-  `String`/`Arrays` statics listed above and the `String` instance methods are
-  the whole library surface — no `java.util.*` collections, no `Math` constants
-  (`Math.PI`), no boxed-type methods beyond the listed statics.
+  `String`/`Arrays`/`Collections` statics listed above, the `String` instance
+  methods, and the `java.util` collections are the whole library surface — no
+  `Math` constants (`Math.PI`), no boxed-type methods beyond the listed statics,
+  no `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no `String.split`/`join`,
+  no I/O.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **Arrow `switch` expressions** and `switch` patterns. (The classic
@@ -244,7 +273,8 @@ known.
 - **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
   no single `|` token, so it fails lexically).
 - **Sealed types, inner (non-`static`) classes, anonymous classes** other than
-  the enum-constant body form, and **`var` type inference beyond storage**.
+  the enum-constant body form, **cast expressions** (`(Object) x`), and **`var`
+  type inference beyond storage**.
 - **Fully-qualified type names in code** (`java.util.function.Supplier<T> s`).
   An `import` line is skipped, and the simple name is what resolves.
 
@@ -318,6 +348,17 @@ known.
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
   something a deterministic program does, so this only shows up if you ask for it.
+- **An element's `toString()` override is not called inside a collection.**
+  Printing a `List<Pt>` of records gives `[Pt@2]` where Java gives
+  `[Pt[x=1, y=2]]`, because rendering happens in a host builtin that cannot
+  re-enter the VM to run the element's Java-level `toString()`. This is the same
+  limitation `Arrays.toString(objArray)` and `String.valueOf(obj)` already have
+  (above); an `enum` constant is the exception, since its name is a real field.
+- **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
+  spreads a *reference* array (`String[]` → a 3-element list) but not a
+  primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element
+  types, so it cannot tell them apart and spreads both. The reference case —
+  the one programs actually write — is exact.
 - **A lambda's result type is its interface's erasure.** `Supplier<Integer> s`
   declares `Object get()` after erasure — exactly what `javac` compiles it to —
   so javars cannot statically type `s.get()` as `int` and `s.get() / 2` does not

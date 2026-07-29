@@ -169,6 +169,24 @@ pub const JCLOSURE_CALL: u16 = 729;
 /// functional-interface call to the lambda body.
 pub const LAMBDA_CLASS: &str = "#lambda";
 
+// ── java.util collections ──
+
+/// `new ArrayList<>()` / `new HashMap<>()` / … — allocate an empty collection.
+/// Stack `[kindName, seedOrUndef]` (`seed` on top); `argc == 2`. `seed` is the
+/// collection or array a copy constructor was given, or `null`. Pushes the
+/// collection's `Obj` handle.
+pub const JCOLL_NEW: u16 = 730;
+/// An instance method on a collection receiver. Stack
+/// `[recv, arg0, …, argN, methodName]` (`methodName` on top); `argc` counts all
+/// of them. Same shape as [`JSTR_DISPATCH`], which is what routes a
+/// statically-untyped receiver here.
+pub const JCOLL_DISPATCH: u16 = 731;
+/// The elements of an enhanced-`for` iterable, as a Java array. An array
+/// receiver is returned unchanged; a collection is snapshotted into a fresh
+/// array. Stack `[iterable]`; `argc == 1`. Emitted only when the compiler could
+/// not prove the iterable is already an array, so array loops are unchanged.
+pub const JITER_ARRAY: u16 = 732;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -187,6 +205,41 @@ enum HostObj {
         params: u8,
         captures: Vec<Value>,
     },
+    /// A `java.util.List` (`ArrayList`) — elements in list order.
+    List { items: Vec<Value>, fixed: Fixity },
+    /// A `java.util.Map`. Entries are stored in *insertion* order whatever the
+    /// implementation; [`Order`] decides what order iteration and `toString`
+    /// present them in.
+    Map {
+        entries: Vec<(Value, Value)>,
+        order: Order,
+    },
+    /// A `java.util.Set`, stored and ordered exactly like [`HostObj::Map`].
+    Set { items: Vec<Value>, order: Order },
+}
+
+/// What a collection's iteration order is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// `HashMap`/`HashSet` — Java's bucket order (see [`hash_order`]).
+    Hash,
+    /// `LinkedHashMap`/`LinkedHashSet` — insertion order.
+    Insertion,
+    /// `TreeMap`/`TreeSet` — ascending natural order of the keys/elements.
+    Sorted,
+}
+
+/// Whether a list accepts structural modification. `Arrays.asList` is
+/// fixed-size (`set` yes, `add`/`remove` no) and `List.of` is fully immutable —
+/// both throw `UnsupportedOperationException` in Java, so javars throws too
+/// rather than silently accepting the write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fixity {
+    Mutable,
+    /// `Arrays.asList` — elements may be replaced, the length may not change.
+    FixedSize,
+    /// `List.of` — nothing may change.
+    Immutable,
 }
 
 thread_local! {
@@ -393,6 +446,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JARGV, b_argv);
     vm.register_builtin(JMAKE_CLOSURE, b_make_closure);
     vm.register_builtin(JCLOSURE_CALL, b_closure_call);
+    vm.register_builtin(JCOLL_NEW, b_coll_new);
+    vm.register_builtin(JCOLL_DISPATCH, b_coll_dispatch);
+    vm.register_builtin(JITER_ARRAY, b_iter_array);
 }
 
 /// `main`'s `String[] args` — a fresh array of the program arguments.
@@ -611,6 +667,273 @@ fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
         vm.stack.push(cap);
     }
     run_sub(vm, entry, stack_base)
+}
+
+// ── java.util collections ────────────────────────────────────────────────────
+//
+// Every collection is a `HostObj` on the same slab arrays and instances live
+// on, so `List` aliasing, `==` identity, and passing one to a method all behave
+// like Java references with no extra machinery.
+//
+// Entries are always *stored* in insertion order; the implementation's
+// [`Order`] is applied when they are iterated, printed, or handed to
+// `keySet()`/`values()`. That keeps `LinkedHashMap` free and makes `HashMap`'s
+// order a pure function of the keys — see [`hash_order`].
+
+/// Java's `Object.hashCode()` for the value kinds javars models. `None` for a
+/// heap object, whose Java hash is an identity hash javars cannot reproduce (and
+/// whose iteration order is therefore not reproducible in Java either).
+fn java_hash(v: &Value) -> Option<i32> {
+    Some(match v {
+        // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
+        // counts UTF-16 code units; javars counts scalars, the same
+        // `char`-model simplification the `String` methods already make.
+        Value::Str(s) => s
+            .chars()
+            .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32)),
+        // `Integer.hashCode` is the value; `Long.hashCode` folds the halves.
+        Value::Int(n) => {
+            if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
+                *n as i32
+            } else {
+                (*n ^ ((*n as u64) >> 32) as i64) as i32
+            }
+        }
+        // `Double.hashCode` folds `doubleToLongBits` the way `Long` does.
+        Value::Float(f) => {
+            let bits = f.to_bits() as i64;
+            (bits ^ ((bits as u64) >> 32) as i64) as i32
+        }
+        Value::Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The order a `HashMap`/`HashSet` iterates `keys` in, as indices into `keys`.
+///
+/// Java lays entries out in a power-of-two table, indexing with
+/// `(capacity - 1) & (h ^ (h >>> 16))`, appending within a bucket and preserving
+/// relative order across a resize. Iteration then walks bucket 0 upward. So the
+/// order is exactly a *stable* sort of the insertion sequence by bucket index —
+/// verified against OpenJDK 26 for `String` and `Integer` keys, including across
+/// the resize at 13 entries.
+///
+/// Two things are not modeled, and neither is reproducible in Java either: a bin
+/// that treeifies (8 collisions in one bucket with a table of 64+) and a key
+/// whose `hashCode` is the JVM identity hash. A key with no modeled hash keeps
+/// insertion order.
+fn hash_order(keys: &[Value]) -> Vec<usize> {
+    let n = keys.len();
+    let mut cap = 16usize;
+    while n > cap * 3 / 4 {
+        cap *= 2;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by_key(|&i| {
+        let h = java_hash(&keys[i]).unwrap_or(0) as u32;
+        ((cap as u32 - 1) & (h ^ (h >> 16))) as usize
+    });
+    idx
+}
+
+/// The order `items` are presented in under `order`, as indices into `items`.
+fn present_order(items: &[Value], order: Order) -> Vec<usize> {
+    match order {
+        Order::Insertion => (0..items.len()).collect(),
+        Order::Hash => hash_order(items),
+        Order::Sorted => {
+            let mut idx: Vec<usize> = (0..items.len()).collect();
+            idx.sort_by(|&a, &b| natural_cmp(&items[a], &items[b]));
+            idx
+        }
+    }
+}
+
+/// Java's `equals` for the value kinds javars models: value equality for
+/// strings, numbers, and booleans; reference identity for a heap object (the
+/// same simplification javars's `==` already makes — a user `equals` override is
+/// not called).
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        (Value::Undef, Value::Undef) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            // `Integer.equals(Long)` is false in Java, but javars has one
+            // integral kind, so numeric equality is compared by value.
+            match (a, b) {
+                (Value::Int(x), Value::Int(y)) => x == y,
+                _ => a.to_float() == b.to_float(),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Ascending natural order (`Comparable`) for the sorted collections and
+/// `Collections.sort`: numbers numerically, strings lexicographically by
+/// `char`, `null` first. Mixed kinds fall back to a stable "equal".
+fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Undef, Value::Undef) => Ordering::Equal,
+        (Value::Undef, _) => Ordering::Less,
+        (_, Value::Undef) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => a
+            .to_float()
+            .partial_cmp(&b.to_float())
+            .unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Allocate the collection `kind` names, seeded from `seed` when a copy
+/// constructor supplied one.
+fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
+    let obj = match kind {
+        "ArrayList" | "LinkedList" | "List" => HostObj::List {
+            items: sequence_items(seed).unwrap_or_default(),
+            fixed: Fixity::Mutable,
+        },
+        "HashMap" | "Map" => HostObj::Map {
+            entries: map_entries(seed).unwrap_or_default(),
+            order: Order::Hash,
+        },
+        "LinkedHashMap" => HostObj::Map {
+            entries: map_entries(seed).unwrap_or_default(),
+            order: Order::Insertion,
+        },
+        "TreeMap" => HostObj::Map {
+            entries: map_entries(seed).unwrap_or_default(),
+            order: Order::Sorted,
+        },
+        "HashSet" | "Set" => HostObj::Set {
+            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            order: Order::Hash,
+        },
+        "LinkedHashSet" => HostObj::Set {
+            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            order: Order::Insertion,
+        },
+        "TreeSet" => HostObj::Set {
+            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            order: Order::Sorted,
+        },
+        other => {
+            return Err(Fault::internal(format!(
+                "javars: `{other}` is not a collection javars models"
+            )))
+        }
+    };
+    Ok(Value::Obj(heap_alloc(obj)))
+}
+
+/// The distinct values of `vals`, keeping the first of each repeat — what
+/// building a `Set` from a sequence produces.
+fn distinct(vals: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(vals.len());
+    for v in vals {
+        if !out.iter().any(|x| value_eq(x, v)) {
+            out.push(v.clone());
+        }
+    }
+    out
+}
+
+/// The elements of any sequence-shaped heap object — an array, a `List`, or a
+/// `Set` (in presentation order) — cloned out from under the heap borrow.
+fn sequence_items(v: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(*id as usize) {
+            Some(HostObj::Array(items)) | Some(HostObj::List { items, .. }) => Some(items.clone()),
+            Some(HostObj::Set { items, order }) => Some(
+                present_order(items, *order)
+                    .into_iter()
+                    .map(|i| items[i].clone())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    })
+}
+
+/// The entries of a `Map` heap object, in insertion order.
+fn map_entries(v: &Value) -> Option<Vec<(Value, Value)>> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { entries, .. }) => Some(entries.clone()),
+        _ => None,
+    })
+}
+
+/// True when the handle points at a collection — the test that routes a
+/// statically-untyped receiver away from the `String` methods.
+fn is_collection(v: &Value) -> bool {
+    let Value::Obj(id) = v else {
+        return false;
+    };
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(HostObj::List { .. } | HostObj::Map { .. } | HostObj::Set { .. })
+        )
+    })
+}
+
+/// [`JCOLL_NEW`] — see [`new_collection`].
+fn b_coll_new(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let kind = args
+        .first()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let seed = args.get(1).cloned().unwrap_or(Value::Undef);
+    match new_collection(&kind, &seed) {
+        Ok(v) => v,
+        Err(f) => raise(vm, f),
+    }
+}
+
+/// [`JITER_ARRAY`] — the elements of an enhanced-`for` iterable as an array.
+fn b_iter_array(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let it = args.into_iter().next().unwrap_or(Value::Undef);
+    // Already an array: hand the same handle back, so an array loop keeps
+    // aliasing (mutating `a[i]` inside the loop is visible).
+    if let Value::Obj(id) = it {
+        if HEAP.with(|h| matches!(h.borrow().get(id as usize), Some(HostObj::Array(_)))) {
+            return it;
+        }
+    }
+    match sequence_items(&it) {
+        Some(items) => Value::Obj(heap_alloc(HostObj::Array(items))),
+        None if matches!(it, Value::Undef) => raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                "Cannot iterate over a null reference".to_string(),
+            ),
+        ),
+        None => raise(
+            vm,
+            Fault::internal("javars: the enhanced `for` needs an array or a collection"),
+        ),
+    }
 }
 
 /// Run the subroutine at `entry` whose prologue values are already stacked above
@@ -949,6 +1272,422 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// [`JCOLL_DISPATCH`] — an instance method on a collection receiver.
+fn b_coll_dispatch(vm: &mut VM, argc: u8) -> Value {
+    let method = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let n = argc.saturating_sub(2) as usize;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    let recv = vm.stack.pop().unwrap_or(Value::Undef);
+    coll_method(vm, &recv, &method, &args)
+}
+
+/// Evaluate `recv.method(args)` on a collection.
+///
+/// Every method that mutates takes the heap borrow, edits, and drops it before
+/// returning; the two that run user code (`sort` with a comparator, `forEach`)
+/// snapshot first and re-enter the VM with no borrow held, because a lambda body
+/// can allocate.
+fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    let Value::Obj(id) = recv else {
+        return raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                format!("Cannot invoke \"{method}()\" because the receiver is null"),
+            ),
+        );
+    };
+    let id = *id as usize;
+    // The two VM-re-entering methods are handled before any borrow is taken.
+    match (method, args.len()) {
+        ("sort", 1) => {
+            let Some(items) = sequence_items(recv) else {
+                return raise(vm, Fault::internal("javars: `sort` needs a List receiver"));
+            };
+            let sorted = match sort_with(vm, items, &args[0]) {
+                Ok(v) => v,
+                Err(f) => return raise(vm, f),
+            };
+            HEAP.with(|h| {
+                if let Some(HostObj::List { items, .. }) = h.borrow_mut().get_mut(id) {
+                    *items = sorted;
+                }
+            });
+            return Value::Undef;
+        }
+        ("forEach", 1) => {
+            // A `Map`'s consumer takes (key, value); a List/Set's takes one.
+            if let Some(entries) = map_entries(recv) {
+                let order = map_order(recv);
+                let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                for i in present_order(&keys, order) {
+                    let (k, v) = entries[i].clone();
+                    invoke_closure(vm, &args[0], &[k, v]);
+                }
+            } else if let Some(items) = sequence_items(recv) {
+                for it in items {
+                    invoke_closure(vm, &args[0], &[it]);
+                }
+            }
+            return Value::Undef;
+        }
+        _ => {}
+    }
+    // `toString` renders elements, which re-reads the heap (an element may be
+    // another collection), so it runs before any borrow is taken.
+    if method == "toString" && args.is_empty() {
+        return Value::str(java_str(recv));
+    }
+    // Likewise `addAll`/`equals` read their argument collection: snapshot it
+    // first, because the borrow below is exclusive.
+    let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
+    let result = HEAP.with(|h| {
+        let mut heap = h.borrow_mut();
+        let Some(obj) = heap.get_mut(id) else {
+            return Err(Fault::internal("javars: dangling collection handle"));
+        };
+        match obj {
+            HostObj::List { items, fixed } => list_method(items, *fixed, method, args, &arg_seqs),
+            HostObj::Map { entries, order } => map_method(entries, *order, method, args),
+            HostObj::Set { items, .. } => set_method(items, method, args, &arg_seqs),
+            _ => Err(Fault::internal(format!(
+                "javars: `{method}` is not a collection method"
+            ))),
+        }
+    });
+    match result {
+        Ok(NewColl::Value(v)) => v,
+        // A derived view (`keySet`, `values`) is allocated after the borrow is
+        // released, because allocating touches the same slab.
+        Ok(NewColl::Alloc(obj)) => Value::Obj(heap_alloc(obj)),
+        Err(f) => raise(vm, f),
+    }
+}
+
+/// A collection method's result: a plain value, or a new heap object that must
+/// be allocated once the receiver's borrow has been dropped.
+enum NewColl {
+    Value(Value),
+    Alloc(HostObj),
+}
+
+/// The presentation order of a `Map` handle.
+fn map_order(v: &Value) -> Order {
+    let Value::Obj(id) = v else {
+        return Order::Insertion;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { order, .. }) => *order,
+        _ => Order::Insertion,
+    })
+}
+
+/// `Collections.sort(list, cmp)` / `list.sort(cmp)` — a stable sort driven by a
+/// comparator closure, matching Java's stable `List.sort`. A `null` comparator
+/// is natural order, exactly as Java specifies it.
+fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Value>, Fault> {
+    if matches!(cmp, Value::Undef) {
+        items.sort_by(natural_cmp);
+        return Ok(items);
+    }
+    if closure_meta(cmp).is_none() {
+        return Err(Fault::internal("javars: `sort` needs a Comparator lambda"));
+    }
+    // `sort_by` needs a total order it can trust; a user comparator may not give
+    // one, so an insertion sort is used instead — stable, and it can never panic
+    // on an inconsistent comparator the way `sort_by` can.
+    let mut out: Vec<Value> = Vec::with_capacity(items.len());
+    for it in items {
+        let mut at = out.len();
+        for (i, existing) in out.iter().enumerate() {
+            let r = invoke_closure(vm, cmp, &[existing.clone(), it.clone()]);
+            if r.to_int() > 0 {
+                at = i;
+                break;
+            }
+        }
+        out.insert(at, it);
+    }
+    Ok(out)
+}
+
+/// Invoke `clo` with `args` through the closure-call path, discarding the arity
+/// bookkeeping the builtin ABI would otherwise do on the stack.
+fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Value {
+    vm.stack.push(clo.clone());
+    for a in args {
+        vm.stack.push(a.clone());
+    }
+    b_closure_call(vm, args.len() as u8 + 1)
+}
+
+/// `java.util.List` methods.
+fn list_method(
+    items: &mut Vec<Value>,
+    fixed: Fixity,
+    method: &str,
+    args: &[Value],
+    arg_seqs: &[Option<Vec<Value>>],
+) -> Result<NewColl, Fault> {
+    // A structural change to `Arrays.asList` / `List.of` is Java's
+    // `UnsupportedOperationException`, not a silent success.
+    let structural = || match fixed {
+        Fixity::Mutable => Ok(()),
+        _ => Err(Fault::java("UnsupportedOperationException", String::new())),
+    };
+    let replace = || match fixed {
+        Fixity::Immutable => Err(Fault::java("UnsupportedOperationException", String::new())),
+        _ => Ok(()),
+    };
+    let bounds = |i: i64, len: usize| -> Result<usize, Fault> {
+        if i < 0 || i as usize >= len {
+            return Err(Fault::java(
+                "IndexOutOfBoundsException",
+                format!("Index {i} out of bounds for length {len}"),
+            ));
+        }
+        Ok(i as usize)
+    };
+    let v = match (method, args.len()) {
+        ("size", 0) => Value::Int(items.len() as i64),
+        ("isEmpty", 0) => Value::bool(items.is_empty()),
+        ("add", 1) => {
+            structural()?;
+            items.push(args[0].clone());
+            Value::bool(true)
+        }
+        ("add", 2) => {
+            structural()?;
+            let at = args[0].to_int();
+            if at < 0 || at as usize > items.len() {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Index: {at}, Size: {}", items.len()),
+                ));
+            }
+            items.insert(at as usize, args[1].clone());
+            Value::Undef
+        }
+        ("get", 1) => {
+            let i = bounds(args[0].to_int(), items.len())?;
+            items[i].clone()
+        }
+        ("set", 2) => {
+            replace()?;
+            let i = bounds(args[0].to_int(), items.len())?;
+            std::mem::replace(&mut items[i], args[1].clone())
+        }
+        // `List.remove(int)` removes by index — the overload Java picks for an
+        // integral argument. There is no `remove(Object)` here, because javars
+        // cannot tell a boxed `Integer` from an `int`.
+        ("remove", 1) => {
+            structural()?;
+            let i = bounds(args[0].to_int(), items.len())?;
+            items.remove(i)
+        }
+        ("clear", 0) => {
+            structural()?;
+            items.clear();
+            Value::Undef
+        }
+        ("contains", 1) => Value::bool(items.iter().any(|x| value_eq(x, &args[0]))),
+        ("indexOf", 1) => Value::Int(
+            items
+                .iter()
+                .position(|x| value_eq(x, &args[0]))
+                .map_or(-1, |i| i as i64),
+        ),
+        ("lastIndexOf", 1) => Value::Int(
+            items
+                .iter()
+                .rposition(|x| value_eq(x, &args[0]))
+                .map_or(-1, |i| i as i64),
+        ),
+        ("addAll", 1) => {
+            structural()?;
+            let add = arg_seqs[0].clone().unwrap_or_default();
+            let changed = !add.is_empty();
+            items.extend(add);
+            Value::bool(changed)
+        }
+        ("equals", 1) => {
+            let other = arg_seqs[0].clone().unwrap_or_default();
+            Value::bool(
+                other.len() == items.len() && items.iter().zip(&other).all(|(a, b)| value_eq(a, b)),
+            )
+        }
+        _ => {
+            return Err(Fault::internal(format!(
+                "javars: unsupported List method `{method}` with {} argument(s)",
+                args.len()
+            )))
+        }
+    };
+    Ok(NewColl::Value(v))
+}
+
+/// `java.util.Map` methods.
+fn map_method(
+    entries: &mut Vec<(Value, Value)>,
+    order: Order,
+    method: &str,
+    args: &[Value],
+) -> Result<NewColl, Fault> {
+    let find =
+        |entries: &Vec<(Value, Value)>, k: &Value| entries.iter().position(|(x, _)| value_eq(x, k));
+    let out = match (method, args.len()) {
+        ("size", 0) => NewColl::Value(Value::Int(entries.len() as i64)),
+        ("isEmpty", 0) => NewColl::Value(Value::bool(entries.is_empty())),
+        // A re-`put` keeps the entry's original insertion position, which is
+        // what Java's linked/bucket layouts both do.
+        ("put", 2) => NewColl::Value(match find(entries, &args[0]) {
+            Some(i) => std::mem::replace(&mut entries[i].1, args[1].clone()),
+            None => {
+                entries.push((args[0].clone(), args[1].clone()));
+                Value::Undef
+            }
+        }),
+        ("putIfAbsent", 2) => NewColl::Value(match find(entries, &args[0]) {
+            Some(i) => entries[i].1.clone(),
+            None => {
+                entries.push((args[0].clone(), args[1].clone()));
+                Value::Undef
+            }
+        }),
+        ("get", 1) => {
+            NewColl::Value(find(entries, &args[0]).map_or(Value::Undef, |i| entries[i].1.clone()))
+        }
+        ("getOrDefault", 2) => NewColl::Value(
+            find(entries, &args[0]).map_or_else(|| args[1].clone(), |i| entries[i].1.clone()),
+        ),
+        ("containsKey", 1) => NewColl::Value(Value::bool(find(entries, &args[0]).is_some())),
+        ("containsValue", 1) => NewColl::Value(Value::bool(
+            entries.iter().any(|(_, v)| value_eq(v, &args[0])),
+        )),
+        ("remove", 1) => NewColl::Value(match find(entries, &args[0]) {
+            Some(i) => entries.remove(i).1,
+            None => Value::Undef,
+        }),
+        ("clear", 0) => {
+            entries.clear();
+            NewColl::Value(Value::Undef)
+        }
+        ("keySet", 0) => {
+            let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            let ordered = present_order(&keys, order)
+                .into_iter()
+                .map(|i| keys[i].clone())
+                .collect();
+            // The view is a `Set` that already holds the map's order, so it
+            // iterates and prints exactly as the map does.
+            NewColl::Alloc(HostObj::Set {
+                items: ordered,
+                order: Order::Insertion,
+            })
+        }
+        ("values", 0) => {
+            let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            let ordered = present_order(&keys, order)
+                .into_iter()
+                .map(|i| entries[i].1.clone())
+                .collect();
+            NewColl::Alloc(HostObj::List {
+                items: ordered,
+                fixed: Fixity::FixedSize,
+            })
+        }
+        _ => {
+            return Err(Fault::internal(format!(
+                "javars: unsupported Map method `{method}` with {} argument(s)",
+                args.len()
+            )))
+        }
+    };
+    Ok(out)
+}
+
+/// `java.util.Set` methods.
+fn set_method(
+    items: &mut Vec<Value>,
+    method: &str,
+    args: &[Value],
+    arg_seqs: &[Option<Vec<Value>>],
+) -> Result<NewColl, Fault> {
+    let v = match (method, args.len()) {
+        ("size", 0) => Value::Int(items.len() as i64),
+        ("isEmpty", 0) => Value::bool(items.is_empty()),
+        ("add", 1) => {
+            if items.iter().any(|x| value_eq(x, &args[0])) {
+                Value::bool(false)
+            } else {
+                items.push(args[0].clone());
+                Value::bool(true)
+            }
+        }
+        ("contains", 1) => Value::bool(items.iter().any(|x| value_eq(x, &args[0]))),
+        ("remove", 1) => match items.iter().position(|x| value_eq(x, &args[0])) {
+            Some(i) => {
+                items.remove(i);
+                Value::bool(true)
+            }
+            None => Value::bool(false),
+        },
+        ("clear", 0) => {
+            items.clear();
+            Value::Undef
+        }
+        ("addAll", 1) => {
+            let mut changed = false;
+            for v in arg_seqs[0].clone().unwrap_or_default() {
+                if !items.iter().any(|x| value_eq(x, &v)) {
+                    items.push(v);
+                    changed = true;
+                }
+            }
+            Value::bool(changed)
+        }
+        _ => {
+            return Err(Fault::internal(format!(
+                "javars: unsupported Set method `{method}` with {} argument(s)",
+                args.len()
+            )))
+        }
+    };
+    Ok(NewColl::Value(v))
+}
+
+/// `[a, b, c]` — `AbstractCollection.toString`.
+fn render_sequence(items: &[Value]) -> String {
+    let body: Vec<String> = items.iter().map(java_str).collect();
+    format!("[{}]", body.join(", "))
+}
+
+fn render_set(items: &[Value], order: Order) -> String {
+    let ordered: Vec<Value> = present_order(items, order)
+        .into_iter()
+        .map(|i| items[i].clone())
+        .collect();
+    render_sequence(&ordered)
+}
+
+/// `{k=v, k=v}` — `AbstractMap.toString`.
+fn render_map(entries: &[(Value, Value)], order: Order) -> String {
+    let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+    let body: Vec<String> = present_order(&keys, order)
+        .into_iter()
+        .map(|i| format!("{}={}", java_str(&entries[i].0), java_str(&entries[i].1)))
+        .collect();
+    format!("{{{}}}", body.join(", "))
+}
+
 /// `recv.method(args...)` dispatch builtin for `String` receivers. Pops the
 /// method name (top of stack), its `argc - 2` arguments, and the receiver, then
 /// runs the corresponding `java.lang.String` method. A faulting method (bad
@@ -979,6 +1718,11 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         }
         return b_closure_call(vm, n as u8 + 1);
     }
+    // A collection receiver whose static type the compiler could not pin down
+    // (an erased `Map.get` result, say) routes to the collection methods.
+    if is_collection(&recv) {
+        return coll_method(vm, &recv, &method, &args);
+    }
     // A method call on a `null` reference is Java's NPE, not an empty string.
     if matches!(recv, Value::Undef) {
         return raise(
@@ -996,6 +1740,27 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// `String.compareTo` / `compareToIgnoreCase`: the difference of the first
+/// differing `char`, else the length difference. Java compares UTF-16 code
+/// units; javars compares Unicode scalars, the same `char` simplification the
+/// index-based methods make.
+fn compare_strings(a: &str, b: &str, fold_case: bool) -> i64 {
+    let norm = |s: &str| -> Vec<char> {
+        if fold_case {
+            s.chars().flat_map(|c| c.to_lowercase()).collect()
+        } else {
+            s.chars().collect()
+        }
+    };
+    let (x, y) = (norm(a), norm(b));
+    for (ca, cb) in x.iter().zip(&y) {
+        if ca != cb {
+            return *ca as i64 - *cb as i64;
+        }
+    }
+    x.len() as i64 - y.len() as i64
+}
+
 /// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
 /// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
 /// consistent with javars's existing "a `char` literal is a one-character
@@ -1008,6 +1773,13 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
     match (method, args.len()) {
         ("length", 0) => Ok(Value::Int(char_len())),
         ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
+        // `String.compareTo` is specified as the difference of the first
+        // differing character, else the length difference — not merely its sign,
+        // which is why a lexicographic `Ord` cannot stand in for it.
+        ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &args[0].as_str_cow(), false))),
+        ("compareToIgnoreCase", 1) => {
+            Ok(Value::Int(compare_strings(s, &args[0].as_str_cow(), true)))
+        }
         ("charAt", 1) => {
             let i = args[0].to_int();
             match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
@@ -1104,10 +1876,109 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    // The collection statics come first: two of them (`Collections.sort` with a
+    // comparator) run user code, which `static_method` — which has no VM — could
+    // not do.
+    match collection_static(vm, &class, &method, &args) {
+        Some(Ok(v)) => return v,
+        Some(Err(f)) => return raise(vm, f),
+        None => {}
+    }
     match static_method(&class, &method, &args) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
+}
+
+/// The `java.util` statics: `Arrays.asList`, `List.of`/`Set.of`,
+/// `Collections.sort`/`reverse`/`max`/`min`. `None` when `Class.method` is not
+/// one of them, so the ordinary stdlib statics are reached unchanged.
+fn collection_static(
+    vm: &mut VM,
+    class: &str,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    let list = |items: Vec<Value>, fixed: Fixity| {
+        Ok(Value::Obj(heap_alloc(HostObj::List { items, fixed })))
+    };
+    Some(match (class, method) {
+        // `Arrays.asList` is a fixed-size *view*: `set` works, `add` throws.
+        ("Arrays", "asList") => list(varargs_items(args), Fixity::FixedSize),
+        ("List", "of") => list(varargs_items(args), Fixity::Immutable),
+        ("Set", "of") => Ok(Value::Obj(heap_alloc(HostObj::Set {
+            items: distinct(&varargs_items(args)),
+            order: Order::Hash,
+        }))),
+        ("Collections", "sort") if !args.is_empty() => {
+            let items = match sequence_items(&args[0]) {
+                Some(i) => i,
+                None => {
+                    return Some(Err(Fault::internal(
+                        "javars: `Collections.sort` needs a List",
+                    )))
+                }
+            };
+            let cmp = args.get(1).cloned().unwrap_or(Value::Undef);
+            match sort_with(vm, items, &cmp) {
+                Ok(sorted) => {
+                    write_list(&args[0], sorted);
+                    Ok(Value::Undef)
+                }
+                Err(f) => Err(f),
+            }
+        }
+        ("Collections", "reverse") if args.len() == 1 => {
+            let mut items = sequence_items(&args[0]).unwrap_or_default();
+            items.reverse();
+            write_list(&args[0], items);
+            Ok(Value::Undef)
+        }
+        ("Collections", "max") | ("Collections", "min") if args.len() == 1 => {
+            let items = sequence_items(&args[0]).unwrap_or_default();
+            let pick = if method == "max" {
+                items.iter().max_by(|a, b| natural_cmp(a, b))
+            } else {
+                items.iter().min_by(|a, b| natural_cmp(a, b))
+            };
+            match pick {
+                Some(v) => Ok(v.clone()),
+                None => Err(Fault::java("NoSuchElementException", String::new())),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The elements a varargs static receives. A lone *array* argument spreads —
+/// `Arrays.asList(strArray)` is a list of the array's elements, not a
+/// one-element list holding the array — which is what Java's varargs does for
+/// every reference array. A lone `List`/`Set` argument does not spread, matching
+/// Java exactly.
+fn varargs_items(args: &[Value]) -> Vec<Value> {
+    if let [Value::Obj(id)] = args {
+        let spread = HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Array(items)) => Some(items.clone()),
+            _ => None,
+        });
+        if let Some(items) = spread {
+            return items;
+        }
+    }
+    args.to_vec()
+}
+
+/// Overwrite a `List` handle's elements in place, so a sort or reverse is
+/// visible through every reference to it — Java's semantics for these statics.
+fn write_list(target: &Value, items: Vec<Value>) {
+    let Value::Obj(id) = target else {
+        return;
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::List { items: dst, .. }) = h.borrow_mut().get_mut(*id as usize) {
+            *dst = items;
+        }
+    });
 }
 
 /// Evaluate a static stdlib method `Class.method(args)`.
@@ -1526,6 +2397,9 @@ fn obj_default_str(id: u32) -> String {
                 _ => format!("{class}@{id:x}"),
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
+            Some(HostObj::List { items, .. }) => render_sequence(items),
+            Some(HostObj::Set { items, order }) => render_set(items, *order),
+            Some(HostObj::Map { entries, order }) => render_map(entries, *order),
             // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,
             // which is not reproducible (and not stable across JVM runs), so
             // javars prints a fixed marker instead. See `BUGS.md`.

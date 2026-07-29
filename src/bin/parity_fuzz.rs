@@ -603,6 +603,66 @@ fn g_lambda(r: &mut Rng) -> String {
     }
 }
 
+/// `java.util` collections: `List`/`ArrayList`, the three `Map`s and three
+/// `Set`s, `Arrays.asList`, `Collections.sort`/`reverse`, the enhanced `for`
+/// over a collection, and the views (`keySet`, `values`). The point of the mode
+/// is **iteration order**: a `HashMap`/`HashSet` prints in Java's bucket order,
+/// which is a pure function of the keys and the size, so it is a parity signal
+/// rather than nondeterminism. Elements stay `String`/`int`/`double`/`boolean`,
+/// because a user object inside a collection renders through its `toString()`
+/// in Java and through the default form in javars (a documented gap).
+fn g_collection(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let c = pick(r, INTS);
+    let s1 = pick(r, STRS);
+    let s2 = pick(r, STRS);
+    match r.below(14) {
+        0 => format!(
+            "{{ List<Integer> l = new ArrayList<>(); l.add({a}); l.add({b}); l.add({c}); System.out.println(l + \" \" + l.size() + \" \" + l.get(1)); }}"
+        ),
+        1 => format!(
+            "{{ List<String> l = new ArrayList<>(); l.add({s1}); l.add({s2}); System.out.println(l.contains({s1}) + \",\" + l.indexOf({s2}) + \",\" + l.isEmpty()); }}"
+        ),
+        2 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList({a}, {b}, {c})); Collections.sort(l); System.out.println(l); }}"
+        ),
+        3 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList({a}, {b}, {c})); Collections.reverse(l); System.out.println(l); }}"
+        ),
+        4 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList({a}, {b}, {c})); l.sort((p, q) -> p - q); System.out.println(l); }}"
+        ),
+        5 => format!(
+            "{{ Map<String, Integer> m = new HashMap<>(); m.put({s1}, {a}); m.put({s2}, {b}); m.put(\"zz\", {c}); System.out.println(m); }}"
+        ),
+        6 => format!(
+            "{{ Map<String, Integer> m = new LinkedHashMap<>(); m.put({s1}, {a}); m.put({s2}, {b}); System.out.println(m + \" \" + m.keySet() + \" \" + m.values()); }}"
+        ),
+        7 => format!(
+            "{{ Map<String, Integer> m = new TreeMap<>(); m.put({s1}, {a}); m.put({s2}, {b}); m.put(\"m\", {c}); System.out.println(m); }}"
+        ),
+        8 => format!(
+            "{{ Set<Integer> t = new HashSet<>(); t.add({a}); t.add({b}); t.add({c}); System.out.println(t + \" \" + t.size() + \" \" + t.contains({a})); }}"
+        ),
+        9 => format!(
+            "{{ Set<String> t = new LinkedHashSet<>(Arrays.asList({s1}, {s2}, {s1})); System.out.println(t); }}"
+        ),
+        10 => format!(
+            "{{ Set<Integer> t = new TreeSet<>(Arrays.asList({a}, {b}, {c})); System.out.println(t); }}"
+        ),
+        11 => format!(
+            "{{ int tot = 0; for (int v : Arrays.asList({a}, {b}, {c})) {{ tot += v; }} System.out.println(tot); }}"
+        ),
+        12 => format!(
+            "{{ Map<String, Integer> m = new HashMap<>(); for (int i = 0; i < 15; i++) {{ m.put(\"k\" + i, i * {a}); }} System.out.println(m); }}"
+        ),
+        _ => format!(
+            "{{ Map<String, Integer> m = new LinkedHashMap<>(); m.put({s1}, {a}); System.out.println(m.get({s1}) + \",\" + m.getOrDefault(\"absent\", -1) + \",\" + m.containsKey({s2})); }}"
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -702,6 +762,7 @@ enum Mode {
     Static,
     Record,
     Lambda,
+    Collection,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -731,6 +792,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Static,
     Mode::Record,
     Mode::Lambda,
+    Mode::Collection,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -762,6 +824,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Static => "static",
         Mode::Record => "record",
         Mode::Lambda => "lambda",
+        Mode::Collection => "collection",
     }
 }
 
@@ -805,6 +868,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Static => g_static(r),
         Mode::Record => g_record(r),
         Mode::Lambda => g_lambda(r),
+        Mode::Collection => g_collection(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -817,7 +881,9 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// Wrap probes in the single-class shell both sides accept. The class must be
 /// named for the file, so callers write it to `T.java`.
 fn build_program(probes: &[String]) -> String {
-    let mut s = String::from("public class T {\n    public static void main(String[] args) {\n");
+    let mut s = String::from(
+        "import java.util.*;\npublic class T {\n    public static void main(String[] args) {\n",
+    );
     for probe in probes {
         s.push_str("        ");
         s.push_str(probe);

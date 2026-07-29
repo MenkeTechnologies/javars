@@ -1556,3 +1556,148 @@ fn an_ambiguous_method_reference_is_a_compile_error() {
          System.out.println(g.apply(1)); } }");
     assert!(!ok);
 }
+
+#[test]
+fn hash_map_and_hash_set_iterate_in_javas_bucket_order() {
+    // The point of the whole collections wave. Java lays entries out in a
+    // power-of-two table indexed by `(capacity - 1) & (h ^ (h >>> 16))`,
+    // appending within a bucket and preserving relative order across a resize —
+    // so iteration is a *stable* sort of the insertion sequence by bucket index.
+    // These three cases pin that: `String` keys, `Integer` keys, and 20 entries
+    // (which crosses the resize at 13). Verified against OpenJDK 26 — a
+    // LinkedHashMap of the same keys prints in a visibly different order.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class Main { public static void main(String[] a) {\
+         String[] ks = {\"banana\", \"apple\", \"cherry\", \"date\", \"elderberry\", \"fig\", \"grape\"};\
+         Map<String, Integer> m = new HashMap<>();\
+         for (int i = 0; i < ks.length; i++) { m.put(ks[i], i); }\
+         System.out.println(m);\
+         System.out.println(m.keySet());\
+         System.out.println(m.values());\
+         Map<String, Integer> lm = new LinkedHashMap<>();\
+         for (int i = 0; i < ks.length; i++) { lm.put(ks[i], i); }\
+         System.out.println(lm);\
+         Set<String> hs = new HashSet<>(Arrays.asList(ks));\
+         System.out.println(hs);\
+         Map<Integer, String> mi = new HashMap<>();\
+         int[] is = {5, 3, 17, 1, 33, 2, 16};\
+         for (int i : is) { mi.put(i, \"v\" + i); }\
+         System.out.println(mi);\
+         Map<String, Integer> big = new HashMap<>();\
+         for (int i = 0; i < 20; i++) { big.put(\"k\" + i, i); }\
+         System.out.println(big); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "{banana=0, date=3, apple=1, cherry=2, fig=5, grape=6, elderberry=4}\n\
+         [banana, date, apple, cherry, fig, grape, elderberry]\n\
+         [0, 3, 1, 2, 5, 6, 4]\n\
+         {banana=0, apple=1, cherry=2, date=3, elderberry=4, fig=5, grape=6}\n\
+         [banana, date, apple, cherry, fig, grape, elderberry]\n\
+         {16=v16, 17=v17, 1=v1, 33=v33, 2=v2, 3=v3, 5=v5}\n\
+         {k0=0, k1=1, k2=2, k3=3, k4=4, k5=5, k11=11, k6=6, k10=10, k7=7, \
+         k13=13, k8=8, k12=12, k9=9, k15=15, k14=14, k17=17, k16=16, k19=19, k18=18}\n"
+    );
+}
+
+#[test]
+fn list_map_and_set_methods_match_java() {
+    // The mutating and querying surface, the sorted implementations, the
+    // enhanced `for` over a collection, and reference semantics (a `List` handed
+    // to a method is the same object). Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class Main {\
+         static void fill(List<Integer> out) { out.add(7); out.add(8); }\
+         public static void main(String[] a) {\
+         List<String> xs = new ArrayList<>();\
+         xs.add(\"b\"); xs.add(\"a\"); xs.add(\"c\");\
+         System.out.println(xs + \" \" + xs.size() + \" \" + xs.get(1) + \" \" + xs.contains(\"a\") + \" \" + xs.indexOf(\"c\"));\
+         xs.set(0, \"z\"); xs.remove(1);\
+         System.out.println(xs + \" \" + xs.isEmpty());\
+         for (String s : xs) { System.out.print(s + \";\"); }\
+         System.out.println();\
+         Collections.sort(xs); System.out.println(xs);\
+         Map<String, Integer> tm = new TreeMap<>();\
+         tm.put(\"z\", 1); tm.put(\"a\", 2); tm.put(\"m\", 3);\
+         System.out.println(tm + \" \" + tm.get(\"m\") + \" \" + tm.getOrDefault(\"q\", -1) + \" \" + tm.containsKey(\"a\"));\
+         System.out.println(new TreeSet<>(Arrays.asList(5, 1, 9, 3)));\
+         Set<String> ls = new LinkedHashSet<>(Arrays.asList(\"b\", \"a\", \"b\"));\
+         System.out.println(ls + \" \" + ls.add(\"a\") + \" \" + ls.add(\"c\") + \" \" + ls);\
+         List<Integer> shared = new ArrayList<>(); fill(shared);\
+         System.out.println(shared);\
+         Map<String, List<Integer>> nested = new LinkedHashMap<>();\
+         nested.put(\"odd\", new ArrayList<>()); nested.get(\"odd\").add(1); nested.get(\"odd\").add(3);\
+         System.out.println(nested + \" \" + nested.get(\"odd\").size());\
+         System.out.println(new ArrayList<Integer>() + \" \" + new HashMap<String,Integer>() + \" \" + new HashSet<String>()); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[b, a, c] 3 a true 2\n\
+         [z, c] false\n\
+         z;c;\n\
+         [c, z]\n\
+         {a=2, m=3, z=1} 3 -1 true\n\
+         [1, 3, 5, 9]\n\
+         [b, a] false true [b, a, c]\n\
+         [7, 8]\n\
+         {odd=[1, 3]} 2\n\
+         [] {} []\n"
+    );
+}
+
+#[test]
+fn collections_take_lambdas_and_raise_javas_faults() {
+    // A comparator lambda drives a stable sort, `forEach` runs one per element
+    // (and per entry, for a `Map`), and the two faults Java raises here — an
+    // out-of-range `get` and a structural write to `List.of` — arrive as
+    // catchable Java exceptions with Java's detail message. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class Main { public static void main(String[] a) {\
+         List<String> xs = new ArrayList<>(Arrays.asList(\"pear\", \"fig\", \"banana\", \"kiwi\"));\
+         xs.sort((p, q) -> p.length() - q.length());\
+         System.out.println(xs);\
+         Collections.sort(xs, (p, q) -> q.compareTo(p));\
+         System.out.println(xs);\
+         Collections.reverse(xs);\
+         System.out.println(xs + \" \" + Collections.max(Arrays.asList(3, 9, 2)) + \" \" + Collections.min(Arrays.asList(3, 9, 2)));\
+         xs.forEach(s -> System.out.print(s + \"|\"));\
+         System.out.println();\
+         Map<String, Integer> m = new LinkedHashMap<>();\
+         m.put(\"a\", 1); m.put(\"b\", 2);\
+         m.forEach((k, v) -> System.out.print(k + \"=\" + v + \";\"));\
+         System.out.println();\
+         try { xs.get(99); } catch (IndexOutOfBoundsException e) { System.out.println(\"oob \" + e.getMessage()); }\
+         try { List.of(\"a\").add(\"b\"); } catch (UnsupportedOperationException e) { System.out.println(\"uoe\"); }\
+         try { Arrays.asList(1, 2).add(3); } catch (UnsupportedOperationException e) { System.out.println(\"uoe2\"); } } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[fig, pear, kiwi, banana]\n\
+         [pear, kiwi, fig, banana]\n\
+         [banana, fig, kiwi, pear] 9 2\n\
+         banana|fig|kiwi|pear|\n\
+         a=1;b=2;\n\
+         oob Index 99 out of bounds for length 4\n\
+         uoe\n\
+         uoe2\n"
+    );
+}
+
+#[test]
+fn string_compare_to_returns_javas_difference_not_just_its_sign() {
+    // `String.compareTo` is specified as the difference of the first differing
+    // character (else the length difference), and programs print it — so
+    // returning only -1/0/1 would be wrong. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         System.out.println(\"abc\".compareTo(\"abd\") + \" \" + \"b\".compareTo(\"a\") + \" \"\
+         + \"ab\".compareTo(\"ab\") + \" \" + \"abc\".compareTo(\"ab\")); } }");
+    assert!(ok);
+    assert_eq!(out, "-1 1 0 1\n");
+}
