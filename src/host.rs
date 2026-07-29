@@ -1331,7 +1331,15 @@ fn obj_default_str(id: u32) -> String {
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
-            Some(HostObj::Instance { class, .. }) => format!("{class}@{id:x}"),
+            // An enum constant carries its name in a synthesized field, and
+            // `Enum.toString()` returns exactly that. Reading it here is what
+            // makes `String.valueOf(color)` and `Arrays.toString(values())`
+            // print `RED` rather than `Color@1` — a builtin cannot re-enter the
+            // VM to call the Java-level `toString()`.
+            Some(HostObj::Instance { class, fields }) => match fields.get(crate::ast::ENUM_NAME) {
+                Some(n) if !matches!(n, Value::Undef) => n.as_str_cow().into_owned(),
+                _ => format!("{class}@{id:x}"),
+            },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
             None => format!("(obj:{id})"),
         }

@@ -77,8 +77,12 @@ by parameter type** (most-specific resolution for methods and constructors), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
 X>`, the diamond, erased library type args) all run. `String.format` (a
 `Formatter` subset) and `Arrays.toString` round out the stdlib essentials; the
-wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). Nothing is
-faked — an unsupported construct is a parse error, not a silent mis-run.
+wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). **Exceptions**
+(`throw`/`try`/`catch`/`finally`, try-with-resources, and javars's own runtime
+faults raised as catchable throwables) and **`enum` types** run too. An
+unsupported construct is a parse error rather than a silent mis-run, with one
+documented exception — a `static` field, which parses and then reads as `null`
+(see [`BUGS.md`](BUGS.md)).
 
 ---
 
@@ -145,8 +149,9 @@ Buzz
 Implemented and checked against the reference `java`:
 
 - **Entry point** — `public class Name { public static void main(String[] args) { … } }`.
-  A class may also declare `static` helper methods (compiled — see below); other
-  members (fields, constructors, instance methods) are skipped.
+  Every other member — `static` helpers, instance fields, constructors, instance
+  methods — is compiled too; only `static` fields are still a gap. `main`'s
+  `args` parameter is unbound (see [`BUGS.md`](BUGS.md)).
 - **Locals** — `int` / `long` / `double` / `boolean` / `String` / `var`
   declarations with optional initializers; plain and compound assignment
   (`=`, `+=`, `-=`, `*=`, `/=`, `%=`); post-increment / post-decrement
@@ -165,6 +170,9 @@ Implemented and checked against the reference `java`:
   real fusevm call frames into the caller's handler; an uncaught one reports and
   exits non-zero. A `return`/`break`/`continue` leaving a guarded block runs the
   `finally` on its way out, and so does an exception raised inside a `catch` arm.
+- **`enum` types** — constants as singletons with reference identity,
+  `name()`/`ordinal()`/`toString()`/`equals`, `values()`/`valueOf`, unqualified
+  `switch` labels, enum bodies with their own methods, and `implements`.
 - **Catchable runtime faults** — javars's own faults are Java exceptions rather
   than aborts: an out-of-range array index, a null receiver, `Integer.parseInt`
   on junk, integral `/ 0` and `% 0`, a negative array size, and the `String`
@@ -301,8 +309,8 @@ Next waves, in priority order:
 1. **`static` fields** — `static int n = 0;` parses but is not modeled: the name
    reads as `null` instead of its initializer. The highest-priority gap, because
    it is the one construct that runs wrong rather than being rejected.
-2. **Object-model depth** — enums, records, and abstract classes (enums need
-   `static` fields first).
+2. **Object-model depth** — records, abstract classes, and the enum forms that
+   carry per-constant state (`EARTH(5.97)`), which need `static` fields first.
 3. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
    collections, more `String` methods, and arrow-`switch` expressions.
 

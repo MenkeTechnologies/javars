@@ -77,6 +77,12 @@ struct ClassInfo {
     supertypes: Vec<String>,
     /// True when this is an `interface` (not instantiable; a dispatch-only type).
     is_interface: bool,
+    /// True when this is an `enum` — the flag that makes a bare `Color` a type
+    /// reference rather than a variable, even for `enum Empty { }`.
+    is_enum: bool,
+    /// An `enum`'s constant names in declaration order. Index is the constant's
+    /// `ordinal()`.
+    enum_constants: Vec<String>,
     /// Every instance field this class has (ancestors first, then own), in
     /// initialization order — the sequence the constructor prologue emits.
     fields: Vec<FieldInit>,
@@ -337,6 +343,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         finallys: Vec::new(),
     };
     // ── main body (global scope) ──
+    // Enum constants are singletons that exist before any user code runs, so
+    // their instances are built first.
+    c.emit_enum_prologue(prog)?;
     for stmt in &prog.main {
         c.stmt(stmt)?;
     }
@@ -514,6 +523,8 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 superclass: cl.superclass.clone(),
                 supertypes,
                 is_interface: cl.is_interface,
+                is_enum: cl.is_enum,
+                enum_constants: cl.enum_constants.clone(),
                 fields,
                 field_types,
                 methods,
@@ -554,6 +565,173 @@ impl Compiler {
                 self.b.emit(Op::SetVar(idx), line);
             }
         }
+    }
+
+    // ── enums ────────────────────────────────────────────────────────────
+    //
+    // An enum constant is a singleton created once, before any user code runs,
+    // and named from every frame. fusevm's `GetVar`/`SetVar` address a flat
+    // global table (frame slots are per-call), so each constant gets one global
+    // — `#enum#Color#RED` — that both `main` and a method body read directly.
+    // Everything after that is ordinary object machinery: the constants are
+    // instances of a normal class, so `==`, `instanceof`, virtual dispatch, and
+    // arrays of them all work with no further special cases.
+
+    /// Read the global holding an enum constant, from any frame.
+    fn emit_global_get(&mut self, name: &str, line: u32) {
+        let idx = self.b.add_name(name);
+        self.b.emit(Op::GetVar(idx), line);
+    }
+
+    /// Store the top of stack into a global, from any frame.
+    fn emit_global_set(&mut self, name: &str, line: u32) {
+        let idx = self.b.add_name(name);
+        self.b.emit(Op::SetVar(idx), line);
+    }
+
+    /// Build every enum constant's instance and park it in its global. Emitted
+    /// at the very top of `main`, before the program's first statement.
+    fn emit_enum_prologue(&mut self, prog: &Program) -> Result<(), String> {
+        for cl in &prog.classes {
+            for (ordinal, constant) in cl.enum_constants.iter().enumerate() {
+                let line = cl.line;
+                // `new C()` runs the field defaults and the (implicit) ctor …
+                self.new_object(&cl.name, &[], line)?;
+                let obj = self.temp();
+                self.emit_set(&obj, line);
+                // … then the identity every enum constant carries.
+                for (field, value) in [
+                    (ENUM_NAME, Expr::Str(constant.clone())),
+                    (ENUM_ORDINAL, Expr::Int(ordinal as i64)),
+                ] {
+                    self.emit_get(&obj, line);
+                    let name_c = self.b.add_constant(Value::str(field.to_string()));
+                    self.b.emit(Op::LoadConst(name_c), line);
+                    self.expr(&value)?;
+                    self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
+                    self.b.emit(Op::Pop, line);
+                }
+                self.emit_get(&obj, line);
+                self.emit_global_set(&enum_global(&cl.name, constant), line);
+            }
+        }
+        Ok(())
+    }
+
+    /// When `e` is `EnumName.CONSTANT`, the enum's name — the one `Expr::Field`
+    /// shape that is a *type* reference rather than an instance field read.
+    /// `None` for every other expression, including a field of a variable that
+    /// happens to share an enum's name (a declared variable always wins).
+    fn enum_constant_ref(&self, e: &Expr) -> Option<String> {
+        let Expr::Field { recv, name } = e else {
+            return None;
+        };
+        let Expr::Var(class) = recv.as_ref() else {
+            return None;
+        };
+        if self.is_declared_var(class) {
+            return None;
+        }
+        let info = self.classes.get(class)?;
+        info.enum_constants
+            .iter()
+            .any(|c| c == name)
+            .then(|| class.clone())
+    }
+
+    /// A bare `MUL` written inside `enum Op`'s own body names its constant —
+    /// Java allows the unqualified form only there and in a `switch` label.
+    /// A local of the same name shadows it, exactly as it shadows a field.
+    fn enclosing_enum_constant(&self, name: &str) -> Option<String> {
+        if self.is_local(name) {
+            return None;
+        }
+        let this = self.this_class.as_deref()?;
+        let info = self.classes.get(this)?;
+        info.enum_constants
+            .iter()
+            .any(|c| c == name)
+            .then(|| this.to_string())
+    }
+
+    /// The type of `EnumName.values()` / `EnumName.valueOf(s)` — the two enum
+    /// statics the compiler generates, which have no entry in any method table.
+    fn enum_static_type(&self, recv: &Expr, method: &str, argc: usize) -> Option<String> {
+        let class = self.enum_type_ref(recv)?;
+        match (method, argc) {
+            ("values", 0) => Some(format!("{class}[]")),
+            ("valueOf", 1) => Some(class),
+            _ => None,
+        }
+    }
+
+    /// The enum type named by a bare receiver (`Color.values()`), or `None` when
+    /// the receiver is a value rather than an enum type name.
+    fn enum_type_ref(&self, recv: &Expr) -> Option<String> {
+        let Expr::Var(class) = recv else {
+            return None;
+        };
+        if self.is_declared_var(class) {
+            return None;
+        }
+        let info = self.classes.get(class)?;
+        info.is_enum.then(|| class.clone())
+    }
+
+    /// Lower `EnumName.values()` — a fresh array of the constants, in
+    /// declaration order, exactly as Java hands out a fresh copy each call.
+    fn emit_enum_values(&mut self, class: &str, line: u32) {
+        let constants = self.classes[class].enum_constants.clone();
+        for c in &constants {
+            self.emit_global_get(&enum_global(class, c), line);
+        }
+        self.b.emit(
+            Op::CallBuiltin(crate::host::JARRAY_LIT, constants.len() as u8),
+            line,
+        );
+    }
+
+    /// Lower `EnumName.valueOf(s)` — a name-to-constant lookup, raising Java's
+    /// `IllegalArgumentException: No enum constant Color.PINK` on a miss.
+    fn emit_enum_value_of(&mut self, class: &str, arg: &Expr, line: u32) -> Result<(), String> {
+        let constants = self.classes[class].enum_constants.clone();
+        let key = self.temp();
+        self.expr(arg)?;
+        self.emit_set(&key, line);
+        let mut done = Vec::new();
+        for c in &constants {
+            self.emit_get(&key, line);
+            let cc = self.b.add_constant(Value::str(c.clone()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::StrEq, line);
+            let jf = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_global_get(&enum_global(class, c), line);
+            done.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        // No match. The message needs the runtime argument, so it is built with
+        // a concatenation rather than a constant.
+        let msg = self.temp();
+        let prefix = self
+            .b
+            .add_constant(Value::str(format!("No enum constant {class}.")));
+        self.b.emit(Op::LoadConst(prefix), line);
+        self.emit_get(&key, line);
+        self.b.emit(Op::Add, line);
+        self.emit_set(&msg, line);
+        let cls = self.b.add_constant(Value::str("IllegalArgumentException"));
+        self.b.emit(Op::LoadConst(cls), line);
+        self.emit_get(&msg, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JFAULT, 2), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_unwind(line);
+        // The unwind never falls through, but the jumps from a match do.
+        let end = self.b.current_pos();
+        for j in done {
+            self.b.patch_jump(j, end);
+        }
+        Ok(())
     }
 
     /// Record the declared numeric type of a local/parameter in the active scope.
@@ -647,6 +825,12 @@ impl Compiler {
                 let ft = self.classes.get(&rc)?.field_types.get(name)?;
                 ft.ends_with("[]").then(|| ft.clone())
             }
+            // `Color.values()` hands back a `Color[]`.
+            Expr::MethodCall {
+                recv, method, args, ..
+            } if method == "values" && args.is_empty() => {
+                self.enum_type_ref(recv).map(|c| format!("{c}[]"))
+            }
             // A row of a multi-dimensional array: `int[][]` indexed once is an
             // `int[]`, so `g[i][j]` types its element as `int`.
             Expr::Index { array, .. } => {
@@ -669,12 +853,18 @@ impl Compiler {
                         return Some(ty.to_string());
                     }
                 }
+                if let Some(class) = self.enclosing_enum_constant(name) {
+                    return Some(class);
+                }
                 // A bare field reference of `this`.
                 let this = self.this_class.as_ref()?;
                 let ty = self.classes.get(this)?.field_types.get(name)?;
                 self.classes.contains_key(ty).then(|| ty.to_string())
             }
             Expr::Field { recv, name } => {
+                if let Some(class) = self.enum_constant_ref(e) {
+                    return Some(class);
+                }
                 let rc = self.expr_class(recv)?;
                 let ty = self.classes.get(&rc)?.field_types.get(name)?;
                 self.classes.contains_key(ty).then(|| ty.to_string())
@@ -689,6 +879,9 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                if let Some(t) = self.enum_static_type(recv, method, args.len()) {
+                    return self.classes.contains_key(&t).then_some(t);
+                }
                 let rc = self.expr_class(recv)?;
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -704,6 +897,9 @@ impl Compiler {
     fn bare_var_type(&self, name: &str) -> Option<String> {
         if let Some(t) = self.var_decl_type(name) {
             return Some(t.to_string());
+        }
+        if let Some(class) = self.enclosing_enum_constant(name) {
+            return Some(class);
         }
         let this = self.this_class.as_ref()?;
         self.classes.get(this)?.field_types.get(name).cloned()
@@ -755,6 +951,9 @@ impl Compiler {
                 if name == "length" {
                     return Some("int".to_string());
                 }
+                if let Some(class) = self.enum_constant_ref(e) {
+                    return Some(class);
+                }
                 let rc = self.expr_class(recv)?;
                 self.classes.get(&rc)?.field_types.get(name).cloned()
             }
@@ -781,6 +980,9 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                if let Some(t) = self.enum_static_type(recv, method, args.len()) {
+                    return Some(t);
+                }
                 // A bare stdlib class receiver (`Integer.parseInt`) is a static
                 // call whose declared return type is known.
                 if let Expr::Var(class) = recv.as_ref() {
@@ -2213,6 +2415,11 @@ impl Compiler {
         // with a user variable.
         let temp = format!("#switch{}", self.switch_counter);
         self.switch_counter += 1;
+        // Java writes `case RED:` unqualified when switching on an enum; the
+        // label's meaning comes from the discriminant's static type.
+        let enum_disc = self
+            .expr_java_type(disc)
+            .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
         self.expr(disc)?;
         self.emit_set(&temp, 0);
 
@@ -2225,7 +2432,14 @@ impl Compiler {
             let mut jumps = Vec::new();
             for lab in &g.labels {
                 self.emit_get(&temp, 0);
-                self.expr(lab)?;
+                match (&enum_disc, lab) {
+                    (Some(class), Expr::Var(c)) => {
+                        self.emit_global_get(&enum_global(class, c), 0);
+                    }
+                    _ => self.expr(lab)?,
+                }
+                // Enum constants are singletons, so identity is equality — the
+                // same `NumEq` handle comparison `==` on objects already uses.
                 self.b.emit(Op::NumEq, 0);
                 jumps.push(self.b.emit(Op::JumpIfTrue(0), 0));
             }
@@ -2403,7 +2617,9 @@ impl Compiler {
             Expr::Var(name) => {
                 // A bare name that is a field of `this` (not a local) reads
                 // `this.name`; otherwise it is a plain local/global.
-                if self.implicit_this_field(name).is_some() {
+                if let Some(class) = self.enclosing_enum_constant(name) {
+                    self.emit_global_get(&enum_global(&class, name), 0);
+                } else if self.implicit_this_field(name).is_some() {
                     self.b.emit(Op::GetSlot(0), 0); // this
                     self.emit_field_get(name, 0);
                 } else {
@@ -2460,8 +2676,14 @@ impl Compiler {
                 self.emit_raising_builtin(crate::host::JARRAY_GET, 2, 0);
             }
             Expr::Field { recv, name } => {
-                self.expr(recv)?;
-                self.emit_field_get(name, 0);
+                // `Color.RED` names an enum constant's singleton, not a field of
+                // a value — there is no receiver to evaluate.
+                if let Some(class) = self.enum_constant_ref(e) {
+                    self.emit_global_get(&enum_global(&class, name), 0);
+                } else {
+                    self.expr(recv)?;
+                    self.emit_field_get(name, 0);
+                }
             }
             Expr::NewObject { class, args, line } => self.new_object(class, args, *line)?,
             Expr::InstanceOf { expr, class } => {
@@ -2531,6 +2753,24 @@ impl Compiler {
         // `Integer.parseInt`, `String.valueOf`) is a static stdlib call: the
         // receiver is not a value, so it is not evaluated. Args, then the class
         // and method names, are handed to the static-dispatch builtin.
+        // `Color.values()` / `Color.valueOf(s)` — the two statics every enum has.
+        // They are compiler-generated because javars keeps no per-class static
+        // method table.
+        if let Some(class) = self.enum_type_ref(recv) {
+            match (method, args.len()) {
+                ("values", 0) => {
+                    self.emit_enum_values(&class, line);
+                    return Ok(());
+                }
+                ("valueOf", 1) => return self.emit_enum_value_of(&class, &args[0], line),
+                _ => {
+                    return Err(format!(
+                        "javars: enum `{class}` has no static method `{method}` taking {} argument(s) (line {line})",
+                        args.len()
+                    ))
+                }
+            }
+        }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
                 for a in args {

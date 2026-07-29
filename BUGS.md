@@ -121,6 +121,17 @@ then runs wrong (see below).
   a `return` out of the block. `close()` is called on the declared type through
   ordinary dispatch; javars has no `java.lang.AutoCloseable`, so implementing it
   is optional (an unknown interface name is inert).
+- **`enum` types.** `enum Color { RED, GREEN, BLUE }`, with or without a body of
+  its own (`; int rank() { … }`), `implements I`, and an empty constant list.
+  Each constant is a singleton instance built before `main` runs and held in a
+  compiler-minted global, so `Color.RED == Color.RED` is reference identity,
+  `instanceof` works, and an enum-typed array or parameter is an ordinary
+  reference. `name()`, `ordinal()`, `toString()` (defaulting to `name()`), and
+  `equals` are synthesized unless the body declares them; `values()` returns a
+  fresh array in declaration order and `valueOf(s)` raises Java's
+  `IllegalArgumentException: No enum constant Color.PINK` on a miss.
+  `switch (c) { case RED: … }` takes the unqualified label, and a bare constant
+  name resolves inside the enum's own body (`this == MUL`).
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -141,16 +152,22 @@ then runs wrong (see below).
 
 ## Not implemented (parse errors today)
 
-- **Abstract classes, enums, records.** (Interface abstract methods and
-  `abstract` method *signatures* parse; a standalone `abstract class` body is not
-  specially modeled.)
+- **Abstract classes and records.** (Interface abstract methods and `abstract`
+  method *signatures* parse; a standalone `abstract class` body is not specially
+  modeled.)
+- **An `enum` constant with arguments or a body** (`EARTH(5.97)`,
+  `A { int v() { … } }`) — rejected rather than run as a bare constant, which
+  would silently drop the per-constant state javars does not model. Everything
+  else about enums works (see above).
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
   `String`/`Arrays` statics listed above and the `String` instance methods are
   the whole library surface — no `java.util.*` collections, no `Math` constants
   (`Math.PI`), no boxed-type methods beyond the listed statics.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
-- **Arrow `switch` expressions**, `switch` on enums/patterns.
+- **Arrow `switch` expressions** and `switch` patterns. (The classic
+  `switch` *statement* on an enum works.)
+- **`Enum.compareTo`/`hashCode`, `EnumSet`, `EnumMap`.**
 - **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
   no single `|` token, so it fails lexically).
 - **Lambdas, streams, `var` type inference beyond storage.**

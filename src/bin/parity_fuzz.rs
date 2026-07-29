@@ -17,9 +17,10 @@
 //! `+` string-concatenation coercion, `Double.toString` notation (the
 //! decimal/scientific threshold), `String.format`, the `String` instance methods,
 //! `Math` overload result typing, the runtime faults javars raises itself
-//! (`fault`), the cleanup blocks a jump has to run (`finally`), and
-//! try-with-resources close ordering (`resource`). Pure random bytes only produce
-//! mutual parse errors that agree on both sides and teach nothing.
+//! (`fault`), the cleanup blocks a jump has to run (`finally`),
+//! try-with-resources close ordering (`resource`), and `enum` identity and
+//! ordering (`enum`). Pure random bytes only produce mutual parse errors that
+//! agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
@@ -470,6 +471,40 @@ fn g_resource(r: &mut Rng) -> String {
     }
 }
 
+/// `enum` types: constant identity, `name()`/`ordinal()`/`toString()`,
+/// `values()` order, `valueOf` (including its `IllegalArgumentException`),
+/// `switch` on an unqualified constant, an enum-typed parameter/return, and an
+/// enum with a body of its own.
+fn g_enum(r: &mut Rng) -> String {
+    let c = pick(r, &["RED", "GREEN", "BLUE"]);
+    match r.below(7) {
+        0 => format!(
+            "{{ Color e = Color.{c}; System.out.println(e + \",\" + e.name() + \",\" + e.ordinal()); }}"
+        ),
+        1 => format!(
+            "{{ Color e = Color.{c}; System.out.println((e == Color.{}) + \",\" + e.equals(Color.{})); }}",
+            pick(r, &["RED", "BLUE"]),
+            pick(r, &["GREEN", "RED"])
+        ),
+        2 => "{ for (Color e : Color.values()) { System.out.print(e + \":\" + e.ordinal() + \" \"); } System.out.println(Color.values().length); }"
+            .to_string(),
+        3 => format!(
+            "{{ try {{ System.out.println(Color.valueOf(\"{}\")); }} catch (IllegalArgumentException x) {{ System.out.println(x.getMessage()); }} }}",
+            pick(r, &["RED", "BLUE", "PINK", "red", ""])
+        ),
+        4 => format!(
+            "{{ Color e = Color.{c}; switch (e) {{ case RED: System.out.println(\"r\"); break; case GREEN: System.out.println(\"g\"); break; default: System.out.println(\"d\"); }} }}"
+        ),
+        5 => format!("{{ System.out.println(shout(Color.{c}) + \" \" + next(Color.{c})); }}"),
+        _ => format!(
+            "{{ Op o = Op.{}; System.out.println(o.apply({}, {}) + \" \" + o.isMul() + \" \" + o); }}",
+            pick(r, &["ADD", "SUB", "MUL"]),
+            pick(r, INTS),
+            pick(r, DIVS)
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -477,10 +512,18 @@ const SUPPORT: &str = concat!(
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
     "    static int fin3() { try { return 6; } finally { return 66; } }\n",
     "    static int resret() { try (Res a = new Res(\"r\")) { return 7; } }\n",
+    "    static String shout(Color c) { return c.name() + \"!\"; }\n",
+    "    static Color next(Color c) { return c == Color.BLUE ? Color.RED : Color.values()[c.ordinal() + 1]; }\n",
 );
 
 /// The `AutoCloseable` the resource probes open and close.
 const SUPPORT_CLASS: &str = concat!(
+    "enum Color { RED, GREEN, BLUE }\n",
+    "enum Op {\n",
+    "    ADD, SUB, MUL;\n",
+    "    int apply(int a, int b) { switch (this) { case ADD: return a + b; case SUB: return a - b; default: return a * b; } }\n",
+    "    boolean isMul() { return this == MUL; }\n",
+    "}\n",
     "class Res implements AutoCloseable {\n",
     "    String n;\n",
     "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
@@ -513,6 +556,7 @@ enum Mode {
     Fault,
     Finally,
     Resource,
+    Enum,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -538,6 +582,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Fault,
     Mode::Finally,
     Mode::Resource,
+    Mode::Enum,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -565,6 +610,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Fault => "fault",
         Mode::Finally => "finally",
         Mode::Resource => "resource",
+        Mode::Enum => "enum",
     }
 }
 
@@ -604,6 +650,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Fault => g_fault(r),
         Mode::Finally => g_finally(r),
         Mode::Resource => g_resource(r),
+        Mode::Enum => g_enum(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

@@ -131,10 +131,12 @@ impl Parser {
             self.advance();
         }
         let line = self.line();
-        // `class Name` or `interface Name`. `interface` is an ordinary ident
-        // (not a reserved token), matched here.
+        // `class Name`, `interface Name`, or `enum Name`. Neither `interface`
+        // nor `enum` is a reserved token in this lexer, so both are matched by
+        // name here.
         let is_interface = matches!(self.peek(), Tok::Ident(w) if w == "interface");
-        if is_interface {
+        let is_enum = matches!(self.peek(), Tok::Ident(w) if w == "enum");
+        if is_interface || is_enum {
             self.advance();
         } else {
             self.eat(&Tok::Class)?;
@@ -180,6 +182,13 @@ impl Parser {
         let mut fields = Vec::new();
         let mut ctors = Vec::new();
         let mut inst_methods = Vec::new();
+        // An `enum` body opens with its constant list; the ordinary members (if
+        // any) follow the `;` that terminates it.
+        let enum_constants = if is_enum {
+            self.enum_constants(&name)?
+        } else {
+            Vec::new()
+        };
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             if let Some(body) = self.try_main()? {
                 *entry = Some((name.clone(), body));
@@ -200,11 +209,16 @@ impl Parser {
             }
         }
         self.eat(&Tok::RBrace)?;
+        if is_enum {
+            enum_members(line, &mut fields, &mut inst_methods);
+        }
         classes.push(Class {
             name,
             superclass,
             interfaces,
             is_interface,
+            is_enum,
+            enum_constants,
             fields,
             ctors,
             methods: inst_methods,
@@ -213,6 +227,115 @@ impl Parser {
         Ok(())
     }
 
+    /// Parse an `enum` body's constant list (the cursor just past `{`), and give
+    /// the type the state and accessors every enum has.
+    ///
+    /// javars models an enum as an ordinary class with two synthesized fields —
+    /// `#name` and `#ordinal`, whose `#` is not a legal Java identifier char, so
+    /// they cannot collide with a user field — plus the `name()`, `ordinal()`,
+    /// and `toString()` bodies that read them. The compiler builds one instance
+    /// per constant before `main` runs (see `Compiler::emit_enum_prologue`), so
+    /// everything else (virtual dispatch, `instanceof`, reference `==`, arrays)
+    /// applies unchanged.
+    ///
+    /// A constant carrying an argument list or a class body is rejected rather
+    /// than parsed with the extra dropped: javars has no per-constant state, and
+    /// running `EARTH(5.97)` as a bare `EARTH` would silently lose the mass.
+    fn enum_constants(&mut self, name: &str) -> Result<Vec<String>, String> {
+        let mut constants = Vec::new();
+        while matches!(self.peek(), Tok::Ident(_)) {
+            let line = self.line();
+            let c = self.ident()?;
+            if self.is(&Tok::LParen) || self.is(&Tok::LBrace) {
+                return Err(format!(
+                    "javars: enum constant `{name}.{c}` with arguments or a body is not supported (line {line})"
+                ));
+            }
+            constants.push(c);
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        // The `;` is optional when the body holds nothing but constants.
+        if self.is(&Tok::Semi) {
+            self.advance();
+        }
+        Ok(constants)
+    }
+}
+
+/// Give an `enum` its synthesized state and accessors, after its own members
+/// have been parsed so a user-declared `toString()`/`name()`/`ordinal()` is left
+/// alone. Called once per enum declaration.
+fn enum_members(line: u32, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method>) {
+    fields.push(FieldDecl {
+        ty: "String".to_string(),
+        name: ENUM_NAME.to_string(),
+        init: None,
+    });
+    fields.push(FieldDecl {
+        ty: "int".to_string(),
+        name: ENUM_ORDINAL.to_string(),
+        init: None,
+    });
+    let reader = |method: &str, field: &str, ret: &str| Method {
+        name: method.to_string(),
+        params: Vec::new(),
+        ret: ret.to_string(),
+        body: vec![Stmt::new(
+            line,
+            StmtKind::Return(Some(Expr::Field {
+                recv: Box::new(Expr::This),
+                name: field.to_string(),
+            })),
+        )],
+        is_abstract: false,
+        line,
+    };
+    // `Enum.toString()` returns `name()`. A body that declares any of these
+    // itself keeps its own version — the synthesized one is only a default.
+    for (method, field, ret) in [
+        ("name", ENUM_NAME, "String"),
+        ("ordinal", ENUM_ORDINAL, "int"),
+        ("toString", ENUM_NAME, "String"),
+    ] {
+        if !methods
+            .iter()
+            .any(|m| m.name == method && m.params.is_empty())
+        {
+            methods.push(reader(method, field, ret));
+        }
+    }
+    // `Enum.equals` is identity — constants are singletons, so `==` is exactly
+    // it, and `final` in Java (never overridden).
+    if !methods
+        .iter()
+        .any(|m| m.name == "equals" && m.params.len() == 1)
+    {
+        methods.push(Method {
+            name: "equals".to_string(),
+            params: vec![Param {
+                ty: "Object".to_string(),
+                name: "other".to_string(),
+            }],
+            ret: "boolean".to_string(),
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::This),
+                    rhs: Box::new(Expr::Var("other".to_string())),
+                })),
+            )],
+            is_abstract: false,
+            line,
+        });
+    }
+}
+
+impl Parser {
     /// Skip a generic type-parameter/argument group `< ... >` when the cursor is
     /// on `<`, matching nested `<`/`>` (Java erases these at runtime, so javars
     /// parses and discards them). A no-op when the cursor is not on `<`.

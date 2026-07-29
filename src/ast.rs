@@ -32,6 +32,18 @@ pub struct Program {
     pub uses_exceptions: bool,
 }
 
+/// Field holding an enum constant's `name()`. `#` is not a legal Java identifier
+/// character, so a synthesized field can never collide with a user-declared one.
+pub const ENUM_NAME: &str = "#name";
+/// Field holding an enum constant's `ordinal()`.
+pub const ENUM_ORDINAL: &str = "#ordinal";
+
+/// The global holding the singleton instance of `class.constant` — the storage
+/// `Color.RED` reads. Minted by the compiler's enum prologue.
+pub fn enum_global(class: &str, constant: &str) -> String {
+    format!("#enum#{class}#{constant}")
+}
+
 /// A user-defined class: its instance fields, constructors, and instance
 /// methods. `static` methods are hoisted into [`Program::methods`]; only the
 /// non-static members live here. Modeled as heap objects ([`crate::host`]
@@ -50,6 +62,15 @@ pub struct Class {
     /// interface is not instantiable; its abstract methods are dispatch-only and
     /// its `default` methods supply an inherited body to implementors.
     pub is_interface: bool,
+    /// True when this declaration is an `enum`. Distinct from a non-empty
+    /// [`Class::enum_constants`] because `enum Empty { }` is legal Java.
+    pub is_enum: bool,
+    /// The constant names of an `enum`, in declaration order — the value of
+    /// `ordinal()`. Empty for a `class`/`interface`. An enum is otherwise an
+    /// ordinary class: the parser gives it the `#name`/`#ordinal` fields and the
+    /// `name()`/`ordinal()`/`toString()` bodies that read them, and the compiler
+    /// builds one instance per constant before `main` runs.
+    pub enum_constants: Vec<String>,
     /// Instance fields in declaration order (name, type, optional initializer).
     pub fields: Vec<FieldDecl>,
     /// Declared constructors. Empty means the implicit no-arg default ctor.

@@ -1096,6 +1096,43 @@ fn throwing_in_a_loop_does_not_grow_the_value_stack() {
 }
 
 #[test]
+fn enum_constants_are_singletons_with_name_and_ordinal() {
+    // Constants are one instance each, created before `main`, so `==` is
+    // identity and `values()` hands them back in declaration order. `name()`,
+    // `ordinal()`, `toString()`, `valueOf`, an unqualified `switch` label, an
+    // enum-typed parameter, and a body of the enum's own all work off that.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run("enum Op {\
+         ADD, SUB, MUL;\
+         int apply(int a, int b) { switch (this) { case ADD: return a + b; case SUB: return a - b; default: return a * b; } }\
+         boolean isMul() { return this == MUL; } }\
+         public class Main {\
+         static String describe(Op o) { return o.name() + \"/\" + o.ordinal(); }\
+         public static void main(String[] a) {\
+         for (Op o : Op.values()) { System.out.println(describe(o) + \" \" + o.apply(6, 3) + \" \" + o.isMul()); }\
+         System.out.println(Op.values().length + \" \" + (Op.ADD == Op.ADD) + \" \" + Op.ADD.equals(Op.SUB));\
+         System.out.println(Op.valueOf(\"MUL\").apply(2, 3));\
+         Op v = Op.SUB;\
+         switch (v) { case ADD: System.out.println(\"a\"); break; case SUB: System.out.println(\"s\"); break; default: System.out.println(\"m\"); }\
+         try { Op.valueOf(\"nope\"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); } } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ADD/0 9 false\nSUB/1 3 false\nMUL/2 18 true\n\
+         3 true false\n6\ns\nNo enum constant Op.nope\n"
+    );
+}
+
+#[test]
+fn an_enum_constant_with_arguments_is_rejected() {
+    // javars has no per-constant state, so running `EARTH(5.97)` as a bare
+    // `EARTH` would silently drop the mass. The program is refused instead.
+    let (_, ok) = run("enum Planet { EARTH(5.97), MARS(0.64); double mass; }\
+         public class Main { public static void main(String[] a) { System.out.println(Planet.EARTH); } }");
+    assert!(!ok);
+}
+
+#[test]
 fn a_runtime_fault_is_a_catchable_exception() {
     // javars's own faults — array index, `Integer.parseInt`, integral `/ 0`,
     // a negative array size, a `String` index — raise the throwable Java raises,
