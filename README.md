@@ -210,6 +210,7 @@ Implemented and checked against the reference `java`:
 | `--dump-tokens FILE` | Print the lexer token stream and exit. |
 | `--dump-ast FILE` | Print the parsed AST and exit. |
 | `--disasm FILE` | Print the lowered fusevm bytecode and exit. |
+| `--tiers FILE` | Run it, then report which fusevm execution tier took each of its chunks. |
 | `--lsp` | Speak the Language Server Protocol over stdio (completion, hover, diagnostics). |
 | `--dap` | Speak the Debug Adapter Protocol over stdio (breakpoints, stepping, locals). |
 
