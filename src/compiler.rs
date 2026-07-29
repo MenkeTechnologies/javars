@@ -2411,10 +2411,19 @@ impl Compiler {
     /// floating point (fusevm's `Op::Div`) and truncates toward zero to an
     /// integer only when both operands are statically integral — reproduced
     /// with a trailing `Op::TruncInt`.
+    /// Lower `/`.
+    ///
+    /// Statically-integral division keeps the native op pair so the JIT can
+    /// trace it. Anything else — a floating operand, or an operand whose type is
+    /// not statically known — routes through the `JDIV` builtin, because Java
+    /// floating division is IEEE-754: `x / 0.0` is a signed infinity and
+    /// `0.0 / 0.0` is NaN, where the native op yields `Undef`.
     fn emit_div(&mut self, l: NumType, r: NumType, line: u32) {
-        self.b.emit(Op::Div, line);
         if l == NumType::Int && r == NumType::Int {
+            self.b.emit(Op::Div, line);
             self.b.emit(Op::TruncInt, line);
+        } else {
+            self.b.emit(Op::CallBuiltin(crate::host::JDIV, 2), line);
         }
     }
 }

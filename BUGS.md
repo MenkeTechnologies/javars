@@ -104,6 +104,11 @@ reported as parse errors, never silently mis-run.
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
 - **`char` literals are one-character strings**, not an integer `char` type.
+- **Floating `/` routes through a builtin.** Statically-integral division keeps
+  the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating or
+  statically-unknown operand routes through `JDIV`, because Java floating
+  division is IEEE-754 (`x / 0.0` is a signed infinity, `0.0 / 0.0` is NaN)
+  where the native op yields `Undef`.
 - **Integer arithmetic uses fusevm's 64-bit semantics.** Java `int` 32-bit
   overflow wrapping is not yet modeled (values behave like `long`).
 - **Uninitialized locals are unbound** rather than rejected; reading one before

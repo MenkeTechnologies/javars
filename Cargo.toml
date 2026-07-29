@@ -72,3 +72,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "parity-fuzz"
+path = "src/bin/parity_fuzz.rs"

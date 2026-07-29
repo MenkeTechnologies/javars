@@ -1,0 +1,51 @@
+public class T { public static void main(String[] a) { System.out.println(7 / 2); } }	3\n
+public class T { public static void main(String[] a) { System.out.println(-7 / 2); } }	-3\n
+public class T { public static void main(String[] a) { System.out.println(7 % 3); } }	1\n
+public class T { public static void main(String[] a) { System.out.println(-7 % 3); } }	-1\n
+public class T { public static void main(String[] a) { System.out.println(7 / 2.0); } }	3.5\n
+public class T { public static void main(String[] a) { System.out.println(2.5 / 1.0e-7); } }	2.5E7\n
+public class T { public static void main(String[] a) { System.out.println(7 / 0.0); } }	Infinity\n
+public class T { public static void main(String[] a) { System.out.println(0.0 / 0.0); } }	NaN\n
+public class T { public static void main(String[] a) { System.out.println(-1.0 / 0.0); } }	-Infinity\n
+public class T { public static void main(String[] a) { System.out.println(1e3); } }	1000.0\n
+public class T { public static void main(String[] a) { System.out.println(1e-3); } }	0.001\n
+public class T { public static void main(String[] a) { System.out.println(9.999e-4); } }	9.999E-4\n
+public class T { public static void main(String[] a) { System.out.println(1.0e7); } }	1.0E7\n
+public class T { public static void main(String[] a) { System.out.println(9999999.0); } }	9999999.0\n
+public class T { public static void main(String[] a) { System.out.println(2.5e7); } }	2.5E7\n
+public class T { public static void main(String[] a) { System.out.println(1.5e-3); } }	0.0015\n
+public class T { public static void main(String[] a) { System.out.println(123456789.0); } }	1.23456789E8\n
+public class T { public static void main(String[] a) { System.out.println(0.0); } }	0.0\n
+public class T { public static void main(String[] a) { System.out.println(-0.0); } }	-0.0\n
+public class T { public static void main(String[] a) { System.out.println(1.0 / 3.0); } }	0.3333333333333333\n
+public class T { public static void main(String[] a) { System.out.println(100.0 - 1e-3); } }	99.999\n
+public class T { public static void main(String[] a) { System.out.println(0.1 <= 1e3); } }	true\n
+public class T { public static void main(String[] a) { System.out.println("a" + 1); } }	a1\n
+public class T { public static void main(String[] a) { System.out.println("a" + 1.5); } }	a1.5\n
+public class T { public static void main(String[] a) { System.out.println("x" + true); } }	xtrue\n
+public class T { public static void main(String[] a) { System.out.println("" + 0.5 + "y"); } }	0.5y\n
+public class T { public static void main(String[] a) { System.out.println(1 + 2 * 3); } }	7\n
+public class T { public static void main(String[] a) { System.out.println((1 + 2) * 3); } }	9\n
+public class T { public static void main(String[] a) { System.out.println(true && false); } }	false\n
+public class T { public static void main(String[] a) { System.out.println(true || false); } }	true\n
+public class T { public static void main(String[] a) { System.out.println(3 < 4); } }	true\n
+public class T { public static void main(String[] a) { System.out.println(3.5 >= 3.5); } }	true\n
+public class T { public static void main(String[] a) { System.out.println((2 < 3) ? 10 : 20); } }	10\n
+public class T { public static void main(String[] a) { System.out.println("Hello".length()); } }	5\n
+public class T { public static void main(String[] a) { System.out.println("Hello".toUpperCase()); } }	HELLO\n
+public class T { public static void main(String[] a) { System.out.println(" x ".trim()); } }	x\n
+public class T { public static void main(String[] a) { System.out.println("aXbXc".replace("X", "-")); } }	a-b-c\n
+public class T { public static void main(String[] a) { System.out.println("abc".indexOf("b")); } }	1\n
+public class T { public static void main(String[] a) { System.out.println("abc".contains("b")); } }	true\n
+public class T { public static void main(String[] a) { System.out.println("".isEmpty()); } }	true\n
+public class T { public static void main(String[] a) { System.out.println(Math.abs(-7)); } }	7\n
+public class T { public static void main(String[] a) { System.out.println(Math.max(3, 9)); } }	9\n
+public class T { public static void main(String[] a) { System.out.println(Math.min(2.5, 1.5)); } }	1.5\n
+public class T { public static void main(String[] a) { System.out.println(Math.floor(3.7)); } }	3.0\n
+public class T { public static void main(String[] a) { System.out.println(Math.ceil(3.2)); } }	4.0\n
+public class T { public static void main(String[] a) { System.out.println(Math.sqrt(16.0)); } }	4.0\n
+public class T { public static void main(String[] a) { System.out.println(String.format("%d", 42)); } }	42\n
+public class T { public static void main(String[] a) { System.out.println(String.format("%5d|", 42)); } }	   42|\n
+public class T { public static void main(String[] a) { System.out.println(String.format("%-5d|", 42)); } }	42   |\n
+public class T { public static void main(String[] a) { System.out.println(Integer.parseInt("-42")); } }	-42\n
+public class T { public static void main(String[] a) { System.out.println(Integer.toString(100)); } }	100\n

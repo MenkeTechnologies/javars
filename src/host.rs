@@ -96,6 +96,14 @@ pub const JCLASSOF: u16 = 717;
 /// handle. Aliasing is by reference like any other array.
 pub const JARRAY_NEW_MULTI: u16 = 718;
 
+/// Builtin id for Java floating-point division. Java `/` on a floating operand
+/// follows IEEE-754 — `x / 0.0` is a signed infinity and `0.0 / 0.0` is NaN,
+/// never a fault — whereas fusevm's native `Op::Div` yields `Undef` for a zero
+/// divisor (its shell/awk flavour has no infinities). Statically-integral
+/// division keeps the native op so the JIT can still trace it; only the
+/// floating path routes through here.
+pub const JDIV: u16 = 719;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -210,6 +218,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JFIELD_SET, b_field_set);
     vm.register_builtin(JINSTANCEOF, b_instanceof);
     vm.register_builtin(JCLASSOF, b_classof);
+    vm.register_builtin(JDIV, b_div);
 }
 
 /// `classof(obj)` — the runtime class name of an instance (stack `[obj]`), or
@@ -1084,14 +1093,41 @@ fn obj_default_str(id: u32) -> String {
 /// `Infinity`/`-Infinity`/`NaN`.
 fn format_double(f: f64) -> String {
     if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string()
-    } else if f.fract() == 0.0 && f.abs() < 1e16 {
-        format!("{f}.0")
-    } else {
-        format!("{f}")
+        return "NaN".to_string();
     }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        // Java distinguishes the signed zeroes: `-0.0` prints with its sign.
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+
+    // `Double.toString` uses plain decimal only inside [1e-3, 1e7); outside that
+    // range it switches to "computerized scientific notation". Rust's `{}` never
+    // switches, so the range test has to be explicit or large/small magnitudes
+    // print as long digit strings (`25000000.0` where Java says `2.5E7`).
+    let mag = f.abs();
+    if (1e-3..1e7).contains(&mag) {
+        let s = format!("{f}");
+        // Java always keeps a fractional digit: `1.0`, never `1`.
+        return if s.contains('.') { s } else { format!("{s}.0") };
+    }
+
+    // Scientific form. Rust renders `2.5e7` / `1e7`; Java wants `2.5E7` / `1.0E7`
+    // — an uppercase exponent, no `+`, and a mantissa that always carries a
+    // fractional digit.
+    let s = format!("{f:e}");
+    let (mantissa, exp) = match s.split_once('e') {
+        Some((m, e)) => (m, e),
+        None => return s,
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa.to_string()
+    } else {
+        format!("{mantissa}.0")
+    };
+    format!("{mantissa}E{exp}")
 }
 
 /// Strict numeric hook: fusevm calls this only for an operation with a
@@ -1122,5 +1158,31 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
             "javars: unary `-` is not defined for `{}`",
             java_str(a)
         )),
+    }
+}
+
+/// Java floating-point `/`: IEEE-754 semantics, including the infinities and
+/// NaN that a zero divisor produces. Both operands are coerced to `f64`, which
+/// is correct because the compiler only routes a division here when at least one
+/// side is not statically integral.
+fn b_div(vm: &mut VM, _argc: u8) -> Value {
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    Value::float(as_f64(&a) / as_f64(&b))
+}
+
+/// Coerce a value to `f64` for the floating division path.
+fn as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        other => other.as_str_cow().parse::<f64>().unwrap_or(f64::NAN),
     }
 }
