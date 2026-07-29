@@ -62,7 +62,10 @@ fn frozen_corpus_matches_reference_java() {
 
         let (got, ok) = run(prog);
         if !ok {
-            failures.push(format!("line {}: frontend failed\n  program: {prog}", i + 1));
+            failures.push(format!(
+                "line {}: frontend failed\n  program: {prog}",
+                i + 1
+            ));
         } else if got != expected {
             failures.push(format!(
                 "line {}: output mismatch\n  program:  {prog}\n  expected: {:?}\n  got:      {:?}",
