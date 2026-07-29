@@ -1266,7 +1266,10 @@ impl Parser {
         if self.is(&Tok::LBrace) {
             self.advance();
             let elems = self.array_lit_elems()?;
-            Ok(Expr::ArrayLit { elems })
+            Ok(Expr::ArrayLit {
+                elems,
+                elem_ty: None,
+            })
         } else {
             self.expression()
         }
@@ -2015,6 +2018,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Int(n))
             }
+            Tok::Long(n) => {
+                self.advance();
+                Ok(Expr::Long(n))
+            }
             Tok::Float(f) => {
                 self.advance();
                 Ok(Expr::Float(f))
@@ -2107,11 +2114,23 @@ impl Parser {
         if self.is(&Tok::LBracket) {
             self.advance();
             if self.is(&Tok::RBracket) {
-                // `new T[]{...}` — an array literal with an explicit element type.
+                // `new T[]{…}` / `new T[][]{{…},{…}}` — an array literal with an
+                // explicit element type. Each extra `[]` pair deepens the
+                // element type by one dimension (`new int[][]` has `int[]`
+                // elements), which is what a `var` binding needs to infer from.
                 self.advance();
+                let mut elem_ty = ty;
+                while self.is(&Tok::LBracket) {
+                    self.advance();
+                    self.eat(&Tok::RBracket)?;
+                    elem_ty.push_str("[]");
+                }
                 self.eat(&Tok::LBrace)?;
                 let elems = self.array_lit_elems()?;
-                return Ok(Expr::ArrayLit { elems });
+                return Ok(Expr::ArrayLit {
+                    elems,
+                    elem_ty: Some(elem_ty),
+                });
             }
             // `new T[s0][s1]…[sK][]…` — collect the sized dimensions, then any
             // trailing unsized `[]` (whose elements default to null).
@@ -2162,7 +2181,10 @@ impl Parser {
             if self.is(&Tok::LBrace) {
                 self.advance();
                 let inner = self.array_lit_elems()?;
-                elems.push(Expr::ArrayLit { elems: inner });
+                elems.push(Expr::ArrayLit {
+                    elems: inner,
+                    elem_ty: None,
+                });
             } else {
                 elems.push(self.expression()?);
             }

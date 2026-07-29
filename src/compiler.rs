@@ -1173,6 +1173,7 @@ impl Compiler {
     fn expr_java_type(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(_) => Some("int".to_string()),
+            Expr::Long(_) => Some("long".to_string()),
             Expr::Float(_) => Some("double".to_string()),
             Expr::Bool(_) => Some("boolean".to_string()),
             Expr::Str(_) => Some("String".to_string()),
@@ -1234,6 +1235,9 @@ impl Compiler {
                 "{elem_ty}{}",
                 "[]".repeat(sizes.len() + extra_dims)
             )),
+            // `new int[]{…}` named its element type; a bare `{…}` did not, and
+            // takes its type from the declaration it initializes instead.
+            Expr::ArrayLit { elem_ty, .. } => elem_ty.as_ref().map(|t| format!("{t}[]")),
             Expr::InstanceOf { .. } => Some("boolean".to_string()),
             Expr::SwitchExpr { arms, .. } => arms.iter().find_map(|a| match &a.body {
                 SwitchArmBody::Expr(e) => self.expr_java_type(e),
@@ -1870,7 +1874,7 @@ impl Compiler {
     /// Drives the truncating-vs-floating choice for `/`.
     fn expr_type(&self, e: &Expr) -> NumType {
         match e {
-            Expr::Int(_) => NumType::Int,
+            Expr::Int(_) | Expr::Long(_) => NumType::Int,
             Expr::Float(_) => NumType::Float,
             Expr::Str(_) | Expr::Bool(_) => NumType::Other,
             Expr::Var(name) => self.lookup_type(name),
@@ -3580,7 +3584,7 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
-            Expr::Int(n) => {
+            Expr::Int(n) | Expr::Long(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
             Expr::Float(f) => {
@@ -3644,7 +3648,7 @@ impl Compiler {
                     );
                 }
             }
-            Expr::ArrayLit { elems } => {
+            Expr::ArrayLit { elems, .. } => {
                 for el in elems {
                     self.expr(el)?;
                 }
@@ -4405,7 +4409,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Println { arg, .. } => arg.as_deref().is_some_and(expr_has_ffi),
         Expr::MethodCall { recv, args, .. } => expr_has_ffi(recv) || args.iter().any(expr_has_ffi),
         Expr::NewArray { sizes, .. } => sizes.iter().any(expr_has_ffi),
-        Expr::ArrayLit { elems } => elems.iter().any(expr_has_ffi),
+        Expr::ArrayLit { elems, .. } => elems.iter().any(expr_has_ffi),
         Expr::Index { array, index } => expr_has_ffi(array) || expr_has_ffi(index),
         Expr::Field { recv, .. } => expr_has_ffi(recv),
         Expr::NewObject { args, .. } => args.iter().any(expr_has_ffi),
@@ -4426,6 +4430,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
                 })
         }
         Expr::Int(_)
+        | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::Bool(_)

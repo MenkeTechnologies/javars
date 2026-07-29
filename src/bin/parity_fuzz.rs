@@ -708,6 +708,46 @@ fn g_switchexpr(r: &mut Rng) -> String {
     }
 }
 
+/// `var` inference and `long` literals. A `var` local has to carry the *type*
+/// of its initializer, not just its value, or `/` stops truncating and `int`
+/// arithmetic stops wrapping — so every probe reads the binding back through an
+/// operation that only a correct static type gets right. The `long` half is the
+/// other side of the same coin: an `L`-suffixed literal must NOT wrap at 32
+/// bits, which is only visible past `Integer.MAX_VALUE`.
+fn g_varinfer(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let d = pick(r, DIVS);
+    let f = pick(r, DBLS);
+    let s = pick(r, STRS);
+    let big = pick(
+        r,
+        &["3000000000L", "2147483648L", "1000000000L", "5000000000L"],
+    );
+    match r.below(11) {
+        0 => format!("{{ var v = {a}; System.out.println(v / {d} + \",\" + v % {d}); }}"),
+        1 => format!("{{ var v = {f}; System.out.println(v / {d}); }}"),
+        2 => format!("{{ var v = {s}; System.out.println(v.length() + v.toUpperCase()); }}"),
+        3 => format!(
+            "{{ var arr = new int[]{{{a}, {d}, 8}}; for (var e : arr) {{ System.out.print(e / 2 + \",\"); }} System.out.println(); }}"
+        ),
+        4 => format!(
+            "{{ var g = new int[][]{{{{{a}, 2}}, {{3, {d}}}}}; for (var row : g) {{ for (var c : row) {{ System.out.print(c / 2); }} }} System.out.println(); }}"
+        ),
+        5 => format!(
+            "{{ var t = 0; for (var i = 0; i < 5; i++) {{ t += i * {a}; }} System.out.println(t / 2); }}"
+        ),
+        6 => format!("{{ var v = {big}; System.out.println(v + v); }}"),
+        7 => format!("{{ System.out.println({big} + {big}); }}"),
+        8 => format!("{{ var v = {big}; System.out.println(v * 3 + \",\" + v / 7); }}"),
+        9 => format!(
+            "{{ var ps = new String[]{{{s}, \"zz\"}}; for (var p : ps) {{ System.out.print(p.length()); }} System.out.println(); }}"
+        ),
+        _ => format!(
+            "{{ var p = new Pt({a}, {d}); System.out.println(p + \",\" + p.x() / 2 + \",\" + p.sum()); }}"
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -809,6 +849,7 @@ enum Mode {
     Lambda,
     Collection,
     SwitchExpr,
+    VarInfer,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -840,6 +881,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Lambda,
     Mode::Collection,
     Mode::SwitchExpr,
+    Mode::VarInfer,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -873,6 +915,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Lambda => "lambda",
         Mode::Collection => "collection",
         Mode::SwitchExpr => "switchexpr",
+        Mode::VarInfer => "varinfer",
     }
 }
 
@@ -918,6 +961,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Lambda => g_lambda(r),
         Mode::Collection => g_collection(r),
         Mode::SwitchExpr => g_switchexpr(r),
+        Mode::VarInfer => g_varinfer(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

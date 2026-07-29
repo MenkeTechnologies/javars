@@ -220,6 +220,15 @@ at the bottom, and are summarized in the section right after this one.
   `Arrays.asList` is fixed-size and `List.of` immutable, so a structural write
   to either throws `UnsupportedOperationException` exactly as Java's does, and an
   out-of-range `get` throws `IndexOutOfBoundsException` with Java's message.
+- **`var` type inference.** A `var` local records the *type* it infers, not just
+  the value: `var i = 7; i / 2` truncates, `var big = 100000; big * big` wraps at
+  32 bits, `var p = new Pt(9, 4); p.sum()` dispatches, and `for (var v : arr)`
+  takes the array's element type (which `new int[]{…}` and `new int[][]{…}` carry
+  along for exactly this reason). `var` in a C-style `for` init, over a jagged
+  array, and over a collection all work.
+- **`long` literals.** An `L`-suffixed literal is typed `long` and so is exempt
+  from the 32-bit `int` wrap — `3000000000L + 3000000000L` is `6000000000`, not
+  `1705032704`.
 - **Arrow `switch`, as an expression and as a statement.**
   `int r = switch (x) { case 1, 2 -> 10; default -> { … yield v; } };` and the
   statement form `switch (x) { case 1 -> …; default -> …; }`, which is the same
@@ -287,8 +296,7 @@ known.
 - **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
   no single `|` token, so it fails lexically).
 - **Sealed types, inner (non-`static`) classes, anonymous classes** other than
-  the enum-constant body form, **cast expressions** (`(Object) x`), and **`var`
-  type inference beyond storage**.
+  the enum-constant body form, and **cast expressions** (`(Object) x`).
 - **Fully-qualified type names in code** (`java.util.function.Supplier<T> s`).
   An `import` line is skipped, and the simple name is what resolves.
 

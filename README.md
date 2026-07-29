@@ -172,7 +172,9 @@ Implemented and checked against the reference `java`:
 - **Locals** — `int` / `long` / `double` / `boolean` / `String` / `var`
   declarations with optional initializers; plain and compound assignment
   (`=`, `+=`, `-=`, `*=`, `/=`, `%=`); post-increment / post-decrement
-  (`i++`, `i--`).
+  (`i++`, `i--`). A `var` records the *type* it infers, so `var i = 7; i / 2`
+  truncates and `var big = 100000; big * big` wraps — including the element type
+  of a `var` enhanced-`for` over an array literal.
 - **Expressions** — integer / floating / string / char / boolean literals; the
   binary operators `+ - * / %`, `== != < > <= >=`, `&& ||` (short-circuiting);
   unary `-` and `!`; parenthesised grouping; Java's `+` string concatenation.

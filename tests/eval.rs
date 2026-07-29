@@ -1758,3 +1758,57 @@ fn arrow_switch_statements_and_arms_that_leave_the_switch() {
     assert!(ok);
     assert_eq!(out, "two\n1or2\nfell\nfin\ny\ncaught nope\n6\n");
 }
+
+#[test]
+fn var_carries_its_initializers_type_not_just_its_value() {
+    // `var` has to record the *type* it infers, or the binding stops truncating
+    // its division and stops wrapping at 32 bits. Each line reads the binding
+    // back through an operation only a correct static type gets right —
+    // including a `var` enhanced-`for` variable over `new int[]{…}`, whose
+    // element type the array literal has to have carried along. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         record Pt(int x, int y) { int sum() { return x + y; } }\
+         public static void main(String[] a) {\
+         var i = 7; var d = 7.0;\
+         System.out.println(i / 2 + \" \" + d / 2);\
+         var arr = new int[]{1, 5, 9};\
+         for (var v : arr) { System.out.print(v / 2); }\
+         System.out.println();\
+         var g = new int[][]{{1, 2}, {3, 4}};\
+         for (var row : g) { for (var c : row) { System.out.print(c / 2); } }\
+         System.out.println();\
+         var s = new String[]{\"aa\", \"b\"};\
+         for (var e : s) { System.out.print(e.length()); }\
+         System.out.println();\
+         var p = new Pt(9, 4);\
+         System.out.println(p + \" \" + p.x() / 2 + \" \" + p.sum());\
+         var t = 0;\
+         for (var k = 0; k < 5; k++) { t += k; }\
+         System.out.println(t / 2);\
+         var big = 100000;\
+         System.out.println(big * big); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3 3.5\n024\n0112\n21\nPt[x=9, y=4] 4 13\n5\n1410065408\n"
+    );
+}
+
+#[test]
+fn long_literals_are_not_wrapped_at_32_bits() {
+    // An `L`-suffixed literal is a `long` in Java, so it is exempt from the
+    // 32-bit `int` wrap — and dropping the suffix at lex time (as javars used
+    // to) made `3000000000L + 3000000000L` print `1705032704`. Only visible
+    // past `Integer.MAX_VALUE`, which is why it needs its own case. Verified
+    // against OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         var big = 3000000000L;\
+         System.out.println(big + big);\
+         System.out.println(3000000000L + 3000000000L);\
+         long x = 3000000000L;\
+         System.out.println(x * 3);\
+         System.out.println(2147483647L + 1L); } }");
+    assert!(ok);
+    assert_eq!(out, "6000000000\n6000000000\n9000000000\n2147483648\n");
+}

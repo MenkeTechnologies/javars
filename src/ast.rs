@@ -337,6 +337,10 @@ pub enum AssignOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
+    /// An `L`-suffixed integer literal. Runs on the same 64-bit value as
+    /// [`Expr::Int`]; the distinct node exists only so the static type is
+    /// `long`, which keeps the operation out of the 32-bit `int` wrap.
+    Long(i64),
     Float(f64),
     Str(String),
     Bool(bool),
@@ -413,6 +417,11 @@ pub enum Expr {
     /// `new int[]{1,2,3}`). Builds a heap array from the element values.
     ArrayLit {
         elems: Vec<Expr>,
+        /// The element type when the literal named one (`new int[]{…}`), so
+        /// `var a = new int[]{1, 2};` still infers `int[]` and its elements
+        /// still truncate their division. `None` for the bare `{…}` form, whose
+        /// type comes from the declaration it initializes.
+        elem_ty: Option<String>,
     },
     /// `array[index]` — element read. Bounds-checked at runtime.
     Index {

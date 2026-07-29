@@ -19,6 +19,10 @@ pub struct Token {
 pub enum Tok {
     // literals & names
     Int(i64),
+    /// An `L`-suffixed integer literal (`3000000000L`). Java types it `long`,
+    /// which is what keeps it out of the 32-bit `int` wrap — so the suffix has
+    /// to survive lexing rather than being dropped with the other ones.
+    Long(i64),
     Float(f64),
     Str(String),
     Ident(String),
@@ -190,13 +194,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
             }
-            // integer/long/float/double suffixes are accepted and dropped. The
-            // slice ends here rather than being alpha-trimmed, because trimming
-            // trailing letters would also eat the `e` of an exponent.
+            // Float/double suffixes only make the literal floating; the `L`
+            // suffix is kept, because it is what makes the literal a `long` and
+            // therefore exempt from Java's 32-bit `int` wrap. The slice ends
+            // here rather than being alpha-trimmed, because trimming trailing
+            // letters would also eat the `e` of an exponent.
             let num_end = i;
+            let mut is_long = false;
             if i < bytes.len() && matches!(bytes[i], b'L' | b'l' | b'f' | b'F' | b'd' | b'D') {
-                if matches!(bytes[i], b'f' | b'F' | b'd' | b'D') {
-                    is_float = true;
+                match bytes[i] {
+                    b'f' | b'F' | b'd' | b'D' => is_float = true,
+                    _ => is_long = true,
                 }
                 i += 1;
             }
@@ -214,7 +222,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     .parse()
                     .map_err(|_| format!("javars: bad integer literal `{text}` on line {line}"))?;
                 out.push(Token {
-                    kind: Tok::Int(v),
+                    kind: if is_long { Tok::Long(v) } else { Tok::Int(v) },
                     line,
                 });
             }
