@@ -34,6 +34,11 @@ pub struct Program {
     /// the compiler (which only emits the post-call exception checks when this is
     /// set, so an exception-free program's bytecode is unchanged).
     pub uses_exceptions: bool,
+    /// True when the unit mentions a lambda, a method reference, or one of the
+    /// `java.util.function` interface names. Set by the parser and read by
+    /// [`crate::prelude::inject`], which supplies the functional interfaces —
+    /// a program with no lambda carries none of them.
+    pub uses_functional: bool,
 }
 
 /// Field holding an enum constant's `name()`. `#` is not a legal Java identifier
@@ -431,6 +436,42 @@ pub enum Expr {
         expr: Box<Expr>,
         class: String,
     },
+    /// A lambda expression: `() -> e`, `x -> e`, `(a, b) -> { … }`. Compiled to
+    /// a heap closure that captures the enclosing scope **by value**, because a
+    /// lambda outlives the fusevm call frame whose slots hold those locals.
+    /// Java only lets a lambda capture effectively-final locals, so a by-value
+    /// snapshot is observationally exact.
+    Lambda {
+        /// Formal parameter names, in order. Declared types (`(int a) -> …`) are
+        /// erased by the parser, exactly as they are for every other javars
+        /// declaration.
+        params: Vec<String>,
+        body: LambdaBody,
+        line: u32,
+    },
+    /// A method reference: `String::length`, `Integer::parseInt`, `obj::run`,
+    /// `Point::new`. Desugared by the compiler into the equivalent
+    /// [`Expr::Lambda`] once the referenced member's arity is known.
+    MethodRef {
+        /// The receiver expression — a value (`obj::run`, captured by the
+        /// synthesized lambda) or a bare type name (`String::length`, which
+        /// takes the receiver as its first parameter instead).
+        recv: Box<Expr>,
+        /// The referenced member, or `new` for a constructor reference.
+        method: String,
+        line: u32,
+    },
+}
+
+/// A lambda's body: a single expression (whose value is the result) or a block.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LambdaBody {
+    /// `x -> x + 1` — the expression is the returned value.
+    Expr(Box<Expr>),
+    /// `x -> { … }` — statements; a `return e;` inside supplies the value and a
+    /// fall-off returns `null` (which is what a `void` functional interface
+    /// wants).
+    Block(Vec<Stmt>),
 }
 
 /// Unary operators.

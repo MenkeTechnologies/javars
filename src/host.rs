@@ -145,6 +145,30 @@ pub const JFAULT: u16 = 726;
 /// array the program sees is its own (mutating it cannot affect a later read).
 pub const JARGV: u16 = 727;
 
+// ── Lambdas ──
+// A lambda outlives the frame it was written in, but a javars local lives in a
+// fusevm call-frame slot that does not. So a lambda becomes a heap closure that
+// snapshots every enclosing local **by value** at the point the literal runs.
+// Java only lets a lambda capture effectively-final locals, so a snapshot is
+// observationally exact — and it is the only model that gives the enhanced
+// `for` its per-iteration capture.
+
+/// Build a closure. Stack `[cap0, …, capK, nameIdx, params, ncap]` (`ncap` on
+/// top); `argc == ncap + 3`. `nameIdx` is the chunk name index of the lambda
+/// body's subroutine and `params` its declared parameter count. Pushes the
+/// closure's `Obj` handle.
+pub const JMAKE_CLOSURE: u16 = 728;
+/// Invoke a closure. Stack `[closure, arg0, …, argN]` (last argument on top);
+/// `argc == N + 2` (the closure plus its arguments). Runs the body in its own
+/// fusevm call frame through a nested `VM::run` and pushes its result.
+pub const JCLOSURE_CALL: u16 = 729;
+
+/// The runtime "class" [`JCLASSOF`] reports for a closure. `#` is not a legal
+/// Java identifier character, so a user class can never collide with it; the
+/// compiler's virtual-dispatch chain uses it as the arm that routes a
+/// functional-interface call to the lambda body.
+pub const LAMBDA_CLASS: &str = "#lambda";
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -154,6 +178,14 @@ enum HostObj {
     Instance {
         class: String,
         fields: HashMap<String, Value>,
+    },
+    /// A lambda: the chunk name index of its body subroutine, its declared
+    /// parameter count, and the enclosing locals it snapshotted by value. The
+    /// body's prologue expects the parameters first, then the captures.
+    Closure {
+        name_idx: u16,
+        params: u8,
+        captures: Vec<Value>,
     },
 }
 
@@ -359,6 +391,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JEXC_ABORT, b_exc_abort);
     vm.register_builtin(JFAULT, b_fault);
     vm.register_builtin(JARGV, b_argv);
+    vm.register_builtin(JMAKE_CLOSURE, b_make_closure);
+    vm.register_builtin(JCLOSURE_CALL, b_closure_call);
 }
 
 /// `main`'s `String[] args` — a fresh array of the program arguments.
@@ -486,10 +520,126 @@ fn b_classof(vm: &mut VM, argc: u8) -> Value {
             let h = h.borrow();
             match h.get(*id as usize) {
                 Some(HostObj::Instance { class, .. }) => Value::str(class.clone()),
+                // A lambda's "class" is the sentinel the dispatch chain tests,
+                // so a functional-interface call routes to the closure body.
+                Some(HostObj::Closure { .. }) => Value::str(LAMBDA_CLASS),
                 _ => Value::str(""),
             }
         }),
         _ => Value::str(""),
+    }
+}
+
+// ── Lambdas ─────────────────────────────────────────────────────────────────
+
+/// [`JMAKE_CLOSURE`] — snapshot the captures and register the closure.
+fn b_make_closure(vm: &mut VM, _argc: u8) -> Value {
+    let ncap = vm.stack.pop().unwrap_or(Value::Undef).to_int() as usize;
+    let params = vm.stack.pop().unwrap_or(Value::Undef).to_int() as u8;
+    let name_idx = vm.stack.pop().unwrap_or(Value::Undef).to_int() as u16;
+    let mut captures = Vec::with_capacity(ncap);
+    for _ in 0..ncap {
+        captures.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    captures.reverse();
+    Value::Obj(heap_alloc(HostObj::Closure {
+        name_idx,
+        params,
+        captures,
+    }))
+}
+
+/// A copy of a closure handle's metadata, if `v` is one.
+fn closure_meta(v: &Value) -> Option<(u16, u8, Vec<Value>)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(*id as usize) {
+            Some(HostObj::Closure {
+                name_idx,
+                params,
+                captures,
+            }) => Some((*name_idx, *params, captures.clone())),
+            _ => None,
+        }
+    })
+}
+
+/// [`JCLOSURE_CALL`] — invoke a closure with the arguments already on the stack.
+///
+/// The body is an ordinary javars subroutine, so it runs in a real fusevm call
+/// frame; the frame is entered by hand (rather than by `Op::Call`) because the
+/// entry address comes from the closure value, not from a compile-time name
+/// operand. A nested `VM::run` drives it, exactly as the sibling fusevm
+/// frontends (kotlinrs, groovyrs, scalars) drive their closure bodies.
+fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
+    let n = argc.saturating_sub(1) as usize;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        args.push(vm.stack.pop().unwrap_or(Value::Undef));
+    }
+    args.reverse();
+    let clo = vm.stack.pop().unwrap_or(Value::Undef);
+    // An exception already in flight must not start another body running: the
+    // enclosing frame is unwinding and would otherwise re-run side effects.
+    if PENDING.with(|p| p.borrow().is_some()) {
+        return Value::Undef;
+    }
+    let Some((name_idx, params, captures)) = closure_meta(&clo) else {
+        return raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                "Cannot invoke a functional interface method because the target is null"
+                    .to_string(),
+            ),
+        );
+    };
+    let Some(entry) = vm.chunk.find_sub(name_idx) else {
+        return raise(vm, Fault::internal("javars: lambda body not found"));
+    };
+    // The prologue binds exactly `params` arguments then the captures, so a
+    // mismatched arity is padded with `null` / truncated rather than corrupting
+    // the frame.
+    let stack_base = vm.stack.len();
+    for i in 0..params as usize {
+        vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
+    }
+    for cap in captures {
+        vm.stack.push(cap);
+    }
+    run_sub(vm, entry, stack_base)
+}
+
+/// Run the subroutine at `entry` whose prologue values are already stacked above
+/// `stack_base`, in its own call frame, and return its value.
+///
+/// The pushed frame's `return_ip` is past the end of the chunk, so the body's
+/// `Op::ReturnValue` pops the frame and ends the nested run at exactly that
+/// point. The interpreter's `ip` is saved and restored so the paused enclosing
+/// dispatch loop resumes where it left off.
+fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Value {
+    let return_ip = vm.chunk.ops.len();
+    vm.frames.push(fusevm::Frame {
+        return_ip,
+        stack_base,
+        slots: Vec::new(),
+    });
+    let saved_ip = vm.ip;
+    vm.ip = entry;
+    let result = vm.run();
+    vm.ip = saved_ip;
+    match result {
+        fusevm::VMResult::Ok(v) => v,
+        // A halt raised inside the body (an internal fault) leaves the halt flag
+        // set, which stops the enclosing run too; hand back whatever is on top.
+        fusevm::VMResult::Halted => vm.stack.pop().unwrap_or(Value::Undef),
+        fusevm::VMResult::Error(e) => {
+            ffi_fault(vm, format!("javars: {e}"));
+            Value::Undef
+        }
     }
 }
 
@@ -817,6 +967,18 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.stack.pop().unwrap_or(Value::Undef);
+    // A lambda whose static type the compiler could not pin down lands here —
+    // the erasure of a nested generic (`Supplier<Supplier<String>>.get()` is
+    // declared to return `Object`) is the common case. Any method call on a
+    // closure receiver is its single abstract method, because `javac` has
+    // already rejected every other name, so it is invoked directly.
+    if closure_meta(&recv).is_some() {
+        vm.stack.push(recv);
+        for a in args {
+            vm.stack.push(a);
+        }
+        return b_closure_call(vm, n as u8 + 1);
+    }
     // A method call on a `null` reference is Java's NPE, not an empty string.
     if matches!(recv, Value::Undef) {
         return raise(
@@ -1364,6 +1526,10 @@ fn obj_default_str(id: u32) -> String {
                 _ => format!("{class}@{id:x}"),
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
+            // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,
+            // which is not reproducible (and not stable across JVM runs), so
+            // javars prints a fixed marker instead. See `BUGS.md`.
+            Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             None => format!("(obj:{id})"),
         }
     })

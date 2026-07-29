@@ -53,6 +53,10 @@ pub enum Tok {
     Dot,
     Question,
     Colon,
+    /// `->` — the lambda arrow (and the arrow form of `switch`).
+    Arrow,
+    /// `::` — the method-reference separator (`String::length`).
+    ColonColon,
     // operators
     Assign,
     PlusAssign,
@@ -293,6 +297,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             ">=" => (Tok::Ge, 2),
             "&&" => (Tok::AndAnd, 2),
             "||" => (Tok::OrOr, 2),
+            // `->` cannot collide with `-` followed by `>`: Java has no prefix
+            // `>`, so a `-`/`>` adjacency is only ever the arrow. `::` likewise
+            // cannot collide with the ternary/label `:`.
+            "->" => (Tok::Arrow, 2),
+            "::" => (Tok::ColonColon, 2),
             _ => match c {
                 '{' => (Tok::LBrace, 1),
                 '}' => (Tok::RBrace, 1),

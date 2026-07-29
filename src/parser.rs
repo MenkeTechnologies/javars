@@ -18,6 +18,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         toks: tokens,
         pos: 0,
         uses_exceptions: false,
+        uses_functional: false,
     };
     p.program()
 }
@@ -47,6 +48,11 @@ struct Parser {
     /// prelude and the compiler's exception lowering (see
     /// [`crate::ast::Program::uses_exceptions`]).
     uses_exceptions: bool,
+    /// Set when a lambda, a method reference, or a declared
+    /// `java.util.function` type is parsed — the signal that this unit needs the
+    /// functional-interface prelude (see
+    /// [`crate::ast::Program::uses_functional`]).
+    uses_functional: bool,
 }
 
 impl Parser {
@@ -115,6 +121,7 @@ impl Parser {
                 methods,
                 classes,
                 uses_exceptions: self.uses_exceptions,
+                uses_functional: self.uses_functional,
             }),
             None => Err(
                 "javars: no class declares `public static void main(String[] args)`".to_string(),
@@ -945,6 +952,12 @@ impl Parser {
     /// Trailing `[]` pairs are folded into the returned name (e.g. `int[]`).
     fn type_name(&mut self) -> Result<String, String> {
         let mut ty = self.ident()?;
+        // Naming a functional interface pulls in the prelude that declares it,
+        // even when the program never writes a lambda literal (a method
+        // parameter of type `Runnable` is enough).
+        if crate::prelude::is_functional(&ty) {
+            self.uses_functional = true;
+        }
         // Generic type arguments (`List<String>`, `Map<K, V>`) are erased — the
         // erased type is just the raw name.
         self.skip_generics();
@@ -1138,6 +1151,9 @@ impl Parser {
         // A local declaration starts with a type keyword/ident followed by an
         // identifier: `int x`, `String s`, `var v`, `int[] a`, `Point p`.
         if self.looks_like_decl() {
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                self.advance();
+            }
             let ty = self.type_name()?;
             let name = self.ident()?;
             let init = if self.is(&Tok::Assign) {
@@ -1245,12 +1261,21 @@ impl Parser {
     /// a value keyword — a local declaration. Array types (`int[] a`) are
     /// handled by skipping the `[]` before the name.
     fn looks_like_decl(&self) -> bool {
-        let t0 = &self.toks[self.pos].kind;
+        // `final` is a legal modifier on a local declaration (and the classic
+        // spelling of a lambda-capturable local). It constrains reassignment,
+        // which `javac` has already checked, so javars parses and drops it.
+        let mut start = self.pos;
+        if matches!(&self.toks[start].kind, Tok::Ident(w) if w == "final")
+            && matches!(self.toks[start + 1].kind, Tok::Ident(_))
+        {
+            start += 1;
+        }
+        let t0 = &self.toks[start].kind;
         let is_type = matches!(t0, Tok::Ident(_));
         if !is_type {
             return false;
         }
-        let mut j = self.pos + 1;
+        let mut j = start + 1;
         // optional generic type arguments on the type (`List<String> xs`)
         if matches!(self.toks[j].kind, Tok::Lt) {
             let mut depth = 0;
@@ -1548,6 +1573,10 @@ impl Parser {
             return Ok(None);
         }
         let save = self.pos;
+        // `for (final String s : xs)` — the modifier is parsed and dropped.
+        if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+            self.advance();
+        }
         let ty = self.type_name()?;
         let name = self.ident()?;
         if self.is(&Tok::Colon) {
@@ -1642,6 +1671,12 @@ impl Parser {
     /// parses as `a ? b : (c ? d : e)` because the `els` branch recurses through
     /// `expression`.
     fn expression(&mut self) -> Result<Expr, String> {
+        // A lambda is recognised before any operator parsing, because its
+        // parameter list is not an expression: `(a, b) -> …` would otherwise be
+        // parsed as a parenthesized `a` followed by a stray comma.
+        if let Some(lambda) = self.try_lambda()? {
+            return Ok(lambda);
+        }
         let cond = self.binary(0)?;
         if self.is(&Tok::Question) {
             self.advance();
@@ -1686,6 +1721,90 @@ impl Parser {
             };
         }
         Ok(lhs)
+    }
+
+    /// Parse a lambda if the cursor is at one, else leave the cursor untouched.
+    ///
+    /// Two spellings start a lambda: a bare `x ->`, and a parenthesized
+    /// parameter list `(…) ->`. Only the arrow distinguishes the second from a
+    /// parenthesized expression, so the decision needs a scan to the matching
+    /// `)` before any token is consumed.
+    fn try_lambda(&mut self) -> Result<Option<Expr>, String> {
+        let line = self.line();
+        // `x -> …`
+        if matches!(self.peek(), Tok::Ident(_)) && self.toks[self.pos + 1].kind == Tok::Arrow {
+            let name = self.ident()?;
+            self.eat(&Tok::Arrow)?;
+            let body = self.lambda_body()?;
+            self.uses_functional = true;
+            return Ok(Some(Expr::Lambda {
+                params: vec![name],
+                body,
+                line,
+            }));
+        }
+        if !self.is(&Tok::LParen) {
+            return Ok(None);
+        }
+        // `(…) -> …` — scan to the matching `)` and require an arrow after it.
+        let mut depth = 0usize;
+        let mut j = self.pos;
+        loop {
+            match &self.toks[j].kind {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => return Ok(None),
+                _ => {}
+            }
+            j += 1;
+        }
+        if self.toks[j + 1].kind != Tok::Arrow {
+            return Ok(None);
+        }
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        while !self.is(&Tok::RParen) {
+            // `final` is a legal modifier on an explicitly-typed parameter.
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                self.advance();
+            }
+            // An explicitly-typed parameter (`(int a, String b) -> …`) is two
+            // identifiers; an inferred one (`(a, b) -> …`) is one. The declared
+            // type is erased, as every other javars declared type is.
+            if matches!(self.peek(), Tok::Ident(_) | Tok::Void)
+                && matches!(
+                    self.toks[self.pos + 1].kind,
+                    Tok::Ident(_) | Tok::Lt | Tok::LBracket
+                )
+            {
+                self.type_name()?;
+            }
+            params.push(self.ident()?);
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::Arrow)?;
+        let body = self.lambda_body()?;
+        self.uses_functional = true;
+        Ok(Some(Expr::Lambda { params, body, line }))
+    }
+
+    /// A lambda's body: `{ statements }` or a single expression.
+    fn lambda_body(&mut self) -> Result<LambdaBody, String> {
+        if self.is(&Tok::LBrace) {
+            self.advance();
+            return Ok(LambdaBody::Block(self.block()?));
+        }
+        Ok(LambdaBody::Expr(Box::new(self.expression()?)))
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
@@ -1733,6 +1852,23 @@ impl Parser {
                         name: member,
                     };
                 }
+            } else if self.is(&Tok::ColonColon) {
+                let line = self.line();
+                self.advance();
+                // `Type::new` is a constructor reference; everything else names
+                // a method.
+                let method = if self.is(&Tok::New) {
+                    self.advance();
+                    "new".to_string()
+                } else {
+                    self.ident()?
+                };
+                self.uses_functional = true;
+                e = Expr::MethodRef {
+                    recv: Box::new(e),
+                    method,
+                    line,
+                };
             } else if self.is(&Tok::LBracket) {
                 self.advance();
                 let index = self.expression()?;
@@ -1786,6 +1922,18 @@ impl Parser {
                 // a bare-identifier call `name(args)`, or unsupported field
                 // access.
                 if name == "System" {
+                    // `System.out::println` is a method *reference*, not a call:
+                    // hand the stream back as a field access and let the postfix
+                    // layer take the `::`.
+                    if self.toks[self.pos + 3].kind == Tok::ColonColon {
+                        self.advance(); // System
+                        self.eat(&Tok::Dot)?;
+                        let stream = self.ident()?;
+                        return Ok(Expr::Field {
+                            recv: Box::new(Expr::Var("System".to_string())),
+                            name: stream,
+                        });
+                    }
                     return self.system_out();
                 }
                 let line = self.line();

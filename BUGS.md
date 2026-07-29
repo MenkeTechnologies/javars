@@ -165,6 +165,37 @@ meaning — there is no construct javars accepts and then mis-runs.
   it as — so its overrides are reached by the ordinary runtime-class virtual
   dispatch, an `abstract` method on the enum resolves to the per-constant body,
   and a constant that declares no override inherits the enum's own.
+- **Lambdas and functional interfaces.** `() -> e`, `x -> e`, `(a, b) -> { … }`,
+  and explicitly-typed `(int a, String b) -> …`. A lambda outlives the frame it
+  was written in, so it compiles to a heap closure (`HostObj::Closure`) carrying
+  a **by-value snapshot** of the enclosing locals plus `this`; the body is an
+  ordinary subroutine invoked in its own fusevm call frame. Java only lets a
+  lambda read effectively-final locals, so the snapshot is observationally
+  exact — and it is what gives the enhanced `for` Java's per-iteration capture.
+  The target is **any interface with exactly one abstract method**, which is
+  Java's own rule, so a user-declared `interface Calc { int of(int a); }` needs
+  no registration; `Runnable`, `Callable`, `Supplier`, `Consumer`/`BiConsumer`,
+  `Function`/`BiFunction`, `UnaryOperator`/`BinaryOperator`,
+  `Predicate`/`BiPredicate`, `Comparator`, and the `Int*`/`To*Function` shapes
+  are supplied the same way, as one-method interfaces in `src/prelude.rs`. A
+  variable of a functional-interface type may hold a lambda *or* a class
+  instance: the runtime-class dispatch chain gains an arm for the closure, so
+  both work through the same call site. The interface's declared parameter
+  types travel into the body (from a local's declared type, a parameter type, or
+  a method's return type), so `Calc c = (a, b) -> a / b;` truncates and
+  `(a, b) -> a * b` wraps at 32 bits exactly where `int` says it should. `return`
+  inside a lambda returns from the *lambda*; `break`/`continue`, `try`/`finally`,
+  and a `throw` all work inside one, and an exception it raises unwinds to the
+  caller's handler.
+- **Method references.** `String::length` and `Integer::parseInt` (unbound
+  receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
+  `this::method` (bound — the receiver is captured), `Point::new`, and
+  `System.out::println`. Java infers the reference's arity from its *target*
+  type; javars has no target-typing pass, so the arity comes from the referenced
+  member's own declaration — which resolves every unambiguous form and rejects
+  an overloaded name with a diagnostic rather than guessing an overload.
+- **`final` on a local or enhanced-`for` variable.** Parsed and dropped: it
+  constrains reassignment, which `javac` has already checked.
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -172,19 +203,32 @@ meaning — there is no construct javars accepts and then mis-runs.
 
 ## Runs wrong rather than being rejected
 
-Nothing. Every construct javars accepts runs with Java's meaning; the
-simplifications it *does* make are listed at the bottom and are all cases where
-javars deliberately models less, not cases where it computes a wrong answer for
-a program `javac` accepts.
+No construct is *silently* mis-run: every case where javars computes something
+other than Java is named in "Modeled with a documented simplification" below,
+and each is a deliberate, bounded model rather than a bug found and left.
+
+Some of those simplifications do print a different answer for a program `javac`
+accepts, and it is worth naming which — they are all missing *conversions*
+javars's untyped runtime never performs, not wrong arithmetic:
+
+- `double d = 7;` prints `7`, not `7.0` (no widening value conversion).
+- `s.get() / 2` on a `Supplier<Integer>` prints `3.5`, not `3` (the erased
+  interface returns `Object`, so javars cannot type the result as `int`).
+- `int` arithmetic whose operand types are not statically known keeps fusevm's
+  64-bit result rather than wrapping at 32 bits.
+
+Everything else javars accepts runs with Java's meaning, and the differential
+fuzzer (`parity-fuzz`) generates none of the above precisely because they are
+known.
 
 ## Not implemented (parse or compile errors today)
 
-- **Lambdas and method references** (`() -> …`, `x -> x + 1`, `String::length`)
-  and therefore the functional interfaces (`Runnable`, `Function`,
-  `Comparator`) and streams. Rejected by the parser. javars has no closure model
-  — a lambda captures enclosing locals, and every javars frame's locals live in
-  fusevm call-frame slots that do not outlive the call — so this needs a capture
-  environment before it needs syntax.
+- **Streams** (`.stream()`, `map`/`filter`/`collect`), and the `default` methods
+  the JDK's functional interfaces carry (`Function.andThen`/`compose`,
+  `Predicate.negate`/`and`/`or`, `Comparator.reversed`/`comparing`). The
+  interfaces javars supplies declare only their single abstract method, so
+  calling a `default` one is a compile error, not a wrong answer. Lambdas and
+  method references themselves are implemented (above).
 - **`hashCode()`**, including a `record`'s derived one. A record supplies its
   accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
   ("class `Pt` has no method `hashCode`") rather than a wrong number.
@@ -201,6 +245,8 @@ a program `javac` accepts.
   no single `|` token, so it fails lexically).
 - **Sealed types, inner (non-`static`) classes, anonymous classes** other than
   the enum-constant body form, and **`var` type inference beyond storage**.
+- **Fully-qualified type names in code** (`java.util.function.Supplier<T> s`).
+  An `import` line is skipped, and the simple name is what resolves.
 
 ## Modeled with a documented simplification
 
@@ -268,3 +314,14 @@ a program `javac` accepts.
 - **A throwing `close()` replaces the body's exception rather than being
   suppressed.** Java records it via `Throwable.addSuppressed`; javars has no
   suppression list, so the later exception wins.
+- **A lambda's own `toString()` is a marker, not Java's.** Java renders one as
+  `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
+  across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
+  something a deterministic program does, so this only shows up if you ask for it.
+- **A lambda's result type is its interface's erasure.** `Supplier<Integer> s`
+  declares `Object get()` after erasure — exactly what `javac` compiles it to —
+  so javars cannot statically type `s.get()` as `int` and `s.get() / 2` does not
+  truncate. Java recovers the type from the generic signature and inserts a
+  checked cast; javars does not model generic signatures (see the type-erasure
+  entry above). A lambda's *parameters* are typed, because those come from the
+  interface's own declaration rather than from a type argument.

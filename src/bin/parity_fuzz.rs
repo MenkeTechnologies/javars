@@ -568,6 +568,41 @@ fn g_record(r: &mut Rng) -> String {
     }
 }
 
+/// Lambdas and functional interfaces: an expression and a block body, a
+/// captured effectively-final local, a lambda passed as an argument, one
+/// returned from a method (so it outlives the frame that built it), the target
+/// interface's declared `int` parameters driving `/` truncation and the 32-bit
+/// wrap inside the body, and the three method-reference shapes. A lambda's own
+/// `toString` is a JVM identity hash, so no probe ever prints one.
+fn g_lambda(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let d = pick(r, DIVS);
+    let s = pick(r, STRS);
+    let op = pick(r, AOPS);
+    match r.below(11) {
+        0 => format!("{{ Calc c = (x, y) -> x {op} y; System.out.println(c.of({a}, {b})); }}"),
+        1 => format!("{{ Calc c = (x, y) -> {{ return x {op} y; }}; System.out.println(c.of({a}, {b})); }}"),
+        2 => format!("{{ Calc c = (x, y) -> x / y; System.out.println(c.of({a}, {d})); }}"),
+        3 => format!("{{ System.out.println(useCalc((x, y) -> x {op} y, {a}, {b})); }}"),
+        4 => format!(
+            "{{ int cap = {a}; Calc c = (x, y) -> x + y + cap; System.out.println(c.of({b}, {d})); }}"
+        ),
+        5 => format!("{{ System.out.println(mkAdder({a}).of({b}, {d})); }}"),
+        6 => format!(
+            "{{ Str1 f = t -> t.toUpperCase() + t.length(); System.out.println(f.of({s})); }}"
+        ),
+        7 => format!(
+            "{{ Pred1 pr = x -> x > {a}; System.out.println(pr.of({b}) + \",\" + pr.of({d})); }}"
+        ),
+        8 => format!("{{ Sup0 g = () -> {a} * {b}; System.out.println(g.of()); }}"),
+        9 => format!("{{ Str1 f = String::toUpperCase; System.out.println(f.of({s})); }}"),
+        _ => format!(
+            "{{ Calc c = (x, y) -> {{ if (y == 0) {{ return -1; }} return x % y; }}; System.out.println(c.of({a}, {d})); }}"
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -577,6 +612,8 @@ const SUPPORT: &str = concat!(
     "    static int resret() { try (Res a = new Res(\"r\")) { return 7; } }\n",
     "    static String shout(Color c) { return c.name() + \"!\"; }\n",
     "    static Color next(Color c) { return c == Color.BLUE ? Color.RED : Color.values()[c.ordinal() + 1]; }\n",
+    "    static int useCalc(Calc c, int a, int b) { return c.of(a, b); }\n",
+    "    static Calc mkAdder(int n) { return (x, y) -> x + y + n; }\n",
 );
 
 /// The types the probes construct: the `AutoCloseable` the resource probes open
@@ -622,6 +659,13 @@ const SUPPORT_CLASS: &str = concat!(
     "record Ord(int lo, int hi) {\n",
     "    Ord { if (lo > hi) { throw new IllegalArgumentException(lo + \">\" + hi); } }\n",
     "}\n",
+    // The functional interfaces the lambda probes target. A user-declared
+    // single-abstract-method interface is exactly what the JDK's own
+    // `java.util.function` types are, so these exercise the same path.
+    "interface Calc { int of(int a, int b); }\n",
+    "interface Str1 { String of(String s); }\n",
+    "interface Pred1 { boolean of(int a); }\n",
+    "interface Sup0 { int of(); }\n",
     "class Res implements AutoCloseable {\n",
     "    String n;\n",
     "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
@@ -657,6 +701,7 @@ enum Mode {
     Enum,
     Static,
     Record,
+    Lambda,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -685,6 +730,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Enum,
     Mode::Static,
     Mode::Record,
+    Mode::Lambda,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -715,6 +761,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Enum => "enum",
         Mode::Static => "static",
         Mode::Record => "record",
+        Mode::Lambda => "lambda",
     }
 }
 
@@ -757,6 +804,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Enum => g_enum(r),
         Mode::Static => g_static(r),
         Mode::Record => g_record(r),
+        Mode::Lambda => g_lambda(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

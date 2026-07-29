@@ -212,6 +212,21 @@ Implemented and checked against the reference `java`:
   receivers: `length`, `isEmpty`, `charAt`, `substring`, `indexOf`, `contains`,
   `equals`, `equalsIgnoreCase`, `toUpperCase`, `toLowerCase`, `trim`,
   `startsWith`, `endsWith`, `concat`, `replace`, `repeat` (chainable).
+- **Lambdas and functional interfaces** — `() -> e`, `x -> e`,
+  `(a, b) -> { … }`, and the explicitly-typed `(int a, String b) -> …`. A lambda
+  compiles to a heap closure carrying a by-value snapshot of the enclosing
+  locals (and `this`), because it outlives the fusevm call frame those locals
+  live in — which is also what gives the enhanced `for` Java's per-iteration
+  capture. The target is any interface with one abstract method, Java's own
+  rule, so a user-declared `interface Calc { int of(int a); }` works with no
+  registration; `Runnable`, `Supplier`, `Consumer`, `Function`, `BiFunction`,
+  `Predicate`, `Comparator`, `UnaryOperator`/`BinaryOperator` and the `Int*`
+  shapes are supplied as one-method interfaces in the prelude. A
+  functional-interface variable may hold a lambda *or* a class instance; the
+  runtime-class dispatch chain routes each. `return`, `break`/`continue`,
+  `try`/`finally` and `throw` all work inside a lambda body.
+- **Method references** — `String::length`, `Integer::parseInt`, `Point::area`,
+  `obj::method`, `this::method`, `Point::new`, `System.out::println`.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
@@ -321,8 +336,9 @@ dispatch through an interface type), **method overloading by parameter type**
 generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
 diamond), **`static` fields** with `static { }` initializer blocks, **`record`
 types** with their derived accessors / `toString` / `equals`, **abstract
-classes**, and **`enum` constants carrying state or bodies** — all verified
-byte-for-byte against OpenJDK.
+classes**, **`enum` constants carrying state or bodies**, and **lambdas +
+method references** (heap closures capturing by value, dispatched through any
+single-abstract-method interface) — all verified byte-for-byte against OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
@@ -331,13 +347,16 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **Lambdas and functional interfaces** — `() -> …`, `x -> x + 1`,
-   `String::length`, and the `Runnable`/`Function`/`Comparator` shapes that use
-   them. The blocker is a capture environment: a lambda outlives the frame it
-   was written in, and javars locals live in fusevm call-frame slots that do not.
-2. **Wider standard library** — `java.util` collections, more `Math`/`Integer`
-   statics, more `String` methods, `hashCode`, and arrow-`switch` expressions.
-3. **Lazy class initialization** — javars runs every class's `static`
+1. **`java.util` collections** — `List`/`ArrayList`, `Map`/`HashMap`,
+   `Set`/`HashSet`, `Arrays.asList`, `Collections.sort`, and the enhanced `for`
+   over them.
+2. **Streams and the functional-interface `default` methods** —
+   `.stream().map(…).filter(…)`, `Function.andThen`, `Predicate.negate`,
+   `Comparator.reversed`. The lambdas they take already work; what is missing is
+   the library on top of them.
+3. **Arrow `switch` expressions** (`case A -> …`, `yield`) and wider stdlib
+   coverage (more `Math`/`Integer` statics, more `String` methods, `hashCode`).
+4. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.

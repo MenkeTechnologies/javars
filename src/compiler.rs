@@ -64,6 +64,9 @@ struct StaticResolved {
     mangled: String,
     ret: NumType,
     ret_name: String,
+    /// The chosen overload's declared parameter types — the lambda target type
+    /// for each argument.
+    param_tys: Vec<String>,
 }
 
 /// Compile-time metadata for one user-defined class, resolved with inheritance
@@ -143,6 +146,10 @@ struct MethodScope {
     /// Names actually declared as a local or parameter here — distinguishes a
     /// true local from an implicit-`this` field reference.
     declared: std::collections::HashSet<String>,
+    /// The slot holding `this`, when this frame has one. Slot 0 for an instance
+    /// method or constructor; a lambda body binds `this` as its last captured
+    /// upvalue instead, so the slot is not fixed.
+    this_slot: Option<u16>,
 }
 
 impl MethodScope {
@@ -153,7 +160,9 @@ impl MethodScope {
 
     /// An instance-method/constructor scope: slot 0 is `this`, params start at 1.
     fn for_instance() -> Self {
-        MethodScope::with_first_slot(1)
+        let mut s = MethodScope::with_first_slot(1);
+        s.this_slot = Some(0);
+        s
     }
 
     fn with_first_slot(first: u16) -> Self {
@@ -163,6 +172,7 @@ impl MethodScope {
             types: HashMap::new(),
             decl_types: HashMap::new(),
             declared: std::collections::HashSet::new(),
+            this_slot: None,
         }
     }
 
@@ -305,6 +315,59 @@ struct Compiler {
     /// Enclosing `finally` blocks of the current frame, innermost last. A jump
     /// that leaves them (`return`/`break`/`continue`) emits their bodies first.
     finallys: Vec<FinallyScope>,
+    /// Lambda bodies queued for emission as subroutines. A lambda literal emits
+    /// only the closure construction at its site; the body is laid out with the
+    /// other subroutines, after `main`, so control never falls into it. The queue
+    /// grows while it drains (a lambda may contain a lambda).
+    pending_lambdas: Vec<PendingLambda>,
+    /// Counter minting unique lambda subroutine names (`#lambda#0`).
+    lambda_counter: u32,
+    /// The functional-interface type the expression being lowered is assigned
+    /// to, when one is known — a local's declared type, a parameter's type, a
+    /// method's return type. A lambda literal consumes it to type its own
+    /// parameters from the interface's single abstract method, which is how
+    /// `Calc c = x -> 100 / x;` gets Java's integral division inside the body.
+    lambda_target: Option<String>,
+    /// The declared return type of the method being lowered, so a `return
+    /// <lambda>;` knows its target type.
+    current_ret: Option<String>,
+}
+
+/// A lambda body waiting to be emitted as a subroutine.
+struct PendingLambda {
+    /// Chunk name index of the body's subroutine — the value the closure stores
+    /// and [`crate::host::JCLOSURE_CALL`] looks the entry address up by.
+    name_idx: u16,
+    /// The lambda's formal parameter names, bound to slots `0..n`.
+    params: Vec<String>,
+    /// The declared parameter types the target interface's single abstract
+    /// method gives them, when the literal's context named a target type. Empty
+    /// when it did not, in which case the parameters are statically untyped and
+    /// arithmetic on them falls back to the runtime's own rules.
+    param_tys: Vec<String>,
+    /// The enclosing locals captured by value, in push order, each with the
+    /// declared type and numeric category it had in the enclosing scope (so
+    /// `/`-truncation and class-typed dispatch keep working inside the body).
+    /// Bound to the slots after the parameters.
+    captures: Vec<Capture>,
+    /// True when the enclosing frame had a `this` — captured as the last
+    /// upvalue, so `this`, implicit field reads, and instance calls work inside
+    /// a lambda written in an instance method or constructor.
+    captures_this: bool,
+    body: LambdaBody,
+    /// The `this`/enclosing class the body lowers under (restored around the
+    /// body, because it is emitted long after its literal site).
+    this_class: Option<String>,
+    current_class: Option<String>,
+    line: u32,
+}
+
+/// One captured upvalue: the name it keeps inside the body, plus the static
+/// typing it had outside.
+struct Capture {
+    name: String,
+    decl_ty: Option<String>,
+    num_ty: NumType,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
@@ -352,6 +415,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         has_exceptions: prog.uses_exceptions,
         tries: Vec::new(),
         finallys: Vec::new(),
+        pending_lambdas: Vec::new(),
+        lambda_counter: 0,
+        lambda_target: None,
+        current_ret: None,
     };
     // ── main body (global scope) ──
     // Class-level state exists before any user code runs, in Java's order:
@@ -382,6 +449,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Emitted after `main` and jumped over so control never falls into them;
     // each is reached only via `Op::Call`.
     let has_subs = !prog.methods.is_empty()
+        || !c.pending_lambdas.is_empty()
         || prog
             .classes
             .iter()
@@ -404,6 +472,11 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             for ctor in &cl.ctors {
                 c.compile_ctor(cl, ctor)?;
             }
+        }
+        // Lambda bodies last, and by draining rather than iterating: emitting one
+        // can queue another (a lambda that returns a lambda).
+        while let Some(pl) = c.pending_lambdas.pop() {
+            c.compile_lambda_body(pl)?;
         }
         let after = c.b.current_pos();
         c.b.patch_jump(skip, after);
@@ -596,6 +669,13 @@ impl Compiler {
                 self.b.emit(Op::SetVar(idx), line);
             }
         }
+    }
+
+    /// Emit a read of `this`. Slot 0 in an instance method or constructor; the
+    /// slot holding the captured receiver inside a lambda body.
+    fn emit_this(&mut self, line: u32) {
+        let slot = self.scope.as_ref().and_then(|s| s.this_slot).unwrap_or(0);
+        self.b.emit(Op::GetSlot(slot), line);
     }
 
     // ── enums ────────────────────────────────────────────────────────────
@@ -1027,6 +1107,13 @@ impl Compiler {
                 let elem = arr_ty.strip_suffix("[]")?;
                 self.classes.contains_key(elem).then(|| elem.to_string())
             }
+            // A bare call to a user `static` method: its declared return type.
+            Expr::Call { name, args, .. } => {
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let ret = self.resolve_static_call(name, &arg_tys)?.ret_name;
+                self.classes.contains_key(&ret).then_some(ret)
+            }
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
@@ -1445,6 +1532,7 @@ impl Compiler {
             mangled: mangle_static(name, &s.param_tys),
             ret: s.ret,
             ret_name: s.ret_name.clone(),
+            param_tys: s.param_tys.clone(),
         })
     }
 
@@ -1571,17 +1659,24 @@ impl Compiler {
             })?;
         let distinct: std::collections::HashSet<&str> =
             targets.iter().map(|(_, m)| m.as_str()).collect();
+        // Calling the single abstract method of a functional interface may land
+        // on a lambda, which is a closure rather than a class instance — so that
+        // receiver gets its own arm in the dispatch chain (keyed on the sentinel
+        // runtime class the host reports for a closure), and the fast path is
+        // given up even when only one class implements the interface.
+        let lambda_arm = matches!(
+            self.functional_sam(rc),
+            Some((sam, arity)) if sam == method && arity == args.len()
+        );
         // Fast path: a single concrete implementation across the whole subtree.
         // Use the concrete target's mangled name (not the static type's), so an
         // interface- or abstract-typed receiver still calls a real subroutine.
-        if distinct.len() <= 1 {
+        if distinct.len() <= 1 && !lambda_arm {
             let mangled = targets.first().map(|(_, m)| m.clone()).ok_or_else(|| {
                 format!("javars: no concrete implementation of `{method}` for `{rc}` (line {line})")
             })?;
             self.expr(recv)?; // this (deepest)
-            for a in args {
-                self.expr(a)?;
-            }
+            self.call_args_targeted(args, &param_tys)?;
             let idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
             self.emit_exc_check(line);
@@ -1594,9 +1689,11 @@ impl Compiler {
         self.emit_set(&recv_t, line);
         let arg_ts: Vec<String> = args
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(i, a)| {
                 let t = self.temp();
-                self.expr(a)?;
+                let want = param_tys.get(i).cloned();
+                self.expr_targeted(a, want.as_deref())?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -1608,6 +1705,24 @@ impl Compiler {
 
         let argc = args.len() as u8 + 1;
         let mut end_jumps = Vec::new();
+        if lambda_arm {
+            // if classof == "#lambda" { closure + args; JCLOSURE_CALL }
+            self.emit_get(&class_t, line);
+            let cc = self
+                .b
+                .add_constant(Value::str(crate::host::LAMBDA_CLASS.to_string()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::StrEq, line);
+            let skip = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_get(&recv_t, line);
+            for t in &arg_ts {
+                self.emit_get(t, line);
+            }
+            self.emit_raising_builtin(crate::host::JCLOSURE_CALL, argc, line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(skip, next);
+        }
         for (class, mangled) in &targets {
             // if classof == "class" { this + args; Call(mangled) }
             self.emit_get(&class_t, line);
@@ -1629,15 +1744,22 @@ impl Compiler {
         // Fallback (unreachable at runtime — every concrete class is a target):
         // call an arbitrary concrete target so the stack stays balanced. Using a
         // real target (not the static type) keeps this valid when `rc` is an
-        // interface whose own method has no subroutine.
-        let base = targets[0].1.clone();
+        // interface whose own method has no subroutine. A functional interface
+        // that no class implements has no such target, so its fallback is the
+        // closure call — which is also the arm that reports the Java
+        // `NullPointerException` when the target is null.
         self.emit_get(&recv_t, line);
         for t in &arg_ts {
             self.emit_get(t, line);
         }
-        let idx = self.b.add_name(&base);
-        self.b.emit(Op::Call(idx, argc), line);
-        self.emit_exc_check(line);
+        match targets.first() {
+            Some((_, base)) => {
+                let idx = self.b.add_name(base);
+                self.b.emit(Op::Call(idx, argc), line);
+                self.emit_exc_check(line);
+            }
+            None => self.emit_raising_builtin(crate::host::JCLOSURE_CALL, argc, line),
+        }
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
@@ -1834,6 +1956,8 @@ impl Compiler {
             | Expr::ArrayLit { .. }
             | Expr::NewObject { .. }
             | Expr::InstanceOf { .. }
+            | Expr::Lambda { .. }
+            | Expr::MethodRef { .. }
             | Expr::This => NumType::Other,
         }
     }
@@ -1854,6 +1978,7 @@ impl Compiler {
         self.scope = Some(scope);
         // A `static` method sees its own class's statics unqualified.
         let saved_class = self.current_class.replace(m.owner.clone());
+        let saved_ret = self.current_ret.replace(m.ret.clone());
 
         // Prologue: pop args into their slots. The last parameter is on top of
         // the stack, so bind slots high-to-low.
@@ -1868,7 +1993,420 @@ impl Compiler {
 
         self.scope = None;
         self.current_class = saved_class;
+        self.current_ret = saved_ret;
         result
+    }
+
+    // ── lambdas ──────────────────────────────────────────────────────────
+    //
+    // A lambda is a value that outlives the frame it was written in, but a
+    // javars local lives in a fusevm call-frame slot that does not. So the
+    // literal site emits a heap closure carrying a *snapshot* of the enclosing
+    // locals, and the body becomes an ordinary subroutine whose slots hold the
+    // parameters first and those captured values after. Java only lets a lambda
+    // read effectively-final locals, so the snapshot is observationally exact —
+    // and it is what gives the enhanced `for` Java's per-iteration capture,
+    // which a by-name read of javars's shared loop variable would not.
+
+    /// Build a closure value at a lambda literal: push the captured upvalues,
+    /// then the body's name index, parameter count, and capture count, and call
+    /// [`crate::host::JMAKE_CLOSURE`] (which returns the handle). The body itself
+    /// is queued for emission with the other subroutines.
+    fn compile_lambda(
+        &mut self,
+        params: &[String],
+        body: &LambdaBody,
+        line: u32,
+    ) -> Result<(), String> {
+        // The interface this lambda implements (when the assignment context
+        // named one) types its parameters, so `Calc c = x -> 100 / x;` divides
+        // integrally exactly where `int of(int)` says it should.
+        let param_tys: Vec<String> = self
+            .lambda_target
+            .take()
+            .as_deref()
+            .and_then(|t| self.functional_sam_meta(t))
+            .map(|sam| sam.param_tys.clone())
+            .unwrap_or_default();
+        // Capture every name declared in the enclosing scope that the lambda's
+        // own parameters do not shadow. Compiler temps are deliberately not in
+        // `declared`, so none are captured.
+        let mut visible: Vec<String> = match &self.scope {
+            Some(sc) => sc.declared.iter().cloned().collect(),
+            None => self
+                .global_decl_types
+                .keys()
+                .chain(self.global_types.keys())
+                .cloned()
+                .collect(),
+        };
+        visible.sort();
+        visible.dedup();
+        let captures: Vec<Capture> = visible
+            .into_iter()
+            .filter(|n| !params.contains(n))
+            .map(|n| Capture {
+                decl_ty: self.var_decl_type(&n).map(str::to_string),
+                num_ty: self.lookup_type(&n),
+                name: n,
+            })
+            .collect();
+        for c in &captures {
+            let name = c.name.clone();
+            self.emit_get(&name, line);
+        }
+        let captures_this = self.this_class.is_some();
+        if captures_this {
+            self.emit_this(line);
+        }
+
+        let name_idx = self.b.add_name(&format!("#lambda#{}", self.lambda_counter));
+        self.lambda_counter += 1;
+        let ncap = captures.len() + usize::from(captures_this);
+        self.pending_lambdas.push(PendingLambda {
+            name_idx,
+            params: params.to_vec(),
+            param_tys,
+            captures,
+            captures_this,
+            body: body.clone(),
+            this_class: self.this_class.clone(),
+            current_class: self.current_class.clone(),
+            line,
+        });
+        self.b.emit(Op::LoadInt(name_idx as i64), line);
+        self.b.emit(Op::LoadInt(params.len() as i64), line);
+        self.b.emit(Op::LoadInt(ncap as i64), line);
+        self.b.emit(
+            Op::CallBuiltin(crate::host::JMAKE_CLOSURE, ncap as u8 + 3),
+            line,
+        );
+        Ok(())
+    }
+
+    /// Emit a queued lambda body as a subroutine. Slots hold the parameters
+    /// (`0..n`), then the captured upvalues, then `this` when one was captured;
+    /// the prologue binds all of them high-to-low, exactly like a method's.
+    ///
+    /// The body is its own frame for `break`/`continue`/`return`/`try`, so those
+    /// stacks are swapped out around it — a `return` inside a lambda returns from
+    /// the *lambda*, not from the method that wrote it.
+    fn compile_lambda_body(&mut self, pl: PendingLambda) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        self.b.add_sub_entry(pl.name_idx, entry);
+        let line = pl.line;
+
+        let mut scope = MethodScope::new();
+        for (i, p) in pl.params.iter().enumerate() {
+            scope.slot(p);
+            scope.declared.insert(p.clone());
+            if let Some(ty) = pl.param_tys.get(i) {
+                scope.decl_types.insert(p.clone(), ty.clone());
+                scope
+                    .types
+                    .insert(p.clone(), numtype_of_ty(ty).unwrap_or(NumType::Other));
+            }
+        }
+        for c in &pl.captures {
+            scope.slot(&c.name);
+            scope.declared.insert(c.name.clone());
+            scope.types.insert(c.name.clone(), c.num_ty);
+            if let Some(t) = &c.decl_ty {
+                scope.decl_types.insert(c.name.clone(), t.clone());
+            }
+        }
+        let total = pl.params.len() + pl.captures.len() + usize::from(pl.captures_this);
+        if pl.captures_this {
+            // `this` rides in the slot after the last named capture; nothing
+            // reads it by name, so it needs no `declared` entry.
+            scope.this_slot = Some((total - 1) as u16);
+            scope.next_slot = total as u16;
+        }
+
+        let saved_scope = self.scope.replace(scope);
+        let saved_this = std::mem::replace(&mut self.this_class, pl.this_class.clone());
+        let saved_current = std::mem::replace(&mut self.current_class, pl.current_class.clone());
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_tries = std::mem::take(&mut self.tries);
+        let saved_finallys = std::mem::take(&mut self.finallys);
+        let saved_exits = std::mem::take(&mut self.exit_ops);
+        let saved_ret = self.current_ret.take();
+
+        for i in (0..total).rev() {
+            self.b.emit(Op::SetSlot(i as u16), line);
+        }
+        let result = match &pl.body {
+            // An expression body's value is the lambda's result.
+            LambdaBody::Expr(e) => self.expr(e).map(|()| {
+                self.b.emit(Op::ReturnValue, line);
+            }),
+            LambdaBody::Block(stmts) => stmts.iter().try_for_each(|s| self.stmt(s)),
+        };
+        // Fall-off (and a bare `return;`) yields `null`, which is what a `void`
+        // functional interface wants and what a value-returning one never reaches.
+        let end = self.b.current_pos();
+        let exits = std::mem::replace(&mut self.exit_ops, saved_exits);
+        for op in exits {
+            self.b.patch_jump(op, end);
+        }
+        self.b.emit(Op::LoadUndef, line);
+        self.b.emit(Op::ReturnValue, line);
+
+        self.scope = saved_scope;
+        self.this_class = saved_this;
+        self.current_class = saved_current;
+        self.scopes = saved_scopes;
+        self.tries = saved_tries;
+        self.finallys = saved_finallys;
+        self.current_ret = saved_ret;
+        result
+    }
+
+    /// The single abstract method of a functional interface: `(name, arity)`.
+    ///
+    /// Any interface with exactly one abstract method is a lambda target — Java's
+    /// own rule, and the reason a user-declared `interface Calc { int of(int a); }`
+    /// works with no registration. The `java.util.function` interfaces reach here
+    /// the same way, because [`crate::prelude`] declares them as ordinary
+    /// one-method interfaces.
+    fn functional_sam(&self, ty: &str) -> Option<(String, usize)> {
+        let sam = self.functional_sam_meta(ty)?;
+        Some((sam.name.clone(), sam.param_tys.len()))
+    }
+
+    /// The full signature of a functional interface's single abstract method.
+    fn functional_sam_meta(&self, ty: &str) -> Option<&MethodMeta> {
+        let ci = self.classes.get(ty)?;
+        if !ci.is_interface {
+            return None;
+        }
+        let mut abstracts = ci.methods.iter().filter(|m| m.is_abstract);
+        let sam = abstracts.next()?;
+        abstracts.next().is_none().then_some(sam)
+    }
+
+    /// Lower `e` knowing the type it is being assigned to. Only a lambda (or the
+    /// method reference that desugars to one) reads the target, so anything else
+    /// lowers exactly as it did before.
+    fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
+        if !matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
+            return self.expr(e);
+        }
+        let saved = std::mem::replace(&mut self.lambda_target, target.map(str::to_string));
+        let result = self.expr(e);
+        self.lambda_target = saved;
+        result
+    }
+
+    /// Lower a call's arguments, giving each the declared parameter type as its
+    /// lambda target. `param_tys` may be shorter than `args` (an unresolved
+    /// signature), in which case the extras lower untargeted.
+    fn call_args_targeted(&mut self, args: &[Expr], param_tys: &[String]) -> Result<(), String> {
+        for (i, a) in args.iter().enumerate() {
+            self.expr_targeted(a, param_tys.get(i).map(String::as_str))?;
+        }
+        Ok(())
+    }
+
+    /// Desugar a method reference into the lambda it abbreviates.
+    ///
+    /// Java infers the reference's arity from its *target* type; javars has no
+    /// target-typing pass, so the arity is taken from the referenced member's own
+    /// declaration instead. That resolves every unambiguous form and rejects the
+    /// rest with a diagnostic rather than guessing.
+    fn desugar_method_ref(&self, recv: &Expr, method: &str, line: u32) -> Result<Expr, String> {
+        // Synthesized parameter names. `#` is not a legal Java identifier char,
+        // so they cannot collide with (or be shadowed by) a user variable.
+        let mk = |arity: usize| -> Vec<String> { (0..arity).map(|i| format!("#p{i}")).collect() };
+        let vars =
+            |ps: &[String]| -> Vec<Expr> { ps.iter().map(|p| Expr::Var(p.clone())).collect() };
+        let lambda = |params: Vec<String>, body: Expr| Expr::Lambda {
+            body: LambdaBody::Expr(Box::new(body)),
+            params,
+            line,
+        };
+
+        // `System.out::println` — the print statement, not a dispatchable method.
+        if let Expr::Field { recv: sys, name } = recv {
+            if matches!(&**sys, Expr::Var(v) if v == "System") {
+                let err = name == "err";
+                let newline = match method {
+                    "println" => true,
+                    "print" => false,
+                    _ => {
+                        return Err(format!(
+                            "javars: `System.{name}::{method}` is not a supported method reference (line {line})"
+                        ))
+                    }
+                };
+                let ps = mk(1);
+                let arg = Expr::Var(ps[0].clone());
+                return Ok(lambda(
+                    ps,
+                    Expr::Println {
+                        newline,
+                        err,
+                        arg: Some(Box::new(arg)),
+                    },
+                ));
+            }
+        }
+
+        // A bare type name on the left: `Point::new`, `Point::area`,
+        // `Integer::parseInt`, `String::length`.
+        if let Expr::Var(name) = recv {
+            if !self.is_declared_var(name) {
+                if let Some(e) = self.type_method_ref(name, method, line, &mk, &vars, &lambda)? {
+                    return Ok(e);
+                }
+            }
+        }
+
+        // Otherwise the left side is a value: `obj::method`, `this::method`. The
+        // receiver must be a plain name so the synthesized lambda captures it —
+        // Java evaluates the receiver once, at the reference, and a captured
+        // local is exactly that.
+        if !matches!(recv, Expr::Var(_) | Expr::This) {
+            return Err(format!(
+                "javars: a bound method reference needs a variable or `this` receiver (line {line})"
+            ));
+        }
+        let rc = self.expr_class(recv).ok_or_else(|| {
+            format!("javars: cannot resolve the receiver of `::{method}` (line {line})")
+        })?;
+        let arity = self.unique_method_arity(&rc, method).ok_or_else(|| {
+            format!(
+                "javars: `{rc}::{method}` has no single method reference can name (line {line})"
+            )
+        })?;
+        let ps = mk(arity);
+        Ok(lambda(
+            ps.clone(),
+            Expr::MethodCall {
+                recv: Box::new(recv.clone()),
+                method: method.to_string(),
+                args: vars(&ps),
+                line,
+            },
+        ))
+    }
+
+    /// The type-name form of [`Compiler::desugar_method_ref`]. Returns `None`
+    /// when `name` is not a type javars knows, so the caller can fall through to
+    /// the bound (value receiver) form.
+    #[allow(clippy::type_complexity)]
+    fn type_method_ref(
+        &self,
+        name: &str,
+        method: &str,
+        line: u32,
+        mk: &dyn Fn(usize) -> Vec<String>,
+        vars: &dyn Fn(&[String]) -> Vec<Expr>,
+        lambda: &dyn Fn(Vec<String>, Expr) -> Expr,
+    ) -> Result<Option<Expr>, String> {
+        if let Some(ci) = self.classes.get(name) {
+            // `Point::new` — a constructor reference.
+            if method == "new" {
+                let arity = match ci.ctors.len() {
+                    0 => 0,
+                    1 => ci.ctors[0].len(),
+                    _ => {
+                        return Err(format!(
+                            "javars: `{name}::new` is ambiguous — {} constructors (line {line})",
+                            ci.ctors.len()
+                        ))
+                    }
+                };
+                let ps = mk(arity);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::NewObject {
+                        class: name.to_string(),
+                        args: vars(&ps),
+                        line,
+                    },
+                )));
+            }
+            // `Point::area` — an unbound instance reference takes the receiver as
+            // its first parameter.
+            if let Some(arity) = self.unique_method_arity(name, method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+            // `Helper::twice` — a `static` method of a user class.
+            if let Some(arity) = self.unique_static_arity(method) {
+                let ps = mk(arity);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::Call {
+                        name: method.to_string(),
+                        args: vars(&ps),
+                        line,
+                    },
+                )));
+            }
+            return Err(format!(
+                "javars: class `{name}` has no member `{method}` a method reference can name (line {line})"
+            ));
+        }
+        if !is_static_class(name) {
+            return Ok(None);
+        }
+        // `Integer::parseInt` — a modeled stdlib static.
+        if let Some(arity) = stdlib_static_ref_arity(name, method) {
+            let ps = mk(arity);
+            return Ok(Some(lambda(
+                ps.clone(),
+                Expr::MethodCall {
+                    recv: Box::new(Expr::Var(name.to_string())),
+                    method: method.to_string(),
+                    args: vars(&ps),
+                    line,
+                },
+            )));
+        }
+        // `String::length` — an unbound `String` instance method.
+        if name == "String" {
+            if let Some(arity) = string_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
+        Err(format!(
+            "javars: `{name}::{method}` is not a method reference javars models (line {line})"
+        ))
+    }
+
+    /// The parameter count of `class.method` when the class declares exactly one
+    /// method of that name; `None` when there is none or several (an overloaded
+    /// name gives a method reference no unambiguous arity).
+    fn unique_method_arity(&self, class: &str, method: &str) -> Option<usize> {
+        let ci = self.classes.get(class)?;
+        let mut it = ci.methods.iter().filter(|m| m.name == method);
+        let first = it.next()?;
+        it.next().is_none().then_some(first.param_tys.len())
+    }
+
+    /// The parameter count of a user `static` method with exactly one overload.
+    fn unique_static_arity(&self, method: &str) -> Option<usize> {
+        let sigs = self.methods.get(method)?;
+        (sigs.len() == 1).then(|| sigs[0].param_tys.len())
     }
 
     /// Lower one instance method to a subroutine named `Class#method#argc`. Slot
@@ -1886,6 +2424,7 @@ impl Compiler {
         self.scope = Some(scope);
         self.this_class = Some(class.to_string());
         let saved_class = self.current_class.replace(class.to_string());
+        let saved_ret = self.current_ret.replace(m.ret.clone());
 
         // Prologue: bind `this` (slot 0) + params (slots 1..=n), high-to-low.
         for i in (0..=m.params.len()).rev() {
@@ -1898,6 +2437,7 @@ impl Compiler {
         self.scope = None;
         self.this_class = None;
         self.current_class = saved_class;
+        self.current_ret = saved_ret;
         result
     }
 
@@ -1964,7 +2504,7 @@ impl Compiler {
                 };
                 self.declare_local(name, &raw, nt);
                 if let Some(e) = init {
-                    self.expr(e)?;
+                    self.expr_targeted(e, Some(&raw))?;
                     self.emit_set(name, line);
                 }
                 // An uninitialized local is simply unbound until first assigned
@@ -1989,7 +2529,8 @@ impl Compiler {
                     *op != AssignOp::Assign && self.compound_wraps(self.var_decl_type(name), value);
                 match op {
                     AssignOp::Assign => {
-                        self.expr(value)?;
+                        let target = self.var_decl_type(name).map(str::to_string);
+                        self.expr_targeted(value, target.as_deref())?;
                     }
                     AssignOp::Div => {
                         // `x /= e` — integer division truncates when both `x`
@@ -2103,7 +2644,10 @@ impl Compiler {
                     // the cleanup blocks, so a `finally` that reassigns the
                     // variable cannot change the value already computed.
                     match val {
-                        Some(e) => self.expr(e)?,
+                        Some(e) => {
+                            let want = self.current_ret.clone();
+                            self.expr_targeted(e, want.as_deref())?;
+                        }
                         None => {
                             self.b.emit(Op::LoadUndef, line);
                         }
@@ -2894,7 +3438,7 @@ impl Compiler {
                 if let Some(class) = self.enclosing_enum_constant(name) {
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if self.implicit_this_field(name).is_some() {
-                    self.b.emit(Op::GetSlot(0), 0); // this
+                    self.emit_this(0); // this
                     self.emit_field_get(name, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
                     self.emit_global_get(&static_global(&class, name), 0);
@@ -2906,7 +3450,7 @@ impl Compiler {
                 if self.this_class.is_none() {
                     return Err("javars: `this` used outside an instance method".to_string());
                 }
-                self.b.emit(Op::GetSlot(0), 0);
+                self.emit_this(0);
             }
             Expr::NewArray {
                 elem_ty,
@@ -2998,7 +3542,7 @@ impl Compiler {
             Expr::PostIncDec { name, inc } => {
                 // Value position: push the old value, then apply the mutation.
                 if self.implicit_this_field(name).is_some() {
-                    self.b.emit(Op::GetSlot(0), 0);
+                    self.emit_this(0);
                     self.emit_field_get(name, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
                     self.emit_global_get(&static_global(&class, name), 0);
@@ -3014,6 +3558,11 @@ impl Compiler {
                 args,
                 line,
             } => self.method_call(recv, method, args, *line)?,
+            Expr::Lambda { params, body, line } => self.compile_lambda(params, body, *line)?,
+            Expr::MethodRef { recv, method, line } => {
+                let lambda = self.desugar_method_ref(recv, method, *line)?;
+                self.expr(&lambda)?;
+            }
         }
         Ok(())
     }
@@ -3180,9 +3729,7 @@ impl Compiler {
         let ctor_sig = self.resolve_ctor(ctor_class, &arg_tys);
         if let Some(param_tys) = ctor_sig {
             self.emit_get(&obj, line); // this
-            for a in args {
-                self.expr(a)?;
-            }
+            self.call_args_targeted(args, &param_tys)?;
             let mangled = mangle(ctor_class, "<init>", &param_tys);
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
@@ -3381,10 +3928,8 @@ impl Compiler {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
                     if let Some(param_tys) = self.resolve_ctor(&sup, &arg_tys) {
-                        self.b.emit(Op::GetSlot(0), line); // this
-                        for a in args {
-                            self.expr(a)?;
-                        }
+                        self.emit_this(line); // this
+                        self.call_args_targeted(args, &param_tys)?;
                         let mangled = mangle(&sup, "<init>", &param_tys);
                         let idx = self.b.add_name(&mangled);
                         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
@@ -3409,9 +3954,7 @@ impl Compiler {
                     args.len()
                 )
             })?;
-            for a in args {
-                self.expr(a)?;
-            }
+            self.call_args_targeted(args, &resolved.param_tys)?;
             let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
             self.emit_exc_check(line);
@@ -3660,6 +4203,11 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Field { recv, .. } => expr_has_ffi(recv),
         Expr::NewObject { args, .. } => args.iter().any(expr_has_ffi),
         Expr::InstanceOf { expr, .. } => expr_has_ffi(expr),
+        Expr::Lambda { body, .. } => match body {
+            LambdaBody::Expr(e) => expr_has_ffi(e),
+            LambdaBody::Block(b) => body_has_ffi(b),
+        },
+        Expr::MethodRef { recv, .. } => expr_has_ffi(recv),
         Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
@@ -3785,6 +4333,40 @@ fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
         ("Math", "round") => Some(NumType::Int),
         _ => None,
     }
+}
+
+/// The parameter count of a modeled stdlib static a method reference can name.
+///
+/// Only the single-arity entries are listed: `Integer.toString` and
+/// `String.valueOf` take one *or* two arguments in Java, and a method reference
+/// to an overloaded name has no arity until it is target-typed — which javars
+/// does not do — so naming one is an error rather than a guess.
+fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
+    Some(match (class, method) {
+        ("Integer", "parseInt")
+        | ("Long", "parseLong")
+        | ("Boolean", "parseBoolean")
+        | ("Math", "sqrt")
+        | ("Math", "floor")
+        | ("Math", "ceil")
+        | ("Math", "round")
+        | ("Arrays", "toString") => 1,
+        ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,
+        _ => return None,
+    })
+}
+
+/// The parameter count of a `String` instance method a method reference can name
+/// (`String::length` → 0, so the synthesized lambda takes 1: the receiver).
+/// `substring` and `indexOf` are overloaded on arity in Java and so are absent.
+fn string_instance_ref_arity(method: &str) -> Option<usize> {
+    Some(match method {
+        "length" | "isEmpty" | "toUpperCase" | "toLowerCase" | "trim" => 0,
+        "charAt" | "contains" | "startsWith" | "endsWith" | "equals" | "equalsIgnoreCase"
+        | "concat" | "repeat" => 1,
+        "replace" => 2,
+        _ => return None,
+    })
 }
 
 /// True when a statement is a loop or `switch` — a construct that owns its own

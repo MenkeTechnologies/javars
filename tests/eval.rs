@@ -1442,3 +1442,117 @@ fn tostring_dispatches_through_an_interface_typed_receiver() {
     assert!(ok);
     assert_eq!(out, "Cir[r=2.0] 12.0\nSq[side=3] 9.0\n");
 }
+
+#[test]
+fn lambdas_implement_functional_interfaces() {
+    // A lambda assigned to a single-abstract-method interface is invoked through
+    // that method — expression and block bodies, a captured effectively-final
+    // local, an interface with both a lambda and a class implementor (so the
+    // dispatch chain has to pick the right arm), and the target interface's
+    // declared `int` parameters driving both `/` truncation and the 32-bit wrap
+    // inside the body. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         interface Calc { int of(int a, int b); }\
+         interface Named { String label(); default String shout() { return label() + \"!\"; } }\
+         static class Impl implements Named { public String label() { return \"impl\"; } }\
+         static int fold(Calc c, int[] xs) { int acc = xs[0]; for (int i = 1; i < xs.length; i++) { acc = c.of(acc, xs[i]); } return acc; }\
+         static String use(Named n) { return n.shout(); }\
+         public static void main(String[] a) {\
+         Calc add = (x, y) -> x + y;\
+         Calc mul = (x, y) -> { return x * y; };\
+         System.out.println(add.of(3, 4) + \" \" + mul.of(3, 4));\
+         int base = 10;\
+         Calc off = (x, y) -> x + y + base;\
+         System.out.println(off.of(1, 2));\
+         System.out.println(fold(add, new int[]{1,2,3,4}) + \" \" + fold((x, y) -> x / y, new int[]{100, 3, 2}));\
+         System.out.println(use(new Impl()) + \" \" + use(() -> \"lam\"));\
+         Calc big = (x, y) -> x * y;\
+         System.out.println(big.of(100000, 100000)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "7 12\n13\n10 16\nimpl! lam!\n1410065408\n");
+}
+
+#[test]
+fn lambdas_capture_by_value_and_method_references_desugar() {
+    // The capture is a by-value snapshot taken where the literal runs, which is
+    // the only model that gives the enhanced `for` Java's per-iteration capture
+    // (`a!b!c!`, not `c!c!c!`) and lets a lambda outlive the frame that built it
+    // (`adder(5)`). Also covers capturing an instance field and a `static`
+    // through `this`, the three method-reference shapes, a lambda returning a
+    // lambda, `finally` inside a lambda body, and a throw out of one. Verified
+    // against OpenJDK 26.
+    let (out, ok) = run(
+        "import java.util.function.*;\
+         public class Main {\
+         interface Calc { int of(int a); }\
+         static int k = 5;\
+         int f = 3;\
+         String viaField() { Supplier<String> s = () -> \"f=\" + f + \",k=\" + k; return s.get(); }\
+         static Calc adder(int n) { return x -> x + n; }\
+         public static void main(String[] a) {\
+         String[] names = {\"a\", \"b\", \"c\"};\
+         Supplier<String>[] subs = new Supplier[3];\
+         int i = 0;\
+         for (String s : names) { subs[i] = () -> s + \"!\"; i++; }\
+         for (Supplier<String> s : subs) { System.out.print(s.get()); }\
+         System.out.println();\
+         System.out.println(adder(5).of(10));\
+         System.out.println(new Main().viaField());\
+         Function<String, Integer> len = String::length;\
+         Function<String, Integer> pi = Integer::parseInt;\
+         Consumer<String> pr = System.out::println;\
+         System.out.println(len.apply(\"hello\") + \" \" + pi.apply(\"123\"));\
+         pr.accept(\"ref\");\
+         Function<Integer, Function<Integer, Integer>> add = p -> q -> p + q;\
+         System.out.println(add.apply(3).apply(4));\
+         Calc fin = x -> { try { return x * 2; } finally { System.out.println(\"fin \" + x); } };\
+         System.out.println(fin.of(4));\
+         Calc boom = x -> { if (x == 0) { throw new IllegalStateException(\"zero\"); } return 100 / x; };\
+         try { System.out.println(boom.of(0)); } catch (IllegalStateException e) { System.out.println(\"caught \" + e.getMessage()); }\
+         System.out.println(boom.of(4)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "a!b!c!\n15\nf=3,k=5\n5 123\nref\n7\nfin 4\n8\ncaught zero\n25\n"
+    );
+}
+
+#[test]
+fn an_uncaught_throw_from_a_lambda_exits_non_zero() {
+    // A lambda body is a real fusevm call frame, so a throw with no handler in
+    // it unwinds to the caller's — and, with no handler anywhere, reports Java's
+    // uncaught line and exits non-zero rather than resuming with a placeholder.
+    let (out, err, ok) = run_streams(
+        "public class Main {\
+         interface Calc { int of(int a); }\
+         public static void main(String[] a) {\
+         Calc boom = x -> { throw new IllegalArgumentException(\"bad \" + x); };\
+         System.out.println(\"before\");\
+         System.out.println(boom.of(7));\
+         System.out.println(\"unreached\"); } }",
+    );
+    assert!(!ok);
+    assert_eq!(out, "before\n");
+    assert!(
+        err.contains("Exception in thread \"main\" java.lang.IllegalArgumentException: bad 7"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_ambiguous_method_reference_is_a_compile_error() {
+    // A method reference's arity comes from the referenced member, because
+    // javars does not target-type. An overloaded name therefore has no single
+    // arity and is rejected, rather than one overload being guessed.
+    let (_, ok) = run("import java.util.function.*;\
+         public class Main {\
+         static int f(int a) { return a; }\
+         static int f(int a, int b) { return a + b; }\
+         public static void main(String[] x) {\
+         Function<Integer, Integer> g = Main::f;\
+         System.out.println(g.apply(1)); } }");
+    assert!(!ok);
+}

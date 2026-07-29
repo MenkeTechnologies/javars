@@ -1,4 +1,4 @@
-//! The implicit `java.lang` exception prelude.
+//! The implicit `java.lang` / `java.util.function` prelude.
 //!
 //! javars has no JDK to link against, so the exception classes a `throw`/`catch`
 //! program names (`RuntimeException`, `IllegalStateException`, …) do not exist
@@ -11,9 +11,15 @@
 //! (Exception e)` catching a `NumberFormatException` is then just the
 //! `instanceof` walk javars already had.
 //!
-//! The prelude is injected only into programs that actually use exceptions (see
-//! [`inject`]), so a program that never throws carries none of these classes and
-//! emits exactly the bytecode it did before.
+//! The `java.util.function` interfaces (`Runnable`, `Function`, `Predicate`, …)
+//! are supplied the same way, and for the same reason: a lambda target is just
+//! an interface with one abstract method, so declaring them in Java means the
+//! compiler needs no table of built-in functional types — a user's own
+//! `interface Calc { int of(int a); }` reaches the identical code path.
+//!
+//! Each half of the prelude is injected only into programs that actually use it
+//! (see [`inject`]), so a program that never throws and never writes a lambda
+//! carries none of these types and emits exactly the bytecode it did before.
 
 use crate::ast::Program;
 
@@ -51,6 +57,44 @@ pub const THROWABLES: &[(&str, &str)] = &[
 /// True when `name` is one of the modeled `java.lang` throwables.
 pub fn is_throwable(name: &str) -> bool {
     THROWABLES.iter().any(|(n, _)| *n == name)
+}
+
+/// The modeled functional interfaces: `(name, declared single abstract method)`.
+///
+/// Each is declared to javars as an ordinary `interface` with exactly one
+/// abstract method, which is all a lambda target needs — the compiler recognises
+/// *any* single-abstract-method interface (user-declared ones included) as a
+/// lambda target, so these entries buy no special case, only the declarations
+/// the JDK would have supplied. Type parameters are erased, so the parameter and
+/// return types below are the erasure Java itself uses (`Object`), except where
+/// the JDK's own signature is primitive (`Predicate.test` → `boolean`,
+/// `Comparator.compare` → `int`), which javars keeps so a call participates in
+/// numeric typing.
+pub const FUNCTIONAL: &[(&str, &str)] = &[
+    ("Runnable", "void run()"),
+    ("Callable", "Object call()"),
+    ("Supplier", "Object get()"),
+    ("Consumer", "void accept(Object t)"),
+    ("BiConsumer", "void accept(Object t, Object u)"),
+    ("Function", "Object apply(Object t)"),
+    ("BiFunction", "Object apply(Object t, Object u)"),
+    ("UnaryOperator", "Object apply(Object t)"),
+    ("BinaryOperator", "Object apply(Object t, Object u)"),
+    ("Predicate", "boolean test(Object t)"),
+    ("BiPredicate", "boolean test(Object t, Object u)"),
+    ("Comparator", "int compare(Object a, Object b)"),
+    ("IntSupplier", "int getAsInt()"),
+    ("IntPredicate", "boolean test(int value)"),
+    ("IntConsumer", "void accept(int value)"),
+    ("IntUnaryOperator", "int applyAsInt(int operand)"),
+    ("IntBinaryOperator", "int applyAsInt(int left, int right)"),
+    ("ToIntFunction", "int applyAsInt(Object value)"),
+    ("ToDoubleFunction", "double applyAsDouble(Object value)"),
+];
+
+/// True when `name` is one of the modeled functional interfaces.
+pub fn is_functional(name: &str) -> bool {
+    FUNCTIONAL.iter().any(|(n, _)| *n == name)
 }
 
 /// The Java source of the prelude classes the program does not already declare.
@@ -99,19 +143,50 @@ fn prelude_source(declared: &[String]) -> String {
 /// as they were. A class the user declares themselves (`class Exception { … }`)
 /// wins: its name is skipped, so the user's definition is the only one.
 pub fn inject(prog: &mut Program) -> Result<(), String> {
-    if !prog.uses_exceptions {
-        return Ok(());
+    if prog.uses_exceptions {
+        let src = prelude_source(&declared_names(prog));
+        merge(prog, &src)?;
     }
-    let declared: Vec<String> = prog.classes.iter().map(|c| c.name.clone()).collect();
-    let src = prelude_source(&declared);
-    let parsed = crate::parser::parse(&src)?;
+    if prog.uses_functional {
+        let src = functional_source(&declared_names(prog));
+        merge(prog, &src)?;
+    }
+    Ok(())
+}
+
+/// The names of every type the unit already declares (a user declaration always
+/// wins over a prelude one of the same name).
+fn declared_names(prog: &Program) -> Vec<String> {
+    prog.classes.iter().map(|c| c.name.clone()).collect()
+}
+
+/// Parse a prelude compilation unit and fold its types into `prog`.
+fn merge(prog: &mut Program, src: &str) -> Result<(), String> {
+    let parsed = crate::parser::parse(src)?;
     // Everything except the synthetic entry class (which only exists because a
-    // compilation unit must declare a `main`).
+    // compilation unit must declare a `main`). `__` is not a name any Java
+    // program uses for a type, and both prelude units spell theirs that way.
     prog.classes.extend(
         parsed
             .classes
             .into_iter()
-            .filter(|c| c.name != "__JavaLang"),
+            .filter(|c| !c.name.starts_with("__")),
     );
     Ok(())
+}
+
+/// The Java source of the functional interfaces the program does not already
+/// declare. Each is a plain one-method `interface`, so a lambda assigned to it
+/// reaches the compiler's ordinary single-abstract-method lambda target path.
+fn functional_source(declared: &[String]) -> String {
+    let mut src = String::from(
+        "public class __JavaUtilFunction { public static void main(String[] a) { } }\n",
+    );
+    for (name, sam) in FUNCTIONAL {
+        if declared.iter().any(|d| d == name) {
+            continue;
+        }
+        src.push_str(&format!("interface {name} {{ {sam}; }}\n"));
+    }
+    src
 }
