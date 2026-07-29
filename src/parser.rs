@@ -1,11 +1,12 @@
 //! A recursive-descent parser with precedence-climbing for expressions.
 //!
-//! Grammar (slice 1): a compilation unit is `public class Name { ... }`; inside
-//! it, javars locates `public static void main(String[] args) { <body> }` and
-//! parses `<body>` into `ast::Stmt`s. Other members are skipped by brace
-//! matching so a class that also declares helper methods still parses its
-//! `main`. Statements cover local decls, assignments, `if`/`while`/`for`,
-//! `break`/`continue`, `System.out.print[ln]`, and post-inc/dec.
+//! Grammar: a compilation unit is one or more `class`/`interface` declarations;
+//! javars locates `public static void main(String[] args) { <body> }` as the
+//! entry and parses every other member (fields, constructors, static and
+//! instance methods) into the AST. Statements cover local decls, assignments,
+//! `if`/`while`/`do`/`for` (C-style and enhanced)/`switch`, labeled
+//! `break`/`continue`, `return`, `try`/`catch`/`finally`, `throw`,
+//! `System.out.print[ln]`, and post-inc/dec.
 
 use crate::ast::*;
 use crate::lexer::{Tok, Token};
@@ -16,6 +17,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        uses_exceptions: false,
     };
     p.program()
 }
@@ -23,6 +25,11 @@ pub fn parse(src: &str) -> Result<Program, String> {
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// Set when a `try`, a `throw`, or a `new` of a modeled `java.lang`
+    /// throwable is parsed — the signal that this unit needs the exception
+    /// prelude and the compiler's exception lowering (see
+    /// [`crate::ast::Program::uses_exceptions`]).
+    uses_exceptions: bool,
 }
 
 impl Parser {
@@ -89,6 +96,7 @@ impl Parser {
                 main,
                 methods,
                 classes,
+                uses_exceptions: self.uses_exceptions,
             }),
             None => Err(
                 "javars: no class declares `public static void main(String[] args)`".to_string(),
@@ -258,6 +266,7 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         let params = self.params()?;
         self.eat(&Tok::RParen)?;
+        self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
         let body = self.block()?;
         Ok(Some(Ctor { params, body, line }))
@@ -354,6 +363,7 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         let params = self.params()?;
         self.eat(&Tok::RParen)?;
+        self.skip_throws()?;
         // An interface abstract method (or `abstract` class method) ends in `;`
         // with no body; a concrete/`default` method has a `{ ... }` block.
         let (body, is_abstract) = if self.is(&Tok::Semi) {
@@ -374,6 +384,25 @@ impl Parser {
             },
             saw_static,
         )))
+    }
+
+    /// Skip a `throws A, B` clause following a method/constructor parameter
+    /// list. javars has no checked-exception analysis — an exception either
+    /// reaches a handler or terminates the program — so the declared list is
+    /// parsed and discarded, exactly as its runtime effect is nil.
+    fn skip_throws(&mut self) -> Result<(), String> {
+        if !matches!(self.peek(), Tok::Ident(w) if w == "throws") {
+            return Ok(());
+        }
+        self.advance();
+        loop {
+            self.type_name()?;
+            if self.is(&Tok::Comma) {
+                self.advance();
+            } else {
+                return Ok(());
+            }
+        }
     }
 
     /// Parse a comma-separated formal parameter list `<type> <name>, ...`, the
@@ -448,6 +477,7 @@ impl Parser {
                 _ => {}
             }
         }
+        self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
         let body = self.block()?;
         Ok(Some(body))
@@ -525,6 +555,22 @@ impl Parser {
                     label,
                     body: Box::new(body),
                 });
+            }
+        }
+        // `try` and `throw` are not reserved tokens in this lexer (they lex as
+        // identifiers, like `instanceof` and `interface`), so they are matched
+        // here by name before the general statement forms.
+        if let Tok::Ident(w) = self.peek() {
+            match w.as_str() {
+                "try" => return self.try_stmt(),
+                "throw" => {
+                    self.uses_exceptions = true;
+                    self.advance();
+                    let e = self.expression()?;
+                    self.eat(&Tok::Semi)?;
+                    return Ok(StmtKind::Throw(e));
+                }
+                _ => {}
             }
         }
         match self.peek() {
@@ -745,9 +791,24 @@ impl Parser {
         Ok(StmtKind::While { cond, body })
     }
 
+    /// Both `for` forms: the enhanced `for (T x : arr)` and the C-style
+    /// `for (init; cond; update)`. The two are told apart by a probe for the
+    /// `<type> <name> :` header — a C-style init clause always has `=` or `;`
+    /// where the enhanced form has `:`, so the probe is unambiguous.
     fn for_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
+        if let Some((ty, name)) = self.try_foreach_header()? {
+            let iter = self.expression()?;
+            self.eat(&Tok::RParen)?;
+            let body = self.braced_or_single()?;
+            return Ok(StmtKind::ForEach {
+                ty,
+                name,
+                iter,
+                body,
+            });
+        }
         let init = if self.is(&Tok::Semi) {
             None
         } else {
@@ -775,6 +836,82 @@ impl Parser {
             update,
             body,
         })
+    }
+
+    /// Parse `try { .. } catch (Type name) { .. }* [finally { .. }]`.
+    ///
+    /// Try-with-resources (`try (var r = …)`) is rejected here rather than
+    /// silently parsed as a `try` with a dropped resource clause — javars has no
+    /// `AutoCloseable`, so accepting it would run the body without ever closing.
+    /// Multi-catch (`catch (A | B e)`) does not reach this point: the lexer has
+    /// no single `|` token, so it fails earlier with a lexical error.
+    fn try_stmt(&mut self) -> Result<StmtKind, String> {
+        self.uses_exceptions = true;
+        self.advance(); // `try`
+        if self.is(&Tok::LParen) {
+            return Err(format!(
+                "javars: try-with-resources is not supported (line {})",
+                self.line()
+            ));
+        }
+        self.eat(&Tok::LBrace)?;
+        let body = self.block()?;
+        let mut catches = Vec::new();
+        while matches!(self.peek(), Tok::Ident(w) if w == "catch") {
+            self.advance();
+            self.eat(&Tok::LParen)?;
+            // `final` is legal on a catch parameter and carries no meaning here.
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                self.advance();
+            }
+            let ty = self.type_name()?;
+            let name = self.ident()?;
+            self.eat(&Tok::RParen)?;
+            self.eat(&Tok::LBrace)?;
+            let arm_body = self.block()?;
+            catches.push(CatchArm {
+                ty,
+                name,
+                body: arm_body,
+            });
+        }
+        let finally_body = if matches!(self.peek(), Tok::Ident(w) if w == "finally") {
+            self.advance();
+            self.eat(&Tok::LBrace)?;
+            self.block()?
+        } else {
+            Vec::new()
+        };
+        if catches.is_empty() && finally_body.is_empty() {
+            return Err(format!(
+                "javars: `try` needs a `catch` or a `finally` (line {})",
+                self.line()
+            ));
+        }
+        Ok(StmtKind::Try {
+            body,
+            catches,
+            finally_body,
+        })
+    }
+
+    /// Probe for an enhanced-`for` header `<type> <name> :`, the cursor sitting
+    /// just past the `(`. On a match the cursor is left on the iterable
+    /// expression and the declared type + variable name are returned; otherwise
+    /// the cursor is restored untouched so the C-style clauses can parse.
+    fn try_foreach_header(&mut self) -> Result<Option<(String, String)>, String> {
+        if !self.looks_like_decl() {
+            return Ok(None);
+        }
+        let save = self.pos;
+        let ty = self.type_name()?;
+        let name = self.ident()?;
+        if self.is(&Tok::Colon) {
+            self.advance();
+            return Ok(Some((ty, name)));
+        }
+        self.pos = save;
+        Ok(None)
     }
 
     /// Consume an optional label identifier following `break`/`continue`
@@ -1083,7 +1220,12 @@ impl Parser {
                 extra_dims,
             });
         }
-        // `new Class(args)` — object construction.
+        // `new Class(args)` — object construction. Constructing a modeled
+        // `java.lang` throwable pulls in the exception prelude even when the
+        // program never throws it (`Exception e = new Exception("x");`).
+        if crate::prelude::is_throwable(&ty) {
+            self.uses_exceptions = true;
+        }
         let args = self.call_args()?;
         Ok(Expr::NewObject {
             class: ty,

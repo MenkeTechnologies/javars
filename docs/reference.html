@@ -100,7 +100,7 @@
         </article>
         <article class="doc-entry" id="doc-keyword-8">
           <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>for</code></h3>
-          <p>C-style loop: `for (init; cond; update) { .. }`</p>
+          <p>loop: C-style `for (init; cond; update)` or enhanced `for (T x : arr)`</p>
           <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { System.out.println(i); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-9">
@@ -139,17 +139,42 @@
           <pre><code class="lang-java">for (int i = 0; i &lt; 5; i++) { if (i == 2) continue; }</code></pre>
         </article>
         <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>true</code></h3>
+          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>try</code></h3>
+          <p>guard a block with handlers: `try { .. } catch (E e) { .. } finally { .. }`</p>
+          <pre><code class="lang-java">try { risky(); } catch (RuntimeException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-17">
+          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>catch</code></h3>
+          <p>handle a thrown exception whose class matches; arms are tried in order</p>
+          <pre><code class="lang-java">catch (IllegalArgumentException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-18">
+          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>finally</code></h3>
+          <p>block that runs on both the normal and the exceptional path out of a `try`</p>
+          <pre><code class="lang-java">try { work(); } finally { System.out.println("done"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-19">
+          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>throw</code></h3>
+          <p>raise a throwable; it unwinds to the nearest matching `catch`</p>
+          <pre><code class="lang-java">throw new IllegalStateException("bad state");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-20">
+          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>throws</code></h3>
+          <p>declare the exceptions a method may raise (parsed; javars checks none)</p>
+          <pre><code class="lang-java">static int parse(String s) throws Exception { return Integer.parseInt(s); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-keyword-21">
+          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>true</code></h3>
           <p>the boolean literal true</p>
           <pre><code class="lang-java">boolean b = true;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-17">
-          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>false</code></h3>
+        <article class="doc-entry" id="doc-keyword-22">
+          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>false</code></h3>
           <p>the boolean literal false</p>
           <pre><code class="lang-java">boolean b = false;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>new</code></h3>
+        <article class="doc-entry" id="doc-keyword-23">
+          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>new</code></h3>
           <p>object/array allocation keyword (reserved; recognized by the lexer)</p>
           <pre><code class="lang-java">int[] a = new int[3];</code></pre>
         </article>

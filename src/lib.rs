@@ -15,6 +15,7 @@ pub mod host;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
+pub mod prelude;
 pub mod rust_ffi;
 
 pub use banner::version_banner;
@@ -26,7 +27,12 @@ use fusevm::{VMResult, Value, VM};
 /// source. No-op when the source has no `rust` block.
 pub fn parse(src: &str) -> Result<ast::Program, String> {
     let src = rust_ffi::desugar(src);
-    parser::parse(&src)
+    let mut prog = parser::parse(&src)?;
+    // A program that throws or catches also declares, implicitly, the
+    // `java.lang` throwable classes it names — there is no JDK to import them
+    // from. No-op for every other program (see [`prelude::inject`]).
+    prelude::inject(&mut prog)?;
+    Ok(prog)
 }
 
 /// Parse and lower Java `src` to a runnable fusevm chunk.

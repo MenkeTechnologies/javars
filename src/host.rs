@@ -104,6 +104,38 @@ pub const JARRAY_NEW_MULTI: u16 = 718;
 /// floating path routes through here.
 pub const JDIV: u16 = 719;
 
+// ── Exception builtins (`throw` / `try` / `catch` / `finally`) ──
+// fusevm has no unwind opcode, so javars models the in-flight exception as a
+// host-side pending value plus a compiler-emitted check after every `Op::Call`.
+// A `throw` parks the throwable in [`PENDING`] and the compiler jumps to the
+// innermost handler in the current frame — or, when there is none, returns out
+// of the frame so the caller's post-call check sees the pending value and
+// repeats. That is the same "bubble the flag at every call site" contract the
+// sibling frontends use; only the unwind step differs, because javars's calls
+// are real fusevm call frames rather than nested VMs.
+
+/// `throw e` — stack `[throwable]`; `argc == 1`. Parks the value as the pending
+/// exception and returns `null`. The compiler emits the jump to the handler (or
+/// the frame exit) immediately after.
+pub const JTHROW: u16 = 720;
+/// Is an exception in flight? `argc == 0`; pushes a `Bool`. Emitted after every
+/// `Op::Call` in a program that uses exceptions.
+pub const JEXC_PENDING: u16 = 721;
+/// Take the pending exception (clearing it). `argc == 0`; pushes the throwable
+/// (or `null` when none). Emitted at the top of a handler.
+pub const JEXC_TAKE: u16 = 722;
+/// The current value-stack depth. `argc == 0`; pushes an `Int`. Recorded on
+/// entry to a `try` so the handler can discard the operands of the expression
+/// the throw abandoned.
+pub const JEXC_DEPTH: u16 = 723;
+/// Truncate the value stack to a depth recorded by [`JEXC_DEPTH`]. Stack
+/// `[depth]`; `argc == 1`.
+pub const JEXC_CUT: u16 = 724;
+/// Report an uncaught exception and halt. `argc == 0`. Formats Java's
+/// `Exception in thread "main" <qualified class>: <message>` line and faults, so
+/// the process exits non-zero the way `java` does.
+pub const JEXC_ABORT: u16 = 725;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -126,6 +158,11 @@ thread_local! {
     /// interfaces), populated by [`set_supertypes`] before a run. Used by
     /// `instanceof` and default `toString` to walk the supertype graph.
     static SUPERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    /// The exception in flight, if any. Set by [`JTHROW`], cleared by
+    /// [`JEXC_TAKE`] when a handler claims it. Lives here rather than on the
+    /// value stack because it has to survive the `Op::ReturnValue` that unwinds
+    /// each frame between the `throw` and its handler.
+    static PENDING: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Clear the object heap (and superclass table stays until reset). Called at the
@@ -133,6 +170,7 @@ thread_local! {
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
+    PENDING.with(|p| *p.borrow_mut() = None);
 }
 
 /// Install the type → direct-supertypes map for the current program (used by
@@ -219,6 +257,97 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JINSTANCEOF, b_instanceof);
     vm.register_builtin(JCLASSOF, b_classof);
     vm.register_builtin(JDIV, b_div);
+    vm.register_builtin(JTHROW, b_throw);
+    vm.register_builtin(JEXC_PENDING, b_exc_pending);
+    vm.register_builtin(JEXC_TAKE, b_exc_take);
+    vm.register_builtin(JEXC_DEPTH, b_exc_depth);
+    vm.register_builtin(JEXC_CUT, b_exc_cut);
+    vm.register_builtin(JEXC_ABORT, b_exc_abort);
+}
+
+/// `throw e` — park the throwable as the pending exception.
+fn b_throw(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let exc = args.into_iter().next().unwrap_or(Value::Undef);
+    PENDING.with(|p| *p.borrow_mut() = Some(exc));
+    Value::Undef
+}
+
+/// True while an exception is in flight (the post-call check).
+fn b_exc_pending(vm: &mut VM, argc: u8) -> Value {
+    pop_args(vm, argc);
+    Value::bool(PENDING.with(|p| p.borrow().is_some()))
+}
+
+/// Claim the pending exception for a handler, clearing it.
+fn b_exc_take(vm: &mut VM, argc: u8) -> Value {
+    pop_args(vm, argc);
+    PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef)
+}
+
+/// The value-stack depth at `try` entry.
+fn b_exc_depth(vm: &mut VM, argc: u8) -> Value {
+    pop_args(vm, argc);
+    Value::Int(vm.stack.len() as i64)
+}
+
+/// Discard everything the abandoned expression left on the value stack, back to
+/// the depth [`JEXC_DEPTH`] recorded at `try` entry. Frames between the `throw`
+/// and the handler clean themselves (`Op::ReturnValue` truncates to the frame
+/// base), but the operands of the half-evaluated expression *inside* the
+/// handler's own frame would otherwise pile up — once per throw, forever, in a
+/// loop.
+fn b_exc_cut(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let depth = args.first().map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
+    if depth <= vm.stack.len() {
+        vm.stack.truncate(depth);
+    }
+    Value::Undef
+}
+
+/// An exception that reached the top of `main`. Reports it the way `java` does
+/// — `Exception in thread "main" java.lang.Foo: message` — and faults, so the
+/// process exits non-zero.
+fn b_exc_abort(vm: &mut VM, argc: u8) -> Value {
+    pop_args(vm, argc);
+    let exc = PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or(Value::Undef);
+    let msg = format!("Exception in thread \"main\" {}", throwable_str(&exc));
+    ffi_fault(vm, msg);
+    Value::Undef
+}
+
+/// Render a throwable the way `Throwable.toString()` does, from the heap object
+/// directly. The Java-level `toString()` override cannot be called from here (a
+/// builtin cannot re-enter the VM), and this path only serves the uncaught
+/// report, so it reproduces the same text: the class name — qualified with
+/// `java.lang.` for the modeled JDK throwables, bare for a user class — plus
+/// `": " + detailMessage` when a message was supplied.
+fn throwable_str(v: &Value) -> String {
+    let Value::Obj(id) = v else {
+        return java_str(v);
+    };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(*id as usize) {
+            Some(HostObj::Instance { class, fields }) => {
+                let name = if crate::prelude::is_throwable(class) {
+                    format!("java.lang.{class}")
+                } else {
+                    class.clone()
+                };
+                match fields.get("detailMessage") {
+                    Some(m) if !matches!(m, Value::Undef) => format!("{name}: {}", java_str(m)),
+                    _ => name,
+                }
+            }
+            _ => java_str(v),
+        }
+    })
 }
 
 /// `classof(obj)` — the runtime class name of an instance (stack `[obj]`), or

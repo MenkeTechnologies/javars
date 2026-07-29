@@ -24,6 +24,12 @@ pub struct Program {
     /// (whichever declares `main`) is also present here so `new EntryClass()` and
     /// its instance members resolve.
     pub classes: Vec<Class>,
+    /// True when the unit mentions exceptions at all — a `try`, a `throw`, or a
+    /// `new` of a modeled `java.lang` throwable. Set by the parser and read by
+    /// [`crate::prelude::inject`] (which supplies the throwable classes) and by
+    /// the compiler (which only emits the post-call exception checks when this is
+    /// set, so an exception-free program's bytecode is unchanged).
+    pub uses_exceptions: bool,
 }
 
 /// A user-defined class: its instance fields, constructors, and instance
@@ -166,6 +172,21 @@ pub enum StmtKind {
         update: Option<Box<Stmt>>,
         body: Vec<Stmt>,
     },
+    /// `for (T x : arr) { .. }` — the enhanced (`for-each`) loop. Java defines
+    /// it over arrays and `Iterable`; javars has no collections, so the source
+    /// of elements is always an array. Kept as its own node rather than
+    /// desugared in the parser because the index cursor and the array temp must
+    /// be compiler-minted internal names (`#t0`), which are not expressible in
+    /// the `Stmt` surface the parser produces.
+    ForEach {
+        /// The declared element type (`String`, `int`, `var`, …) — recorded for
+        /// `/`-truncation typing and class-typed dispatch of the loop variable.
+        ty: String,
+        name: String,
+        /// The array expression, evaluated exactly once before the loop.
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     /// `switch (disc) { case L: .. break; default: .. }` — the classic
     /// statement form with fall-through between groups.
     Switch {
@@ -175,6 +196,15 @@ pub enum StmtKind {
     /// A labeled statement `label: <stmt>`. The label names the enclosing loop
     /// or switch so `break label;`/`continue label;` can target it.
     Labeled { label: String, body: Box<Stmt> },
+    /// `try { .. } catch (E e) { .. } … finally { .. }`. `catches` may be empty
+    /// (a `try`/`finally`), and `finally_body` may be empty (a `try`/`catch`).
+    Try {
+        body: Vec<Stmt>,
+        catches: Vec<CatchArm>,
+        finally_body: Vec<Stmt>,
+    },
+    /// `throw <expr>;` — raise the (already-constructed) throwable.
+    Throw(Expr),
     /// `break;` or `break label;`.
     Break(Option<String>),
     /// `continue;` or `continue label;`.
@@ -197,6 +227,19 @@ pub struct SwitchGroup {
     /// True when this group carries the `default:` label.
     pub is_default: bool,
     /// The statements of this group.
+    pub body: Vec<Stmt>,
+}
+
+/// One `catch (Type name) { body }` clause. Arms are tested in source order and
+/// the first whose type the thrown object `instanceof`-matches wins — Java's
+/// rule, and the reason a `catch (Exception e)` written before a
+/// `catch (RuntimeException e)` shadows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchArm {
+    /// The caught type's name (`RuntimeException`, a user class, …).
+    pub ty: String,
+    /// The bound exception variable.
+    pub name: String,
     pub body: Vec<Stmt>,
 }
 

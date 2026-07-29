@@ -27,12 +27,13 @@
 //!     function of its source.
 //!   * Documented `BUGS.md` simplifications are NOT generated, because they would
 //!     only reproduce known entries rather than find anything:
-//!       - 32-bit `int` overflow wrapping (operands and products stay well inside
-//!         `int` range),
 //!       - integer division/modulo by zero (divisors are always non-zero),
 //!       - widening *value* conversion (`double d = 7;` printing `7` not `7.0`),
 //!       - `char` as a one-character string,
-//!       - `==` identity on non-string objects.
+//!       - `==` identity on non-string objects,
+//!       - `int` arithmetic whose operand types are not statically known (the
+//!         `overflow` mode uses only statically `int`-typed operands, which is
+//!         exactly the subset javars wraps).
 //!
 //! Subprocess-only: this binary never links the javars library — it compares two
 //! `java` processes, exactly as a user would observe them.
@@ -71,16 +72,37 @@ fn pick<'a, T>(rng: &mut Rng, xs: &'a [T]) -> &'a T {
     &xs[rng.below(xs.len())]
 }
 
-// Operand pools. Integers stay well inside `int` range so 32-bit overflow —
-// a documented gap — is never the thing under test.
-const INTS: &[&str] = &["0", "1", "2", "3", "7", "10", "42", "100", "-1", "-7", "-42"];
+// Operand pools. These integers stay well inside `int` range so the general
+// modes test arithmetic rather than wrapping; 32-bit overflow has its own
+// `overflow` mode with its own operand pool.
+const INTS: &[&str] = &[
+    "0", "1", "2", "3", "7", "10", "42", "100", "-1", "-7", "-42",
+];
 const DIVS: &[&str] = &["1", "2", "3", "4", "5", "7", "-2", "-3"];
 const DBLS: &[&str] = &[
-    "0.0", "1.0", "0.5", "2.5", "3.14", "-1.5", "100.0", "1e3", "1e-3", "0.1", "1234567.0",
-    "1.0e7", "1.0e-7", "123456789.0",
+    "0.0",
+    "1.0",
+    "0.5",
+    "2.5",
+    "3.14",
+    "-1.5",
+    "100.0",
+    "1e3",
+    "1e-3",
+    "0.1",
+    "1234567.0",
+    "1.0e7",
+    "1.0e-7",
+    "123456789.0",
 ];
 const STRS: &[&str] = &[
-    "\"\"", "\"a\"", "\"abc\"", "\"Hello\"", "\" x \"", "\"AbC\"", "\"aXbXc\"",
+    "\"\"",
+    "\"a\"",
+    "\"abc\"",
+    "\"Hello\"",
+    "\" x \"",
+    "\"AbC\"",
+    "\"aXbXc\"",
 ];
 const BOOLS: &[&str] = &["true", "false"];
 const AOPS: &[&str] = &["+", "-", "*"];
@@ -200,7 +222,10 @@ fn g_math(r: &mut Rng) -> String {
         2 => p(format!("Math.min({}, {})", pick(r, DBLS), pick(r, DBLS))),
         3 => p(format!("Math.floor({})", pick(r, DBLS))),
         4 => p(format!("Math.ceil({})", pick(r, DBLS))),
-        _ => p(format!("Math.sqrt({})", pick(r, &["0.0", "1.0", "2.0", "9.0", "16.0"]))),
+        _ => p(format!(
+            "Math.sqrt({})",
+            pick(r, &["0.0", "1.0", "2.0", "9.0", "16.0"])
+        )),
     }
 }
 
@@ -211,14 +236,20 @@ fn g_format(r: &mut Rng) -> String {
         1 => p(format!("String.format(\"%s\", {})", pick(r, STRS))),
         2 => p(format!("String.format(\"%5d|\", {})", pick(r, INTS))),
         3 => p(format!("String.format(\"%-5d|\", {})", pick(r, INTS))),
-        _ => p(format!("String.format(\"%x\", Math.abs({}))", pick(r, INTS))),
+        _ => p(format!(
+            "String.format(\"%x\", Math.abs({}))",
+            pick(r, INTS)
+        )),
     }
 }
 
 /// `Integer` statics.
 fn g_integer(r: &mut Rng) -> String {
     match r.below(3) {
-        0 => p(format!("Integer.parseInt(\"{}\")", pick(r, &["0", "7", "-42", "100"]))),
+        0 => p(format!(
+            "Integer.parseInt(\"{}\")",
+            pick(r, &["0", "7", "-42", "100"])
+        )),
         1 => p(format!("Integer.toString({})", pick(r, INTS))),
         _ => p(format!("Integer.valueOf({})", pick(r, INTS))),
     }
@@ -251,6 +282,75 @@ fn g_array(r: &mut Rng) -> String {
     )
 }
 
+/// 32-bit `int` overflow. Every operand is statically `int`-typed (a literal, an
+/// `int` local, an `int` parameter, an `int[]` element, an `int` field) — the
+/// shape javars models — so a divergence here is a real wrap bug and not the
+/// documented "operand type not statically known" gap.
+fn g_overflow(r: &mut Rng) -> String {
+    let big = pick(
+        r,
+        &[
+            "2147483647",
+            "-2147483648",
+            "2000000000",
+            "1103515245",
+            "65536",
+            "100000",
+            "46341",
+        ],
+    );
+    let k = pick(r, &["2", "3", "31", "-1", "1103515245", "100000"]);
+    match r.below(7) {
+        0 => p(format!("{big} * {k}")),
+        1 => p(format!("{big} + {big}")),
+        2 => format!("{{ int ov = {big}; ov *= {k}; System.out.println(ov); }}"),
+        3 => format!("{{ int ov = {big}; ov++; System.out.println(ov); }}"),
+        4 => format!(
+            "{{ int ov = 12345; for (int i = 0; i < 8; i++) {{ ov = ov * {k} + 7; }} System.out.println(ov); }}"
+        ),
+        5 => format!("{{ int[] ova = {{{big}}}; ova[0] *= {k}; System.out.println(ova[0]); }}"),
+        // A `long` operand must NOT wrap — the other half of the rule.
+        _ => format!("{{ long ovl = {big}; System.out.println(ovl * {k}); }}"),
+    }
+}
+
+/// The enhanced `for` over an array — element rebinding, `.length` bound, and
+/// the `break`/`continue` edges.
+fn g_foreach(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    match r.below(3) {
+        0 => format!(
+            "{{ int[] fe = {{{a}, {b}, 5}}; int t = 0; for (int v : fe) {{ t += v; }} System.out.println(t); }}"
+        ),
+        1 => "{ String[] fs = {\"a\", \"bb\", \"ccc\"}; for (String v : fs) { System.out.print(v.length()); } System.out.println(); }"
+            .to_string(),
+        _ => format!(
+            "{{ int[] fe = {{{a}, {b}, 5, 9}}; int t = 0; for (int v : fe) {{ if (v == 5) {{ continue; }} if (v == 9) {{ break; }} t += v; }} System.out.println(t); }}"
+        ),
+    }
+}
+
+/// `throw`/`catch`/`finally` — handler selection by class, propagation out of a
+/// call, and the `finally` ordering.
+fn g_exception(r: &mut Rng) -> String {
+    let msg = pick(r, &["boom", "x", "bad input"]);
+    match r.below(4) {
+        0 => format!(
+            "{{ try {{ throw new IllegalStateException(\"{msg}\"); }} catch (RuntimeException e) {{ System.out.println(e.getMessage()); }} }}"
+        ),
+        1 => format!(
+            "{{ try {{ throw new NumberFormatException(\"{msg}\"); }} catch (IllegalStateException e) {{ System.out.println(\"wrong\"); }} catch (IllegalArgumentException e) {{ System.out.println(e); }} finally {{ System.out.println(\"fin\"); }} }}"
+        ),
+        2 => format!(
+            "{{ int t = 0; for (int i = 0; i < 4; i++) {{ try {{ if (i % 2 == 0) {{ throw new RuntimeException(\"{msg}\"); }} t += i; }} catch (RuntimeException e) {{ t += 10; }} }} System.out.println(t); }}"
+        ),
+        _ => format!(
+            "{{ try {{ try {{ throw new IllegalArgumentException(\"{msg}\"); }} finally {{ System.out.println(\"inner\"); }} }} catch (Exception e) {{ System.out.println(\"outer \" + e.getMessage()); }} }}"
+        ),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     All,
@@ -270,6 +370,9 @@ enum Mode {
     Loop,
     Switch,
     Array,
+    Overflow,
+    ForEach,
+    Exception,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -289,6 +392,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Loop,
     Mode::Switch,
     Mode::Array,
+    Mode::Overflow,
+    Mode::ForEach,
+    Mode::Exception,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -310,6 +416,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Loop => "loop",
         Mode::Switch => "switch",
         Mode::Array => "array",
+        Mode::Overflow => "overflow",
+        Mode::ForEach => "foreach",
+        Mode::Exception => "exception",
     }
 }
 
@@ -343,6 +452,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Loop => g_loop(r),
         Mode::Switch => g_switch(r),
         Mode::Array => g_array(r),
+        Mode::Overflow => g_overflow(r),
+        Mode::ForEach => g_foreach(r),
+        Mode::Exception => g_exception(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -380,7 +492,10 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("T.java");
     if std::fs::write(&path, src).is_err() {
-        return RunOut { stdout: Vec::new(), ok: false };
+        return RunOut {
+            stdout: Vec::new(),
+            ok: false,
+        };
     }
 
     let mut child = match Command::new(prog)
@@ -418,9 +533,18 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     let out = child.wait_with_output().ok();
     let _ = std::fs::remove_dir_all(&dir);
     match (status, out) {
-        (Some(st), Some(o)) => RunOut { stdout: o.stdout, ok: st.success() },
-        (_, Some(o)) => RunOut { stdout: o.stdout, ok: false },
-        _ => RunOut { stdout: Vec::new(), ok: false },
+        (Some(st), Some(o)) => RunOut {
+            stdout: o.stdout,
+            ok: st.success(),
+        },
+        (_, Some(o)) => RunOut {
+            stdout: o.stdout,
+            ok: false,
+        },
+        _ => RunOut {
+            stdout: Vec::new(),
+            ok: false,
+        },
     }
 }
 
@@ -532,9 +656,7 @@ fn parse_args() -> Args {
             "--seed" => a.seed = next(&mut i).parse().ok(),
             "--once" => a.once = true,
             "--verbose" | "-v" => a.verbose = true,
-            "--timeout" => {
-                a.timeout = Duration::from_secs(next(&mut i).parse().unwrap_or(60))
-            }
+            "--timeout" => a.timeout = Duration::from_secs(next(&mut i).parse().unwrap_or(60)),
             "--mode" => {
                 let m = next(&mut i);
                 match parse_mode(&m) {
@@ -547,7 +669,14 @@ fn parse_args() -> Args {
             }
             "--help" | "-h" => {
                 println!("parity-fuzz [--iters N] [--probes N] [--seed N] [--once] [--mode M] [--timeout SECS] [-v]");
-                println!("modes: all {}", CONCRETE.iter().map(|m| mode_name(*m)).collect::<Vec<_>>().join(" "));
+                println!(
+                    "modes: all {}",
+                    CONCRETE
+                        .iter()
+                        .map(|m| mode_name(*m))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
                 std::process::exit(0);
             }
             other => {
@@ -582,7 +711,11 @@ fn main() {
     let mut probes_run = 0usize;
 
     for k in 0..iters {
-        let seed = if args.once { base } else { base.wrapping_add(k as u64) };
+        let seed = if args.once {
+            base
+        } else {
+            base.wrapping_add(k as u64)
+        };
         let probes = gen_probes(seed, args.mode, args.probes);
         probes_run += probes.len();
         if !diverges(&probes, &ours, &oracle, args.timeout) {

@@ -7,9 +7,11 @@
 //! `crate::host` supplies string `+` concatenation for the mixed operands the
 //! VM's native arithmetic does not compute.
 //!
-//! Locals are addressed by name through `GetVar`/`SetVar` (slice 1 has a single
-//! `main` frame with no lexical scopes), so this stays a direct, readable
-//! lowering. `break`/`continue` are backpatched through a loop-context stack.
+//! `main`'s locals are addressed by name through `GetVar`/`SetVar` (one frame,
+//! no lexical scopes); a method body's locals live in call-frame slots. Both
+//! stay a direct, readable lowering. `break`/`continue` are backpatched through
+//! a loop-context stack, and `throw`/`catch` through a try-context stack plus a
+//! pending-exception check after every call (see the exception section below).
 
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
@@ -208,6 +210,15 @@ impl BreakScope {
     }
 }
 
+/// One enclosing `try` block's pending unwind jumps. A `throw` (or a post-call
+/// check that finds an exception in flight) lowered *inside* the try body emits
+/// a `Jump` and parks its index here; the jumps are patched to the handler once
+/// the try body has been laid out. Popped before the `catch` bodies are lowered,
+/// so a throw from a handler targets the *enclosing* try — Java's rule.
+struct TryScope {
+    unwind_ops: Vec<usize>,
+}
+
 struct Compiler {
     b: ChunkBuilder,
     /// The stack of enclosing breakable constructs (loops and `switch`es),
@@ -252,6 +263,14 @@ struct Compiler {
     this_class: Option<String>,
     /// Counter minting unique internal temp names (`new`/compound-assign temps).
     temp_counter: u32,
+    /// True when the program uses exceptions ([`Program::uses_exceptions`]).
+    /// Only then does a call site carry the pending-exception check, so an
+    /// exception-free program emits byte-identical bytecode to before.
+    has_exceptions: bool,
+    /// Enclosing `try` blocks of the *current frame*, innermost last. Empty in a
+    /// frame with no active try, which makes an unwind a plain "return out of
+    /// this frame and let the caller's check see it".
+    tries: Vec<TryScope>,
 }
 
 /// Compile a parsed [`Program`]'s `main` body to a runnable fusevm chunk.
@@ -295,6 +314,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         classes,
         this_class: None,
         temp_counter: 0,
+        has_exceptions: prog.uses_exceptions,
+        tries: Vec::new(),
     };
     // ── main body (global scope) ──
     for stmt in &prog.main {
@@ -302,7 +323,12 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     // Patch any program-level `break`/`return;` to the position right after
     // main. When subroutines follow, that position holds the skip-over jump.
+    // An exception that reached the top of `main` also lands here, so the
+    // uncaught report is emitted at exactly that position.
     let end = c.b.current_pos();
+    if c.has_exceptions {
+        c.emit_uncaught_check();
+    }
     let exit_ops = std::mem::take(&mut c.exit_ops);
     for op in exit_ops {
         c.b.patch_jump(op, end);
@@ -602,6 +628,13 @@ impl Compiler {
                 let ft = self.classes.get(&rc)?.field_types.get(name)?;
                 ft.ends_with("[]").then(|| ft.clone())
             }
+            // A row of a multi-dimensional array: `int[][]` indexed once is an
+            // `int[]`, so `g[i][j]` types its element as `int`.
+            Expr::Index { array, .. } => {
+                let outer = self.expr_array_type(array)?;
+                let inner = outer.strip_suffix("[]")?;
+                inner.ends_with("[]").then(|| inner.to_string())
+            }
             _ => None,
         }
     }
@@ -729,6 +762,28 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                // A bare stdlib class receiver (`Integer.parseInt`) is a static
+                // call whose declared return type is known.
+                if let Expr::Var(class) = recv.as_ref() {
+                    if is_static_class(class) && !self.is_declared_var(class) {
+                        if let Some(t) = static_call_java_type(class, method) {
+                            return Some(t.to_string());
+                        }
+                        // `Math.abs`/`max`/`min` are overloaded on every numeric
+                        // type and return the promotion of their arguments —
+                        // `abs(int)` is an `int` (and so wraps), `abs(long)` is
+                        // not. Unknown argument types leave the result unknown.
+                        if class == "Math" && matches!(method.as_str(), "abs" | "max" | "min") {
+                            let ranks: Option<Vec<u32>> = args
+                                .iter()
+                                .map(|a| self.expr_java_type(a).as_deref().and_then(numeric_rank))
+                                .collect();
+                            return ranks
+                                .map(|r| rank_name(r.into_iter().max().unwrap_or(3)).to_string());
+                        }
+                        return None;
+                    }
+                }
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
                 if let Some(rc) = self.expr_class(recv) {
@@ -1121,6 +1176,7 @@ impl Compiler {
             }
             let idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+            self.emit_exc_check(line);
             return Ok(());
         }
         // Virtual path: stash receiver + args in temps (single evaluation), read
@@ -1157,6 +1213,7 @@ impl Compiler {
             }
             let idx = self.b.add_name(mangled);
             self.b.emit(Op::Call(idx, argc), line);
+            self.emit_exc_check(line);
             end_jumps.push(self.b.emit(Op::Jump(0), line));
             let next = self.b.current_pos();
             self.b.patch_jump(skip, next);
@@ -1172,6 +1229,7 @@ impl Compiler {
         }
         let idx = self.b.add_name(&base);
         self.b.emit(Op::Call(idx, argc), line);
+        self.emit_exc_check(line);
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
@@ -1197,6 +1255,59 @@ impl Compiler {
                 self.b.emit(Op::LoadUndef, line);
             }
         }
+    }
+
+    // ── 32-bit `int` overflow wrapping ────────────────────────────────────
+    //
+    // fusevm's integers are 64-bit; Java's `int` is 32-bit and wraps. The two
+    // only disagree once a value leaves `int` range, and the compiler is the
+    // only place that knows which operations are `int` operations — the runtime
+    // value model has one integer type. So an operation whose *static* Java type
+    // is `int` gets a sign-extend of its low 32 bits appended, and every other
+    // operation is left alone.
+    //
+    // The sign-extend is `Shl 32; Shr 32` rather than a builtin because fusevm's
+    // `Shr` is an arithmetic shift both in the interpreter and in the Cranelift
+    // backend (`sshr`), so wrapping stays two native, JIT-traceable ops — a
+    // `CallBuiltin` would abort trace recording and cost hot loops their JIT.
+
+    /// True when `ty` is a static type whose arithmetic Java performs at 32-bit
+    /// `int` width. `byte`/`short` operands promote to `int` before any binary
+    /// operation, so they qualify; `long` (64-bit), `char` (a one-character
+    /// string in javars, not an integer), and an unknown type do not.
+    fn is_int_width(ty: Option<&str>) -> bool {
+        matches!(ty, Some("int" | "short" | "byte"))
+    }
+
+    /// True when both operands of a binary arithmetic operation are statically
+    /// `int`-width, which makes the result an `int` that wraps at 32 bits.
+    fn operands_are_int(&self, lhs: &Expr, rhs: &Expr) -> bool {
+        Self::is_int_width(self.expr_java_type(lhs).as_deref())
+            && Self::is_int_width(self.expr_java_type(rhs).as_deref())
+    }
+
+    /// True when a compound assignment (`x op= e`, `a[i] op= e`, `f op= e`,
+    /// `x++`) narrows back to a 32-bit `int`: the target is declared `int` and
+    /// the operand is statically `int`-width. A `long` target, or an operand
+    /// whose type is unknown, keeps the 64-bit result.
+    fn compound_wraps(&self, target_ty: Option<&str>, value: &Expr) -> bool {
+        target_ty == Some("int") && Self::is_int_width(self.expr_java_type(value).as_deref())
+    }
+
+    /// Sign-extend the low 32 bits of the value on top of the stack — Java's
+    /// `int` overflow wrap.
+    fn emit_wrap32(&mut self, line: u32) {
+        self.b.emit(Op::LoadInt(32), line);
+        self.b.emit(Op::Shl, line);
+        self.b.emit(Op::LoadInt(32), line);
+        self.b.emit(Op::Shr, line);
+    }
+
+    /// The declared type name of the field `name` on `recv`'s static class, when
+    /// both are statically known.
+    fn field_type_name(&self, recv: &Expr, name: &str) -> Option<String> {
+        let rc = self.expr_class(recv)?;
+        self.classes.get(&rc)?.field_types.get(name).cloned()
     }
 
     /// The static numeric category of `e` under Java's binary numeric promotion.
@@ -1418,8 +1529,14 @@ impl Compiler {
                     .or_else(|| init.as_ref().map(|e| self.expr_type(e)))
                     .unwrap_or(NumType::Other);
                 let raw = if ty == "var" {
+                    // Infer `var`'s type from the initializer: a user class when
+                    // there is one, else the initializer's static Java type
+                    // (`int`, `String`, `int[]`, …). Keeping the inferred type —
+                    // rather than the literal string `var` — is what lets a
+                    // `var` loop counter participate in `int` wrapping and in
+                    // array-element typing.
                     init.as_ref()
-                        .and_then(|e| self.expr_class(e))
+                        .and_then(|e| self.expr_class(e).or_else(|| self.expr_java_type(e)))
                         .unwrap_or_else(|| ty.clone())
                 } else {
                     ty.clone()
@@ -1436,17 +1553,14 @@ impl Compiler {
             StmtKind::Assign { name, op, value } => {
                 // A bare name that is a field of `this` (not a local) is an
                 // implicit `this.name = …` field assignment.
-                if let Some(class) = self.implicit_this_field(name) {
+                if self.implicit_this_field(name).is_some() {
                     let recv = Expr::This;
-                    let ft = self
-                        .classes
-                        .get(&class)
-                        .and_then(|ci| ci.field_types.get(name))
-                        .and_then(|ty| numtype_of_ty(ty))
-                        .unwrap_or(NumType::Other);
-                    return self.field_assign(&recv, name, *op, value, ft, line);
+                    return self.field_assign(&recv, name, *op, value, line);
                 }
                 let l = self.lookup_type(name);
+                // A compound assignment back into an `int` variable wraps.
+                let wrap =
+                    *op != AssignOp::Assign && self.compound_wraps(self.var_decl_type(name), value);
                 match op {
                     AssignOp::Assign => {
                         self.expr(value)?;
@@ -1460,11 +1574,19 @@ impl Compiler {
                         self.emit_div(l, r, line);
                     }
                     _ => {
-                        // `x <op>= e` → x = x <op> e
+                        // `x <op>= e` → x = x <op> e. `+=` onto a String
+                        // concatenates, so the operand honours `toString()`.
                         self.emit_get(name, line);
-                        self.expr(value)?;
+                        if *op == AssignOp::Add {
+                            self.emit_stringified(value)?;
+                        } else {
+                            self.expr(value)?;
+                        }
                         self.b.emit(compound_op(*op), line);
                     }
+                }
+                if wrap {
+                    self.emit_wrap32(line);
                 }
                 self.emit_set(name, line);
                 Ok(())
@@ -1480,18 +1602,7 @@ impl Compiler {
                 name,
                 op,
                 value,
-            } => {
-                let ft = self
-                    .expr_class(recv)
-                    .and_then(|rc| {
-                        self.classes
-                            .get(&rc)
-                            .and_then(|ci| ci.field_types.get(name))
-                            .and_then(|ty| numtype_of_ty(ty))
-                    })
-                    .unwrap_or(NumType::Other);
-                self.field_assign(recv, name, *op, value, ft, line)
-            }
+            } => self.field_assign(recv, name, *op, value, line),
             StmtKind::Expr(Expr::Println { newline, err, arg }) => {
                 // The print builtin returns `null`; discard it in statement
                 // position.
@@ -1514,6 +1625,12 @@ impl Compiler {
                 update,
                 body,
             } => self.for_stmt(init, cond, update, body),
+            StmtKind::ForEach {
+                ty,
+                name,
+                iter,
+                body,
+            } => self.foreach_stmt(ty, name, iter, body, line),
             StmtKind::Switch { disc, groups } => self.switch_stmt(disc, groups),
             StmtKind::Labeled { label, body } => {
                 // A label prefixing a loop/`switch` is consumed by that
@@ -1538,6 +1655,12 @@ impl Compiler {
                 }
                 Ok(())
             }
+            StmtKind::Try {
+                body,
+                catches,
+                finally_body,
+            } => self.try_stmt(body, catches, finally_body, line),
+            StmtKind::Throw(e) => self.throw_stmt(e, line),
             StmtKind::Break(label) => self.break_stmt(label.as_deref(), line),
             StmtKind::Continue(label) => self.continue_stmt(label.as_deref(), line),
             StmtKind::Return(val) => {
@@ -1682,6 +1805,272 @@ impl Compiler {
         Ok(())
     }
 
+    // ── exceptions (`throw` / `try` / `catch` / `finally`) ────────────────
+    //
+    // fusevm has no unwind opcode. javars models the in-flight exception as a
+    // host-side pending value ([`crate::host::JTHROW`]) plus two compiler-side
+    // pieces:
+    //
+    //   * inside a frame, an unwind is a `Jump` to the innermost enclosing
+    //     handler — backpatched through [`Compiler::tries`];
+    //   * across frames, an unwind is `LoadUndef; ReturnValue`, and every call
+    //     site is followed by a pending-exception check that repeats the unwind
+    //     in the caller. `Op::ReturnValue` truncates the value stack to the
+    //     frame base, so the abandoned operands of the callee cost nothing.
+    //
+    // Only the second piece has a runtime cost, and only in a program that uses
+    // exceptions at all ([`Compiler::has_exceptions`]).
+
+    /// Abandon the current computation: jump to the innermost handler in this
+    /// frame, or leave the frame so the caller's post-call check picks the
+    /// exception up. In `main` (no frame to leave) it jumps to the program exit,
+    /// where the uncaught report runs.
+    fn emit_unwind(&mut self, line: u32) {
+        if !self.tries.is_empty() {
+            let op = self.b.emit(Op::Jump(0), line);
+            self.tries.last_mut().unwrap().unwind_ops.push(op);
+        } else if self.scope.is_some() {
+            // A method/constructor frame: return a placeholder so the frame is
+            // popped and the stack rebalanced. The caller discards it — the
+            // pending exception, not the value, is what it acts on.
+            self.b.emit(Op::LoadUndef, line);
+            self.b.emit(Op::ReturnValue, line);
+        } else {
+            let op = self.b.emit(Op::Jump(0), line);
+            self.exit_ops.push(op);
+        }
+    }
+
+    /// Emit the post-call check: if the call left an exception in flight, unwind.
+    /// A no-op for a program with no exceptions, which is why those programs'
+    /// bytecode is unchanged. Must follow *every* `Op::Call` — a call path that
+    /// skips it swallows the exception and resumes with a placeholder value.
+    fn emit_exc_check(&mut self, line: u32) {
+        if !self.has_exceptions {
+            return;
+        }
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JEXC_PENDING, 0), line);
+        let jf = self.b.emit(Op::JumpIfFalse(0), line);
+        self.emit_unwind(line);
+        let after = self.b.current_pos();
+        self.b.patch_jump(jf, after);
+    }
+
+    /// Emit the end-of-`main` uncaught-exception report: an exception that no
+    /// handler claimed prints Java's `Exception in thread "main" …` line and
+    /// exits non-zero.
+    fn emit_uncaught_check(&mut self) {
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JEXC_PENDING, 0), 0);
+        let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::JEXC_ABORT, 0), 0);
+        self.b.emit(Op::Pop, 0);
+        let after = self.b.current_pos();
+        self.b.patch_jump(jf, after);
+    }
+
+    /// Lower `throw <expr>;`: evaluate the throwable, park it as the pending
+    /// exception, then unwind.
+    fn throw_stmt(&mut self, e: &Expr, line: u32) -> Result<(), String> {
+        self.expr(e)?;
+        self.b.emit(Op::CallBuiltin(crate::host::JTHROW, 1), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_unwind(line);
+        Ok(())
+    }
+
+    /// Lower `try { … } catch (E e) { … }* [finally { … }]`.
+    ///
+    /// Layout:
+    ///
+    /// ```text
+    ///   depth = JEXC_DEPTH          ; so the handler can drop abandoned operands
+    ///   <try body>                  ; unwinds inside it jump to `handler`
+    ///   Jump normal
+    /// handler:
+    ///   JEXC_CUT(depth); exc = JEXC_TAKE
+    ///   if (exc instanceof E1) { e1 = exc; <catch 1>; Jump normal }
+    ///   …
+    ///   <finally>                   ; unmatched: finally still runs …
+    ///   JTHROW(exc); <unwind>       ; … then the exception continues outward
+    /// normal:
+    ///   <finally>
+    /// ```
+    ///
+    /// The `finally` body is emitted twice — once per path — rather than shared
+    /// through a subroutine, because a shared copy would need a return address
+    /// and fusevm's frames are for calls, not for local jumps. Duplication is
+    /// what `javac` itself did before `jsr`/`ret` were dropped.
+    ///
+    /// A `return`/`break`/`continue` that would leave a `try` with a `finally`
+    /// is rejected at compile time (see [`escapes_body`]): javars would run the
+    /// jump without the `finally`, and silently skipping a cleanup block is
+    /// worse than not accepting the program.
+    fn try_stmt(
+        &mut self,
+        body: &[Stmt],
+        catches: &[CatchArm],
+        finally_body: &[Stmt],
+        line: u32,
+    ) -> Result<(), String> {
+        if !finally_body.is_empty()
+            && (escapes_body(body) || catches.iter().any(|c| escapes_body(&c.body)))
+        {
+            return Err(format!(
+                "javars: `return`/`break`/`continue` out of a `try` with a `finally` is not supported (line {line})"
+            ));
+        }
+        // Record the stack depth so the handler can discard whatever the
+        // abandoned expression had already pushed.
+        let depth_t = self.temp();
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JEXC_DEPTH, 0), line);
+        self.emit_set(&depth_t, line);
+
+        self.tries.push(TryScope {
+            unwind_ops: Vec::new(),
+        });
+        for s in body {
+            self.stmt(s)?;
+        }
+        let scope = self.tries.pop().unwrap();
+        let to_normal = self.b.emit(Op::Jump(0), line);
+
+        // ── handler ──
+        let handler = self.b.current_pos();
+        for op in scope.unwind_ops {
+            self.b.patch_jump(op, handler);
+        }
+        self.emit_get(&depth_t, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JEXC_CUT, 1), line);
+        self.b.emit(Op::Pop, line);
+        let exc_t = self.temp();
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JEXC_TAKE, 0), line);
+        self.emit_set(&exc_t, line);
+
+        // `catch` arms, in source order — the first type match wins.
+        let mut matched_jumps = Vec::new();
+        for arm in catches {
+            self.emit_get(&exc_t, line);
+            let c = self.b.add_constant(Value::str(arm.ty.clone()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
+            let jf = self.b.emit(Op::JumpIfFalse(0), line);
+            self.declare_local(&arm.name, &arm.ty, NumType::Other);
+            self.emit_get(&exc_t, line);
+            self.emit_set(&arm.name, line);
+            for s in &arm.body {
+                self.stmt(s)?;
+            }
+            matched_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(jf, next);
+        }
+        // No arm matched: run `finally`, then let the exception continue outward.
+        for s in finally_body {
+            self.stmt(s)?;
+        }
+        self.emit_get(&exc_t, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JTHROW, 1), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_unwind(line);
+
+        // ── normal completion (try fell through, or a catch arm finished) ──
+        let normal = self.b.current_pos();
+        self.b.patch_jump(to_normal, normal);
+        for op in matched_jumps {
+            self.b.patch_jump(op, normal);
+        }
+        for s in finally_body {
+            self.stmt(s)?;
+        }
+        Ok(())
+    }
+
+    /// Lower the enhanced `for (T x : arr) { … }` over an array.
+    ///
+    /// Java specifies the array form as exactly this index loop, with the array
+    /// and the cursor held in variables the program cannot name — so both live in
+    /// compiler-minted `#t` temps here. Evaluating the iterable once matters:
+    /// `for (int v : make())` must call `make()` a single time, and re-reading
+    /// `.length` from the temp (rather than from the source expression) keeps
+    /// that true.
+    ///
+    /// `continue` targets the increment, `break` the exit — the same contract
+    /// the C-style loop uses, so labeled `break`/`continue` work unchanged.
+    fn foreach_stmt(
+        &mut self,
+        ty: &str,
+        name: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: u32,
+    ) -> Result<(), String> {
+        let label = self.pending_label.take();
+        // `var` takes its type from the array's element type when that is
+        // statically known (`String[]` → `String`), so the loop variable still
+        // participates in `/` typing and class-typed dispatch.
+        let elem_ty = if ty == "var" {
+            self.expr_array_type(iter)
+                .and_then(|t| t.strip_suffix("[]").map(str::to_string))
+                .unwrap_or_else(|| ty.to_string())
+        } else {
+            ty.to_string()
+        };
+        let nt = numtype_of_ty(&elem_ty).unwrap_or(NumType::Other);
+        self.declare_local(name, &elem_ty, nt);
+
+        // The array and the index cursor, evaluated/initialised once.
+        let arr_t = self.temp();
+        self.expr(iter)?;
+        self.emit_set(&arr_t, line);
+        let idx_t = self.temp();
+        self.b.emit(Op::LoadInt(0), line);
+        self.emit_set(&idx_t, line);
+
+        // `i < arr.length`
+        let top = self.b.current_pos();
+        self.emit_get(&idx_t, line);
+        self.emit_get(&arr_t, line);
+        self.emit_field_get("length", line);
+        self.b.emit(Op::NumLt, line);
+        let jf = self.b.emit(Op::JumpIfFalse(0), line);
+
+        // The loop variable is rebound from `arr[i]` at the top of every
+        // iteration, before the body runs.
+        self.emit_get(&arr_t, line);
+        self.emit_get(&idx_t, line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), line);
+        self.emit_set(name, line);
+
+        self.scopes.push(BreakScope::loop_scope(label));
+        for s in body {
+            self.stmt(s)?;
+        }
+        // step label: `continue` lands on the increment.
+        let step = self.b.current_pos();
+        self.emit_get(&idx_t, line);
+        self.b.emit(Op::LoadInt(1), line);
+        self.b.emit(Op::Add, line);
+        self.emit_set(&idx_t, line);
+        self.b.emit(Op::Jump(top), line);
+
+        let end = self.b.current_pos();
+        self.b.patch_jump(jf, end);
+        let l = self.scopes.pop().unwrap();
+        for op in l.continue_ops {
+            self.b.patch_jump(op, step);
+        }
+        for op in l.break_ops {
+            self.b.patch_jump(op, end);
+        }
+        Ok(())
+    }
+
     /// Lower a classic `switch`. The discriminant is evaluated once into an
     /// internal temp, then a dispatch chain compares it (via `==`, matching
     /// javars's value-equality model for both `int` and `String`) against each
@@ -1808,24 +2197,18 @@ impl Compiler {
     /// local/global or — when `name` is an implicit `this` field — that field.
     fn post_inc_dec(&mut self, name: &str, inc: bool) -> Result<(), String> {
         let op = if inc { AssignOp::Add } else { AssignOp::Sub };
-        if let Some(class) = self.implicit_this_field(name) {
-            let ft = self.field_numtype(&class, name);
-            return self.field_assign(&Expr::This, name, op, &Expr::Int(1), ft, 0);
+        if self.implicit_this_field(name).is_some() {
+            return self.field_assign(&Expr::This, name, op, &Expr::Int(1), 0);
         }
+        let wrap = self.var_decl_type(name) == Some("int");
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
+        if wrap {
+            self.emit_wrap32(0);
+        }
         self.emit_set(name, 0);
         Ok(())
-    }
-
-    /// The numeric category of a field, for compound-assignment `/` typing.
-    fn field_numtype(&self, class: &str, name: &str) -> NumType {
-        self.classes
-            .get(class)
-            .and_then(|ci| ci.field_types.get(name))
-            .and_then(|ty| numtype_of_ty(ty))
-            .unwrap_or(NumType::Other)
     }
 
     /// Lower `System.out.print[ln](arg)` (or the `System.err` variant when
@@ -1850,10 +2233,10 @@ impl Compiler {
     }
 
     /// Evaluate `e`, dispatching a user-defined `toString()` when `e` is an
-    /// instance of a class whose (subtree) declares one — so `println(obj)`
-    /// honours the override. Otherwise evaluate normally (the host's `java_str`
-    /// renders the default `Class@hash` form). String concatenation with a plain
-    /// object and `String.valueOf(obj)` still use the default form (see BUGS.md).
+    /// instance of a class whose (subtree) declares one — so `println(obj)` and
+    /// string concatenation (`"x " + obj`) honour the override. Otherwise
+    /// evaluate normally (the host's `java_str` renders the default `Class@hash`
+    /// form, which is what `String.valueOf(obj)` still gets — see BUGS.md).
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
         if let Some(rc) = self.expr_class(e) {
             if self.has_instance_method(&rc, "toString", 0) {
@@ -1954,6 +2337,10 @@ impl Compiler {
                 match op {
                     UnOp::Neg => {
                         self.b.emit(Op::Negate, 0);
+                        // `-Integer.MIN_VALUE` is `Integer.MIN_VALUE`.
+                        if Self::is_int_width(self.expr_java_type(rhs).as_deref()) {
+                            self.emit_wrap32(0);
+                        }
                     }
                     UnOp::Not => {
                         self.b.emit(Op::LogNot, 0);
@@ -2111,6 +2498,7 @@ impl Compiler {
             let mangled = mangle(class, "<init>", &param_tys);
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
+            self.emit_exc_check(line);
             self.b.emit(Op::Pop, line); // discard the ctor's (Undef) result
         } else if has_any_ctor || !args.is_empty() {
             return Err(format!(
@@ -2157,15 +2545,17 @@ impl Compiler {
         self.emit_get(&idx_t, line);
         self.b
             .emit(Op::CallBuiltin(crate::host::JARRAY_GET, 2), line);
-        // combine with value
-        let elem_t = match array {
-            Expr::Var(n) => self
-                .var_decl_type(n)
-                .map(array_elem_numtype)
-                .unwrap_or(NumType::Other),
-            _ => NumType::Other,
-        };
-        self.emit_compound(op, value, elem_t, line)?;
+        // combine with value: the element's declared type decides both the
+        // compound-`/` truncation and the 32-bit wrap.
+        let elem_ty = self
+            .expr_array_type(array)
+            .and_then(|t| t.strip_suffix("[]").map(str::to_string));
+        let elem_t = elem_ty
+            .as_deref()
+            .map(|t| numtype_of_ty(t).unwrap_or(NumType::Other))
+            .unwrap_or(NumType::Other);
+        let wrap = self.compound_wraps(elem_ty.as_deref(), value);
+        self.emit_compound(op, value, elem_t, wrap, line)?;
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -2187,9 +2577,16 @@ impl Compiler {
         name: &str,
         op: AssignOp,
         value: &Expr,
-        field_ty: NumType,
         line: u32,
     ) -> Result<(), String> {
+        // The field's declared type drives both the compound-`/` truncation and
+        // the 32-bit wrap, so it is resolved here rather than at each call site.
+        let field_ty_name = self.field_type_name(recv, name);
+        let field_ty = field_ty_name
+            .as_deref()
+            .and_then(numtype_of_ty)
+            .unwrap_or(NumType::Other);
+        let wrap = self.compound_wraps(field_ty_name.as_deref(), value);
         if op == AssignOp::Assign {
             self.expr(recv)?;
             let name_c = self.b.add_constant(Value::str(name.to_string()));
@@ -2206,7 +2603,7 @@ impl Compiler {
         // old field value
         self.emit_get(&obj_t, line);
         self.emit_field_get(name, line);
-        self.emit_compound(op, value, field_ty, line)?;
+        self.emit_compound(op, value, field_ty, wrap, line)?;
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -2228,6 +2625,7 @@ impl Compiler {
         op: AssignOp,
         value: &Expr,
         target: NumType,
+        wrap32: bool,
         line: u32,
     ) -> Result<(), String> {
         if op == AssignOp::Div {
@@ -2235,8 +2633,15 @@ impl Compiler {
             self.expr(value)?;
             self.emit_div(target, r, line);
         } else {
-            self.expr(value)?;
+            if op == AssignOp::Add {
+                self.emit_stringified(value)?;
+            } else {
+                self.expr(value)?;
+            }
             self.b.emit(compound_op(op), line);
+        }
+        if wrap32 {
+            self.emit_wrap32(line);
         }
         Ok(())
     }
@@ -2288,6 +2693,7 @@ impl Compiler {
                         let mangled = mangle(&sup, "<init>", &param_tys);
                         let idx = self.b.add_name(&mangled);
                         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+                        self.emit_exc_check(line);
                         return Ok(());
                     }
                 }
@@ -2313,6 +2719,7 @@ impl Compiler {
             }
             let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
+            self.emit_exc_check(line);
             return Ok(());
         }
         // A bare call inside an instance method/ctor that names an instance
@@ -2382,13 +2789,27 @@ impl Compiler {
         if let BinOp::Div = op {
             let l = self.expr_type(lhs);
             let r = self.expr_type(rhs);
+            let wrap = self.operands_are_int(lhs, rhs);
             self.expr(lhs)?;
             self.expr(rhs)?;
             self.emit_div(l, r, 0);
+            // `Integer.MIN_VALUE / -1` is the one division that overflows.
+            if wrap {
+                self.emit_wrap32(0);
+            }
             return Ok(());
         }
-        self.expr(lhs)?;
-        self.expr(rhs)?;
+        // `+` with a class-typed operand is string concatenation, and Java
+        // concatenation calls the operand's `toString()` — dispatch it here the
+        // same way `println(obj)` does. For every other operator (and every
+        // non-class operand) this is exactly `expr`.
+        if op == BinOp::Add {
+            self.emit_stringified(lhs)?;
+            self.emit_stringified(rhs)?;
+        } else {
+            self.expr(lhs)?;
+            self.expr(rhs)?;
+        }
         let vop = match op {
             BinOp::Add => Op::Add,
             BinOp::Sub => Op::Sub,
@@ -2404,6 +2825,13 @@ impl Compiler {
             BinOp::And | BinOp::Or => unreachable!("handled above"),
         };
         self.b.emit(vop, 0);
+        // An `int` arithmetic result wraps at 32 bits. Comparisons yield a
+        // boolean and `+` on a String concatenates, so neither wraps.
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod)
+            && self.operands_are_int(lhs, rhs)
+        {
+            self.emit_wrap32(0);
+        }
         Ok(())
     }
 
@@ -2463,6 +2891,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                     .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
                 || body_has_ffi(body)
         }
+        StmtKind::ForEach { iter, body, .. } => expr_has_ffi(iter) || body_has_ffi(body),
         StmtKind::Switch { disc, groups } => {
             expr_has_ffi(disc)
                 || groups
@@ -2471,7 +2900,77 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
         }
         StmtKind::Labeled { body, .. } => body_has_ffi(std::slice::from_ref(body)),
         StmtKind::Return(val) => val.as_ref().is_some_and(expr_has_ffi),
+        StmtKind::Try {
+            body,
+            catches,
+            finally_body,
+        } => {
+            body_has_ffi(body)
+                || catches.iter().any(|c| body_has_ffi(&c.body))
+                || body_has_ffi(finally_body)
+        }
+        StmtKind::Throw(e) => expr_has_ffi(e),
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
+    })
+}
+
+/// True when `body` contains a jump that would leave it — a `return`, or a
+/// `break`/`continue` not answered by a loop/`switch` inside `body` itself.
+/// Used to reject the one `finally` shape javars cannot honour: a `finally`
+/// whose block is skipped by a jump out of the guarded region.
+///
+/// A labeled `break`/`continue` always counts as escaping, because its target
+/// is by definition named outside the statement it appears in.
+fn escapes_body(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::Break(label) | StmtKind::Continue(label) => label.is_some(),
+        StmtKind::If { then, els, .. } => escapes_body(then) || escapes_body(els),
+        StmtKind::Labeled { body, .. } => escapes_body(std::slice::from_ref(body)),
+        StmtKind::Try {
+            body,
+            catches,
+            finally_body,
+        } => {
+            escapes_body(body)
+                || catches.iter().any(|c| escapes_body(&c.body))
+                || escapes_body(finally_body)
+        }
+        // A loop or `switch` answers its own unlabeled `break`/`continue`, so
+        // only a `return` (or a labeled jump) inside it escapes.
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. } => body_returns(body),
+        StmtKind::Switch { groups, .. } => groups.iter().any(|g| body_returns(&g.body)),
+        _ => false,
+    })
+}
+
+/// True when `body` contains a `return` or a labeled jump anywhere inside it
+/// (including nested loops) — the part of [`escapes_body`] that a surrounding
+/// loop cannot absorb.
+fn body_returns(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match &s.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::Break(label) | StmtKind::Continue(label) => label.is_some(),
+        StmtKind::If { then, els, .. } => body_returns(then) || body_returns(els),
+        StmtKind::Labeled { body, .. } => body_returns(std::slice::from_ref(body)),
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::ForEach { body, .. } => body_returns(body),
+        StmtKind::Switch { groups, .. } => groups.iter().any(|g| body_returns(&g.body)),
+        StmtKind::Try {
+            body,
+            catches,
+            finally_body,
+        } => {
+            body_returns(body)
+                || catches.iter().any(|c| body_returns(&c.body))
+                || body_returns(finally_body)
+        }
+        _ => false,
     })
 }
 
@@ -2585,6 +3084,26 @@ fn is_static_class(name: &str) -> bool {
     )
 }
 
+/// The declared Java return type of a known stdlib static call, or `None` when
+/// javars does not model it statically. `Math.abs`/`max`/`min` are deliberately
+/// absent: their result is `int` or `double` depending on the argument, and
+/// claiming either would mis-type the other. Feeds overload resolution and the
+/// 32-bit `int` wrap decision.
+fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
+    Some(match (class, method) {
+        ("Integer", "parseInt") | ("Integer", "valueOf") => "int",
+        // `Long.parseLong` and `Math.round` are 64-bit results in Java, so they
+        // must NOT be treated as `int` — that is exactly the case where the
+        // wrap would be wrong.
+        ("Long", "parseLong") | ("Math", "round") => "long",
+        ("Math", "pow") | ("Math", "sqrt") | ("Math", "floor") | ("Math", "ceil") => "double",
+        ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
+        ("Arrays", "toString") => "String",
+        ("Boolean", "parseBoolean") => "boolean",
+        _ => return None,
+    })
+}
+
 /// The static numeric category of a known stdlib static call, when it is
 /// statically `int`-typed (so it participates in `/` truncation). Methods whose
 /// result is `int`-or-`double` at runtime (`Math.abs`/`max`/`min`) stay `None`
@@ -2606,6 +3125,7 @@ fn is_breakable(s: &Stmt) -> bool {
         StmtKind::While { .. }
             | StmtKind::DoWhile { .. }
             | StmtKind::For { .. }
+            | StmtKind::ForEach { .. }
             | StmtKind::Switch { .. }
     )
 }

@@ -81,7 +81,7 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
     (
         "for",
         "Keyword",
-        "C-style loop: `for (init; cond; update) { .. }`",
+        "loop: C-style `for (init; cond; update)` or enhanced `for (T x : arr)`",
         "for (int i = 0; i < 3; i++) { System.out.println(i); }",
     ),
     (
@@ -125,6 +125,36 @@ const CORPUS: &[(&str, &str, &str, &str)] = &[
         "Keyword",
         "skip to the next iteration of the nearest (or labeled) loop",
         "for (int i = 0; i < 5; i++) { if (i == 2) continue; }",
+    ),
+    (
+        "try",
+        "Keyword",
+        "guard a block with handlers: `try { .. } catch (E e) { .. } finally { .. }`",
+        "try { risky(); } catch (RuntimeException e) { System.out.println(e.getMessage()); }",
+    ),
+    (
+        "catch",
+        "Keyword",
+        "handle a thrown exception whose class matches; arms are tried in order",
+        "catch (IllegalArgumentException e) { System.out.println(e); }",
+    ),
+    (
+        "finally",
+        "Keyword",
+        "block that runs on both the normal and the exceptional path out of a `try`",
+        "try { work(); } finally { System.out.println(\"done\"); }",
+    ),
+    (
+        "throw",
+        "Keyword",
+        "raise a throwable; it unwinds to the nearest matching `catch`",
+        "throw new IllegalStateException(\"bad state\");",
+    ),
+    (
+        "throws",
+        "Keyword",
+        "declare the exceptions a method may raise (parsed; javars checks none)",
+        "static int parse(String s) throws Exception { return Integer.parseInt(s); }",
     ),
     (
         "true",

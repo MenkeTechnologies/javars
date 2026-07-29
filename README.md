@@ -155,8 +155,16 @@ Implemented and checked against the reference `java`:
   binary operators `+ - * / %`, `== != < > <= >=`, `&& ||` (short-circuiting);
   unary `-` and `!`; parenthesised grouping; Java's `+` string concatenation.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
-  `for (init; cond; update)`, `break`, `continue`, and `return` (a bare
-  `return;` ends `main`; `return <expr>;` returns a value from a method).
+  `for (init; cond; update)`, the enhanced `for (T x : arr)`, `break`,
+  `continue`, and `return` (a bare `return;` ends `main`; `return <expr>;`
+  returns a value from a method).
+- **Exceptions** — `throw`, `try` / `catch` / `finally`, multiple `catch` arms
+  matched by class, and the modeled `java.lang` throwable hierarchy
+  (`RuntimeException`, `IllegalArgumentException`, `NumberFormatException`, …)
+  supplied as an implicit prelude. A throw unwinds real fusevm call frames into
+  the caller's handler; an uncaught one reports and exits non-zero.
+- **`int` width** — Java's 32-bit `int` wrapping, for operations whose operand
+  types are statically `int`; `long` stays 64-bit.
 - **Division** — Java's binary numeric promotion: `int / int` truncates toward
   zero (`7 / 2` → `3`, `-7 / 2` → `-3`), and a `double` operand keeps the
   fractional result (`7.0 / 2` → `3.5`), decided from the operands' static types.
@@ -285,13 +293,10 @@ Next waves, in priority order:
 
 1. **Wider standard library** — more `Math`/`Integer` statics, `java.util`
    collections, more `String` methods, and arrow-`switch` expressions.
-2. **Object-model depth** — enums and records, abstract classes, the enhanced
-   `for`, and virtual `toString` inside string concatenation (today concatenation
-   with a plain object uses the default `Class@hash` form; `println(obj)` and
-   explicit `.toString()` use the override).
-3. **A differential parity harness** — a snippet corpus diffed live against a
-   reference `java`, frozen and replayed in CI (the pattern `ruby`/`node`/
-   `python` frontends use).
+2. **Object-model depth** — enums, records, and abstract classes.
+3. **Catchable runtime faults** — an out-of-range index or a malformed
+   `Integer.parseInt` still aborts instead of raising a catchable
+   `ArrayIndexOutOfBoundsException` / `NumberFormatException`.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

@@ -49,3 +49,14 @@ public class T { public static void main(String[] a) { System.out.println(String
 public class T { public static void main(String[] a) { System.out.println(String.format("%-5d|", 42)); } }	42   |\n
 public class T { public static void main(String[] a) { System.out.println(Integer.parseInt("-42")); } }	-42\n
 public class T { public static void main(String[] a) { System.out.println(Integer.toString(100)); } }	100\n
+public class T { public static void main(String[] a) { int[] xs = {1, 2, 3}; int t = 0; for (int v : xs) { t += v; } System.out.println(t); } }	6\n
+public class T { public static void main(String[] a) { String[] ns = {"ann", "bo"}; for (String s : ns) { System.out.println(s.toUpperCase()); } } }	ANN\nBO\n
+public class T { public static void main(String[] a) { double[] ds = {1.0, 5.0}; for (double d : ds) { System.out.println(d / 2); } } }	0.5\n2.5\n
+public class T { static int[] g() { System.out.println("g"); return new int[]{4}; } public static void main(String[] a) { for (int v : g()) { System.out.println(v); } } }	g\n4\n
+public class T { public static void main(String[] a) { try { throw new IllegalStateException("boom"); } catch (RuntimeException e) { System.out.println(e.getMessage()); } finally { System.out.println("fin"); } } }	boom\nfin\n
+public class T { static void f() { throw new NumberFormatException("nfe"); } public static void main(String[] a) { try { f(); } catch (IllegalArgumentException e) { System.out.println(e); } } }	java.lang.NumberFormatException: nfe\n
+public class T { public static void main(String[] a) { int t = 0; for (int i = 0; i < 4; i++) { try { if (i % 2 == 0) { throw new RuntimeException("x"); } t += i; } catch (RuntimeException e) { t += 10; } } System.out.println(t); } }	24\n
+public class T { public static void main(String[] a) { System.out.println(2147483647 + 1); System.out.println(-2147483648 - 1); System.out.println(2147483647 * 2147483647); } }	-2147483648\n2147483647\n1\n
+public class T { public static void main(String[] a) { int x = 2147483647; x++; System.out.println(x); int y = 100000; y *= y; System.out.println(y); } }	-2147483648\n1410065408\n
+public class T { public static void main(String[] a) { long l = 2147483647; System.out.println(l + 1); System.out.println(l * l); } }	2147483648\n4611686014132420609\n
+public class T { public static void main(String[] a) { int s = 12345; for (int i = 0; i < 20; i++) { s = s * 1103515245 + 12345; } System.out.println(s); } }	-804247707\n

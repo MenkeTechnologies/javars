@@ -12,6 +12,11 @@ reported as parse errors, never silently mis-run.
   and `continue`, including the labeled forms (`outer: for (…) { break outer; }`)
   — a labeled `break` exits the named loop/`switch`, a labeled `continue` steps
   the named loop.
+- **The enhanced `for`** (`for (String s : arr)`, `for (var v : arr)`) over an
+  array — including a `T[][]` row (`for (int[] row : grid)`), an empty array, and
+  labeled `break`/`continue`. The array expression is evaluated exactly once, and
+  the element type drives `/` typing the same way a declared local does. There
+  are no collections yet, so an array is the only thing it can iterate.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
   `ceil`/`round` (with Java's int-vs-double overload result typing),
   `Integer.parseInt` (with radix)/`valueOf`/`toString` (with radix),
@@ -48,8 +53,10 @@ reported as parse errors, never silently mis-run.
   **virtual** — keyed on the receiver's runtime class via a compile-time chain.
 - **Inheritance.** `extends`, `super(…)` constructor chaining, inherited fields
   and methods, method overriding, and `instanceof` (respecting the subclass
-  chain). `toString()` overrides are honoured by `System.out.println(obj)` and by
-  an explicit `obj.toString()`.
+  chain). `toString()` overrides are honoured by `System.out.println(obj)`, by
+  string concatenation (`"x = " + obj`, `s += obj`), and by an explicit
+  `obj.toString()`. `String.valueOf(obj)` and `Arrays.toString(objArray)` still
+  render the default `Class@hash` form.
 - **Interfaces.** `interface I { void m(); }` with abstract and `default`
   methods, `class C implements I, J`, `interface B extends A`, dispatch through
   an interface-typed variable or parameter (virtual on the runtime class),
@@ -66,6 +73,21 @@ reported as parse errors, never silently mis-run.
   bounded `<T extends Number>` / `<T extends Comparable<T>>`, the diamond
   `new Box<>()`, and library type arguments (`List<String>`, `Map<K, V>`) all
   parse and run with type arguments erased at runtime, exactly like `javac`.
+- **Exceptions.** `throw <expr>;`, `try`/`catch`/`finally`, multiple `catch`
+  arms (first matching type wins), and a `throws` clause (parsed and discarded —
+  javars has no checked-exception analysis). The thrown object unwinds real
+  fusevm call frames: a `throw` several methods deep lands in the caller's
+  handler, and a `finally` runs on both the normal and the exceptional path. The
+  `java.lang` throwable hierarchy from `Throwable` down through `Exception`/
+  `RuntimeException` to `IllegalArgumentException`, `NumberFormatException`,
+  `IllegalStateException`, `ArithmeticException`, `NullPointerException`,
+  `ClassCastException`, `UnsupportedOperationException`, and the
+  `IndexOutOfBounds` pair is supplied as an implicit prelude (`src/prelude.rs`),
+  so `catch (Exception e)` matches a thrown `NumberFormatException`,
+  `e.getMessage()` works, and `System.out.println(e)` prints
+  `java.lang.Foo: message`. A user class may `extend` any of them. An exception
+  no handler claims reports Java's `Exception in thread "main" …` line on stderr
+  and exits non-zero.
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -76,7 +98,6 @@ reported as parse errors, never silently mis-run.
 - **Abstract classes, enums, records.** (Interface abstract methods and
   `abstract` method *signatures* parse; a standalone `abstract class` body is not
   specially modeled.)
-- **The enhanced `for`** (`for (var x : coll)`).
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
   `String`/`Arrays` statics listed above and the `String` instance methods are
   the whole library surface — no `java.util.*` collections, no `Math` constants
@@ -84,7 +105,15 @@ reported as parse errors, never silently mis-run.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **Arrow `switch` expressions**, `switch` on enums/patterns.
-- **`try`/`catch`/`finally`, exceptions, `throw`.**
+- **Try-with-resources** (`try (var r = …)`) and **multi-catch**
+  (`catch (A | B e)`) — both are rejected, not mis-parsed.
+- **A `return`/`break`/`continue` that leaves a `try` with a `finally`.**
+  javars would take the jump without running the `finally`, so the program is
+  rejected at compile time instead. Without a `finally`, all three work.
+- **Catching a runtime fault.** `catch` only sees objects a `throw` raised.
+  javars's own faults — an out-of-range array index, a `NumberFormatException`
+  from `Integer.parseInt`, integer division by zero — still abort the program
+  with a `javars:` message instead of being catchable exceptions.
 - **Lambdas, streams, `var` type inference beyond storage.**
 
 ## Modeled with a documented simplification
@@ -109,7 +138,15 @@ reported as parse errors, never silently mis-run.
   statically-unknown operand routes through `JDIV`, because Java floating
   division is IEEE-754 (`x / 0.0` is a signed infinity, `0.0 / 0.0` is NaN)
   where the native op yields `Undef`.
-- **Integer arithmetic uses fusevm's 64-bit semantics.** Java `int` 32-bit
-  overflow wrapping is not yet modeled (values behave like `long`).
+- **32-bit `int` wrapping needs a statically known `int` type.** An arithmetic
+  operation whose operands are *statically* `int` (or the `byte`/`short` that
+  promote to it) wraps at 32 bits exactly like Java — literals, `int` locals,
+  parameters, fields, array elements, `int`-returning methods, `Integer.parseInt`,
+  and `Math.abs`/`max`/`min` of `int` arguments all qualify, and so do the
+  compound forms (`x *= k`, `x++`, `a[i] += k`, `obj.f -= k`). `long` stays
+  64-bit. When an operand's static type cannot be determined the operation keeps
+  fusevm's 64-bit result, so an overflow there still differs from Java. The wrap
+  is a native `Shl 32; Shr 32` pair rather than a builtin, so hot integer loops
+  keep their JIT trace.
 - **Uninitialized locals are unbound** rather than rejected; reading one before
   assignment yields `null` instead of a compile error.

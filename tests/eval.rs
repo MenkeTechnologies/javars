@@ -962,3 +962,188 @@ fn erased_library_generic_type_args_parse() {
     );
     assert_eq!(out, "true\ntrue\n8\n");
 }
+
+#[test]
+fn enhanced_for_iterates_arrays_once() {
+    // The array expression must be evaluated exactly once (the `made()` probe
+    // prints on each call), the loop variable is rebound per element, and the
+    // element's declared type still drives `/` typing (`d / 2` is floating).
+    // Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int[] made() { System.out.println(\"made\"); return new int[]{5, 6}; }\
+         static int sum(int[] a) { int t = 0; for (int v : a) { t += v; } return t; }\
+         public static void main(String[] x) {\
+         String[] names = {\"ann\", \"bo\"};\
+         for (String s : names) { System.out.println(s.toUpperCase()); }\
+         for (int v : made()) { System.out.println(v); }\
+         System.out.println(sum(new int[]{1, 2, 3}));\
+         double[] ds = {1.0, 5.0}; for (double d : ds) { System.out.println(d / 2); }\
+         for (var s : names) { System.out.println(s.length()); }\
+         for (String s : new String[0]) { System.out.println(\"never\"); } } }");
+    assert!(ok);
+    assert_eq!(out, "ANN\nBO\nmade\n5\n6\n6\n0.5\n2.5\n3\n2\n");
+}
+
+#[test]
+fn enhanced_for_honours_labeled_break_and_continue() {
+    // A labeled `continue`/`break` must target the named enhanced-`for` exactly
+    // as it targets a C-style one. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         int[][] grid = {{1, 2}, {3, 4}, {5, 6}};\
+         int total = 0;\
+         outer: for (int[] row : grid) { for (int v : row) {\
+         if (v == 4) { continue outer; } if (v == 5) { break outer; } total += v; } }\
+         System.out.println(total); } }");
+    assert!(ok);
+    assert_eq!(out, "6\n");
+}
+
+#[test]
+fn exceptions_propagate_across_call_frames_to_a_handler() {
+    // The crux of the lowering: a `throw` several frames deep must unwind every
+    // frame and land in the caller's `catch`, and a `catch` arm matches by the
+    // thrown object's class hierarchy. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static void a() { b(); }\
+         static void b() { throw new IllegalArgumentException(\"deep\"); }\
+         static int guarded() { try { a(); return 1; } catch (RuntimeException e) { return 2; } }\
+         public static void main(String[] x) {\
+         System.out.println(guarded());\
+         try { a(); } catch (Exception e) { System.out.println(\"caught \" + e.getMessage()); }\
+         try { a(); } catch (Exception e) { System.out.println(e); } } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2\ncaught deep\njava.lang.IllegalArgumentException: deep\n"
+    );
+}
+
+#[test]
+fn catch_arms_match_in_source_order_and_finally_always_runs() {
+    // The first arm whose type matches wins (a `NumberFormatException` is an
+    // `IllegalArgumentException`), `finally` runs on both the normal and the
+    // exceptional path, and an unmatched exception continues outward *after*
+    // the inner `finally`. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         try { throw new NumberFormatException(\"nfe\"); }\
+         catch (IllegalStateException e) { System.out.println(\"ise\"); }\
+         catch (IllegalArgumentException e) { System.out.println(\"iae \" + e.getMessage()); }\
+         catch (RuntimeException e) { System.out.println(\"rte\"); }\
+         finally { System.out.println(\"fin1\"); }\
+         try { System.out.println(\"ok\"); } finally { System.out.println(\"fin2\"); }\
+         try { try { throw new IllegalStateException(\"inner\"); } finally { System.out.println(\"fin3\"); } }\
+         catch (RuntimeException e) { System.out.println(\"outer \" + e.getMessage()); }\
+         System.out.println(new RuntimeException().getMessage()); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "iae nfe\nfin1\nok\nfin2\nfin3\nouter inner\nnull\n");
+}
+
+#[test]
+fn user_exception_subclass_carries_its_own_state() {
+    // A user class extending a modeled `java.lang` throwable chains through
+    // `super(m)`, keeps its own fields, and satisfies `instanceof` on both its
+    // own name and its inherited ones. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class MyError extends RuntimeException { int code; MyError(String m, int c) { super(m); code = c; } }\
+         static void boom() { throw new MyError(\"bad\", 7); }\
+         public static void main(String[] a) {\
+         try { boom(); } catch (RuntimeException e) {\
+         System.out.println(e.getMessage());\
+         System.out.println(e instanceof MyError);\
+         System.out.println(e instanceof Exception); } } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "bad\ntrue\ntrue\n");
+}
+
+#[test]
+fn uncaught_exception_reports_and_exits_nonzero() {
+    // An exception no handler claims prints Java's `Exception in thread "main"`
+    // line (on stderr, with javars's error prefix) and fails the run — output
+    // written before the throw is still flushed.
+    let (out, err, ok) = run_streams(
+        "public class Main {\
+         static int f(int n) { if (n > 2) { throw new IllegalStateException(\"big\"); } return n; }\
+         public static void main(String[] a) {\
+         System.out.println(f(1)); System.out.println(f(9)); System.out.println(\"never\"); } }",
+    );
+    assert!(!ok);
+    assert_eq!(out, "1\n");
+    assert!(
+        err.contains("Exception in thread \"main\" java.lang.IllegalStateException: big"),
+        "stderr was {err:?}"
+    );
+}
+
+#[test]
+fn throwing_in_a_loop_does_not_grow_the_value_stack() {
+    // Each throw abandons a half-evaluated expression; the handler must discard
+    // those operands (JEXC_CUT) or a loop would leak one value per iteration.
+    // 20_000 iterations would be visible as unbounded growth.
+    let (out, ok) = run(
+        "public class Main {\
+         static int boom(int i) { throw new RuntimeException(\"x\"); }\
+         public static void main(String[] a) {\
+         int n = 0;\
+         for (int i = 0; i < 20000; i++) { try { n += boom(i) + boom(i); } catch (RuntimeException e) { n++; } }\
+         System.out.println(n); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "20000\n");
+}
+
+#[test]
+fn return_out_of_a_try_with_finally_is_rejected() {
+    // javars would run the jump without the `finally` block, so the program is
+    // refused rather than silently skipping the cleanup.
+    let (_, ok) = run("public class Main {\
+         static int f() { try { return 1; } finally { System.out.println(\"fin\"); } }\
+         public static void main(String[] a) { System.out.println(f()); } }");
+    assert!(!ok);
+}
+
+#[test]
+fn int_arithmetic_wraps_at_32_bits_and_long_does_not() {
+    // Java's `int` is 32-bit and wraps; `long` is 64-bit. The distinction is
+    // static, so it has to survive locals, parameters, compound assignment,
+    // `++`, fields, and array elements. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main {\
+         static int mul(int a, int b) { return a * b; }\
+         static class Acc { int v; }\
+         public static void main(String[] a) {\
+         int max = 2147483647; int min = -2147483648;\
+         System.out.println(max + 1); System.out.println(min - 1);\
+         System.out.println(max * max); System.out.println(-min); System.out.println(min / -1);\
+         System.out.println(mul(100000, 100000));\
+         long lmax = 2147483647; System.out.println(lmax + 1); System.out.println(lmax * lmax);\
+         int x = max; x += 1; System.out.println(x);\
+         int c = max; c++; System.out.println(c);\
+         Acc acc = new Acc(); acc.v = max; acc.v += 5; System.out.println(acc.v);\
+         int[] arr = {max}; arr[0] *= 3; System.out.println(arr[0]);\
+         System.out.println(Integer.parseInt(\"2147483647\") + 1);\
+         System.out.println(Long.parseLong(\"2147483647\") + 1);\
+         System.out.println(Math.abs(max) * 2); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "-2147483648\n2147483647\n1\n-2147483648\n-2147483648\n1410065408\n2147483648\n4611686014132420609\n-2147483648\n-2147483648\n-2147483644\n2147483645\n-2147483648\n2147483648\n-2\n"
+    );
+}
+
+#[test]
+fn int_hash_loop_matches_the_jdk() {
+    // The classic overflow-sensitive shape: a multiply-accumulate that only
+    // agrees with Java once every step wraps. Verified against OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         int seed = 12345;\
+         for (int i = 0; i < 20; i++) { seed = seed * 1103515245 + 12345; }\
+         System.out.println(seed);\
+         int h = 0; String s = \"hello world\";\
+         for (int i = 0; i < s.length(); i++) { h = h * 31 + s.indexOf(s.substring(i, i + 1)); }\
+         System.out.println(h); } }");
+    assert!(ok);
+    assert_eq!(out, "-804247707\n-921940528\n");
+}
