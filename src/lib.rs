@@ -16,6 +16,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod parser;
 pub mod prelude;
+pub mod reference;
 pub mod rust_ffi;
 pub mod tiers;
 

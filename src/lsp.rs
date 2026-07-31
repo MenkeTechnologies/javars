@@ -2,9 +2,11 @@
 //!
 //! Self-contained and read-only: diagnostics come from the same `parser::parse`
 //! the runtime uses (a syntax error maps to the reported line); hover and
-//! completion draw on the keyword / type / IO corpus below. No output ever
-//! reaches the terminal — JSON-RPC on stdio only. Structure follows the sibling
-//! `-rs` frontends' `lsp.rs` (see `pythonrs/src/lsp.rs`).
+//! completion draw on the language-reference corpus in [`crate::reference`], the
+//! same `(name, chapter, signature, doc, example)` table the offline
+//! `docs/reference.html` generator renders. No output ever reaches the terminal
+//! — JSON-RPC on stdio only. Structure follows the sibling `-rs` frontends'
+//! `lsp.rs` (see `pythonrs/src/lsp.rs`).
 
 use std::collections::HashMap;
 
@@ -22,256 +24,7 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, Uri,
 };
 
-/// The keyword / type / IO corpus: (name, chapter, one-line doc, example).
-/// Single source of truth for LSP completion and hover, and for the offline
-/// `docs/reference.html` generator. Every entry mirrors a surface the current
-/// javars build actually recognizes:
-///   * "Keyword" → a reserved word in `lexer.rs` (`keyword_or_ident`).
-///   * "Type" → an identifier javars accepts in declaration position
-///     (`parser.rs` `looks_like_decl`); the runtime is dynamically
-///     typed on the fusevm value model, so the annotation is
-///     retained for diagnostics but does not gate execution yet.
-///   * "IO" → the `System.out` / `System.err` methods lowered to the Java-
-///     formatting print builtins in `host.rs` (`JPRINTLN` / `JPRINT` /
-///     `JEPRINTLN` / `JEPRINT`).
-const CORPUS: &[(&str, &str, &str, &str)] = &[
-    // ── Keyword (lexer keyword_or_ident) ──
-    (
-        "class",
-        "Keyword",
-        "declare a class; javars runs the `main` of the entry class",
-        "public class Main { public static void main(String[] args) { } }",
-    ),
-    (
-        "public",
-        "Keyword",
-        "access modifier; on the entry class and its `main` method",
-        "public static void main(String[] args) { }",
-    ),
-    (
-        "static",
-        "Keyword",
-        "class-level (non-instance) member; required on `main`",
-        "public static void main(String[] args) { }",
-    ),
-    (
-        "void",
-        "Keyword",
-        "no return value; the type of `main`",
-        "static void main(String[] args) { }",
-    ),
-    (
-        "if",
-        "Keyword",
-        "conditional branch: `if (cond) { .. } else { .. }`",
-        "if (x > 0) { System.out.println(\"pos\"); }",
-    ),
-    (
-        "else",
-        "Keyword",
-        "fallback branch of an `if`",
-        "if (x > 0) { } else { System.out.println(\"non-pos\"); }",
-    ),
-    (
-        "while",
-        "Keyword",
-        "loop while the condition is true: `while (cond) { .. }`",
-        "int i = 0; while (i < 3) { i++; }",
-    ),
-    (
-        "for",
-        "Keyword",
-        "loop: C-style `for (init; cond; update)` or enhanced `for (T x : arr)`",
-        "for (int i = 0; i < 3; i++) { System.out.println(i); }",
-    ),
-    (
-        "do",
-        "Keyword",
-        "do/while loop: run the body once, then repeat while the condition holds",
-        "int i = 0; do { i++; } while (i < 3);",
-    ),
-    (
-        "switch",
-        "Keyword",
-        "multi-way branch on an int or String; groups fall through until `break`",
-        "switch (n) { case 1: System.out.println(\"one\"); break; default: }",
-    ),
-    (
-        "case",
-        "Keyword",
-        "a `switch` label; a matched case runs until a `break` or the switch end",
-        "case 2: System.out.println(\"two\"); break;",
-    ),
-    (
-        "default",
-        "Keyword",
-        "the `switch` label taken when no `case` matches",
-        "default: System.out.println(\"other\");",
-    ),
-    (
-        "return",
-        "Keyword",
-        "return from the current method (bare `return;` ends `void main`)",
-        "if (done) return;",
-    ),
-    (
-        "break",
-        "Keyword",
-        "exit the nearest loop/switch, or a labeled one: `break outer;`",
-        "outer: for (int i = 0; ; i++) { if (i == 5) break outer; }",
-    ),
-    (
-        "continue",
-        "Keyword",
-        "skip to the next iteration of the nearest (or labeled) loop",
-        "for (int i = 0; i < 5; i++) { if (i == 2) continue; }",
-    ),
-    (
-        "try",
-        "Keyword",
-        "guard a block with handlers: `try { .. } catch (E e) { .. } finally { .. }`",
-        "try { risky(); } catch (RuntimeException e) { System.out.println(e.getMessage()); }",
-    ),
-    (
-        "catch",
-        "Keyword",
-        "handle a thrown exception whose class matches; arms are tried in order",
-        "catch (IllegalArgumentException e) { System.out.println(e); }",
-    ),
-    (
-        "finally",
-        "Keyword",
-        "block that runs on both the normal and the exceptional path out of a `try`",
-        "try { work(); } finally { System.out.println(\"done\"); }",
-    ),
-    (
-        "throw",
-        "Keyword",
-        "raise a throwable; it unwinds to the nearest matching `catch`",
-        "throw new IllegalStateException(\"bad state\");",
-    ),
-    (
-        "throws",
-        "Keyword",
-        "declare the exceptions a method may raise (parsed; javars checks none)",
-        "static int parse(String s) throws Exception { return Integer.parseInt(s); }",
-    ),
-    (
-        "true",
-        "Keyword",
-        "the boolean literal true",
-        "boolean b = true;",
-    ),
-    (
-        "false",
-        "Keyword",
-        "the boolean literal false",
-        "boolean b = false;",
-    ),
-    (
-        "new",
-        "Keyword",
-        "object/array allocation keyword (reserved; recognized by the lexer)",
-        "int[] a = new int[3];",
-    ),
-    // ── Type (declaration-position type names) ──
-    (
-        "int",
-        "Type",
-        "32-bit integer local declaration",
-        "int n = 42;",
-    ),
-    (
-        "long",
-        "Type",
-        "64-bit integer local declaration (`L` literal suffix accepted)",
-        "long big = 9000000000L;",
-    ),
-    (
-        "short",
-        "Type",
-        "16-bit integer local declaration",
-        "short s = 7;",
-    ),
-    (
-        "byte",
-        "Type",
-        "8-bit integer local declaration",
-        "byte b = 1;",
-    ),
-    (
-        "double",
-        "Type",
-        "64-bit floating-point local declaration (prints with a trailing .0)",
-        "double d = 3.0;   // System.out.println(d) => 3.0",
-    ),
-    (
-        "float",
-        "Type",
-        "32-bit floating-point local declaration (`f` literal suffix accepted)",
-        "float f = 1.5f;",
-    ),
-    (
-        "boolean",
-        "Type",
-        "boolean local declaration (`true` / `false`)",
-        "boolean ok = true;",
-    ),
-    (
-        "char",
-        "Type",
-        "character local; a char literal is modeled as a one-char string",
-        "char c = 'A';",
-    ),
-    (
-        "String",
-        "Type",
-        "string local; `+` with a String operand concatenates (host numeric hook)",
-        "String s = \"hi \" + 1 + 2;   // => 'hi 12'",
-    ),
-    (
-        "var",
-        "Type",
-        "local variable with an inferred type (Java 10+)",
-        "var s = \"inferred\";",
-    ),
-    // ── IO (System.out print builtins) ──
-    (
-        "println",
-        "IO",
-        "System.out.println(arg): print the Java string form of arg, then a newline",
-        "System.out.println(\"hello\");",
-    ),
-    (
-        "print",
-        "IO",
-        "System.out.print(arg): print the Java string form of arg with no newline",
-        "System.out.print(\"no newline\");",
-    ),
-    (
-        "System",
-        "IO",
-        "the System class; javars models `System.out` for console output",
-        "System.out.println(42);",
-    ),
-    (
-        "out",
-        "IO",
-        "System.out — the standard output stream (println / print)",
-        "System.out.print(\"x\");",
-    ),
-    (
-        "err",
-        "IO",
-        "System.err — the standard error stream (println / print)",
-        "System.err.println(\"oops\");",
-    ),
-];
-
-/// The corpus, exposed for offline doc generation.
-pub fn corpus() -> &'static [(&'static str, &'static str, &'static str, &'static str)] {
-    CORPUS
-}
+use crate::reference::{corpus, Entry};
 
 /// Open document text keyed by URI, kept current from the sync notifications so
 /// hover can look up the identifier under the cursor.
@@ -394,26 +147,42 @@ fn dispatch_notification(conn: &Connection, docs: &mut Docs, not: lsp_server::No
     }
 }
 
+/// The completion-item kind a chapter's entries present as, so an editor's
+/// completion list groups keywords, types, and callables the way it would for
+/// real Java.
+fn item_kind(chapter: &str) -> CompletionItemKind {
+    match chapter {
+        "Keywords" | "Contextual Keywords" => CompletionItemKind::KEYWORD,
+        "Literals" => CompletionItemKind::VALUE,
+        "Types" | "Collection Types" | "Throwables" => CompletionItemKind::CLASS,
+        "Functional Interfaces" => CompletionItemKind::INTERFACE,
+        "Operators" | "Format Conversions" => CompletionItemKind::OPERATOR,
+        _ => CompletionItemKind::METHOD,
+    }
+}
+
 fn completions() -> CompletionResponse {
-    let items = CORPUS
+    let items = corpus()
         .iter()
-        .map(|(name, chapter, doc, _example)| CompletionItem {
+        .map(|(name, chapter, sig, doc, _example)| CompletionItem {
             label: name.to_string(),
-            kind: Some(match *chapter {
-                "Keyword" => CompletionItemKind::KEYWORD,
-                "Type" => CompletionItemKind::CLASS,
-                _ => CompletionItemKind::METHOD,
-            }),
-            detail: Some((*doc).to_string()),
+            kind: Some(item_kind(chapter)),
+            // The signature is what an editor shows inline next to the label;
+            // the prose goes to the expandable documentation pane.
+            detail: Some((*sig).to_string()),
+            documentation: Some(lsp_types::Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: (*doc).to_string(),
+            })),
             ..Default::default()
         })
         .collect();
     CompletionResponse::Array(items)
 }
 
-/// Hover: look up the identifier under the cursor in the corpus and render its
-/// chapter, doc, and example. Falls back to a short banner when the cursor is
-/// not on a known name.
+/// Hover: look up the identifier under the cursor in the corpus and render every
+/// entry of that name — its chapter, signature, description, and example. Falls
+/// back to a short banner when the cursor is not on a known name.
 fn hover(docs: &Docs, params: &HoverParams) -> Hover {
     let pos = params.text_document_position_params.position;
     let uri = params
@@ -426,17 +195,19 @@ fn hover(docs: &Docs, params: &HoverParams) -> Hover {
         .and_then(|text| word_at(text, pos))
         .unwrap_or_default();
 
-    let matches: Vec<&(&str, &str, &str, &str)> =
-        CORPUS.iter().filter(|(name, ..)| *name == word).collect();
+    let matches: Vec<&Entry> = corpus().iter().filter(|(name, ..)| *name == word).collect();
 
     let body = if matches.is_empty() {
         "**javars** — Java on the fusevm bytecode VM + Cranelift JIT.".to_string()
     } else {
         let mut out = String::new();
-        for (name, chapter, doc, example) in matches {
+        for (name, chapter, sig, doc, example) in matches {
             out.push_str(&format!(
-                "**`{name}`** — _{chapter}_\n\n{doc}\n\n```java\n{example}\n```\n\n"
+                "**`{name}`** — _{chapter}_\n\n```java\n{sig}\n```\n\n{doc}\n\n"
             ));
+            if !example.is_empty() {
+                out.push_str(&format!("```java\n{example}\n```\n\n"));
+            }
         }
         out.trim_end().to_string()
     };

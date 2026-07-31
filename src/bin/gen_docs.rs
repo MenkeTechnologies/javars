@@ -1,24 +1,26 @@
-//! Offline generator for `docs/reference.html` — the keyword / type / IO
-//! reference page, rendered with the same cyberpunk HUD chrome as
-//! `docs/index.html`. Run before publishing GitHub Pages:
+//! Offline generator for `docs/reference.html` — the full language reference,
+//! rendered with the same cyberpunk HUD chrome as `docs/index.html`. Run before
+//! publishing GitHub Pages:
 //!
 //! ```sh
 //! cargo run --bin gen-docs
 //! ```
 //!
-//! Source of truth: the LSP corpus in `javars::lsp` (`corpus()`), the exact
-//! `(name, chapter, doc, example)` table the editor completion/hover path
-//! renders from. The static page and the language server therefore never drift
-//! — a name is documented here only if the runtime actually recognizes it in
-//! `lexer.rs` (keywords), `parser.rs` (declaration-position types), or `host.rs`
-//! (the `System.out` print builtins).
+//! Source of truth: `javars::reference` (`corpus()`), the exact
+//! `(name, chapter, signature, doc, example)` table the editor completion/hover
+//! path renders from. The static page and the language server therefore never
+//! drift — a name is documented here only if the runtime actually implements it,
+//! and each chapter of the corpus names the source table it was read from
+//! (`lexer.rs` for the reserved words, `parser.rs` for the contextual ones,
+//! `prelude.rs` for the throwables and functional interfaces, `host.rs` for the
+//! builtins and the library surface, `compiler.rs` for the rest).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 fn main() {
-    let corpus = javars::lsp::corpus();
-    let chapters: BTreeSet<&str> = corpus.iter().map(|(_, c, _, _)| *c).collect();
+    let corpus = javars::reference::corpus();
+    let chapters: BTreeSet<&str> = corpus.iter().map(|(_, c, _, _, _)| *c).collect();
 
     let page = format!(
         "{head}{body}{foot}",
@@ -41,11 +43,12 @@ fn main() {
     );
 }
 
-/// A reference-corpus entry: (name, chapter, doc, example).
-type CEntry<'a> = (&'a str, &'a str, &'a str, &'a str);
+/// A reference-corpus entry: (name, chapter, signature, doc, example).
+type CEntry = javars::reference::Entry;
 
 /// Render one `<section>` per chapter (first-seen order), each holding one
-/// `<article class="doc-entry">` per name: heading, one-line description, and a
+/// `<article class="doc-entry">` per name: an anchored heading, the signature in
+/// a fenced code block, the description, and — when the entry carries one — a
 /// runnable usage example.
 fn build_body(corpus: &[CEntry]) -> String {
     let mut chapters: Vec<(&str, Vec<&CEntry>)> = Vec::new();
@@ -66,22 +69,54 @@ fn build_body(corpus: &[CEntry]) -> String {
             slug = slugify(chapter),
             title = html_escape(chapter),
         );
-        for (idx, (name, _chapter, doc, example)) in entries.iter().enumerate() {
+        for (idx, (name, _chapter, sig, doc, example)) in entries.iter().enumerate() {
             let anchor = format!("doc-{}-{}", slugify(chapter), idx + 1);
             let _ = write!(
                 out,
                 "        <article class=\"doc-entry\" id=\"{anchor}\">\n\
                  \x20         <h3><a class=\"doc-anchor\" href=\"#{anchor}\">#</a> <code>{name}</code></h3>\n\
-                 \x20         <p>{doc}</p>\n\
-                 \x20         <pre><code class=\"lang-java\">{example}</code></pre>\n\
-                 \x20       </article>\n",
+                 \x20         <pre><code class=\"lang-java\">{sig}</code></pre>\n\
+                 \x20         <p>{doc}</p>\n",
                 anchor = anchor,
                 name = html_escape(name),
-                doc = html_escape(doc),
-                example = html_escape(example),
+                sig = html_escape(sig),
+                doc = prose(doc),
             );
+            if !example.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "          <pre><code class=\"lang-java\">{example}</code></pre>",
+                    example = html_escape(example),
+                );
+            }
+            out.push_str("        </article>\n");
         }
         out.push_str("      </section>\n");
+    }
+    out
+}
+
+/// Render a description: HTML-escape it, then turn each pair of backticks into
+/// an inline `<code>` span. The corpus writes identifiers in Markdown backticks
+/// because the LSP hover renders Markdown; the HTML page (and the LaTeX the PDF
+/// pipeline derives from it) needs real markup instead of literal backticks. An
+/// unpaired trailing backtick is left as text.
+fn prose(s: &str) -> String {
+    let escaped = html_escape(s);
+    let parts: Vec<&str> = escaped.split('`').collect();
+    // An odd backtick count means the entry is malformed; leave every backtick
+    // as text rather than emitting an unbalanced tag.
+    if parts.len() % 2 == 0 {
+        return escaped;
+    }
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        // Odd-indexed segments are the ones between a pair of backticks.
+        if i % 2 == 1 {
+            let _ = write!(out, "<code>{part}</code>");
+        } else {
+            out.push_str(part);
+        }
     }
     out
 }
@@ -114,7 +149,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="javars — Language reference. Keywords, declaration types, and console IO recognized by the current javars build. MIT licensed.">
+  <meta name="description" content="javars — Language reference. Every keyword, operator, type, library method, throwable, functional interface, and runtime builtin the current javars build implements. MIT licensed.">
   <title>javars &mdash; Language Reference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -169,7 +204,7 @@ const HEAD: &str = r#"<!DOCTYPE html>
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, declaration-position type name, and console-IO surface the current javars build recognizes, grouped by keyword then type then IO. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; types mirror the declaration heuristic in <code>parser.rs</code>; the <code>System.out</code> methods mirror the print builtins in <code>host.rs</code>.</p>
+      <p class="tutorial-subtitle">Every name the current javars build implements — reserved and contextual keywords, literal forms, declaration types, operators, console IO, the <code>java.lang.String</code> and <code>java.util</code> method surfaces, the static library, the modeled throwables and functional interfaces, synthesized class members, method-reference forms, <code>String.format</code> conversions, and the runtime builtin id space. Each entry carries its signature, a description written from the implementation, and — where one clarifies the behaviour — a runnable example. Where javars computes something other than <code>java</code> does, the entry says so. This page is generated from the reference corpus (<code>src/reference.rs</code>) by the <code>gen-docs</code> binary, and the language server reads the same table, so the page, the editor tooling, and the runtime cannot drift apart.</p>
 "#;
 
 const FOOT: &str = r#"

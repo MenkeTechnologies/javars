@@ -269,10 +269,14 @@ Implemented and checked against the reference `java`:
 ### Editor tooling
 
 `java --lsp` runs a read-only language server: completion and hover from the
-keyword / type / IO corpus (the same table that generates
-[`docs/reference.html`](https://menketechnologies.github.io/javars/reference.html)),
-and diagnostics from the runtime's own parser — a syntax error maps to a
-diagnostic on the reported line.
+language-reference corpus in `src/reference.rs` — every keyword, operator, type,
+library method, throwable, functional interface, synthesized class member,
+`String.format` conversion, and runtime builtin the build implements, each with
+its signature, a description, and an example — and diagnostics from the runtime's
+own parser, where a syntax error maps to a diagnostic on the reported line. The
+same table generates
+[`docs/reference.html`](https://menketechnologies.github.io/javars/reference.html),
+so the editor and the published reference cannot drift apart.
 
 `java --dap` runs a Debug Adapter over stdio: line breakpoints, single-stepping
 (`next` / `stepIn` / `stepOut` advance to the next statement in the single `main`

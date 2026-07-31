@@ -121,8 +121,12 @@ and ruby, so JIT and VM improvements benefit all of them at once.
 .SH 4. TOOLING
 .SS Language server (\-\-lsp)
 .B java \-\-lsp
-speaks LSP over stdio: completion and hover from the keyword / type / IO corpus
-(the same table that generates
+speaks LSP over stdio: completion and hover from the language\-reference corpus in
+.IR src/reference.rs
+\(em every keyword, operator, type, library method, throwable, functional
+interface, class member, format conversion and runtime builtin the build
+implements, each with a signature, a description and an example (the same table
+that generates
 .IR docs/reference.html ),
 and diagnostics from the runtime's own parser \(em a syntax error maps to a
 diagnostic on the reported line. It is read\-only; no output reaches the terminal.

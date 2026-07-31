@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="javars — Language reference. Keywords, declaration types, and console IO recognized by the current javars build. MIT licensed.">
+  <meta name="description" content="javars — Language reference. Every keyword, operator, type, library method, throwable, functional interface, and runtime builtin the current javars build implements. MIT licensed.">
   <title>javars &mdash; Language Reference</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -59,207 +59,1954 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>LANGUAGE REFERENCE</h2>
-      <p class="tutorial-subtitle">Every reserved keyword, declaration-position type name, and console-IO surface the current javars build recognizes, grouped by keyword then type then IO. This page is generated from the language-server corpus (<code>src/lsp.rs</code>) by the <code>gen-docs</code> binary, so it stays in sync with what the runtime and editor tooling actually know about. Keywords mirror <code>lexer.rs</code>; types mirror the declaration heuristic in <code>parser.rs</code>; the <code>System.out</code> methods mirror the print builtins in <code>host.rs</code>.</p>
+      <p class="tutorial-subtitle">Every name the current javars build implements — reserved and contextual keywords, literal forms, declaration types, operators, console IO, the <code>java.lang.String</code> and <code>java.util</code> method surfaces, the static library, the modeled throwables and functional interfaces, synthesized class members, method-reference forms, <code>String.format</code> conversions, and the runtime builtin id space. Each entry carries its signature, a description written from the implementation, and — where one clarifies the behaviour — a runnable example. Where javars computes something other than <code>java</code> does, the entry says so. This page is generated from the reference corpus (<code>src/reference.rs</code>) by the <code>gen-docs</code> binary, and the language server reads the same table, so the page, the editor tooling, and the runtime cannot drift apart.</p>
 
-      <section class="tutorial-section" id="ch-keyword">
-        <h2>Keyword</h2>
-        <article class="doc-entry" id="doc-keyword-1">
-          <h3><a class="doc-anchor" href="#doc-keyword-1">#</a> <code>class</code></h3>
-          <p>declare a class; javars runs the `main` of the entry class</p>
-          <pre><code class="lang-java">public class Main { public static void main(String[] args) { } }</code></pre>
+      <section class="tutorial-section" id="ch-keywords">
+        <h2>Keywords</h2>
+        <article class="doc-entry" id="doc-keywords-1">
+          <h3><a class="doc-anchor" href="#doc-keywords-1">#</a> <code>class</code></h3>
+          <pre><code class="lang-java">[modifiers] class Name [extends Base] [implements I, J] { members }</code></pre>
+          <p>Declares a class. Every class in a compilation unit — top-level siblings and nested <code>static</code> classes alike — is flattened into one namespace, so a nested class is referred to by its bare name. javars runs the <code>main</code> of whichever class declares <code>public static void main(String[] args)</code>.</p>
+          <pre><code class="lang-java">public class Main { public static void main(String[] args) { System.out.println("hi"); } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-2">
-          <h3><a class="doc-anchor" href="#doc-keyword-2">#</a> <code>public</code></h3>
-          <p>access modifier; on the entry class and its `main` method</p>
+        <article class="doc-entry" id="doc-keywords-2">
+          <h3><a class="doc-anchor" href="#doc-keywords-2">#</a> <code>public</code></h3>
+          <pre><code class="lang-java">public &lt;member or type declaration&gt;</code></pre>
+          <p>Access modifier. javars parses every access modifier and enforces none — visibility is a <code>javac</code> check, and a program that reaches javars has already passed it. Required spelling on the entry class and its <code>main</code>.</p>
           <pre><code class="lang-java">public static void main(String[] args) { }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-3">
-          <h3><a class="doc-anchor" href="#doc-keyword-3">#</a> <code>static</code></h3>
-          <p>class-level (non-instance) member; required on `main`</p>
-          <pre><code class="lang-java">public static void main(String[] args) { }</code></pre>
+        <article class="doc-entry" id="doc-keywords-3">
+          <h3><a class="doc-anchor" href="#doc-keywords-3">#</a> <code>static</code></h3>
+          <pre><code class="lang-java">static &lt;field, method, initializer block, or nested class&gt;</code></pre>
+          <p>Marks a class-level member. Static fields become chunk globals seeded with their type default; <code>static { … }</code> blocks run at class-initialization time in textual order with the static field initializers. Required on <code>main</code>.</p>
+          <pre><code class="lang-java">class Counter { static int n = 0; static { n = 10; } static int bump() { return ++n; } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-4">
-          <h3><a class="doc-anchor" href="#doc-keyword-4">#</a> <code>void</code></h3>
-          <p>no return value; the type of `main`</p>
-          <pre><code class="lang-java">static void main(String[] args) { }</code></pre>
+        <article class="doc-entry" id="doc-keywords-4">
+          <h3><a class="doc-anchor" href="#doc-keywords-4">#</a> <code>void</code></h3>
+          <pre><code class="lang-java">void method(params)</code></pre>
+          <p>Declares a method with no return value. A bare <code>return;</code> leaves it early; <code>return &lt;value&gt;;</code> from <code>void main</code> is a compile error.</p>
+          <pre><code class="lang-java">static void greet() { System.out.println("hi"); return; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-5">
-          <h3><a class="doc-anchor" href="#doc-keyword-5">#</a> <code>if</code></h3>
-          <p>conditional branch: `if (cond) { .. } else { .. }`</p>
-          <pre><code class="lang-java">if (x &gt; 0) { System.out.println("pos"); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-5">
+          <h3><a class="doc-anchor" href="#doc-keywords-5">#</a> <code>if</code></h3>
+          <pre><code class="lang-java">if (cond) stmt-or-block [else stmt-or-block]</code></pre>
+          <p>Conditional branch. The condition is lowered to <code>Op::JumpIfFalse</code> over the <code>then</code> block, so a false test costs one jump and no allocation.</p>
+          <pre><code class="lang-java">if (x &gt; 0) { System.out.println("pos"); } else { System.out.println("non-pos"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-6">
-          <h3><a class="doc-anchor" href="#doc-keyword-6">#</a> <code>else</code></h3>
-          <p>fallback branch of an `if`</p>
-          <pre><code class="lang-java">if (x &gt; 0) { } else { System.out.println("non-pos"); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-6">
+          <h3><a class="doc-anchor" href="#doc-keywords-6">#</a> <code>else</code></h3>
+          <pre><code class="lang-java">else stmt-or-block</code></pre>
+          <p>The fallback branch of an <code>if</code>. Chains as <code>else if</code> by nesting, exactly as in Java.</p>
+          <pre><code class="lang-java">if (n == 0) { } else if (n == 1) { } else { System.out.println("many"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-7">
-          <h3><a class="doc-anchor" href="#doc-keyword-7">#</a> <code>while</code></h3>
-          <p>loop while the condition is true: `while (cond) { .. }`</p>
-          <pre><code class="lang-java">int i = 0; while (i &lt; 3) { i++; }</code></pre>
+        <article class="doc-entry" id="doc-keywords-7">
+          <h3><a class="doc-anchor" href="#doc-keywords-7">#</a> <code>while</code></h3>
+          <pre><code class="lang-java">while (cond) stmt-or-block</code></pre>
+          <p>Pre-tested loop: the condition is evaluated before each iteration, including the first. Owns a break scope, so an unlabeled <code>break</code>/<code>continue</code> inside it targets this loop.</p>
+          <pre><code class="lang-java">int i = 0; while (i &lt; 3) { System.out.println(i); i++; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-8">
-          <h3><a class="doc-anchor" href="#doc-keyword-8">#</a> <code>for</code></h3>
-          <p>loop: C-style `for (init; cond; update)` or enhanced `for (T x : arr)`</p>
-          <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { System.out.println(i); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-8">
+          <h3><a class="doc-anchor" href="#doc-keywords-8">#</a> <code>for</code></h3>
+          <pre><code class="lang-java">for (init; cond; update) body   |   for (T x : iterable) body</code></pre>
+          <p>Both loop forms. The C-style form declares its own scope for the init clause; the enhanced form walks an array directly, or a collection snapshotted into an array by the <code>JITER_ARRAY</code> builtin, with a fresh binding per iteration so a lambda written in the body captures that iteration's value.</p>
+          <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { System.out.println(i); }
+for (String s : names) { System.out.println(s); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-9">
-          <h3><a class="doc-anchor" href="#doc-keyword-9">#</a> <code>do</code></h3>
-          <p>do/while loop: run the body once, then repeat while the condition holds</p>
-          <pre><code class="lang-java">int i = 0; do { i++; } while (i &lt; 3);</code></pre>
+        <article class="doc-entry" id="doc-keywords-9">
+          <h3><a class="doc-anchor" href="#doc-keywords-9">#</a> <code>do</code></h3>
+          <pre><code class="lang-java">do body while (cond);</code></pre>
+          <p>Post-tested loop: the body always runs at least once, then repeats while the condition holds.</p>
+          <pre><code class="lang-java">int i = 0; do { i += 2; } while (i &lt; 5);   // i == 6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-10">
-          <h3><a class="doc-anchor" href="#doc-keyword-10">#</a> <code>switch</code></h3>
-          <p>multi-way branch on an int or String; groups fall through until `break`</p>
-          <pre><code class="lang-java">switch (n) { case 1: System.out.println("one"); break; default: }</code></pre>
+        <article class="doc-entry" id="doc-keywords-10">
+          <h3><a class="doc-anchor" href="#doc-keywords-10">#</a> <code>switch</code></h3>
+          <pre><code class="lang-java">switch (sel) { case L: … }   |   switch (sel) { case L -&gt; … }   |   T v = switch (sel) { … };</code></pre>
+          <p>Multi-way branch in both Java forms. The classic form falls through between groups until a <code>break</code>; the arrow form does not fall through and works as a statement or as an expression. The selector may be an <code>int</code>, a <code>String</code>, or an <code>enum</code> constant. Pattern labels, <code>case null</code>, and <code>when</code> guards are not implemented.</p>
+          <pre><code class="lang-java">String r = switch (n) { case 1 -&gt; "one"; case 2, 3 -&gt; "few"; default -&gt; "many"; };</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-11">
-          <h3><a class="doc-anchor" href="#doc-keyword-11">#</a> <code>case</code></h3>
-          <p>a `switch` label; a matched case runs until a `break` or the switch end</p>
-          <pre><code class="lang-java">case 2: System.out.println("two"); break;</code></pre>
+        <article class="doc-entry" id="doc-keywords-11">
+          <h3><a class="doc-anchor" href="#doc-keywords-11">#</a> <code>case</code></h3>
+          <pre><code class="lang-java">case L:   |   case L1, L2 -&gt;</code></pre>
+          <p>A <code>switch</code> label. In the classic form a matched label runs on into the following groups until a <code>break</code> or the end of the switch; in the arrow form one label list selects exactly one arm. Multiple labels per arm are supported in both forms.</p>
+          <pre><code class="lang-java">switch (n) { case 1: System.out.println("one"); break; case 2: case 3: System.out.println("few"); break; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-12">
-          <h3><a class="doc-anchor" href="#doc-keyword-12">#</a> <code>default</code></h3>
-          <p>the `switch` label taken when no `case` matches</p>
-          <pre><code class="lang-java">default: System.out.println("other");</code></pre>
+        <article class="doc-entry" id="doc-keywords-12">
+          <h3><a class="doc-anchor" href="#doc-keywords-12">#</a> <code>default</code></h3>
+          <pre><code class="lang-java">default:   |   default -&gt;   |   default T m(params) { … }</code></pre>
+          <p>The <code>switch</code> label taken when no <code>case</code> matches, and — in an interface body — the modifier that gives a method an inherited implementation. Both spellings lex to the same reserved word; the parser tells them apart by position.</p>
+          <pre><code class="lang-java">switch (n) { default: System.out.println("other"); }
+interface Shape { int area(); default String describe() { return "area " + area(); } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-13">
-          <h3><a class="doc-anchor" href="#doc-keyword-13">#</a> <code>return</code></h3>
-          <p>return from the current method (bare `return;` ends `void main`)</p>
-          <pre><code class="lang-java">if (done) return;</code></pre>
+        <article class="doc-entry" id="doc-keywords-13">
+          <h3><a class="doc-anchor" href="#doc-keywords-13">#</a> <code>return</code></h3>
+          <pre><code class="lang-java">return;   |   return expr;</code></pre>
+          <p>Leaves the current method, lowering to <code>Op::ReturnValue</code> (with <code>null</code> pushed for the bare form). Returning a value from <code>void main</code> is rejected at compile time.</p>
+          <pre><code class="lang-java">static int max(int a, int b) { if (a &gt; b) return a; return b; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-14">
-          <h3><a class="doc-anchor" href="#doc-keyword-14">#</a> <code>break</code></h3>
-          <p>exit the nearest loop/switch, or a labeled one: `break outer;`</p>
-          <pre><code class="lang-java">outer: for (int i = 0; ; i++) { if (i == 5) break outer; }</code></pre>
+        <article class="doc-entry" id="doc-keywords-14">
+          <h3><a class="doc-anchor" href="#doc-keywords-14">#</a> <code>break</code></h3>
+          <pre><code class="lang-java">break;   |   break label;</code></pre>
+          <p>Exits the nearest enclosing loop or <code>switch</code>, or the one named by a label. The jump is backpatched once the enclosing construct's end address is known, so a labeled break out of nested loops is a single unconditional jump.</p>
+          <pre><code class="lang-java">outer: for (int i = 0; ; i++) { for (int j = 0; ; j++) { if (i + j &gt; 4) break outer; } }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-15">
-          <h3><a class="doc-anchor" href="#doc-keyword-15">#</a> <code>continue</code></h3>
-          <p>skip to the next iteration of the nearest (or labeled) loop</p>
-          <pre><code class="lang-java">for (int i = 0; i &lt; 5; i++) { if (i == 2) continue; }</code></pre>
+        <article class="doc-entry" id="doc-keywords-15">
+          <h3><a class="doc-anchor" href="#doc-keywords-15">#</a> <code>continue</code></h3>
+          <pre><code class="lang-java">continue;   |   continue label;</code></pre>
+          <p>Skips to the next iteration of the nearest enclosing loop, or of the one named by a label. In a C-style <code>for</code> the jump lands on the update clause, not on the condition.</p>
+          <pre><code class="lang-java">for (int i = 0; i &lt; 5; i++) { if (i % 2 == 0) continue; System.out.println(i); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-16">
-          <h3><a class="doc-anchor" href="#doc-keyword-16">#</a> <code>try</code></h3>
-          <p>guard a block with handlers: `try { .. } catch (E e) { .. } finally { .. }`</p>
-          <pre><code class="lang-java">try { risky(); } catch (RuntimeException e) { System.out.println(e.getMessage()); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-16">
+          <h3><a class="doc-anchor" href="#doc-keywords-16">#</a> <code>true</code></h3>
+          <pre><code class="lang-java">true</code></pre>
+          <p>The boolean literal true. Lowers to <code>Op::LoadTrue</code>, and prints as <code>true</code> rather than fusevm's shell-flavoured <code>1</code>.</p>
+          <pre><code class="lang-java">boolean ok = true; System.out.println(ok);   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-17">
-          <h3><a class="doc-anchor" href="#doc-keyword-17">#</a> <code>catch</code></h3>
-          <p>handle a thrown exception whose class matches; arms are tried in order</p>
-          <pre><code class="lang-java">catch (IllegalArgumentException e) { System.out.println(e); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-17">
+          <h3><a class="doc-anchor" href="#doc-keywords-17">#</a> <code>false</code></h3>
+          <pre><code class="lang-java">false</code></pre>
+          <p>The boolean literal false. Lowers to <code>Op::LoadFalse</code>, and prints as <code>false</code>.</p>
+          <pre><code class="lang-java">boolean done = false; System.out.println(done);   // false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-18">
-          <h3><a class="doc-anchor" href="#doc-keyword-18">#</a> <code>finally</code></h3>
-          <p>block that runs on both the normal and the exceptional path out of a `try`</p>
-          <pre><code class="lang-java">try { work(); } finally { System.out.println("done"); }</code></pre>
+        <article class="doc-entry" id="doc-keywords-18">
+          <h3><a class="doc-anchor" href="#doc-keywords-18">#</a> <code>new</code></h3>
+          <pre><code class="lang-java">new C(args)   |   new T[n]   |   new T[m][n]   |   new T[]{ … }   |   new ArrayList&lt;&gt;()</code></pre>
+          <p>Allocation. A class instance goes through the <code>JNEW</code> builtin and then the field initializers and the selected constructor; an array through <code>JARRAY_NEW</code>/<code>JARRAY_NEW_MULTI</code>; a modeled <code>java.util</code> implementation through <code>JCOLL_NEW</code>. Every result is an opaque <code>Value::Obj</code> handle into the host heap, so assignment aliases by reference.</p>
+          <pre><code class="lang-java">Point p = new Point(1, 2);
+int[][] grid = new int[2][3];
+List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-19">
-          <h3><a class="doc-anchor" href="#doc-keyword-19">#</a> <code>throw</code></h3>
-          <p>raise a throwable; it unwinds to the nearest matching `catch`</p>
-          <pre><code class="lang-java">throw new IllegalStateException("bad state");</code></pre>
+      </section>
+
+      <section class="tutorial-section" id="ch-contextual-keywords">
+        <h2>Contextual Keywords</h2>
+        <article class="doc-entry" id="doc-contextual-keywords-1">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-1">#</a> <code>package</code></h3>
+          <pre><code class="lang-java">package name.of.pkg;</code></pre>
+          <p>Accepted and discarded. javars has one flat namespace and no class path, so a package declaration carries no meaning; the parser skips the prologue line so real Java sources compile unchanged.</p>
+          <pre><code class="lang-java">package com.example.demo;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-20">
-          <h3><a class="doc-anchor" href="#doc-keyword-20">#</a> <code>throws</code></h3>
-          <p>declare the exceptions a method may raise (parsed; javars checks none)</p>
+        <article class="doc-entry" id="doc-contextual-keywords-2">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-2">#</a> <code>import</code></h3>
+          <pre><code class="lang-java">import name.of.Type;   |   import name.of.pkg.*;</code></pre>
+          <p>Accepted and discarded, like <code>package</code>. The modeled library types (<code>Math</code>, <code>ArrayList</code>, the throwables, the functional interfaces) are always in scope, so no import is needed — and a fully-qualified use such as <code>java.util.Arrays.toString(a)</code> is *not* supported, because the qualifier parses as field access on an undefined variable.</p>
+          <pre><code class="lang-java">import java.util.*;   // accepted; Arrays, List and friends are in scope regardless</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-3">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-3">#</a> <code>interface</code></h3>
+          <pre><code class="lang-java">interface Name [extends I, J] { abstract and default methods }</code></pre>
+          <p>Declares an interface. Abstract methods, <code>default</code> bodies, multiple <code>implements</code>, and <code>interface extends</code> all work; an interface with exactly one abstract method is automatically a lambda target with no registration anywhere.</p>
+          <pre><code class="lang-java">interface Shape { int area(); default String describe() { return "area " + area(); } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-4">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-4">#</a> <code>enum</code></h3>
+          <pre><code class="lang-java">enum Name [implements I] { A, B(args), C { body } ; members }</code></pre>
+          <p>Declares an enum. Constants become singleton instances held in chunk globals, each carrying a synthesized name and ordinal; per-constant arguments and per-constant bodies (which compile to an anonymous subclass) are supported, as is <code>implements</code>.</p>
+          <pre><code class="lang-java">enum Op { PLUS { int apply(int a, int b) { return a + b; } }; int apply(int a, int b) { return 0; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-5">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-5">#</a> <code>record</code></h3>
+          <pre><code class="lang-java">record Name(T c1, U c2) { [compact constructor] [members] }</code></pre>
+          <p>Declares a record. The parser synthesizes the canonical constructor, one accessor per component, <code>toString()</code> in Java's <code>Name[c1=v1, c2=v2]</code> form, and a component-wise <code>equals(Object)</code> guarded by an <code>instanceof</code> test. <code>hashCode()</code> is not derived — calling it is an unsupported-method error.</p>
+          <pre><code class="lang-java">record Point(int x, int y) { }
+// new Point(1, 2) prints as Point[x=1, y=2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-6">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-6">#</a> <code>extends</code></h3>
+          <pre><code class="lang-java">class C extends Base   |   interface I extends J, K   |   &lt;T extends Bound&gt;</code></pre>
+          <p>Names a superclass, a set of super-interfaces, or a type-parameter bound. The superclass link drives <code>instanceof</code>, the virtual-dispatch chain, and <code>super(...)</code> constructor chaining; a bound is erased and dropped.</p>
+          <pre><code class="lang-java">class Dog extends Animal { }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-7">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-7">#</a> <code>implements</code></h3>
+          <pre><code class="lang-java">class C implements I, J</code></pre>
+          <p>Names the interfaces a class implements. Each becomes a supertype edge, so <code>instanceof I</code> succeeds and a <code>default</code> method of <code>I</code> is inherited unless the class overrides it.</p>
+          <pre><code class="lang-java">class Sq implements Shape { public int area() { return 4; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-8">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-8">#</a> <code>abstract</code></h3>
+          <pre><code class="lang-java">abstract class C { abstract T m(params); }</code></pre>
+          <p>Marks a class that is never instantiated and a method that has no body. An abstract method contributes its name to the dispatch chain; a concrete subclass supplies the body.</p>
+          <pre><code class="lang-java">abstract class Base { abstract String tag(); }
+class Impl extends Base { String tag() { return "impl"; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-9">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-9">#</a> <code>final</code></h3>
+          <pre><code class="lang-java">final &lt;local, parameter, catch parameter, resource, field, or class&gt;</code></pre>
+          <p>Parsed everywhere Java allows it and then dropped. Immutability is a <code>javac</code> check that has already run, and javars's lambda capture is a by-value snapshot, so a <code>final</code> local and an effectively-final one compile identically.</p>
+          <pre><code class="lang-java">final int limit = 10;
+for (final String s : names) { System.out.println(s); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-10">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-10">#</a> <code>private</code></h3>
+          <pre><code class="lang-java">private &lt;member&gt;</code></pre>
+          <p>Parsed and dropped, like every access modifier. javars enforces no visibility.</p>
+          <pre><code class="lang-java">class Box { private int n; private int get() { return n; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-11">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-11">#</a> <code>protected</code></h3>
+          <pre><code class="lang-java">protected &lt;member&gt;</code></pre>
+          <p>Parsed and dropped, like every access modifier.</p>
+          <pre><code class="lang-java">class Base { protected String tag() { return "base"; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-12">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-12">#</a> <code>synchronized</code></h3>
+          <pre><code class="lang-java">synchronized &lt;method&gt;</code></pre>
+          <p>Accepted as a method modifier and dropped. javars runs a program on one thread, so there is no monitor to acquire; a <code>synchronized (obj) { … }</code> *statement* is not parsed.</p>
+          <pre><code class="lang-java">static synchronized void once() { System.out.println("once"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-13">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-13">#</a> <code>native</code></h3>
+          <pre><code class="lang-java">native &lt;method&gt;</code></pre>
+          <p>Accepted as a method modifier and dropped. javars's own foreign-function path is the inline <code>rust { … }</code> block, not JNI.</p>
+          <pre><code class="lang-java">static native void jni();   // accepted as a modifier; there is no JNI binding</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-14">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-14">#</a> <code>volatile</code></h3>
+          <pre><code class="lang-java">volatile &lt;field&gt;</code></pre>
+          <p>Accepted as a field modifier and dropped — single-threaded execution gives it nothing to order.</p>
+          <pre><code class="lang-java">class Flag { volatile boolean set; }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-15">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-15">#</a> <code>transient</code></h3>
+          <pre><code class="lang-java">transient &lt;field&gt;</code></pre>
+          <p>Accepted as a field modifier and dropped. javars has no serialization.</p>
+          <pre><code class="lang-java">class Cache { transient int hits; }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-16">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-16">#</a> <code>throws</code></h3>
+          <pre><code class="lang-java">T method(params) throws E1, E2</code></pre>
+          <p>Parsed and discarded. javars performs no checked-exception analysis, so the clause is documentation; a method that throws without declaring it runs identically.</p>
           <pre><code class="lang-java">static int parse(String s) throws Exception { return Integer.parseInt(s); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-21">
-          <h3><a class="doc-anchor" href="#doc-keyword-21">#</a> <code>true</code></h3>
-          <p>the boolean literal true</p>
-          <pre><code class="lang-java">boolean b = true;</code></pre>
+        <article class="doc-entry" id="doc-contextual-keywords-17">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-17">#</a> <code>throw</code></h3>
+          <pre><code class="lang-java">throw expr;</code></pre>
+          <p>Raises a throwable. The value is parked as the host's pending exception by the <code>JTHROW</code> builtin and the compiler jumps to the innermost handler in the frame — or returns out of the frame, so the caller's post-call check sees it and repeats. There is no unwind opcode in fusevm; this is how the unwind is modeled.</p>
+          <pre><code class="lang-java">throw new IllegalStateException("bad state");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-22">
-          <h3><a class="doc-anchor" href="#doc-keyword-22">#</a> <code>false</code></h3>
-          <p>the boolean literal false</p>
-          <pre><code class="lang-java">boolean b = false;</code></pre>
+        <article class="doc-entry" id="doc-contextual-keywords-18">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-18">#</a> <code>try</code></h3>
+          <pre><code class="lang-java">try { … } catch (E e) { … } finally { … }   |   try (R r = new R()) { … }</code></pre>
+          <p>Guards a block. The value-stack depth is recorded on entry so a handler can discard the operands of the expression the throw abandoned. A <code>try</code> must carry at least one <code>catch</code> or a <code>finally</code>. The resource form is desugared in the parser into a <code>finally</code> that calls <code>close()</code> on each resource in reverse order.</p>
+          <pre><code class="lang-java">try (Res r = new Res()) { use(r); } catch (Exception e) { System.out.println(e); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-keyword-23">
-          <h3><a class="doc-anchor" href="#doc-keyword-23">#</a> <code>new</code></h3>
-          <p>object/array allocation keyword (reserved; recognized by the lexer)</p>
-          <pre><code class="lang-java">int[] a = new int[3];</code></pre>
+        <article class="doc-entry" id="doc-contextual-keywords-19">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-19">#</a> <code>catch</code></h3>
+          <pre><code class="lang-java">catch (E e) { … }   |   catch (final E e) { … }</code></pre>
+          <p>Handles a pending throwable whose runtime class is <code>E</code> or a subclass — the same supertype walk <code>instanceof</code> uses. Arms are tested in source order. Multi-catch (<code>catch (A | B e)</code>) is not supported: <code>|</code> is not a token this lexer produces.</p>
+          <pre><code class="lang-java">catch (NumberFormatException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-20">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-20">#</a> <code>finally</code></h3>
+          <pre><code class="lang-java">finally { … }</code></pre>
+          <p>A block emitted on both the normal and the exceptional path out of a <code>try</code>, and the target the try-with-resources desugar uses for <code>close()</code>.</p>
+          <pre><code class="lang-java">try { work(); } finally { System.out.println("always"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-21">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-21">#</a> <code>instanceof</code></h3>
+          <pre><code class="lang-java">expr instanceof Type</code></pre>
+          <p>Runtime type test through the <code>JINSTANCEOF</code> builtin. True when the value is a non-null instance whose class is <code>Type</code> or any transitive subclass or implemented interface; <code>null</code> is never an instance. A <code>String</code> value satisfies <code>String</code>, <code>CharSequence</code>, and <code>Object</code>. Pattern binding (<code>x instanceof Point p</code>) is not implemented.</p>
+          <pre><code class="lang-java">if (shape instanceof Sq) { System.out.println("square"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-22">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-22">#</a> <code>this</code></h3>
+          <pre><code class="lang-java">this   |   this.field   |   this.method(args)   |   this::method</code></pre>
+          <p>The receiver of the enclosing instance method or constructor, held in call-frame slot 0. A bare field name that is not a local resolves to <code>this.name</code> implicitly. Using <code>this</code> outside an instance method is a compile error. <code>this(...)</code> constructor delegation is not implemented.</p>
+          <pre><code class="lang-java">class Point { int x; Point(int x) { this.x = x; } int get() { return x; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-23">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-23">#</a> <code>super</code></h3>
+          <pre><code class="lang-java">super(args);</code></pre>
+          <p>Explicit superclass constructor chaining, and the only <code>super</code> form javars implements. The instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. <code>super.method()</code> is NOT supported: it parses as a field access on an undefined variable and faults with a NullPointerException at run time.</p>
+          <pre><code class="lang-java">class Cat extends Animal { Cat(String s) { super(); sound = s; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-24">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-24">#</a> <code>yield</code></h3>
+          <pre><code class="lang-java">yield expr;</code></pre>
+          <p>Supplies the value of a block-bodied arm of a <code>switch</code> *expression*. Recognized only while a switch expression is being parsed, so <code>yield</code> remains a usable identifier everywhere else.</p>
+          <pre><code class="lang-java">int n = switch (k) { case 1 -&gt; 10; default -&gt; { int t = k * 2; yield t; } };</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-contextual-keywords-25">
+          <h3><a class="doc-anchor" href="#doc-contextual-keywords-25">#</a> <code>null</code></h3>
+          <pre><code class="lang-java">null</code></pre>
+          <p>The null reference. javars models it as <code>Value::Undef</code> — the value an unassigned fusevm slot already holds — so <code>null</code> needs no keyword: it lexes as an identifier that was never assigned. It prints as <code>null</code>, compares equal to itself under <code>==</code>, and dereferencing it raises the matching NullPointerException.</p>
+          <pre><code class="lang-java">String s = null;
+System.out.println(s + " " + (s == null));   // null true</code></pre>
         </article>
       </section>
 
-      <section class="tutorial-section" id="ch-type">
-        <h2>Type</h2>
-        <article class="doc-entry" id="doc-type-1">
-          <h3><a class="doc-anchor" href="#doc-type-1">#</a> <code>int</code></h3>
-          <p>32-bit integer local declaration</p>
+      <section class="tutorial-section" id="ch-literals">
+        <h2>Literals</h2>
+        <article class="doc-entry" id="doc-literals-1">
+          <h3><a class="doc-anchor" href="#doc-literals-1">#</a> <code>int literal</code></h3>
+          <pre><code class="lang-java">0   42   2147483647</code></pre>
+          <p>A decimal integer literal. Arithmetic on two statically <code>int</code>-width operands wraps at 32 bits, which the compiler emits as a native shift pair rather than a builtin so the JIT can still trace it. There are no hex, binary, or octal literals and no <code>_</code> digit separators: <code>0x10</code> lexes as <code>0</code> followed by the identifier <code>x10</code>.</p>
+          <pre><code class="lang-java">int big = 2147483647;
+System.out.println(big + 1);   // -2147483648</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-2">
+          <h3><a class="doc-anchor" href="#doc-literals-2">#</a> <code>long literal</code></h3>
+          <pre><code class="lang-java">0L   9000000000L   42l</code></pre>
+          <p>An <code>L</code>/<code>l</code>-suffixed integer literal. The suffix survives lexing as its own token kind because it is what types the value <code>long</code> and therefore exempts it from the 32-bit <code>int</code> wrap.</p>
+          <pre><code class="lang-java">long big = 2147483647L;
+System.out.println(big + 1);   // 2147483648</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-3">
+          <h3><a class="doc-anchor" href="#doc-literals-3">#</a> <code>double literal</code></h3>
+          <pre><code class="lang-java">3.0   1.5d   2D</code></pre>
+          <p>A floating-point literal: any literal with a fractional part, an exponent, or a <code>d</code>/<code>D</code>/<code>f</code>/<code>F</code> suffix. It prints through Java's <code>Double.toString</code> rules — a trailing <code>.0</code> on whole values, <code>Infinity</code>/<code>NaN</code> for the non-finite ones.</p>
+          <pre><code class="lang-java">double d = 3.0;
+System.out.println(d);   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-4">
+          <h3><a class="doc-anchor" href="#doc-literals-4">#</a> <code>float literal</code></h3>
+          <pre><code class="lang-java">1.5f   2F</code></pre>
+          <p>An <code>f</code>/<code>F</code>-suffixed literal. javars has one floating kind (<code>f64</code>), so the suffix only marks the literal as floating; it does not narrow the value to 32-bit precision the way <code>javac</code> does.</p>
+          <pre><code class="lang-java">float f = 1.5f;
+System.out.println(f);   // 1.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-5">
+          <h3><a class="doc-anchor" href="#doc-literals-5">#</a> <code>exponent literal</code></h3>
+          <pre><code class="lang-java">1e3   1.5e-3   2E+2</code></pre>
+          <p>Scientific notation, with or without a fractional part; either way the literal is floating point. The <code>e</code> is consumed only when a valid exponent follows, so <code>1.foo</code> and an identifier beginning with <code>e</code> are left alone. Values outside <code>[1e-3, 1e7)</code> print in Java's uppercase scientific form.</p>
+          <pre><code class="lang-java">System.out.println(1e3);          // 1000.0
+System.out.println(25000000.0);   // 2.5E7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-6">
+          <h3><a class="doc-anchor" href="#doc-literals-6">#</a> <code>string literal</code></h3>
+          <pre><code class="lang-java">"text"</code></pre>
+          <p>A double-quoted string. Multi-byte characters are decoded as full UTF-8 scalars, so a non-ASCII literal survives lexing intact. Text blocks (<code>"""</code>) are not implemented.</p>
+          <pre><code class="lang-java">String s = "hello";</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-7">
+          <h3><a class="doc-anchor" href="#doc-literals-7">#</a> <code>char literal</code></h3>
+          <pre><code class="lang-java">'c'   '\n'</code></pre>
+          <p>A single-quoted character, modeled as a one-character *string* rather than an integer. That is javars's one deliberate <code>char</code> divergence: <code>'A' + 1</code> concatenates to <code>"A1"</code> where Java's numeric promotion gives <code>66</code>.</p>
+          <pre><code class="lang-java">char c = 'A';
+System.out.println(c + 1);   // A1  (Java prints 66)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-8">
+          <h3><a class="doc-anchor" href="#doc-literals-8">#</a> <code>escape sequence</code></h3>
+          <pre><code class="lang-java">\n   \t   \r   \0   \\   \"   \'</code></pre>
+          <p>The escapes the lexer decodes inside a string or char literal. Any other escaped character passes through as itself, so <code>\q</code> is a literal <code>q</code>. Unicode escapes (<code>\uXXXX</code>) are not decoded.</p>
+          <pre><code class="lang-java">System.out.println("a\tb\nc");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-literals-9">
+          <h3><a class="doc-anchor" href="#doc-literals-9">#</a> <code>array initializer</code></h3>
+          <pre><code class="lang-java">{ e0, e1, … }   |   new T[]{ e0, e1, … }</code></pre>
+          <p>An array literal. Elements are evaluated left to right and handed to the <code>JARRAY_LIT</code> builtin, which allocates one heap array. Nested braces build a rectangular multi-dimensional array.</p>
+          <pre><code class="lang-java">int[] a = {1, 2, 3};
+int[][] g = {{1, 2}, {3, 4}};</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-types">
+        <h2>Types</h2>
+        <article class="doc-entry" id="doc-types-1">
+          <h3><a class="doc-anchor" href="#doc-types-1">#</a> <code>int</code></h3>
+          <pre><code class="lang-java">int name [= expr];</code></pre>
+          <p>32-bit integer declaration. Arithmetic between two <code>int</code>-width operands wraps at 32 bits, matching <code>javac</code>; compound assignment and <code>++</code> narrow back to <code>int</code> on store.</p>
           <pre><code class="lang-java">int n = 42;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-2">
-          <h3><a class="doc-anchor" href="#doc-type-2">#</a> <code>long</code></h3>
-          <p>64-bit integer local declaration (`L` literal suffix accepted)</p>
+        <article class="doc-entry" id="doc-types-2">
+          <h3><a class="doc-anchor" href="#doc-types-2">#</a> <code>long</code></h3>
+          <pre><code class="lang-java">long name [= expr];</code></pre>
+          <p>64-bit integer declaration. A <code>long</code> operand suppresses the 32-bit wrap, so the arithmetic runs at fusevm's native <code>i64</code> width.</p>
           <pre><code class="lang-java">long big = 9000000000L;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-3">
-          <h3><a class="doc-anchor" href="#doc-type-3">#</a> <code>short</code></h3>
-          <p>16-bit integer local declaration</p>
+        <article class="doc-entry" id="doc-types-3">
+          <h3><a class="doc-anchor" href="#doc-types-3">#</a> <code>short</code></h3>
+          <pre><code class="lang-java">short name [= expr];</code></pre>
+          <p>16-bit integer declaration. Java promotes <code>short</code> to <code>int</code> before any binary operation, so javars treats it as <code>int</code>-width for the wrap decision and never narrows the stored value to 16 bits.</p>
           <pre><code class="lang-java">short s = 7;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-4">
-          <h3><a class="doc-anchor" href="#doc-type-4">#</a> <code>byte</code></h3>
-          <p>8-bit integer local declaration</p>
+        <article class="doc-entry" id="doc-types-4">
+          <h3><a class="doc-anchor" href="#doc-types-4">#</a> <code>byte</code></h3>
+          <pre><code class="lang-java">byte name [= expr];</code></pre>
+          <p>8-bit integer declaration. Like <code>short</code>, it promotes to <code>int</code> for arithmetic and is not narrowed on store.</p>
           <pre><code class="lang-java">byte b = 1;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-5">
-          <h3><a class="doc-anchor" href="#doc-type-5">#</a> <code>double</code></h3>
-          <p>64-bit floating-point local declaration (prints with a trailing .0)</p>
-          <pre><code class="lang-java">double d = 3.0;   // System.out.println(d) =&gt; 3.0</code></pre>
+        <article class="doc-entry" id="doc-types-5">
+          <h3><a class="doc-anchor" href="#doc-types-5">#</a> <code>double</code></h3>
+          <pre><code class="lang-java">double name [= expr];</code></pre>
+          <p>64-bit floating-point declaration — javars's only floating kind. Division follows IEEE-754 through the <code>JDIV</code> builtin, so a zero divisor yields a signed infinity or NaN instead of faulting.</p>
+          <pre><code class="lang-java">double d = 3.0;
+System.out.println(d);   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-6">
-          <h3><a class="doc-anchor" href="#doc-type-6">#</a> <code>float</code></h3>
-          <p>32-bit floating-point local declaration (`f` literal suffix accepted)</p>
+        <article class="doc-entry" id="doc-types-6">
+          <h3><a class="doc-anchor" href="#doc-types-6">#</a> <code>float</code></h3>
+          <pre><code class="lang-java">float name [= expr];</code></pre>
+          <p>32-bit floating-point declaration in Java; in javars an alias for the single <code>f64</code> kind, so a <code>float</code> local carries double precision and prints with <code>Double.toString</code> rules.</p>
           <pre><code class="lang-java">float f = 1.5f;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-7">
-          <h3><a class="doc-anchor" href="#doc-type-7">#</a> <code>boolean</code></h3>
-          <p>boolean local declaration (`true` / `false`)</p>
+        <article class="doc-entry" id="doc-types-7">
+          <h3><a class="doc-anchor" href="#doc-types-7">#</a> <code>boolean</code></h3>
+          <pre><code class="lang-java">boolean name [= expr];</code></pre>
+          <p>Boolean declaration. Prints as <code>true</code>/<code>false</code> through the Java-formatting print builtins rather than fusevm's shell-flavoured <code>1</code>/<code>0</code>.</p>
           <pre><code class="lang-java">boolean ok = true;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-8">
-          <h3><a class="doc-anchor" href="#doc-type-8">#</a> <code>char</code></h3>
-          <p>character local; a char literal is modeled as a one-char string</p>
+        <article class="doc-entry" id="doc-types-8">
+          <h3><a class="doc-anchor" href="#doc-types-8">#</a> <code>char</code></h3>
+          <pre><code class="lang-java">char name [= expr];</code></pre>
+          <p>Character declaration. A <code>char</code> value is a one-character string, so <code>+</code> concatenates rather than promoting to <code>int</code>, and <code>String</code> index arithmetic counts Unicode scalars rather than UTF-16 code units.</p>
           <pre><code class="lang-java">char c = 'A';</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-9">
-          <h3><a class="doc-anchor" href="#doc-type-9">#</a> <code>String</code></h3>
-          <p>string local; `+` with a String operand concatenates (host numeric hook)</p>
-          <pre><code class="lang-java">String s = "hi " + 1 + 2;   // =&gt; 'hi 12'</code></pre>
+        <article class="doc-entry" id="doc-types-9">
+          <h3><a class="doc-anchor" href="#doc-types-9">#</a> <code>String</code></h3>
+          <pre><code class="lang-java">String name [= expr];</code></pre>
+          <p>String declaration, and the receiver type that routes an instance call to the <code>java.lang.String</code> methods. <code>+</code> with a <code>String</code> operand concatenates through the host numeric hook using Java's value-to-string rules.</p>
+          <pre><code class="lang-java">String s = "hi " + 1 + 2;   // "hi 12"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-type-10">
-          <h3><a class="doc-anchor" href="#doc-type-10">#</a> <code>var</code></h3>
-          <p>local variable with an inferred type (Java 10+)</p>
+        <article class="doc-entry" id="doc-types-10">
+          <h3><a class="doc-anchor" href="#doc-types-10">#</a> <code>var</code></h3>
+          <pre><code class="lang-java">var name = expr;</code></pre>
+          <p>Local variable with an inferred type (Java 10+). javars records the annotation for diagnostics only — the runtime is dynamically typed on the fusevm value model — so <code>var</code> behaves exactly as the explicit spelling would.</p>
           <pre><code class="lang-java">var s = "inferred";</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-11">
+          <h3><a class="doc-anchor" href="#doc-types-11">#</a> <code>Object</code></h3>
+          <pre><code class="lang-java">Object name [= expr];</code></pre>
+          <p>The universal reference type, and the erasure of every generic type parameter. Any reference is assignable to it (at a deliberately high overload-resolution cost, so a more specific overload always wins), and a <code>String</code> satisfies it.</p>
+          <pre><code class="lang-java">Object o = "anything";</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-12">
+          <h3><a class="doc-anchor" href="#doc-types-12">#</a> <code>T[]</code></h3>
+          <pre><code class="lang-java">T[] name [= expr];   |   T name[];   |   T[][] name;</code></pre>
+          <p>An array type. Arrays are host heap objects with reference (aliasing) assignment, a <code>.length</code> field, and a bounds check on every access that raises Java's <code>ArrayIndexOutOfBoundsException</code> with its exact detail message.</p>
+          <pre><code class="lang-java">int[] a = new int[3];
+String[][] grid = new String[2][2];</code></pre>
         </article>
       </section>
 
-      <section class="tutorial-section" id="ch-io">
-        <h2>IO</h2>
-        <article class="doc-entry" id="doc-io-1">
-          <h3><a class="doc-anchor" href="#doc-io-1">#</a> <code>println</code></h3>
-          <p>System.out.println(arg): print the Java string form of arg, then a newline</p>
-          <pre><code class="lang-java">System.out.println("hello");</code></pre>
+      <section class="tutorial-section" id="ch-operators">
+        <h2>Operators</h2>
+        <article class="doc-entry" id="doc-operators-1">
+          <h3><a class="doc-anchor" href="#doc-operators-1">#</a> <code>+</code></h3>
+          <pre><code class="lang-java">a + b</code></pre>
+          <p>Addition when both operands are numeric, string concatenation when either is not. The concatenating path runs in the host's strict numeric hook and renders both sides with Java's <code>String.valueOf</code> rules, so <code>true</code>, <code>3.0</code>, and <code>null</code> all print the way <code>java</code> prints them.</p>
+          <pre><code class="lang-java">System.out.println(1 + 2);            // 3
+System.out.println("n=" + 3.0);       // n=3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-2">
-          <h3><a class="doc-anchor" href="#doc-io-2">#</a> <code>print</code></h3>
-          <p>System.out.print(arg): print the Java string form of arg with no newline</p>
-          <pre><code class="lang-java">System.out.print("no newline");</code></pre>
+        <article class="doc-entry" id="doc-operators-2">
+          <h3><a class="doc-anchor" href="#doc-operators-2">#</a> <code>-</code></h3>
+          <pre><code class="lang-java">a - b</code></pre>
+          <p>Subtraction. A non-numeric operand is a type error in Java, so javars reports it rather than coercing: <code>"a" - 1</code> is a run-time <code>operator </code>Sub<code> is not defined</code> error, not a silent zero.</p>
+          <pre><code class="lang-java">System.out.println(5 - 2);   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-3">
-          <h3><a class="doc-anchor" href="#doc-io-3">#</a> <code>System</code></h3>
-          <p>the System class; javars models `System.out` for console output</p>
+        <article class="doc-entry" id="doc-operators-3">
+          <h3><a class="doc-anchor" href="#doc-operators-3">#</a> <code>*</code></h3>
+          <pre><code class="lang-java">a * b</code></pre>
+          <p>Multiplication, wrapping at 32 bits when both operands are statically <code>int</code>-width.</p>
+          <pre><code class="lang-java">System.out.println(6 * 7);   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-4">
+          <h3><a class="doc-anchor" href="#doc-operators-4">#</a> <code>/</code></h3>
+          <pre><code class="lang-java">a / b</code></pre>
+          <p>Division. Statically-integral division stays on fusevm's native op — so the JIT can trace it — and a zero divisor raises <code>ArithmeticException: / by zero</code>. A floating operand routes to the <code>JDIV</code> builtin instead, where IEEE-754 gives a signed infinity or NaN and never faults.</p>
+          <pre><code class="lang-java">System.out.println(7 / 2);       // 3
+System.out.println(7.0 / 0.0);   // Infinity</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-5">
+          <h3><a class="doc-anchor" href="#doc-operators-5">#</a> <code>%</code></h3>
+          <pre><code class="lang-java">a % b</code></pre>
+          <p>Remainder, taking the sign of the dividend exactly as Java does.</p>
+          <pre><code class="lang-java">System.out.println(-7 % 3);   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-6">
+          <h3><a class="doc-anchor" href="#doc-operators-6">#</a> <code>unary -</code></h3>
+          <pre><code class="lang-java">-a</code></pre>
+          <p>Arithmetic negation, lowered to <code>Op::Negate</code>. Applying it to a non-numeric value is reported as a type error rather than coerced.</p>
+          <pre><code class="lang-java">int n = -5;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-7">
+          <h3><a class="doc-anchor" href="#doc-operators-7">#</a> <code>!</code></h3>
+          <pre><code class="lang-java">!a</code></pre>
+          <p>Logical negation, lowered to <code>Op::LogNot</code>.</p>
+          <pre><code class="lang-java">if (!done) { System.out.println("still going"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-8">
+          <h3><a class="doc-anchor" href="#doc-operators-8">#</a> <code>==</code></h3>
+          <pre><code class="lang-java">a == b</code></pre>
+          <p>Equality. Numbers and booleans compare by value and heap objects by handle identity — but two equal *strings* also compare equal, because javars models a <code>String</code> as a value rather than a reference. That is the one place <code>==</code> diverges: <code>"hi" == "h" + "i"</code> is <code>true</code> here and <code>false</code> in Java.</p>
+          <pre><code class="lang-java">System.out.println("hi" == "h" + "i");   // true  (Java prints false)</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-9">
+          <h3><a class="doc-anchor" href="#doc-operators-9">#</a> <code>!=</code></h3>
+          <pre><code class="lang-java">a != b</code></pre>
+          <p>Inequality — the exact negation of <code>==</code>, including its string behaviour.</p>
+          <pre><code class="lang-java">if (n != 0) { System.out.println(100 / n); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-10">
+          <h3><a class="doc-anchor" href="#doc-operators-10">#</a> <code>&lt;</code></h3>
+          <pre><code class="lang-java">a &lt; b</code></pre>
+          <p>Less-than. Numeric operands compare numerically; a string operand compares lexicographically by <code>char</code> through the numeric hook, which Java would reject at compile time.</p>
+          <pre><code class="lang-java">if (i &lt; 3) { System.out.println(i); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-11">
+          <h3><a class="doc-anchor" href="#doc-operators-11">#</a> <code>&gt;</code></h3>
+          <pre><code class="lang-java">a &gt; b</code></pre>
+          <p>Greater-than, with the same numeric-or-lexicographic behaviour as <code>&lt;</code>.</p>
+          <pre><code class="lang-java">if (score &gt; best) { best = score; }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-12">
+          <h3><a class="doc-anchor" href="#doc-operators-12">#</a> <code>&lt;=</code></h3>
+          <pre><code class="lang-java">a &lt;= b</code></pre>
+          <p>Less-than-or-equal.</p>
+          <pre><code class="lang-java">for (int i = 1; i &lt;= 10; i++) { }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-13">
+          <h3><a class="doc-anchor" href="#doc-operators-13">#</a> <code>&gt;=</code></h3>
+          <pre><code class="lang-java">a &gt;= b</code></pre>
+          <p>Greater-than-or-equal.</p>
+          <pre><code class="lang-java">if (n &gt;= 0) { System.out.println("non-negative"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-14">
+          <h3><a class="doc-anchor" href="#doc-operators-14">#</a> <code>&amp;&amp;</code></h3>
+          <pre><code class="lang-java">a &amp;&amp; b</code></pre>
+          <p>Short-circuiting conjunction: the right operand is not evaluated when the left is false. Lowered to <code>Op::JumpIfFalseKeep</code>, so no builtin call and no allocation are involved.</p>
+          <pre><code class="lang-java">if (s != null &amp;&amp; s.length() &gt; 0) { System.out.println(s); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-15">
+          <h3><a class="doc-anchor" href="#doc-operators-15">#</a> <code>||</code></h3>
+          <pre><code class="lang-java">a || b</code></pre>
+          <p>Short-circuiting disjunction, the mirror of <code>&amp;&amp;</code> via <code>Op::JumpIfTrueKeep</code>.</p>
+          <pre><code class="lang-java">if (n &lt; 0 || n &gt; 100) { System.out.println("out of range"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-16">
+          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>=</code></h3>
+          <pre><code class="lang-java">name = expr;   |   a[i] = expr;   |   obj.f = expr;</code></pre>
+          <p>Assignment, in the three target forms javars lowers separately: a local or global slot, an array element through <code>JARRAY_SET</code>, and an instance field through <code>JFIELD_SET</code>. Assignment is a statement, not an expression — <code>x = y = 0</code> does not parse.</p>
+          <pre><code class="lang-java">int n = 0;
+n = 5;
+arr[0] = n;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-17">
+          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>+=</code></h3>
+          <pre><code class="lang-java">target += expr;</code></pre>
+          <p>Compound addition, on any of the three assignable targets. When the target is declared <code>int</code> the result is narrowed back to 32 bits on store, so <code>int</code> overflow wraps exactly as <code>javac</code> compiles it. With a <code>String</code> target it appends.</p>
+          <pre><code class="lang-java">int i = 5; i += 2;   // 7
+String s = "a"; s += "b";   // "ab"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-18">
+          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>-=</code></h3>
+          <pre><code class="lang-java">target -= expr;</code></pre>
+          <p>Compound subtraction, with the same <code>int</code> narrowing on store.</p>
+          <pre><code class="lang-java">int i = 5; i -= 2;   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-19">
+          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>*=</code></h3>
+          <pre><code class="lang-java">target *= expr;</code></pre>
+          <p>Compound multiplication.</p>
+          <pre><code class="lang-java">int i = 5; i *= 2;   // 10</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-20">
+          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>/=</code></h3>
+          <pre><code class="lang-java">target /= expr;</code></pre>
+          <p>Compound division, following the same integral-versus-floating split as <code>/</code>.</p>
+          <pre><code class="lang-java">int i = 10; i /= 2;   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-21">
+          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>%=</code></h3>
+          <pre><code class="lang-java">target %= expr;</code></pre>
+          <p>Compound remainder.</p>
+          <pre><code class="lang-java">int i = 10; i %= 4;   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-22">
+          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>++</code></h3>
+          <pre><code class="lang-java">name++;   |   a[i]++;   |   obj.f++;</code></pre>
+          <p>Post-increment, narrowing back to 32 bits when the target is <code>int</code>. javars accepts it only in *statement* position: <code>i++</code> used as a value, and the prefix form <code>++i</code>, are rejected at parse time.</p>
+          <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-23">
+          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>--</code></h3>
+          <pre><code class="lang-java">name--;   |   a[i]--;   |   obj.f--;</code></pre>
+          <p>Post-decrement, with the same statement-only restriction as <code>++</code>.</p>
+          <pre><code class="lang-java">int n = 3; n--;   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-24">
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>?:</code></h3>
+          <pre><code class="lang-java">cond ? a : b</code></pre>
+          <p>The conditional expression. Exactly one arm is evaluated; the untaken arm's code is jumped over, so a side effect in it never runs.</p>
+          <pre><code class="lang-java">String label = n &gt; 4 ? "big" : "small";</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>-&gt;</code></h3>
+          <pre><code class="lang-java">(params) -&gt; expr   |   (params) -&gt; { … }   |   p -&gt; expr</code></pre>
+          <p>The lambda arrow, and the arrow form of <code>switch</code>. A lambda becomes a heap closure that snapshots every enclosing local by value at the point the literal runs, which is observationally exact because Java only permits capture of effectively-final locals.</p>
+          <pre><code class="lang-java">Function&lt;Object,Object&gt; up = s -&gt; s + "!";
+System.out.println(up.apply("hi"));   // hi!</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>::</code></h3>
+          <pre><code class="lang-java">Type::member   |   value::method   |   this::method</code></pre>
+          <p>The method-reference separator. Every form is desugared in the compiler into an equivalent lambda with synthesized parameter names, so a method reference and the lambda it stands for share one code path.</p>
+          <pre><code class="lang-java">Function&lt;Object,Object&gt; up = String::toUpperCase;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>[]</code></h3>
+          <pre><code class="lang-java">array[index]</code></pre>
+          <p>Array subscript, through <code>JARRAY_GET</code> for a read and <code>JARRAY_SET</code> for a write. Both are bounds-checked; an out-of-range index raises <code>ArrayIndexOutOfBoundsException</code> carrying Java's <code>Index N out of bounds for length M</code> message, and a null array raises a NullPointerException.</p>
+          <pre><code class="lang-java">int[] a = {1, 2, 3};
+System.out.println(a[1]);   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>.</code></h3>
+          <pre><code class="lang-java">recv.field   |   recv.method(args)   |   Class.staticMember</code></pre>
+          <p>Member access. A field read routes through <code>JFIELD_GET</code> (which also serves an array's <code>.length</code>), an instance call through the receiver's dispatch chain, and a static member through the owning class's chunk global. A <code>null</code> receiver raises a NullPointerException naming the operation.</p>
+          <pre><code class="lang-java">System.out.println(p.x);
+System.out.println(arr.length);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>()</code></h3>
+          <pre><code class="lang-java">name(args)   |   recv.name(args)   |   Class.name(args)</code></pre>
+          <p>Invocation. A bare name resolves to a user <code>static</code> method (choosing the overload with the lowest assignment cost) or, in a program carrying an inline <code>rust { … }</code> block, to an FFI export dispatched by name. Every call site in a program that uses exceptions also carries a pending-exception check.</p>
+          <pre><code class="lang-java">System.out.println(Helper.twice(3));</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-console-io">
+        <h2>Console IO</h2>
+        <article class="doc-entry" id="doc-console-io-1">
+          <h3><a class="doc-anchor" href="#doc-console-io-1">#</a> <code>System</code></h3>
+          <pre><code class="lang-java">System.out   |   System.err</code></pre>
+          <p>The <code>System</code> class. javars models exactly two of its members — the two console streams. <code>System.in</code> is rejected at parse time with a message naming it, so a program that reads stdin fails loudly rather than silently returning nothing.</p>
           <pre><code class="lang-java">System.out.println(42);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-4">
-          <h3><a class="doc-anchor" href="#doc-io-4">#</a> <code>out</code></h3>
-          <p>System.out — the standard output stream (println / print)</p>
+        <article class="doc-entry" id="doc-console-io-2">
+          <h3><a class="doc-anchor" href="#doc-console-io-2">#</a> <code>System.out</code></h3>
+          <pre><code class="lang-java">System.out</code></pre>
+          <p>The standard output stream. It is not an object javars can pass around: <code>System.out</code> is recognized only as the receiver of <code>print</code>/<code>println</code> or as the left side of a <code>System.out::println</code> method reference.</p>
           <pre><code class="lang-java">System.out.print("x");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-io-5">
-          <h3><a class="doc-anchor" href="#doc-io-5">#</a> <code>err</code></h3>
-          <p>System.err — the standard error stream (println / print)</p>
+        <article class="doc-entry" id="doc-console-io-3">
+          <h3><a class="doc-anchor" href="#doc-console-io-3">#</a> <code>System.err</code></h3>
+          <pre><code class="lang-java">System.err</code></pre>
+          <p>The standard error stream, recognized in exactly the same positions as <code>System.out</code> and lowered to the stderr pair of print builtins.</p>
           <pre><code class="lang-java">System.err.println("oops");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-4">
+          <h3><a class="doc-anchor" href="#doc-console-io-4">#</a> <code>System.out.println</code></h3>
+          <pre><code class="lang-java">void System.out.println([Object x])</code></pre>
+          <p>Prints one argument in Java's <code>String.valueOf</code> form followed by a newline, then returns nothing. The Java formatting is the point of the builtin: <code>true</code> prints as <code>true</code> (not <code>1</code>), a whole double as <code>3.0</code> (not <code>3</code>), and a null reference as <code>null</code>. Called with no argument it prints just the newline.</p>
+          <pre><code class="lang-java">System.out.println("hello");
+System.out.println();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-5">
+          <h3><a class="doc-anchor" href="#doc-console-io-5">#</a> <code>System.out.print</code></h3>
+          <pre><code class="lang-java">void System.out.print([Object x])</code></pre>
+          <p>As <code>println</code>, but with no trailing newline.</p>
+          <pre><code class="lang-java">System.out.print("no newline");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-6">
+          <h3><a class="doc-anchor" href="#doc-console-io-6">#</a> <code>System.err.println</code></h3>
+          <pre><code class="lang-java">void System.err.println([Object x])</code></pre>
+          <p>As <code>System.out.println</code>, writing to stderr. stdout and stderr are locked and written independently, so redirecting one does not reorder the other.</p>
+          <pre><code class="lang-java">System.err.println("to stderr");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-7">
+          <h3><a class="doc-anchor" href="#doc-console-io-7">#</a> <code>System.err.print</code></h3>
+          <pre><code class="lang-java">void System.err.print([Object x])</code></pre>
+          <p>As <code>System.err.println</code>, with no trailing newline.</p>
+          <pre><code class="lang-java">System.err.print("partial");</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-string-methods">
+        <h2>String Methods</h2>
+        <article class="doc-entry" id="doc-string-methods-1">
+          <h3><a class="doc-anchor" href="#doc-string-methods-1">#</a> <code>length</code></h3>
+          <pre><code class="lang-java">int length()</code></pre>
+          <p>The number of characters in the string. javars counts Unicode scalars where Java counts UTF-16 code units, so the two agree for every ASCII and BMP string and differ by one per astral character.</p>
+          <pre><code class="lang-java">System.out.println("Hello".length());   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-2">
+          <h3><a class="doc-anchor" href="#doc-string-methods-2">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-java">boolean isEmpty()</code></pre>
+          <p>True when the string has no characters.</p>
+          <pre><code class="lang-java">System.out.println("".isEmpty());   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-3">
+          <h3><a class="doc-anchor" href="#doc-string-methods-3">#</a> <code>charAt</code></h3>
+          <pre><code class="lang-java">char charAt(int index)</code></pre>
+          <p>The character at a zero-based scalar index, returned as a one-character string (javars's <code>char</code> model). An out-of-range index raises <code>StringIndexOutOfBoundsException</code> with Java's exact <code>Index N out of bounds for length M</code> message.</p>
+          <pre><code class="lang-java">System.out.println("Hello".charAt(1));   // e</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-4">
+          <h3><a class="doc-anchor" href="#doc-string-methods-4">#</a> <code>substring</code></h3>
+          <pre><code class="lang-java">String substring(int beginIndex)</code></pre>
+          <p>The suffix beginning at <code>beginIndex</code>, on scalar indices.</p>
+          <pre><code class="lang-java">System.out.println("Hello".substring(1));   // ello</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-5">
+          <h3><a class="doc-anchor" href="#doc-string-methods-5">#</a> <code>substring</code></h3>
+          <pre><code class="lang-java">String substring(int beginIndex, int endIndex)</code></pre>
+          <p>The half-open range <code>[beginIndex, endIndex)</code>, with Java's bounds rule <code>0 &lt;= begin &lt;= end &lt;= length</code>. A violation raises <code>StringIndexOutOfBoundsException</code> carrying Java's <code>Range [b, e) out of bounds for length n</code> message.</p>
+          <pre><code class="lang-java">System.out.println("Hello".substring(1, 3));   // el</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-6">
+          <h3><a class="doc-anchor" href="#doc-string-methods-6">#</a> <code>indexOf</code></h3>
+          <pre><code class="lang-java">int indexOf(String str)</code></pre>
+          <p>The scalar index of the first occurrence of <code>str</code>, or <code>-1</code>. The result is converted from the byte offset the search returns, so it is a character index and not a UTF-8 offset.</p>
+          <pre><code class="lang-java">System.out.println("Hello".indexOf("ll"));   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-7">
+          <h3><a class="doc-anchor" href="#doc-string-methods-7">#</a> <code>contains</code></h3>
+          <pre><code class="lang-java">boolean contains(CharSequence s)</code></pre>
+          <p>True when the string contains <code>s</code> as a substring.</p>
+          <pre><code class="lang-java">System.out.println("Hello".contains("ell"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-8">
+          <h3><a class="doc-anchor" href="#doc-string-methods-8">#</a> <code>equals</code></h3>
+          <pre><code class="lang-java">boolean equals(Object other)</code></pre>
+          <p>Value equality on the character sequence. Note that javars's <code>==</code> already compares strings by value, so <code>equals</code> and <code>==</code> agree here where Java's would not.</p>
+          <pre><code class="lang-java">System.out.println("Hello".equals("Hello"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-9">
+          <h3><a class="doc-anchor" href="#doc-string-methods-9">#</a> <code>equalsIgnoreCase</code></h3>
+          <pre><code class="lang-java">boolean equalsIgnoreCase(String other)</code></pre>
+          <p>Value equality after lowercasing both sides with Unicode case folding.</p>
+          <pre><code class="lang-java">System.out.println("Hello".equalsIgnoreCase("HELLO"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-10">
+          <h3><a class="doc-anchor" href="#doc-string-methods-10">#</a> <code>compareTo</code></h3>
+          <pre><code class="lang-java">int compareTo(String other)</code></pre>
+          <p>Java's specified ordering value, not merely its sign: the difference of the first differing character, or the length difference when one string is a prefix of the other. That exactness is why a plain lexicographic comparison cannot stand in for it.</p>
+          <pre><code class="lang-java">System.out.println("Hello".compareTo("Hellp"));   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-11">
+          <h3><a class="doc-anchor" href="#doc-string-methods-11">#</a> <code>compareToIgnoreCase</code></h3>
+          <pre><code class="lang-java">int compareToIgnoreCase(String other)</code></pre>
+          <p>As <code>compareTo</code>, comparing the case-folded characters.</p>
+          <pre><code class="lang-java">System.out.println("Hello".compareToIgnoreCase("hello"));   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-12">
+          <h3><a class="doc-anchor" href="#doc-string-methods-12">#</a> <code>toUpperCase</code></h3>
+          <pre><code class="lang-java">String toUpperCase()</code></pre>
+          <p>The string uppercased with Unicode case mapping (locale-independent).</p>
+          <pre><code class="lang-java">System.out.println("Hello".toUpperCase());   // HELLO</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-13">
+          <h3><a class="doc-anchor" href="#doc-string-methods-13">#</a> <code>toLowerCase</code></h3>
+          <pre><code class="lang-java">String toLowerCase()</code></pre>
+          <p>The string lowercased with Unicode case mapping.</p>
+          <pre><code class="lang-java">System.out.println("Hello".toLowerCase());   // hello</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-14">
+          <h3><a class="doc-anchor" href="#doc-string-methods-14">#</a> <code>trim</code></h3>
+          <pre><code class="lang-java">String trim()</code></pre>
+          <p>Removes leading and trailing characters whose code point is at or below <code>U+0020</code> — Java's <code>trim()</code> rule, which is deliberately not the same as <code>strip()</code>'s Unicode whitespace test.</p>
+          <pre><code class="lang-java">System.out.println("  x ".trim() + "|");   // x|</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-15">
+          <h3><a class="doc-anchor" href="#doc-string-methods-15">#</a> <code>startsWith</code></h3>
+          <pre><code class="lang-java">boolean startsWith(String prefix)</code></pre>
+          <p>True when the string begins with <code>prefix</code>.</p>
+          <pre><code class="lang-java">System.out.println("Hello".startsWith("He"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-16">
+          <h3><a class="doc-anchor" href="#doc-string-methods-16">#</a> <code>endsWith</code></h3>
+          <pre><code class="lang-java">boolean endsWith(String suffix)</code></pre>
+          <p>True when the string ends with <code>suffix</code>.</p>
+          <pre><code class="lang-java">System.out.println("Hello".endsWith("lo"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-17">
+          <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>concat</code></h3>
+          <pre><code class="lang-java">String concat(String str)</code></pre>
+          <p>The receiver followed by <code>str</code>. Equivalent to <code>+</code> here, since javars's <code>+</code> already concatenates through the same value-to-string rules.</p>
+          <pre><code class="lang-java">System.out.println("Hello".concat("!"));   // Hello!</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-18">
+          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>replace</code></h3>
+          <pre><code class="lang-java">String replace(CharSequence target, CharSequence replacement)</code></pre>
+          <p>Every occurrence of <code>target</code> replaced by <code>replacement</code>. This is the literal two-argument overload; there is no regex <code>replaceAll</code>.</p>
+          <pre><code class="lang-java">System.out.println("Hello".replace("l", "L"));   // HeLLo</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-19">
+          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>repeat</code></h3>
+          <pre><code class="lang-java">String repeat(int count)</code></pre>
+          <p>The string repeated <code>count</code> times. A negative count raises <code>IllegalArgumentException</code> with Java's <code>count is negative: n</code> message.</p>
+          <pre><code class="lang-java">System.out.println("ab".repeat(3));   // ababab</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-static-library">
+        <h2>Static Library</h2>
+        <article class="doc-entry" id="doc-static-library-1">
+          <h3><a class="doc-anchor" href="#doc-static-library-1">#</a> <code>Math.abs</code></h3>
+          <pre><code class="lang-java">int Math.abs(int a)   |   double Math.abs(double a)</code></pre>
+          <p>Absolute value, keeping the operand's kind: an integral argument returns an integer, anything else returns a double. The result type is deliberately not modeled statically, because claiming either would mis-type the other overload.</p>
+          <pre><code class="lang-java">System.out.println(Math.abs(-3) + " " + Math.abs(-3.5));   // 3 3.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-2">
+          <h3><a class="doc-anchor" href="#doc-static-library-2">#</a> <code>Math.max</code></h3>
+          <pre><code class="lang-java">int Math.max(int a, int b)   |   double Math.max(double a, double b)</code></pre>
+          <p>The larger of two values; integral when both operands are integral, double otherwise.</p>
+          <pre><code class="lang-java">System.out.println(Math.max(1, 2));   // 2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-3">
+          <h3><a class="doc-anchor" href="#doc-static-library-3">#</a> <code>Math.min</code></h3>
+          <pre><code class="lang-java">int Math.min(int a, int b)   |   double Math.min(double a, double b)</code></pre>
+          <p>The smaller of two values, with the same integral-versus-double rule as <code>max</code>.</p>
+          <pre><code class="lang-java">System.out.println(Math.min(1.5, 2));   // 1.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-4">
+          <h3><a class="doc-anchor" href="#doc-static-library-4">#</a> <code>Math.pow</code></h3>
+          <pre><code class="lang-java">double Math.pow(double a, double b)</code></pre>
+          <p><code>a</code> raised to the power <code>b</code>, always as a double.</p>
+          <pre><code class="lang-java">System.out.println(Math.pow(2, 10));   // 1024.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-5">
+          <h3><a class="doc-anchor" href="#doc-static-library-5">#</a> <code>Math.sqrt</code></h3>
+          <pre><code class="lang-java">double Math.sqrt(double a)</code></pre>
+          <p>Square root, always as a double. A negative argument gives NaN rather than faulting, as in Java.</p>
+          <pre><code class="lang-java">System.out.println(Math.sqrt(9));   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-6">
+          <h3><a class="doc-anchor" href="#doc-static-library-6">#</a> <code>Math.floor</code></h3>
+          <pre><code class="lang-java">double Math.floor(double a)</code></pre>
+          <p>The largest double less than or equal to <code>a</code> that is a mathematical integer.</p>
+          <pre><code class="lang-java">System.out.println(Math.floor(1.7));   // 1.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-7">
+          <h3><a class="doc-anchor" href="#doc-static-library-7">#</a> <code>Math.ceil</code></h3>
+          <pre><code class="lang-java">double Math.ceil(double a)</code></pre>
+          <p>The smallest double greater than or equal to <code>a</code> that is a mathematical integer.</p>
+          <pre><code class="lang-java">System.out.println(Math.ceil(1.2));   // 2.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-8">
+          <h3><a class="doc-anchor" href="#doc-static-library-8">#</a> <code>Math.round</code></h3>
+          <pre><code class="lang-java">long Math.round(double a)</code></pre>
+          <p>Java's rounding, defined as <code>floor(a + 0.5)</code> — so ties go toward positive infinity and <code>round(-2.5)</code> is <code>-2</code>, which is *not* what Rust's own <code>round</code> would give.</p>
+          <pre><code class="lang-java">System.out.println(Math.round(-2.5));   // -2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-9">
+          <h3><a class="doc-anchor" href="#doc-static-library-9">#</a> <code>Integer.parseInt</code></h3>
+          <pre><code class="lang-java">int Integer.parseInt(String s)</code></pre>
+          <p>Parses a signed decimal integer with <code>java.lang.Integer</code>'s exact rules: no surrounding whitespace is tolerated and the value must fit 32 bits. Every failure raises <code>NumberFormatException</code> carrying Java's own <code>For input string: "…"</code> message.</p>
+          <pre><code class="lang-java">System.out.println(Integer.parseInt("42"));   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-10">
+          <h3><a class="doc-anchor" href="#doc-static-library-10">#</a> <code>Integer.parseInt</code></h3>
+          <pre><code class="lang-java">int Integer.parseInt(String s, int radix)</code></pre>
+          <p>As above in the given radix, which must lie between <code>Character.MIN_RADIX</code> and <code>Character.MAX_RADIX</code>. A bad radix and a bad digit string produce Java's two distinct <code>NumberFormatException</code> messages.</p>
+          <pre><code class="lang-java">System.out.println(Integer.parseInt("ff", 16));   // 255</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-11">
+          <h3><a class="doc-anchor" href="#doc-static-library-11">#</a> <code>Integer.valueOf</code></h3>
+          <pre><code class="lang-java">int Integer.valueOf(String s)   |   int Integer.valueOf(int i)</code></pre>
+          <p>Parses a decimal string with <code>parseInt</code>'s rules, or returns an integral argument unchanged. javars does no boxing, so there is no <code>Integer</code> object and no identity cache to observe.</p>
+          <pre><code class="lang-java">System.out.println(Integer.valueOf("7"));   // 7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-12">
+          <h3><a class="doc-anchor" href="#doc-static-library-12">#</a> <code>Integer.toString</code></h3>
+          <pre><code class="lang-java">String Integer.toString(int i)</code></pre>
+          <p>The decimal rendering of an integer.</p>
+          <pre><code class="lang-java">System.out.println(Integer.toString(255));   // 255</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-13">
+          <h3><a class="doc-anchor" href="#doc-static-library-13">#</a> <code>Integer.toString</code></h3>
+          <pre><code class="lang-java">String Integer.toString(int i, int radix)</code></pre>
+          <p>The rendering in radix 2 through 36, sign-prefixed for negatives. An out-of-range radix falls back to 10, exactly as Java specifies.</p>
+          <pre><code class="lang-java">System.out.println(Integer.toString(255, 16));   // ff</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-14">
+          <h3><a class="doc-anchor" href="#doc-static-library-14">#</a> <code>Long.parseLong</code></h3>
+          <pre><code class="lang-java">long Long.parseLong(String s)</code></pre>
+          <p>Parses a signed decimal <code>long</code>, using the same rules and the same <code>NumberFormatException</code> messages as <code>parseInt</code> but with the 64-bit width check.</p>
+          <pre><code class="lang-java">System.out.println(Long.parseLong("9000000000"));   // 9000000000</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-15">
+          <h3><a class="doc-anchor" href="#doc-static-library-15">#</a> <code>Boolean.parseBoolean</code></h3>
+          <pre><code class="lang-java">boolean Boolean.parseBoolean(String s)</code></pre>
+          <p>True when the string equals <code>"true"</code> ignoring ASCII case, false for everything else — including <code>null</code> and malformed input, which Java also never rejects here.</p>
+          <pre><code class="lang-java">System.out.println(Boolean.parseBoolean("TRUE"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-16">
+          <h3><a class="doc-anchor" href="#doc-static-library-16">#</a> <code>String.valueOf</code></h3>
+          <pre><code class="lang-java">String String.valueOf(Object x)</code></pre>
+          <p>Renders any value with Java's <code>println</code> rules: <code>true</code>/<code>false</code>, a whole double with its trailing <code>.0</code>, <code>null</code> for a null reference, and <code>ClassName@hash</code> for an instance whose class declares no <code>toString()</code>.</p>
+          <pre><code class="lang-java">System.out.println(String.valueOf(3.0));   // 3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-17">
+          <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>String.format</code></h3>
+          <pre><code class="lang-java">String String.format(String fmt, Object... args)</code></pre>
+          <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f b B x X o c %</code> and <code>%n</code>, the flags <code>-</code> <code>0</code> <code>+</code>, an optional width, and an optional <code>.precision</code>. An unsupported conversion is reported rather than rendered wrong.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%05.2f|%-6s|%+d", 3.14159, "ab", 7));   // 03.14|ab    |+7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-18">
+          <h3><a class="doc-anchor" href="#doc-static-library-18">#</a> <code>Arrays.toString</code></h3>
+          <pre><code class="lang-java">String Arrays.toString(Object[] a)</code></pre>
+          <p>The shallow <code>[e0, e1, …]</code> rendering of an array, each element through the same Java value-to-string rules. A null reference renders as <code>null</code>; a nested array renders as its handle, since the rendering is shallow.</p>
+          <pre><code class="lang-java">System.out.println(Arrays.toString(new int[]{1, 2, 3}));   // [1, 2, 3]</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-collection-types">
+        <h2>Collection Types</h2>
+        <article class="doc-entry" id="doc-collection-types-1">
+          <h3><a class="doc-anchor" href="#doc-collection-types-1">#</a> <code>ArrayList</code></h3>
+          <pre><code class="lang-java">new ArrayList&lt;&gt;()   |   new ArrayList&lt;&gt;(other)</code></pre>
+          <p>A mutable <code>List</code>, stored as a vector of values in list order. The copy constructor seeds it from any sequence-shaped argument — an array, a <code>List</code>, or a <code>Set</code> in that set's presentation order.</p>
+          <pre><code class="lang-java">List&lt;String&gt; xs = new ArrayList&lt;&gt;();
+xs.add("a");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-2">
+          <h3><a class="doc-anchor" href="#doc-collection-types-2">#</a> <code>LinkedList</code></h3>
+          <pre><code class="lang-java">new LinkedList&lt;&gt;()   |   new LinkedList&lt;&gt;(other)</code></pre>
+          <p>Constructible, and backed by the same vector <code>ArrayList</code> uses. javars models the <code>List</code> contract, not the node-per-element representation, so the two differ only in name; the <code>Deque</code>/<code>Queue</code> methods are not implemented.</p>
+          <pre><code class="lang-java">List&lt;Integer&gt; q = new LinkedList&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-3">
+          <h3><a class="doc-anchor" href="#doc-collection-types-3">#</a> <code>HashMap</code></h3>
+          <pre><code class="lang-java">new HashMap&lt;&gt;()   |   new HashMap&lt;&gt;(other)</code></pre>
+          <p>A <code>Map</code> whose iteration and <code>toString</code> order reproduce Java's real bucket order: entries are laid out in a power-of-two table indexed by <code>(capacity - 1) &amp; (h ^ (h &gt;&gt;&gt; 16))</code>, which makes the order a stable sort of the insertion sequence by bucket. Verified against OpenJDK 26 for <code>String</code> and <code>Integer</code> keys, including across the resize at 13 entries.</p>
+          <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new HashMap&lt;&gt;();
+m.put("one", 1);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-4">
+          <h3><a class="doc-anchor" href="#doc-collection-types-4">#</a> <code>LinkedHashMap</code></h3>
+          <pre><code class="lang-java">new LinkedHashMap&lt;&gt;()   |   new LinkedHashMap&lt;&gt;(other)</code></pre>
+          <p>A <code>Map</code> that iterates in insertion order. Since javars always *stores* entries in insertion order, this implementation is the one that costs nothing extra.</p>
+          <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new LinkedHashMap&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-5">
+          <h3><a class="doc-anchor" href="#doc-collection-types-5">#</a> <code>TreeMap</code></h3>
+          <pre><code class="lang-java">new TreeMap&lt;&gt;()   |   new TreeMap&lt;&gt;(other)</code></pre>
+          <p>A <code>Map</code> that iterates in ascending natural key order: numbers numerically, strings lexicographically by <code>char</code>, <code>null</code> first. The navigation methods (<code>firstKey</code>, <code>headMap</code>, …) are not implemented.</p>
+          <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new TreeMap&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-6">
+          <h3><a class="doc-anchor" href="#doc-collection-types-6">#</a> <code>HashSet</code></h3>
+          <pre><code class="lang-java">new HashSet&lt;&gt;()   |   new HashSet&lt;&gt;(other)</code></pre>
+          <p>A <code>Set</code> with <code>HashMap</code>'s bucket iteration order. Building one from a sequence keeps the first of each repeated value.</p>
+          <pre><code class="lang-java">Set&lt;String&gt; s = new HashSet&lt;&gt;();
+s.add("a");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-7">
+          <h3><a class="doc-anchor" href="#doc-collection-types-7">#</a> <code>LinkedHashSet</code></h3>
+          <pre><code class="lang-java">new LinkedHashSet&lt;&gt;()   |   new LinkedHashSet&lt;&gt;(other)</code></pre>
+          <p>A <code>Set</code> that iterates in insertion order.</p>
+          <pre><code class="lang-java">Set&lt;String&gt; s = new LinkedHashSet&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-8">
+          <h3><a class="doc-anchor" href="#doc-collection-types-8">#</a> <code>TreeSet</code></h3>
+          <pre><code class="lang-java">new TreeSet&lt;&gt;()   |   new TreeSet&lt;&gt;(other)</code></pre>
+          <p>A <code>Set</code> that iterates in ascending natural order of its elements.</p>
+          <pre><code class="lang-java">Set&lt;String&gt; s = new TreeSet&lt;&gt;();
+s.add("z"); s.add("a");
+System.out.println(s);   // [a, z]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-9">
+          <h3><a class="doc-anchor" href="#doc-collection-types-9">#</a> <code>List</code></h3>
+          <pre><code class="lang-java">List&lt;T&gt; name = …;   |   List.of(…)</code></pre>
+          <p>Declaration-only: the interface types the variable but cannot be instantiated — <code>new List&lt;&gt;()</code> is not a thing in Java either. A user class named <code>List</code> wins over this modeling, so declaring your own is still legal.</p>
+          <pre><code class="lang-java">List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-10">
+          <h3><a class="doc-anchor" href="#doc-collection-types-10">#</a> <code>Collection</code></h3>
+          <pre><code class="lang-java">Collection&lt;T&gt; name = …;</code></pre>
+          <p>Declaration-only, treated as a list-shaped receiver for the purpose of typing a call's result.</p>
+          <pre><code class="lang-java">Collection&lt;String&gt; c = new ArrayList&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-11">
+          <h3><a class="doc-anchor" href="#doc-collection-types-11">#</a> <code>Iterable</code></h3>
+          <pre><code class="lang-java">Iterable&lt;T&gt; name = …;</code></pre>
+          <p>Declaration-only, list-shaped. An enhanced <code>for</code> over any collection works through the <code>JITER_ARRAY</code> builtin regardless of the declared type; there is no <code>Iterator</code> object to obtain.</p>
+          <pre><code class="lang-java">Iterable&lt;String&gt; it = new ArrayList&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-12">
+          <h3><a class="doc-anchor" href="#doc-collection-types-12">#</a> <code>Map</code></h3>
+          <pre><code class="lang-java">Map&lt;K,V&gt; name = …;</code></pre>
+          <p>Declaration-only. The map methods available on the variable are the ones the modeled implementations provide; <code>entrySet</code> is not among them.</p>
+          <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new HashMap&lt;&gt;();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-13">
+          <h3><a class="doc-anchor" href="#doc-collection-types-13">#</a> <code>Set</code></h3>
+          <pre><code class="lang-java">Set&lt;T&gt; name = …;   |   Set.of(…)</code></pre>
+          <p>Declaration-only as a type, though <code>Set.of</code> is a usable static factory.</p>
+          <pre><code class="lang-java">Set&lt;String&gt; s = new HashSet&lt;&gt;();</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-collection-statics">
+        <h2>Collection Statics</h2>
+        <article class="doc-entry" id="doc-collection-statics-1">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-1">#</a> <code>Arrays.asList</code></h3>
+          <pre><code class="lang-java">List&lt;T&gt; Arrays.asList(T... a)</code></pre>
+          <p>A *fixed-size* list view: <code>set</code> replaces an element, but <code>add</code>, <code>remove</code>, and <code>clear</code> raise <code>UnsupportedOperationException</code> exactly as Java's does. A lone array argument spreads into its elements rather than becoming a one-element list, matching Java's varargs rule for reference arrays.</p>
+          <pre><code class="lang-java">List&lt;Integer&gt; xs = Arrays.asList(1, 2, 3);
+xs.set(0, 9);   // fine
+// xs.add(4);   // UnsupportedOperationException</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-2">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-2">#</a> <code>List.of</code></h3>
+          <pre><code class="lang-java">List&lt;T&gt; List.of(T... elements)</code></pre>
+          <p>A fully immutable list: every structural change *and* every element replacement raises <code>UnsupportedOperationException</code>.</p>
+          <pre><code class="lang-java">System.out.println(List.of(1, 2, 3));   // [1, 2, 3]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-3">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-3">#</a> <code>Set.of</code></h3>
+          <pre><code class="lang-java">Set&lt;T&gt; Set.of(T... elements)</code></pre>
+          <p>An immutable set with <code>HashSet</code> iteration order, keeping the first of each repeated element.</p>
+          <pre><code class="lang-java">System.out.println(Set.of("p"));   // [p]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-4">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-4">#</a> <code>Collections.sort</code></h3>
+          <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list)</code></pre>
+          <p>Sorts the list in place into ascending natural order, so the change is visible through every reference to it. Mixed value kinds compare as equal, which keeps the sort stable rather than panicking.</p>
+          <pre><code class="lang-java">Collections.sort(xs);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-5">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-5">#</a> <code>Collections.sort</code></h3>
+          <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list, Comparator&lt;T&gt; cmp)</code></pre>
+          <p>Sorts in place with a comparator lambda. A user comparator may not define a total order, so javars uses a stable insertion sort — which cannot panic on an inconsistent comparator the way a merge sort can — and matches Java's guarantee that <code>List.sort</code> is stable. A <code>null</code> comparator means natural order.</p>
+          <pre><code class="lang-java">Collections.sort(xs, (a, b) -&gt; a.length() - b.length());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-6">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-6">#</a> <code>Collections.reverse</code></h3>
+          <pre><code class="lang-java">void Collections.reverse(List&lt;T&gt; list)</code></pre>
+          <p>Reverses the list in place.</p>
+          <pre><code class="lang-java">Collections.reverse(xs);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-7">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-7">#</a> <code>Collections.max</code></h3>
+          <pre><code class="lang-java">T Collections.max(Collection&lt;T&gt; c)</code></pre>
+          <p>The largest element in ascending natural order. An empty collection raises <code>NoSuchElementException</code> — which is not one of the modeled <code>java.lang</code> throwables, so it cannot be named in a <code>catch</code> clause and reaches the uncaught report unqualified.</p>
+          <pre><code class="lang-java">System.out.println(Collections.max(xs));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-8">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-8">#</a> <code>Collections.min</code></h3>
+          <pre><code class="lang-java">T Collections.min(Collection&lt;T&gt; c)</code></pre>
+          <p>The smallest element in ascending natural order; empty raises the same uncatchable <code>NoSuchElementException</code> as <code>Collections.max</code>.</p>
+          <pre><code class="lang-java">System.out.println(Collections.min(xs));</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-list-methods">
+        <h2>List Methods</h2>
+        <article class="doc-entry" id="doc-list-methods-1">
+          <h3><a class="doc-anchor" href="#doc-list-methods-1">#</a> <code>size</code></h3>
+          <pre><code class="lang-java">int size()</code></pre>
+          <p>The number of elements.</p>
+          <pre><code class="lang-java">System.out.println(xs.size());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-2">
+          <h3><a class="doc-anchor" href="#doc-list-methods-2">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-java">boolean isEmpty()</code></pre>
+          <p>True when the list holds no elements.</p>
+          <pre><code class="lang-java">if (xs.isEmpty()) { System.out.println("none"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-3">
+          <h3><a class="doc-anchor" href="#doc-list-methods-3">#</a> <code>add</code></h3>
+          <pre><code class="lang-java">boolean add(T e)</code></pre>
+          <p>Appends an element and returns <code>true</code>. On a fixed-size or immutable list this raises <code>UnsupportedOperationException</code> rather than succeeding silently.</p>
+          <pre><code class="lang-java">xs.add("c");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-4">
+          <h3><a class="doc-anchor" href="#doc-list-methods-4">#</a> <code>add</code></h3>
+          <pre><code class="lang-java">void add(int index, T e)</code></pre>
+          <p>Inserts at <code>index</code>, shifting the tail right. An index outside <code>[0, size]</code> raises <code>IndexOutOfBoundsException</code> with Java's <code>Index: i, Size: n</code> message — the distinct wording this overload uses.</p>
+          <pre><code class="lang-java">xs.add(0, "first");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-5">
+          <h3><a class="doc-anchor" href="#doc-list-methods-5">#</a> <code>get</code></h3>
+          <pre><code class="lang-java">T get(int index)</code></pre>
+          <p>The element at <code>index</code>; out of range raises <code>IndexOutOfBoundsException</code> carrying <code>Index i out of bounds for length n</code>.</p>
+          <pre><code class="lang-java">System.out.println(xs.get(0));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-6">
+          <h3><a class="doc-anchor" href="#doc-list-methods-6">#</a> <code>set</code></h3>
+          <pre><code class="lang-java">T set(int index, T e)</code></pre>
+          <p>Replaces the element at <code>index</code> and returns the previous value. Permitted on a fixed-size list (that is what <code>Arrays.asList</code> gives you) and refused on an immutable one.</p>
+          <pre><code class="lang-java">xs.set(0, "z");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-7">
+          <h3><a class="doc-anchor" href="#doc-list-methods-7">#</a> <code>remove</code></h3>
+          <pre><code class="lang-java">T remove(int index)</code></pre>
+          <p>Removes and returns the element at <code>index</code>. This is the by-index overload, which is the one Java selects for an integral argument; there is no <code>remove(Object)</code>, because javars cannot tell a boxed <code>Integer</code> from an <code>int</code>.</p>
+          <pre><code class="lang-java">xs.remove(0);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-8">
+          <h3><a class="doc-anchor" href="#doc-list-methods-8">#</a> <code>clear</code></h3>
+          <pre><code class="lang-java">void clear()</code></pre>
+          <p>Removes every element. Structural, so it is refused on a fixed-size or immutable list.</p>
+          <pre><code class="lang-java">xs.clear();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-9">
+          <h3><a class="doc-anchor" href="#doc-list-methods-9">#</a> <code>contains</code></h3>
+          <pre><code class="lang-java">boolean contains(Object o)</code></pre>
+          <p>True when some element equals <code>o</code> by value for strings, numbers, and booleans, or by handle identity for a heap object. A user <code>equals</code> override is not consulted.</p>
+          <pre><code class="lang-java">System.out.println(xs.contains("a"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-10">
+          <h3><a class="doc-anchor" href="#doc-list-methods-10">#</a> <code>indexOf</code></h3>
+          <pre><code class="lang-java">int indexOf(Object o)</code></pre>
+          <p>The index of the first matching element, or <code>-1</code>.</p>
+          <pre><code class="lang-java">System.out.println(xs.indexOf("a"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-11">
+          <h3><a class="doc-anchor" href="#doc-list-methods-11">#</a> <code>lastIndexOf</code></h3>
+          <pre><code class="lang-java">int lastIndexOf(Object o)</code></pre>
+          <p>The index of the last matching element, or <code>-1</code>.</p>
+          <pre><code class="lang-java">System.out.println(xs.lastIndexOf("a"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-12">
+          <h3><a class="doc-anchor" href="#doc-list-methods-12">#</a> <code>addAll</code></h3>
+          <pre><code class="lang-java">boolean addAll(Collection&lt;T&gt; other)</code></pre>
+          <p>Appends every element of <code>other</code> in its presentation order and returns whether anything was added. The argument is snapshotted before the receiver's heap borrow is taken, so <code>xs.addAll(xs)</code> is well defined.</p>
+          <pre><code class="lang-java">xs.addAll(ys);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-13">
+          <h3><a class="doc-anchor" href="#doc-list-methods-13">#</a> <code>equals</code></h3>
+          <pre><code class="lang-java">boolean equals(Object other)</code></pre>
+          <p>Element-wise equality against another sequence of the same length.</p>
+          <pre><code class="lang-java">System.out.println(xs.equals(ys));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-14">
+          <h3><a class="doc-anchor" href="#doc-list-methods-14">#</a> <code>sort</code></h3>
+          <pre><code class="lang-java">void sort(Comparator&lt;T&gt; cmp)</code></pre>
+          <p>Sorts in place with a comparator lambda, or in natural order when given <code>null</code>. Handled before the heap borrow is taken, because the comparator body is user code that may allocate.</p>
+          <pre><code class="lang-java">xs.sort((a, b) -&gt; a.length() - b.length());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-15">
+          <h3><a class="doc-anchor" href="#doc-list-methods-15">#</a> <code>forEach</code></h3>
+          <pre><code class="lang-java">void forEach(Consumer&lt;T&gt; action)</code></pre>
+          <p>Invokes the action once per element, in order. Like <code>sort</code>, the elements are snapshotted first so the lambda body can safely allocate.</p>
+          <pre><code class="lang-java">xs.forEach(x -&gt; System.out.println(x));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-16">
+          <h3><a class="doc-anchor" href="#doc-list-methods-16">#</a> <code>toString</code></h3>
+          <pre><code class="lang-java">String toString()</code></pre>
+          <p><code>AbstractCollection.toString</code> — <code>[a, b, c]</code>, each element rendered with Java's value-to-string rules. This is also what <code>System.out.println(list)</code> prints, without any explicit call.</p>
+          <pre><code class="lang-java">System.out.println(xs);   // [a, b, c]</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-map-methods">
+        <h2>Map Methods</h2>
+        <article class="doc-entry" id="doc-map-methods-1">
+          <h3><a class="doc-anchor" href="#doc-map-methods-1">#</a> <code>size</code></h3>
+          <pre><code class="lang-java">int size()</code></pre>
+          <p>The number of entries.</p>
+          <pre><code class="lang-java">System.out.println(m.size());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-2">
+          <h3><a class="doc-anchor" href="#doc-map-methods-2">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-java">boolean isEmpty()</code></pre>
+          <p>True when the map holds no entries.</p>
+          <pre><code class="lang-java">if (m.isEmpty()) { System.out.println("empty"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-3">
+          <h3><a class="doc-anchor" href="#doc-map-methods-3">#</a> <code>put</code></h3>
+          <pre><code class="lang-java">V put(K key, V value)</code></pre>
+          <p>Associates <code>key</code> with <code>value</code> and returns the previous value, or <code>null</code> when the key was absent. Re-putting an existing key keeps the entry's original insertion position, which is what Java's linked and bucket layouts both do.</p>
+          <pre><code class="lang-java">m.put("one", 1);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-4">
+          <h3><a class="doc-anchor" href="#doc-map-methods-4">#</a> <code>putIfAbsent</code></h3>
+          <pre><code class="lang-java">V putIfAbsent(K key, V value)</code></pre>
+          <p>Inserts only when the key is absent; returns the existing value when it was present, <code>null</code> otherwise.</p>
+          <pre><code class="lang-java">m.putIfAbsent("one", 99);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-5">
+          <h3><a class="doc-anchor" href="#doc-map-methods-5">#</a> <code>get</code></h3>
+          <pre><code class="lang-java">V get(Object key)</code></pre>
+          <p>The value for <code>key</code>, or <code>null</code> when absent. Keys are matched with the same value-or-identity equality the rest of the collections use.</p>
+          <pre><code class="lang-java">System.out.println(m.get("one"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-6">
+          <h3><a class="doc-anchor" href="#doc-map-methods-6">#</a> <code>getOrDefault</code></h3>
+          <pre><code class="lang-java">V getOrDefault(Object key, V fallback)</code></pre>
+          <p>The value for <code>key</code>, or <code>fallback</code> when the key is absent.</p>
+          <pre><code class="lang-java">System.out.println(m.getOrDefault("nope", 0));   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-7">
+          <h3><a class="doc-anchor" href="#doc-map-methods-7">#</a> <code>containsKey</code></h3>
+          <pre><code class="lang-java">boolean containsKey(Object key)</code></pre>
+          <p>True when the map holds an entry for <code>key</code>.</p>
+          <pre><code class="lang-java">System.out.println(m.containsKey("one"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-8">
+          <h3><a class="doc-anchor" href="#doc-map-methods-8">#</a> <code>containsValue</code></h3>
+          <pre><code class="lang-java">boolean containsValue(Object value)</code></pre>
+          <p>True when some entry's value matches — a linear scan, as in Java.</p>
+          <pre><code class="lang-java">System.out.println(m.containsValue(1));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-9">
+          <h3><a class="doc-anchor" href="#doc-map-methods-9">#</a> <code>remove</code></h3>
+          <pre><code class="lang-java">V remove(Object key)</code></pre>
+          <p>Removes the entry and returns its value, or <code>null</code> when the key was absent.</p>
+          <pre><code class="lang-java">m.remove("one");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-10">
+          <h3><a class="doc-anchor" href="#doc-map-methods-10">#</a> <code>clear</code></h3>
+          <pre><code class="lang-java">void clear()</code></pre>
+          <p>Removes every entry.</p>
+          <pre><code class="lang-java">m.clear();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-11">
+          <h3><a class="doc-anchor" href="#doc-map-methods-11">#</a> <code>keySet</code></h3>
+          <pre><code class="lang-java">Set&lt;K&gt; keySet()</code></pre>
+          <p>A <code>Set</code> of the keys, already materialized in the map's own presentation order — so it iterates and prints exactly as the map does. It is a snapshot, not a live view: removing from it does not change the map.</p>
+          <pre><code class="lang-java">System.out.println(m.keySet());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-12">
+          <h3><a class="doc-anchor" href="#doc-map-methods-12">#</a> <code>values</code></h3>
+          <pre><code class="lang-java">Collection&lt;V&gt; values()</code></pre>
+          <p>A fixed-size list of the values, in the map's presentation order and therefore aligned position-for-position with <code>keySet()</code>. Also a snapshot.</p>
+          <pre><code class="lang-java">System.out.println(m.values());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-13">
+          <h3><a class="doc-anchor" href="#doc-map-methods-13">#</a> <code>forEach</code></h3>
+          <pre><code class="lang-java">void forEach(BiConsumer&lt;K,V&gt; action)</code></pre>
+          <p>Invokes a two-argument action per entry, in presentation order. The map's <code>forEach</code> is distinguished from a list's by the receiver, so the same lambda arity rules as Java apply.</p>
+          <pre><code class="lang-java">m.forEach((k, v) -&gt; System.out.println(k + "=" + v));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-14">
+          <h3><a class="doc-anchor" href="#doc-map-methods-14">#</a> <code>toString</code></h3>
+          <pre><code class="lang-java">String toString()</code></pre>
+          <p><code>AbstractMap.toString</code> — <code>{k=v, k=v}</code> in presentation order, which for a <code>HashMap</code> is Java's real bucket order.</p>
+          <pre><code class="lang-java">System.out.println(m);   // {one=1, two=2, three=3}</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-set-methods">
+        <h2>Set Methods</h2>
+        <article class="doc-entry" id="doc-set-methods-1">
+          <h3><a class="doc-anchor" href="#doc-set-methods-1">#</a> <code>size</code></h3>
+          <pre><code class="lang-java">int size()</code></pre>
+          <p>The number of distinct elements.</p>
+          <pre><code class="lang-java">System.out.println(s.size());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-2">
+          <h3><a class="doc-anchor" href="#doc-set-methods-2">#</a> <code>isEmpty</code></h3>
+          <pre><code class="lang-java">boolean isEmpty()</code></pre>
+          <p>True when the set holds no elements.</p>
+          <pre><code class="lang-java">if (s.isEmpty()) { System.out.println("empty"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-3">
+          <h3><a class="doc-anchor" href="#doc-set-methods-3">#</a> <code>add</code></h3>
+          <pre><code class="lang-java">boolean add(T e)</code></pre>
+          <p>Adds the element if it is not already present, returning whether the set changed.</p>
+          <pre><code class="lang-java">System.out.println(s.add("a"));   // true the first time</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-4">
+          <h3><a class="doc-anchor" href="#doc-set-methods-4">#</a> <code>contains</code></h3>
+          <pre><code class="lang-java">boolean contains(Object o)</code></pre>
+          <p>Membership test, by value for strings, numbers, and booleans and by handle identity for a heap object.</p>
+          <pre><code class="lang-java">System.out.println(s.contains("a"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-5">
+          <h3><a class="doc-anchor" href="#doc-set-methods-5">#</a> <code>remove</code></h3>
+          <pre><code class="lang-java">boolean remove(Object o)</code></pre>
+          <p>Removes the element if present, returning whether the set changed. Unlike <code>List.remove</code>, this overload is by value rather than by index.</p>
+          <pre><code class="lang-java">s.remove("a");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-6">
+          <h3><a class="doc-anchor" href="#doc-set-methods-6">#</a> <code>clear</code></h3>
+          <pre><code class="lang-java">void clear()</code></pre>
+          <p>Removes every element.</p>
+          <pre><code class="lang-java">s.clear();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-7">
+          <h3><a class="doc-anchor" href="#doc-set-methods-7">#</a> <code>addAll</code></h3>
+          <pre><code class="lang-java">boolean addAll(Collection&lt;T&gt; other)</code></pre>
+          <p>Adds every element of <code>other</code> that is not already present, returning whether the set changed.</p>
+          <pre><code class="lang-java">s.addAll(other);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-8">
+          <h3><a class="doc-anchor" href="#doc-set-methods-8">#</a> <code>forEach</code></h3>
+          <pre><code class="lang-java">void forEach(Consumer&lt;T&gt; action)</code></pre>
+          <p>Invokes the action once per element, in the set's presentation order.</p>
+          <pre><code class="lang-java">s.forEach(x -&gt; System.out.println(x));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-9">
+          <h3><a class="doc-anchor" href="#doc-set-methods-9">#</a> <code>toString</code></h3>
+          <pre><code class="lang-java">String toString()</code></pre>
+          <p><code>[a, b, c]</code> in presentation order — bucket order for a <code>HashSet</code>, insertion order for a <code>LinkedHashSet</code>, ascending for a <code>TreeSet</code>.</p>
+          <pre><code class="lang-java">System.out.println(s);</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-throwables">
+        <h2>Throwables</h2>
+        <article class="doc-entry" id="doc-throwables-1">
+          <h3><a class="doc-anchor" href="#doc-throwables-1">#</a> <code>Throwable</code></h3>
+          <pre><code class="lang-java">class Throwable { Throwable(); Throwable(String message); String getMessage(); String toString(); }</code></pre>
+          <p>The root of the modeled hierarchy and the only class that carries state: a <code>detailMessage</code> field the whole tree inherits, its accessor, and a <code>toString()</code> that prints <code>java.lang.Throwable</code> alone or with <code>": " + detailMessage</code>. The no-argument constructor leaves the message at its field default, which is exactly the <code>null</code> Java's <code>getMessage()</code> returns.</p>
+          <pre><code class="lang-java">throw new Throwable("root cause");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-2">
+          <h3><a class="doc-anchor" href="#doc-throwables-2">#</a> <code>Error</code></h3>
+          <pre><code class="lang-java">class Error extends Throwable</code></pre>
+          <p>Java's unchecked-error branch. javars never raises one itself; it exists so a program that throws or catches an <code>Error</code> compiles and runs.</p>
+          <pre><code class="lang-java">catch (Error e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-3">
+          <h3><a class="doc-anchor" href="#doc-throwables-3">#</a> <code>Exception</code></h3>
+          <pre><code class="lang-java">class Exception extends Throwable</code></pre>
+          <p>The base of the checked branch, and the arm that catches everything javars raises. <code>catch (Exception e)</code> matching a <code>NumberFormatException</code> is just the <code>instanceof</code> supertype walk the runtime already performs.</p>
+          <pre><code class="lang-java">try { risky(); } catch (Exception e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-4">
+          <h3><a class="doc-anchor" href="#doc-throwables-4">#</a> <code>RuntimeException</code></h3>
+          <pre><code class="lang-java">class RuntimeException extends Exception</code></pre>
+          <p>The unchecked branch, and the superclass of every fault the runtime raises.</p>
+          <pre><code class="lang-java">throw new RuntimeException("boom");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-5">
+          <h3><a class="doc-anchor" href="#doc-throwables-5">#</a> <code>IllegalArgumentException</code></h3>
+          <pre><code class="lang-java">class IllegalArgumentException extends RuntimeException</code></pre>
+          <p>Raised by <code>String.repeat</code> with a negative count, carrying Java's <code>count is negative: n</code> message. Also throwable directly.</p>
+          <pre><code class="lang-java">throw new IllegalArgumentException("bad input");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-6">
+          <h3><a class="doc-anchor" href="#doc-throwables-6">#</a> <code>NumberFormatException</code></h3>
+          <pre><code class="lang-java">class NumberFormatException extends IllegalArgumentException</code></pre>
+          <p>Raised by <code>Integer.parseInt</code>, <code>Integer.valueOf</code>, and <code>Long.parseLong</code> for a malformed string, an out-of-width value, or an out-of-range radix. The detail message is Java's own — <code>For input string: "zz"</code>, and the radix-qualified variant for a non-decimal radix.</p>
+          <pre><code class="lang-java">try { Integer.parseInt("zz"); } catch (NumberFormatException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-7">
+          <h3><a class="doc-anchor" href="#doc-throwables-7">#</a> <code>IllegalStateException</code></h3>
+          <pre><code class="lang-java">class IllegalStateException extends RuntimeException</code></pre>
+          <p>Never raised by the runtime; supplied so program code can throw and catch it.</p>
+          <pre><code class="lang-java">throw new IllegalStateException("bad state");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-8">
+          <h3><a class="doc-anchor" href="#doc-throwables-8">#</a> <code>ArithmeticException</code></h3>
+          <pre><code class="lang-java">class ArithmeticException extends RuntimeException</code></pre>
+          <p>Raised by integral <code>/</code> and <code>%</code> with a zero divisor, carrying Java's message <code>/ by zero</code> for both operators. The check is emitted inline by the compiler rather than by a builtin, so it costs one compare and one branch and stays JIT-traceable. Floating division never raises it — IEEE-754 gives an infinity instead.</p>
+          <pre><code class="lang-java">try { int z = 0; System.out.println(1 / z); } catch (ArithmeticException e) { System.out.println(e.getMessage()); }   // / by zero</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-9">
+          <h3><a class="doc-anchor" href="#doc-throwables-9">#</a> <code>NullPointerException</code></h3>
+          <pre><code class="lang-java">class NullPointerException extends RuntimeException</code></pre>
+          <p>Raised on every null dereference javars models: an array load, store, or <code>.length</code>; an instance field read or assignment; a method call on a null receiver; iterating a null; and invoking a null functional-interface target. Java's "helpful" messages name the bytecode local slot of the null reference (<code>because "&lt;local3&gt;" is null</code>), which javars has no javac slot numbering to reproduce, so it keeps the operation half of Java's wording and drops the provenance clause.</p>
+          <pre><code class="lang-java">String s = null;
+// s.length();   // Cannot invoke "String.length()" because the receiver is null</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-10">
+          <h3><a class="doc-anchor" href="#doc-throwables-10">#</a> <code>ClassCastException</code></h3>
+          <pre><code class="lang-java">class ClassCastException extends RuntimeException</code></pre>
+          <p>Declared and catchable, but never raised: javars does not implement cast expressions, so there is no narrowing conversion to fail.</p>
+          <pre><code class="lang-java">catch (ClassCastException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-11">
+          <h3><a class="doc-anchor" href="#doc-throwables-11">#</a> <code>UnsupportedOperationException</code></h3>
+          <pre><code class="lang-java">class UnsupportedOperationException extends RuntimeException</code></pre>
+          <p>Raised by a structural change to a fixed-size list (<code>Arrays.asList</code>) or by any change at all to an immutable one (<code>List.of</code>). One divergence to know: javars constructs it with an empty string where Java leaves the message <code>null</code>, so <code>getMessage()</code> returns <code>""</code> instead of <code>null</code> and <code>toString()</code> prints a trailing <code>": "</code> that Java omits.</p>
+          <pre><code class="lang-java">List&lt;Integer&gt; xs = List.of(1, 2);
+try { xs.add(3); } catch (UnsupportedOperationException e) { System.out.println("[" + e.getMessage() + "]"); }   // []</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-12">
+          <h3><a class="doc-anchor" href="#doc-throwables-12">#</a> <code>NegativeArraySizeException</code></h3>
+          <pre><code class="lang-java">class NegativeArraySizeException extends RuntimeException</code></pre>
+          <p>Raised by <code>new T[n]</code> and by the multi-dimensional form when any dimension is negative. The detail message is the offending size, as in Java.</p>
+          <pre><code class="lang-java">try { int[] a = new int[-1]; } catch (NegativeArraySizeException e) { System.out.println(e.getMessage()); }   // -1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-13">
+          <h3><a class="doc-anchor" href="#doc-throwables-13">#</a> <code>IndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-java">class IndexOutOfBoundsException extends RuntimeException</code></pre>
+          <p>Raised by the <code>List</code> accessors — <code>get</code>, <code>set</code>, <code>remove</code>, and the two-argument <code>add</code>. The first three carry <code>Index i out of bounds for length n</code>; <code>add(index, e)</code> carries Java's distinct <code>Index: i, Size: n</code> wording.</p>
+          <pre><code class="lang-java">try { xs.get(99); } catch (IndexOutOfBoundsException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-14">
+          <h3><a class="doc-anchor" href="#doc-throwables-14">#</a> <code>ArrayIndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-java">class ArrayIndexOutOfBoundsException extends IndexOutOfBoundsException</code></pre>
+          <p>Raised by an out-of-range array read or write, carrying Java's exact <code>Index i out of bounds for length n</code>. The bounds check runs inside the heap borrow and the throwable is allocated after it is released, since raising allocates on the same heap.</p>
+          <pre><code class="lang-java">int[] a = new int[2];
+try { System.out.println(a[5]); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-15">
+          <h3><a class="doc-anchor" href="#doc-throwables-15">#</a> <code>StringIndexOutOfBoundsException</code></h3>
+          <pre><code class="lang-java">class StringIndexOutOfBoundsException extends IndexOutOfBoundsException</code></pre>
+          <p>Raised by <code>charAt</code> and both <code>substring</code> overloads. <code>charAt</code> carries <code>Index i out of bounds for length n</code>; <code>substring</code> carries <code>Range [b, e) out of bounds for length n</code>.</p>
+          <pre><code class="lang-java">try { "hi".charAt(9); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-functional-interfaces">
+        <h2>Functional Interfaces</h2>
+        <article class="doc-entry" id="doc-functional-interfaces-1">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-1">#</a> <code>Runnable</code></h3>
+          <pre><code class="lang-java">interface Runnable { void run(); }</code></pre>
+          <p>A no-argument, no-result action. javars runs one thread, so a <code>Runnable</code> is only ever invoked directly — there is no <code>Thread</code> to hand it to.</p>
+          <pre><code class="lang-java">Runnable r = () -&gt; System.out.println("ran");
+r.run();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-2">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-2">#</a> <code>Callable</code></h3>
+          <pre><code class="lang-java">interface Callable { Object call(); }</code></pre>
+          <p>A no-argument action that produces a result. Java's declares <code>throws Exception</code>; javars performs no checked-exception analysis, so the clause is omitted with no behavioural difference.</p>
+          <pre><code class="lang-java">Callable c = () -&gt; 42;
+System.out.println(c.call());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-3">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-3">#</a> <code>Supplier</code></h3>
+          <pre><code class="lang-java">interface Supplier { Object get(); }</code></pre>
+          <p>A source of values. The return type is the erasure Java itself uses, which is why a <code>Supplier</code> result printed directly renders with the default <code>ClassName@hash</code> form rather than through a user <code>toString()</code> override — the compiler has no static type to dispatch on.</p>
+          <pre><code class="lang-java">Supplier s = () -&gt; "made";
+System.out.println(s.get());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-4">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-4">#</a> <code>Consumer</code></h3>
+          <pre><code class="lang-java">interface Consumer { void accept(Object t); }</code></pre>
+          <p>A one-argument action with no result — the type <code>List.forEach</code> and <code>Set.forEach</code> expect.</p>
+          <pre><code class="lang-java">Consumer c = x -&gt; System.out.println(x);
+xs.forEach(c);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-5">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-5">#</a> <code>BiConsumer</code></h3>
+          <pre><code class="lang-java">interface BiConsumer { void accept(Object t, Object u); }</code></pre>
+          <p>A two-argument action with no result — the type <code>Map.forEach</code> expects, receiving each key and value.</p>
+          <pre><code class="lang-java">m.forEach((k, v) -&gt; System.out.println(k + "=" + v));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-6">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-6">#</a> <code>Function</code></h3>
+          <pre><code class="lang-java">interface Function { Object apply(Object t); }</code></pre>
+          <p>A one-argument transformation. The composition defaults (<code>andThen</code>, <code>compose</code>) are not declared.</p>
+          <pre><code class="lang-java">Function f = s -&gt; s + "!";
+System.out.println(f.apply("hi"));   // hi!</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-7">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-7">#</a> <code>BiFunction</code></h3>
+          <pre><code class="lang-java">interface BiFunction { Object apply(Object t, Object u); }</code></pre>
+          <p>A two-argument transformation.</p>
+          <pre><code class="lang-java">BiFunction add = (a, b) -&gt; a + "/" + b;
+System.out.println(add.apply(1, 2));   // 1/2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-8">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-8">#</a> <code>UnaryOperator</code></h3>
+          <pre><code class="lang-java">interface UnaryOperator { Object apply(Object t); }</code></pre>
+          <p>A transformation whose argument and result are the same type. Erasure makes its declaration identical to <code>Function</code>'s; the distinct name is what a target type is written as.</p>
+          <pre><code class="lang-java">UnaryOperator u = s -&gt; s + s;
+System.out.println(u.apply("ab"));   // abab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-9">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-9">#</a> <code>BinaryOperator</code></h3>
+          <pre><code class="lang-java">interface BinaryOperator { Object apply(Object t, Object u); }</code></pre>
+          <p>A two-argument operator over one type, erased to the same shape as <code>BiFunction</code>.</p>
+          <pre><code class="lang-java">BinaryOperator pick = (a, b) -&gt; a;
+System.out.println(pick.apply("x", "y"));   // x</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-10">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-10">#</a> <code>Predicate</code></h3>
+          <pre><code class="lang-java">interface Predicate { boolean test(Object t); }</code></pre>
+          <p>A one-argument boolean test. The return type stays primitive rather than erased, so a call participates in javars's numeric typing instead of being an opaque <code>Object</code>.</p>
+          <pre><code class="lang-java">Predicate p = s -&gt; s.equals("yes");
+System.out.println(p.test("yes"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-11">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-11">#</a> <code>BiPredicate</code></h3>
+          <pre><code class="lang-java">interface BiPredicate { boolean test(Object t, Object u); }</code></pre>
+          <p>A two-argument boolean test.</p>
+          <pre><code class="lang-java">BiPredicate eq = (a, b) -&gt; a.equals(b);
+System.out.println(eq.test("a", "a"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-12">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-12">#</a> <code>Comparator</code></h3>
+          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); }</code></pre>
+          <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign.</p>
+          <pre><code class="lang-java">xs.sort((a, b) -&gt; a.length() - b.length());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-13">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-13">#</a> <code>IntSupplier</code></h3>
+          <pre><code class="lang-java">interface IntSupplier { int getAsInt(); }</code></pre>
+          <p>A source of <code>int</code> values — the primitive specialization, whose result stays numerically typed.</p>
+          <pre><code class="lang-java">IntSupplier s = () -&gt; 7;
+System.out.println(s.getAsInt() + 1);   // 8</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-14">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-14">#</a> <code>IntPredicate</code></h3>
+          <pre><code class="lang-java">interface IntPredicate { boolean test(int value); }</code></pre>
+          <p>An <code>int</code>-argument boolean test.</p>
+          <pre><code class="lang-java">IntPredicate even = n -&gt; n % 2 == 0;
+System.out.println(even.test(4));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-15">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-15">#</a> <code>IntConsumer</code></h3>
+          <pre><code class="lang-java">interface IntConsumer { void accept(int value); }</code></pre>
+          <p>An <code>int</code>-argument action with no result.</p>
+          <pre><code class="lang-java">IntConsumer show = n -&gt; System.out.println(n);
+show.accept(3);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-16">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-16">#</a> <code>IntUnaryOperator</code></h3>
+          <pre><code class="lang-java">interface IntUnaryOperator { int applyAsInt(int operand); }</code></pre>
+          <p>An <code>int</code> to <code>int</code> transformation; both sides stay primitive, so the 32-bit wrap applies to arithmetic in the body.</p>
+          <pre><code class="lang-java">IntUnaryOperator sq = n -&gt; n * n;
+System.out.println(sq.applyAsInt(5));   // 25</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-17">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-17">#</a> <code>IntBinaryOperator</code></h3>
+          <pre><code class="lang-java">interface IntBinaryOperator { int applyAsInt(int left, int right); }</code></pre>
+          <p>A two-<code>int</code> to <code>int</code> transformation.</p>
+          <pre><code class="lang-java">IntBinaryOperator add = (a, b) -&gt; a + b;
+System.out.println(add.applyAsInt(2, 3));   // 5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-18">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-18">#</a> <code>ToIntFunction</code></h3>
+          <pre><code class="lang-java">interface ToIntFunction { int applyAsInt(Object value); }</code></pre>
+          <p>A reference-to-<code>int</code> transformation, keeping the primitive result type.</p>
+          <pre><code class="lang-java">ToIntFunction len = s -&gt; s.length();
+System.out.println(len.applyAsInt("abcd"));   // 4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-functional-interfaces-19">
+          <h3><a class="doc-anchor" href="#doc-functional-interfaces-19">#</a> <code>ToDoubleFunction</code></h3>
+          <pre><code class="lang-java">interface ToDoubleFunction { double applyAsDouble(Object value); }</code></pre>
+          <p>A reference-to-<code>double</code> transformation.</p>
+          <pre><code class="lang-java">ToDoubleFunction half = s -&gt; s.length() / 2.0;
+System.out.println(half.applyAsDouble("abc"));   // 1.5</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-class-members">
+        <h2>Class Members</h2>
+        <article class="doc-entry" id="doc-class-members-1">
+          <h3><a class="doc-anchor" href="#doc-class-members-1">#</a> <code>main</code></h3>
+          <pre><code class="lang-java">public static void main(String[] args)   |   public static void main(String... args)</code></pre>
+          <p>The entry point. javars scans the compilation unit for a class declaring it and runs that one; a unit with none is rejected before any code is emitted. Both the array and the varargs spelling are accepted.</p>
+          <pre><code class="lang-java">public class Main { public static void main(String[] args) { System.out.println("hi"); } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-2">
+          <h3><a class="doc-anchor" href="#doc-class-members-2">#</a> <code>args</code></h3>
+          <pre><code class="lang-java">String[] args</code></pre>
+          <p><code>main</code>'s parameter, bound by a prologue call to the <code>JARGV</code> builtin to a fresh array of whatever the CLI collected after the file name. Because it is freshly allocated, mutating it inside <code>main</code> cannot affect anything else.</p>
+          <pre><code class="lang-java">System.out.println(args.length);
+for (String a : args) { System.out.println(a); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-3">
+          <h3><a class="doc-anchor" href="#doc-class-members-3">#</a> <code>instance field</code></h3>
+          <pre><code class="lang-java">[modifiers] T name [= initializer];</code></pre>
+          <p>Per-instance state, held in the instance's field map on the host heap. Fields are seeded with their type's default when the object is allocated and then run their initializers, before the selected constructor body. Inherited fields are seeded at the same time, which is why an explicit <code>super(...)</code> only has to run the parent's body.</p>
+          <pre><code class="lang-java">class Point { int x; int y = 5; }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-4">
+          <h3><a class="doc-anchor" href="#doc-class-members-4">#</a> <code>constructor</code></h3>
+          <pre><code class="lang-java">[modifiers] ClassName(params) { … }</code></pre>
+          <p>Initializes a freshly allocated instance. Constructors overload on parameter type, resolved by the same lowest-assignment-cost rule methods use. A class that declares none gets the implicit no-argument form. <code>this(...)</code> delegation is not implemented.</p>
+          <pre><code class="lang-java">class Point { int x; Point(int x) { this.x = x; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-5">
+          <h3><a class="doc-anchor" href="#doc-class-members-5">#</a> <code>implicit super()</code></h3>
+          <pre><code class="lang-java">class Sub extends Base { /* no declared constructor */ }</code></pre>
+          <p>A divergence worth stating plainly: javars never emits the implicit <code>super()</code> call. A subclass that declares no constructor of its own — or one whose constructor does not begin with an explicit <code>super(...)</code> — silently skips its parent's constructor body, so fields the parent would have assigned keep their type defaults. Write <code>super(...)</code> explicitly and the parent body runs normally.</p>
+          <pre><code class="lang-java">class Animal { String sound; Animal() { sound = "generic"; } }
+class Dog extends Animal { }
+// new Dog().sound is null here; Java gives "generic"</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-6">
+          <h3><a class="doc-anchor" href="#doc-class-members-6">#</a> <code>static field</code></h3>
+          <pre><code class="lang-java">static T name [= initializer];</code></pre>
+          <p>Class-level state, compiled to a chunk global seeded with the type default. Reads resolve through the owning class, so both <code>C.n</code> and a bare <code>n</code> inside <code>C</code> reach the same global.</p>
+          <pre><code class="lang-java">class Counter { static int n = 0; }
+System.out.println(Counter.n);</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-7">
+          <h3><a class="doc-anchor" href="#doc-class-members-7">#</a> <code>static initializer</code></h3>
+          <pre><code class="lang-java">static { … }</code></pre>
+          <p>A class-initialization block. Blocks and static field initializers run in textual order, eagerly, before <code>main</code> — javars initializes every class up front rather than lazily on first use.</p>
+          <pre><code class="lang-java">class Counter { static int n; static { n = 10; } }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-8">
+          <h3><a class="doc-anchor" href="#doc-class-members-8">#</a> <code>toString</code></h3>
+          <pre><code class="lang-java">String toString()</code></pre>
+          <p>The rendering used by <code>println</code>, <code>String.valueOf</code>, and string concatenation. A declared override is dispatched by the compiler *before* the value reaches the host formatter; a class that declares none falls back to <code>ClassName@hash</code>, where the hash is the heap handle (deterministic within a run, unlike a JVM identity hash).</p>
+          <pre><code class="lang-java">class Box { public String toString() { return "Box!"; } }
+System.out.println(new Box());   // Box!</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-9">
+          <h3><a class="doc-anchor" href="#doc-class-members-9">#</a> <code>equals</code></h3>
+          <pre><code class="lang-java">boolean equals(Object other)</code></pre>
+          <p>Derived automatically for a <code>record</code> (component-wise, guarded by an <code>instanceof</code> test) and for an <code>enum</code> (identity, since constants are singletons). A class that declares its own keeps it. The collections do *not* consult an override — their membership tests use value equality for scalars and handle identity for objects.</p>
+          <pre><code class="lang-java">record Point(int x, int y) { }
+System.out.println(new Point(1,2).equals(new Point(1,2)));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-10">
+          <h3><a class="doc-anchor" href="#doc-class-members-10">#</a> <code>getMessage</code></h3>
+          <pre><code class="lang-java">String getMessage()</code></pre>
+          <p>The <code>Throwable</code> accessor for the detail message, declared once on the root and inherited by every modeled throwable. It returns the field's default — a null reference — when the no-argument constructor was used.</p>
+          <pre><code class="lang-java">catch (NumberFormatException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-11">
+          <h3><a class="doc-anchor" href="#doc-class-members-11">#</a> <code>name</code></h3>
+          <pre><code class="lang-java">String name()</code></pre>
+          <p>An enum constant's declared name, read from a field the parser synthesizes. A user-declared <code>name()</code> wins over the derived one.</p>
+          <pre><code class="lang-java">System.out.println(Color.RED.name());   // RED</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-12">
+          <h3><a class="doc-anchor" href="#doc-class-members-12">#</a> <code>ordinal</code></h3>
+          <pre><code class="lang-java">int ordinal()</code></pre>
+          <p>An enum constant's zero-based declaration position, from a synthesized field.</p>
+          <pre><code class="lang-java">System.out.println(Color.RED.ordinal());   // 0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-13">
+          <h3><a class="doc-anchor" href="#doc-class-members-13">#</a> <code>values</code></h3>
+          <pre><code class="lang-java">E[] EnumType.values()</code></pre>
+          <p>The static factory returning a fresh array of the enum's constants in declaration order — fresh on every call, exactly as Java hands out a copy so the caller cannot corrupt the enum.</p>
+          <pre><code class="lang-java">System.out.println(Arrays.toString(Color.values()));   // [RED, GREEN, BLUE]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-14">
+          <h3><a class="doc-anchor" href="#doc-class-members-14">#</a> <code>valueOf</code></h3>
+          <pre><code class="lang-java">E EnumType.valueOf(String name)</code></pre>
+          <p>The static lookup by constant name, compiled to a chain of string comparisons. No match raises <code>IllegalArgumentException</code> with Java's <code>No enum constant Type.NAME</code> message.</p>
+          <pre><code class="lang-java">System.out.println(Color.valueOf("BLUE"));   // BLUE</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-15">
+          <h3><a class="doc-anchor" href="#doc-class-members-15">#</a> <code>record accessor</code></h3>
+          <pre><code class="lang-java">T componentName()</code></pre>
+          <p>One derived accessor per record component, named for the component and returning its field. Declaring one by hand suppresses the derived version.</p>
+          <pre><code class="lang-java">record Point(int x, int y) { }
+System.out.println(new Point(1, 2).x());   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-16">
+          <h3><a class="doc-anchor" href="#doc-class-members-16">#</a> <code>close</code></h3>
+          <pre><code class="lang-java">void close()</code></pre>
+          <p>What try-with-resources calls. The parser desugars the resource list into a <code>finally</code> that closes each resource in reverse declaration order; there is no <code>AutoCloseable</code> interface to implement, so any class declaring <code>close()</code> qualifies.</p>
+          <pre><code class="lang-java">class Res { public void close() { System.out.println("closed"); } }
+try (Res r = new Res()) { }   // prints closed</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-class-members-17">
+          <h3><a class="doc-anchor" href="#doc-class-members-17">#</a> <code>length</code></h3>
+          <pre><code class="lang-java">int array.length</code></pre>
+          <p>An array's element count — a field read, not a method call, routed through <code>JFIELD_GET</code>. Reading it on a null reference raises Java's array-length NullPointerException.</p>
+          <pre><code class="lang-java">int[] a = {1, 2, 3};
+System.out.println(a.length);   // 3</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-method-references">
+        <h2>Method References</h2>
+        <article class="doc-entry" id="doc-method-references-1">
+          <h3><a class="doc-anchor" href="#doc-method-references-1">#</a> <code>Type::new</code></h3>
+          <pre><code class="lang-java">Supplier s = ClassName::new;</code></pre>
+          <p>A constructor reference. The arity comes from the class's single declared constructor (or zero when it declares none); a class with two or more constructors is rejected as ambiguous, because javars does not target-type a reference to pick an arity.</p>
+          <pre><code class="lang-java">Supplier make = Box::new;
+System.out.println(make.get());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-2">
+          <h3><a class="doc-anchor" href="#doc-method-references-2">#</a> <code>Type::instanceMethod</code></h3>
+          <pre><code class="lang-java">Function f = ClassName::method;</code></pre>
+          <p>An unbound instance reference: the synthesized lambda takes the receiver as its first parameter, then the method's own. The name must resolve to exactly one method of the class, otherwise it is rejected rather than guessed.</p>
+          <pre><code class="lang-java">Function area = Sq::area;
+System.out.println(area.apply(new Sq()));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-3">
+          <h3><a class="doc-anchor" href="#doc-method-references-3">#</a> <code>Type::staticMethod</code></h3>
+          <pre><code class="lang-java">Function f = ClassName::staticMethod;</code></pre>
+          <p>A reference to a user class's <code>static</code> method, with the method's own arity.</p>
+          <pre><code class="lang-java">class Helper { static int twice(int n) { return n * 2; } }
+Function t = Helper::twice;</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-4">
+          <h3><a class="doc-anchor" href="#doc-method-references-4">#</a> <code>Class::stdlibStatic</code></h3>
+          <pre><code class="lang-java">Function f = Integer::parseInt;</code></pre>
+          <p>A reference to a modeled stdlib static. Only the single-arity entries are nameable — <code>Integer.parseInt</code>, <code>Long.parseLong</code>, <code>Boolean.parseBoolean</code>, <code>Math.sqrt</code>/<code>floor</code>/<code>ceil</code>/<code>round</code>, <code>Arrays.toString</code>, and the two-argument <code>Math.max</code>/<code>min</code>/<code>pow</code>. Names Java overloads on arity (<code>Integer::toString</code>, <code>String::valueOf</code>) are refused, because a reference has no arity until it is target-typed.</p>
+          <pre><code class="lang-java">Function pi = Integer::parseInt;
+System.out.println(pi.apply("21"));   // 21</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-5">
+          <h3><a class="doc-anchor" href="#doc-method-references-5">#</a> <code>String::instanceMethod</code></h3>
+          <pre><code class="lang-java">Function f = String::toUpperCase;</code></pre>
+          <p>An unbound reference to a <code>java.lang.String</code> method, taking the receiver as its first parameter. <code>substring</code> and <code>indexOf</code> are excluded for the same arity-ambiguity reason.</p>
+          <pre><code class="lang-java">Function up = String::toUpperCase;
+System.out.println(up.apply("abc"));   // ABC</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-6">
+          <h3><a class="doc-anchor" href="#doc-method-references-6">#</a> <code>value::method</code></h3>
+          <pre><code class="lang-java">Supplier s = variable::method;   |   Supplier s = this::method;</code></pre>
+          <p>A bound reference. The receiver must be a plain name or <code>this</code> so the synthesized lambda captures it by value — which is exactly Java's rule that the receiver expression is evaluated once, at the reference.</p>
+          <pre><code class="lang-java">Box b = new Box();
+Supplier bound = b::label;
+System.out.println(bound.get());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-method-references-7">
+          <h3><a class="doc-anchor" href="#doc-method-references-7">#</a> <code>System.out::println</code></h3>
+          <pre><code class="lang-java">Consumer c = System.out::println;   |   Consumer c = System.err::print;</code></pre>
+          <p>A reference to a console stream's <code>print</code>/<code>println</code>. It is special-cased because printing lowers to a builtin rather than to a dispatchable method; any other member name after <code>System.out::</code> is refused.</p>
+          <pre><code class="lang-java">Consumer show = System.out::println;
+xs.forEach(show);</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-format-conversions">
+        <h2>Format Conversions</h2>
+        <article class="doc-entry" id="doc-format-conversions-1">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-1">#</a> <code>%d</code></h3>
+          <pre><code class="lang-java">String.format("%d", int)</code></pre>
+          <p>Decimal integer. Numeric, so a <code>0</code> flag zero-pads it after any leading sign.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%d", 42));   // 42</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-2">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-2">#</a> <code>%f</code></h3>
+          <pre><code class="lang-java">String.format("%f", double)</code></pre>
+          <p>Fixed-point decimal with six fraction digits by default, or as many as <code>.precision</code> names.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%.2f", 3.14159));   // 3.14</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-3">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-3">#</a> <code>%s</code></h3>
+          <pre><code class="lang-java">String.format("%s", Object)</code></pre>
+          <p>The argument's Java string form — <code>true</code>, <code>3.0</code>, <code>null</code>, or a class's <code>toString()</code> rendering. A <code>.precision</code> truncates it to that many characters.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%.2s", "abcdef"));   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-4">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-4">#</a> <code>%S</code></h3>
+          <pre><code class="lang-java">String.format("%S", Object)</code></pre>
+          <p>As <code>%s</code>, uppercased.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%S", "abc"));   // ABC</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-5">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-5">#</a> <code>%b</code></h3>
+          <pre><code class="lang-java">String.format("%b", Object)</code></pre>
+          <p>Java's boolean conversion: the value itself for a boolean, <code>false</code> for a null reference, and <code>true</code> for any other non-null value.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%b %b %b", true, null, "x"));   // true false true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-6">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-6">#</a> <code>%B</code></h3>
+          <pre><code class="lang-java">String.format("%B", Object)</code></pre>
+          <p>As <code>%b</code>, uppercased.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%B", true));   // TRUE</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-7">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-7">#</a> <code>%x</code></h3>
+          <pre><code class="lang-java">String.format("%x", int)</code></pre>
+          <p>Lowercase hexadecimal. javars formats the value at 64-bit width, so a negative number renders with sixteen digits where Java's <code>int</code> conversion gives eight — the one place this conversion diverges.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%x", 255));   // ff</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-8">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-8">#</a> <code>%X</code></h3>
+          <pre><code class="lang-java">String.format("%X", int)</code></pre>
+          <p>Uppercase hexadecimal, with the same 64-bit width note as <code>%x</code>.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%X", 255));   // FF</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-9">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-9">#</a> <code>%o</code></h3>
+          <pre><code class="lang-java">String.format("%o", int)</code></pre>
+          <p>Octal.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%o", 8));   // 10</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-10">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-10">#</a> <code>%c</code></h3>
+          <pre><code class="lang-java">String.format("%c", char)</code></pre>
+          <p>The argument's string form. Because javars models a <code>char</code> as a one-character string, a genuine char argument renders correctly — but an *integer* code point renders as its digits rather than as the character Java would produce.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%c", 'A'));   // A</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-11">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-11">#</a> <code>%%</code></h3>
+          <pre><code class="lang-java">String.format("%%")</code></pre>
+          <p>A literal percent sign; consumes no argument.</p>
+          <pre><code class="lang-java">System.out.println(String.format("100%%"));   // 100%</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-12">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-12">#</a> <code>%n</code></h3>
+          <pre><code class="lang-java">String.format("%n")</code></pre>
+          <p>A line separator, always emitted as <code>\n</code> rather than the platform's separator, and consuming no argument.</p>
+          <pre><code class="lang-java">System.out.print(String.format("line%n"));</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-13">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-13">#</a> <code>flag -</code></h3>
+          <pre><code class="lang-java">String.format("%-8s", x)</code></pre>
+          <p>Left-justify within the field width, padding on the right with spaces.</p>
+          <pre><code class="lang-java">System.out.println(String.format("[%-6s]", "ab"));   // [ab    ]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-14">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-14">#</a> <code>flag 0</code></h3>
+          <pre><code class="lang-java">String.format("%08d", x)</code></pre>
+          <p>Zero-pad to the field width. Applies only to the numeric conversions, and pads after a leading <code>-</code> or <code>+</code> so the sign stays leftmost.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%05.2f", 3.14159));   // 03.14</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-15">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-15">#</a> <code>flag +</code></h3>
+          <pre><code class="lang-java">String.format("%+d", x)</code></pre>
+          <p>Always show a sign: a <code>+</code> on non-negative numbers, with the existing <code>-</code> left alone.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%+d", 7));   // +7</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-16">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-16">#</a> <code>width</code></h3>
+          <pre><code class="lang-java">String.format("%12s", x)</code></pre>
+          <p>Minimum field width in characters. A value already at or beyond the width is never truncated by it — only <code>.precision</code> shortens.</p>
+          <pre><code class="lang-java">System.out.println(String.format("[%8.3f]", 3.14159));   // [   3.142]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-17">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-17">#</a> <code>.precision</code></h3>
+          <pre><code class="lang-java">String.format("%.3f", x)   |   String.format("%.2s", x)</code></pre>
+          <p>Fraction digits for <code>%f</code>, or a maximum character count for <code>%s</code>/<code>%S</code>.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%.3f", 2.0));   // 2.000</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-format-conversions-18">
+          <h3><a class="doc-anchor" href="#doc-format-conversions-18">#</a> <code>ignored flags</code></h3>
+          <pre><code class="lang-java">String.format("%,d", x)   |   %#x   |   %(d   |   % d</code></pre>
+          <p>The grouping, alternate-form, parenthesized-negative, and leading-space flags are accepted and have no effect, so a format string carrying them formats without error but without their decoration. Any conversion character javars does not model is reported as an error rather than rendered wrong.</p>
+          <pre><code class="lang-java">System.out.println(String.format("%,d", 1234));   // 1234  (Java prints 1,234)</code></pre>
+        </article>
+      </section>
+
+      <section class="tutorial-section" id="ch-runtime-builtins">
+        <h2>Runtime Builtins</h2>
+        <article class="doc-entry" id="doc-runtime-builtins-1">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-1">#</a> <code>JPRINTLN</code></h3>
+          <pre><code class="lang-java">id 700 · stack [arg?] -&gt; null</code></pre>
+          <p><code>System.out.println</code>. Formats the argument through the Java value-to-string rules and appends a newline — the reason printing is a builtin at all, since fusevm's native print renders shell-style (<code>true</code> as <code>1</code>, <code>3.0</code> as <code>3</code>).</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-2">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-2">#</a> <code>JPRINT</code></h3>
+          <pre><code class="lang-java">id 701 · stack [arg?] -&gt; null</code></pre>
+          <p><code>System.out.print</code> — as <code>JPRINTLN</code> with no trailing newline.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-3">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-3">#</a> <code>DBG_LINE</code></h3>
+          <pre><code class="lang-java">id 702 · stack [] -&gt; null</code></pre>
+          <p>The <code>--dap</code> per-statement marker. Registered only by <code>install_debug</code> and emitted only by the debug compile path, so a normal run never carries it. It hands control to the DAP server, which pauses in place when the line is a breakpoint or a step target.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-4">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-4">#</a> <code>JFFI_COMPILE</code></h3>
+          <pre><code class="lang-java">id 703 · stack [base64] -&gt; null</code></pre>
+          <p>Compiles an inline <code>rust { … }</code> block to a cdylib and registers its exports. The parser desugars the block into a <code>__rust_compile("&lt;base64&gt;", line)</code> call, which lowers to this builtin.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-5">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-5">#</a> <code>JFFI_CALL</code></h3>
+          <pre><code class="lang-java">id 704 · stack [args…, name] -&gt; result</code></pre>
+          <p>Calls an FFI export by name. In a program containing a <code>rust { … }</code> block, any otherwise-unresolved call becomes one of these; without such a block an unknown name stays a compile-time error.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-6">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-6">#</a> <code>JSTR_DISPATCH</code></h3>
+          <pre><code class="lang-java">id 705 · stack [recv, args…, method] -&gt; result</code></pre>
+          <p>An instance method call on a <code>String</code> receiver. It also serves as the fallback for a receiver whose static type the compiler could not pin down: a closure receiver routes to its single abstract method, a collection receiver to the collection methods, and a null receiver to the matching NullPointerException.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-7">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-7">#</a> <code>JEPRINTLN</code></h3>
+          <pre><code class="lang-java">id 706 · stack [arg?] -&gt; null</code></pre>
+          <p><code>System.err.println</code>.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-8">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-8">#</a> <code>JEPRINT</code></h3>
+          <pre><code class="lang-java">id 707 · stack [arg?] -&gt; null</code></pre>
+          <p><code>System.err.print</code>.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-9">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-9">#</a> <code>JSTATIC_DISPATCH</code></h3>
+          <pre><code class="lang-java">id 708 · stack [args…, class, method] -&gt; result</code></pre>
+          <p>A static stdlib call. The collection statics are tried first, because two of them (<code>Collections.sort</code> with a comparator) run user code and therefore need the VM; the rest fall through to the pure static table.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-10">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-10">#</a> <code>JARRAY_NEW</code></h3>
+          <pre><code class="lang-java">id 709 · stack [size, default] -&gt; array</code></pre>
+          <p><code>new T[n]</code> — allocates an array filled with the element type's default. A negative size raises <code>NegativeArraySizeException</code>.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-11">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-11">#</a> <code>JARRAY_LIT</code></h3>
+          <pre><code class="lang-java">id 710 · stack [e0, …, eN] -&gt; array</code></pre>
+          <p>An array literal: pops the already-evaluated elements deepest-first and pushes a fresh array handle.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-12">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-12">#</a> <code>JARRAY_GET</code></h3>
+          <pre><code class="lang-java">id 711 · stack [array, index] -&gt; element</code></pre>
+          <p><code>a[i]</code>, bounds-checked. The lookup runs inside the heap borrow and any fault is raised after it is released, because raising allocates the throwable on that same heap.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-13">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-13">#</a> <code>JARRAY_SET</code></h3>
+          <pre><code class="lang-java">id 712 · stack [array, index, value] -&gt; value</code></pre>
+          <p><code>a[i] = v</code>, bounds-checked, returning the stored value.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-14">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-14">#</a> <code>JNEW</code></h3>
+          <pre><code class="lang-java">id 713 · stack [className] -&gt; instance</code></pre>
+          <p><code>new C(…)</code> — allocates an instance with an empty field map. The compiler emits the field defaults, the field initializers, and the constructor call immediately after.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-15">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-15">#</a> <code>JFIELD_GET</code></h3>
+          <pre><code class="lang-java">id 714 · stack [recv, name] -&gt; value</code></pre>
+          <p>A field read: an array's <code>.length</code> or an instance field. An absent instance field reads as <code>null</code>; a null receiver raises the NullPointerException whose wording matches the operation.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-16">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-16">#</a> <code>JFIELD_SET</code></h3>
+          <pre><code class="lang-java">id 715 · stack [recv, name, value] -&gt; value</code></pre>
+          <p>A field write, returning the stored value.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-17">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-17">#</a> <code>JINSTANCEOF</code></h3>
+          <pre><code class="lang-java">id 716 · stack [obj, className] -&gt; boolean</code></pre>
+          <p><code>x instanceof C</code>, resolved by walking the supertype graph the compiler installed before the run.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-18">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-18">#</a> <code>JCLASSOF</code></h3>
+          <pre><code class="lang-java">id 717 · stack [obj] -&gt; className</code></pre>
+          <p>The runtime class name of an instance, which drives the compiler's virtual-dispatch chain. A closure reports the sentinel <code>#lambda</code> — not a legal Java identifier, so a user class can never collide with it — and that is the arm routing a functional-interface call to the lambda body.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-19">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-19">#</a> <code>JARRAY_NEW_MULTI</code></h3>
+          <pre><code class="lang-java">id 718 · stack [s0, …, sK, leafDefault] -&gt; array</code></pre>
+          <p><code>new T[m][n]…</code> — builds K+1 nested levels of default-valued arrays. Trailing unsized dimensions (<code>new int[2][]</code>) get <code>null</code> leaves.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-20">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-20">#</a> <code>JDIV</code></h3>
+          <pre><code class="lang-java">id 719 · stack [a, b] -&gt; double</code></pre>
+          <p>Java's floating-point division. fusevm's native <code>Div</code> yields <code>Undef</code> for a zero divisor because its shell/awk flavour has no infinities; only the floating path routes here, so statically-integral division keeps the native op and stays JIT-traceable.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-21">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-21">#</a> <code>JTHROW</code></h3>
+          <pre><code class="lang-java">id 720 · stack [throwable] -&gt; null</code></pre>
+          <p><code>throw e</code> — parks the value as the host's pending exception. The compiler emits the jump to the handler, or the frame exit, immediately after.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-22">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-22">#</a> <code>JEXC_PENDING</code></h3>
+          <pre><code class="lang-java">id 721 · stack [] -&gt; boolean</code></pre>
+          <p>Is an exception in flight? Emitted after every call in a program that uses exceptions — that per-call-site check is how the unwind is modeled, since fusevm has no unwind opcode.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-23">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-23">#</a> <code>JEXC_TAKE</code></h3>
+          <pre><code class="lang-java">id 722 · stack [] -&gt; throwable</code></pre>
+          <p>Claims the pending exception, clearing it. Emitted at the top of a handler.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-24">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-24">#</a> <code>JEXC_DEPTH</code></h3>
+          <pre><code class="lang-java">id 723 · stack [] -&gt; int</code></pre>
+          <p>The current value-stack depth, recorded on entry to a <code>try</code>.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-25">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-25">#</a> <code>JEXC_CUT</code></h3>
+          <pre><code class="lang-java">id 724 · stack [depth] -&gt; null</code></pre>
+          <p>Truncates the value stack back to a recorded depth, discarding the operands of the expression the throw abandoned. Without it those operands would pile up once per throw, forever, inside a loop.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-26">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-26">#</a> <code>JEXC_ABORT</code></h3>
+          <pre><code class="lang-java">id 725 · stack [] -&gt; null</code></pre>
+          <p>Reports an exception that reached the top of <code>main</code> in Java's own <code>Exception in thread "main" &lt;class&gt;: &lt;message&gt;</code> form and halts, so the process exits non-zero the way <code>java</code> does.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-27">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-27">#</a> <code>JFAULT</code></h3>
+          <pre><code class="lang-java">id 726 · stack [className, message] -&gt; null</code></pre>
+          <p>Raises a fault the compiler detected inline — integral division by zero, and an enum <code>valueOf</code> with no matching constant — through the same path a host-detected fault takes, so the throwable is catchable.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-28">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-28">#</a> <code>JARGV</code></h3>
+          <pre><code class="lang-java">id 727 · stack [] -&gt; array</code></pre>
+          <p><code>main</code>'s <code>String[] args</code>, as a fresh array of the program arguments the CLI collected. Called once by the prologue, so the array the program sees is its own.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-29">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-29">#</a> <code>JMAKE_CLOSURE</code></h3>
+          <pre><code class="lang-java">id 728 · stack [caps…, nameIdx, params, ncap] -&gt; closure</code></pre>
+          <p>Builds a lambda closure, snapshotting the enclosing locals by value. A javars local lives in a call-frame slot that does not outlive the frame, so a by-value snapshot is the only model that also gives the enhanced <code>for</code> its per-iteration capture.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-30">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-30">#</a> <code>JCLOSURE_CALL</code></h3>
+          <pre><code class="lang-java">id 729 · stack [closure, args…] -&gt; result</code></pre>
+          <p>Invokes a closure in its own fusevm call frame through a nested run. A mismatched arity is padded with <code>null</code> or truncated rather than corrupting the frame, and an exception already in flight suppresses the call so a unwinding frame cannot re-run side effects.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-31">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-31">#</a> <code>JCOLL_NEW</code></h3>
+          <pre><code class="lang-java">id 730 · stack [kindName, seed] -&gt; collection</code></pre>
+          <p>Allocates a modeled <code>java.util</code> collection, optionally seeded by a copy constructor's argument. Collections live on the same heap slab as arrays and instances, so aliasing, <code>==</code> identity, and passing one to a method all behave like Java references with no extra machinery.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-32">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-32">#</a> <code>JCOLL_DISPATCH</code></h3>
+          <pre><code class="lang-java">id 731 · stack [recv, args…, method] -&gt; result</code></pre>
+          <p>An instance method on a collection receiver. Methods that run user code (<code>sort</code> with a comparator, <code>forEach</code>) snapshot the elements and re-enter the VM with no heap borrow held, because a lambda body can allocate.</p>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-33">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-33">#</a> <code>JITER_ARRAY</code></h3>
+          <pre><code class="lang-java">id 732 · stack [iterable] -&gt; array</code></pre>
+          <p>The elements of an enhanced-<code>for</code> iterable, as an array. An array receiver is handed back unchanged so an array loop keeps aliasing; a collection is snapshotted. Emitted only when the compiler could not prove the iterable is already an array.</p>
         </article>
       </section>
 
