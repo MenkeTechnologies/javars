@@ -2427,3 +2427,52 @@ fn a_downcast_is_checked_against_the_runtime_class() {
         "ClassCastException:class Left cannot be cast to class Right\nL\nL\nL\ntrue\nnull\nxnull\n"
     );
 }
+
+#[test]
+fn a_package_qualifier_resolves_to_the_simple_name_in_declaration_position() {
+    // javars keys every type on its simple name — there is no JDK to import
+    // from and no package graph — so `java.util.List` is `List`. That already
+    // held for a qualified *static call*; it now holds wherever a type is
+    // written: a local, a field, a parameter, a return type, a `new`, and a
+    // `catch`. Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run("public class T {\
+             static java.lang.String greet(java.lang.String who) { return \"hi \" + who; }\
+             java.lang.String field = \"f\";\
+             public static void main(String[] args) {\
+                 java.util.List<String> l = new java.util.ArrayList<>();\
+                 l.add(\"x\");\
+                 System.out.println(l);\
+                 java.util.Map<String, Integer> m = new java.util.LinkedHashMap<>();\
+                 m.put(\"k\", 1);\
+                 System.out.println(m);\
+                 System.out.println(greet(\"you\"));\
+                 System.out.println(new T().field);\
+                 System.out.println(java.util.Arrays.toString(new int[] {5, 0}));\
+                 java.lang.System.out.println(java.lang.Math.max(2, 5));\
+                 try { throw new java.lang.IllegalStateException(\"boom\"); }\
+                 catch (java.lang.IllegalStateException e) { System.out.println(e.getMessage()); }\
+             }\
+         }");
+    assert!(ok);
+    assert_eq!(out, "[x]\n{k=1}\nhi you\nf\n[5, 0]\n5\nboom\n");
+}
+
+#[test]
+fn a_dotted_expression_statement_is_not_read_as_a_declaration() {
+    // The package-qualifier lookahead walks the same `name.name.name` shape a
+    // field assignment does, so the disambiguation has to survive it: only a
+    // trailing *identifier* makes it a declaration. Verified against OpenJDK 26.
+    let (out, ok) = run("class Inner { int n = 1; String s = \"s\"; Inner next; }\
+         public class T { public static void main(String[] args) {\
+             Inner outer = new Inner();\
+             outer.next = new Inner();\
+             outer.next.n = 9;\
+             System.out.println(outer.next.n);\
+             outer.next.s = \"deep\";\
+             System.out.println(outer.next.s.length());\
+             java.lang.String q = outer.s;\
+             System.out.println(q);\
+         } }");
+    assert!(ok);
+    assert_eq!(out, "9\n4\ns\n");
+}

@@ -86,6 +86,14 @@ at the bottom, and are summarized in the section right after this one.
   anchoring. A malformed pattern raises `java.util.regex.PatternSyntaxException`
   and a replacement naming an absent group raises `IndexOutOfBoundsException`,
   both catchable.
+- **Fully-qualified type names.** `java.util.List<String> l`,
+  `new java.util.ArrayList<>()`, `static java.lang.String greet(java.lang.String
+  who)`, a qualified field type, `catch (java.util.regex.PatternSyntaxException
+  e)`, `java.lang.System.out.println(…)`, and the qualified *static call*
+  (`java.util.Arrays.sort(x)`) all resolve to the simple name — javars keys every
+  type on it, and an `import` line is skipped for the same reason. A package
+  segment is recognised by starting lowercase and being followed by another name,
+  which is what keeps the identical `outer.next.n = 9` shape an expression.
 - **A compound assignment narrows back to its target's width.** JLS 15.26.2
   makes `b += 100` on a `byte` mean `b = (byte) (b + 100)`, so it overflows at
   the *target's* width, not at `int`'s: `byte` and `short` sign-extend (`-56`,
@@ -414,11 +422,6 @@ known.
 - **`Enum.compareTo`, `EnumSet`, `EnumMap`.**
 - **Sealed types, inner (non-`static`) classes,** and **anonymous classes** other
   than the enum-constant body form.
-- **Fully-qualified type names in *declaration* position**
-  (`java.util.function.Supplier<T> s`). An `import` line is skipped, and the
-  simple name is what resolves. A qualified *static call* does work
-  (`java.util.Arrays.sort(x)`), because the package prefix is dropped and the
-  simple name dispatches.
 
 ## Modeled with a documented simplification
 

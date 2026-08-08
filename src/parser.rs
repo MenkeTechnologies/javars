@@ -955,10 +955,33 @@ impl Parser {
         matches!(self.peek(), Tok::Void | Tok::Ident(_))
     }
 
+    /// Read a type's name, dropping any package qualifier
+    /// (`java.util.List` → `List`). javars keys every type on its simple name —
+    /// there is no JDK to import from and no package graph — so the prefix
+    /// carries no meaning, exactly as it does not for the qualified *static*
+    /// call `java.util.Arrays.sort(x)`.
+    ///
+    /// A segment counts as a package only when it starts with a lowercase letter
+    /// *and* is followed by another name. That is what keeps `Map.Entry` (a
+    /// nested type, not a package) and the expression `obj.field` out of the
+    /// loop, and what leaves `int... xs` alone (the dot is not followed by a
+    /// name).
+    fn simple_type_name(&mut self) -> Result<String, String> {
+        let mut ty = self.ident()?;
+        while ty.starts_with(|c: char| c.is_lowercase())
+            && self.is(&Tok::Dot)
+            && matches!(&self.toks[self.pos + 1].kind, Tok::Ident(_))
+        {
+            self.advance();
+            ty = self.ident()?;
+        }
+        Ok(ty)
+    }
+
     /// Parse a declaration-position type: `void`, `int`, `String`, `int[]`, ….
     /// Trailing `[]` pairs are folded into the returned name (e.g. `int[]`).
     fn type_name(&mut self) -> Result<String, String> {
-        let mut ty = self.ident()?;
+        let mut ty = self.simple_type_name()?;
         // Naming a functional interface pulls in the prelude that declares it,
         // even when the program never writes a lambda literal (a method
         // parameter of type `Runnable` is enough).
@@ -1295,6 +1318,16 @@ impl Parser {
             return false;
         }
         let mut j = start + 1;
+        // Step over a package qualifier (`java.util.List xs`), on the same
+        // lowercase-segment rule [`Parser::simple_type_name`] uses. An
+        // expression like `obj.field = 1` walks the same path and then fails the
+        // trailing-identifier test below, so it is still not a declaration.
+        while matches!(&self.toks[j - 1].kind, Tok::Ident(w) if w.starts_with(|c: char| c.is_lowercase()))
+            && matches!(self.toks[j].kind, Tok::Dot)
+            && matches!(self.toks.get(j + 1).map(|t| &t.kind), Some(Tok::Ident(_)))
+        {
+            j += 2;
+        }
         // optional generic type arguments on the type (`List<String> xs`)
         if matches!(self.toks[j].kind, Tok::Lt) {
             let mut depth = 0;
@@ -2249,6 +2282,20 @@ impl Parser {
                 // `System.out.println(...)` / `.print(...)`, or a var read,
                 // a bare-identifier call `name(args)`, or unsupported field
                 // access.
+                // `java.lang.System.out.println(...)` names the same stream its
+                // simple form does. The package prefix is stepped over here
+                // rather than in [`Parser::simple_type_name`] because
+                // `System.out` is parsed as a dedicated node, not as a type.
+                if name == "java"
+                    && matches!(&self.toks[self.pos + 2].kind, Tok::Ident(w) if w == "lang")
+                    && matches!(&self.toks[self.pos + 4].kind, Tok::Ident(w) if w == "System")
+                {
+                    self.advance(); // java
+                    self.eat(&Tok::Dot)?;
+                    self.advance(); // lang
+                    self.eat(&Tok::Dot)?;
+                    return self.system_out();
+                }
                 if name == "System" {
                     // `System.out::println` is a method *reference*, not a call:
                     // hand the stream back as a field access and let the postfix
@@ -2299,7 +2346,7 @@ impl Parser {
     fn new_expr(&mut self) -> Result<Expr, String> {
         let line = self.line();
         self.eat(&Tok::New)?;
-        let ty = self.ident()?;
+        let ty = self.simple_type_name()?;
         // Diamond / explicit type arguments (`new Box<>()`, `new Box<Integer>()`)
         // — erased.
         self.skip_generics();
