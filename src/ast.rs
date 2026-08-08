@@ -361,6 +361,11 @@ pub enum Expr {
     Long(i64),
     Float(f64),
     Str(String),
+    /// A `char` literal. Runs as its code point (an integer), because Java's
+    /// `char` is an integral type that participates in numeric promotion; the
+    /// distinct node exists so the static type is `char`, which is what turns
+    /// the value back into a one-character String at a string conversion.
+    Char(char),
     Bool(bool),
     /// A bare identifier — a local variable read.
     Var(String),

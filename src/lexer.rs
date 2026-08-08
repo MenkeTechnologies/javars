@@ -25,6 +25,9 @@ pub enum Tok {
     Long(i64),
     Float(f64),
     Str(String),
+    /// A `char` literal (`'a'`, `'\n'`). Java's `char` is a 16-bit *integral*
+    /// type, so this is distinct from [`Tok::Str`]: `'a' + 1` is 98, not `"a1"`.
+    Char(char),
     Ident(String),
     // keywords
     Class,
@@ -355,7 +358,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // char literals — modeled as a one-char string (slice 1)
+        // char literals — a 16-bit integral value (its code point), which is
+        // what makes `'a' + 1` arithmetic rather than concatenation.
         if c == '\'' {
             i += 1;
             let ch = if bytes[i] == b'\\' {
@@ -373,7 +377,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             i += 1;
             out.push(Token {
-                kind: Tok::Str(ch.to_string()),
+                kind: Tok::Char(ch),
                 line,
             });
             continue;

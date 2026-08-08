@@ -197,10 +197,21 @@ pub const JUSHR: u16 = 733;
 /// A narrowing primitive cast, `(ty) value`. Stack `[value, tyName]`
 /// (`tyName` on top); `argc == 2`. Java's narrowing conversions are real value
 /// changes: `(int) 3.9` truncates toward zero, `(int) 1e18` *saturates* to
-/// `Integer.MAX_VALUE`, `(byte) 200` wraps to -56, and `(char) 65` is the
-/// one-character string javars models a `char` as. Widening and identity casts
-/// never reach here — the compiler emits the operand alone.
+/// `Integer.MAX_VALUE`, `(byte) 200` wraps to -56, and `(char) 70000` wraps to
+/// its low 16 bits. Widening and identity casts never reach here — the compiler
+/// emits the operand alone.
 pub const JCAST: u16 = 734;
+
+/// Java's *string conversion* of a `char` (JLS 5.1.11): the code point becomes
+/// the one-character String. `argc == 1`. A `char` runs as an integer so that
+/// `'a' + 1` is 98, and the compiler emits this at every point where the value
+/// crosses into a String — `println(c)`, `"x" + c`, `String.valueOf(c)`, a
+/// `String`-method argument — and where a `char` is boxed to a `Character` (a
+/// collection element, which javars models as the one-character String). A
+/// `char[]` operand converts element-wise, which is what makes
+/// `Arrays.toString(s.toCharArray())` print `[a, b, c]`. Any other value passes
+/// through unchanged.
+pub const JCHR_STR: u16 = 735;
 
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
@@ -453,6 +464,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JDIV, b_div);
     vm.register_builtin(JUSHR, b_ushr);
     vm.register_builtin(JCAST, b_cast);
+    vm.register_builtin(JCHR_STR, b_chr_str);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -1800,10 +1812,13 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("compareToIgnoreCase", 1) => {
             Ok(Value::Int(compare_strings(s, &args[0].as_str_cow(), true)))
         }
+        // `charAt` returns a `char`, i.e. the code point — `"abc".charAt(2) + 1`
+        // is 100, not "c1". The compiler converts it back to a String wherever
+        // Java's string conversion applies.
         ("charAt", 1) => {
             let i = args[0].to_int();
             match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
-                Some(c) => Ok(Value::str(c.to_string())),
+                Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(
                     "StringIndexOutOfBoundsException",
                     format!("Index {i} out of bounds for length {}", char_len()),
@@ -1863,8 +1878,11 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         } else {
             s.to_string()
         })),
+        // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
+        // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
+        // through [`JCHR_STR`] by the compiler, which knows the element type.
         ("toCharArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
-            s.chars().map(|c| Value::str(c.to_string())).collect(),
+            s.chars().map(|c| Value::Int(c as i64)).collect(),
         )))),
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
@@ -2218,8 +2236,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
 
         // ── java.lang.Character ──
-        // javars models a `char` as a one-character string, so each predicate
-        // reads the receiver's first character.
+        // The argument is a `char` code point (`char_arg` also accepts the
+        // one-character String a boxed `Character` is). `toUpperCase`/
+        // `toLowerCase` return a `char`, so they return a code point too.
         ("Character", "isDigit", 1) => Ok(Value::bool(char_arg(&args[0]).is_ascii_digit())),
         ("Character", "isLetter", 1) => Ok(Value::bool(char_arg(&args[0]).is_alphabetic())),
         ("Character", "isLetterOrDigit", 1) => {
@@ -2228,12 +2247,17 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Character", "isWhitespace", 1) => Ok(Value::bool(char_arg(&args[0]).is_whitespace())),
         ("Character", "isUpperCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_uppercase())),
         ("Character", "isLowerCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_lowercase())),
-        ("Character", "toUpperCase", 1) => {
-            Ok(Value::str(char_arg(&args[0]).to_uppercase().to_string()))
-        }
-        ("Character", "toLowerCase", 1) => {
-            Ok(Value::str(char_arg(&args[0]).to_lowercase().to_string()))
-        }
+        // Java's `Character.toUpperCase(char)` is a *one-to-one* code-point map:
+        // a character whose full uppercasing is multi-character (`ß`) is left
+        // alone, unlike `String.toUpperCase`.
+        ("Character", "toUpperCase", 1) => Ok(Value::Int(one_to_one_case(
+            char_arg(&args[0]),
+            char::to_uppercase,
+        ))),
+        ("Character", "toLowerCase", 1) => Ok(Value::Int(one_to_one_case(
+            char_arg(&args[0]),
+            char::to_lowercase,
+        ))),
         ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
         ("Character", "getNumericValue", 1) => Ok(Value::Int(
             char_arg(&args[0]).to_digit(36).map_or(-1, i64::from),
@@ -2411,6 +2435,18 @@ fn cmp_to_int(o: std::cmp::Ordering) -> i64 {
 
 /// The `char` a `Character.*` argument names. javars models a `char` as a
 /// one-character string, and a numeric argument is a code point.
+/// The code point of `c` after a one-to-one case mapping, or `c` itself when the
+/// mapping expands to more than one character. Java's `Character.toUpperCase`
+/// works on a single `char` and so has no way to express `ß` → `SS`; it returns
+/// the argument unchanged there, where `String.toUpperCase` expands.
+fn one_to_one_case<I: Iterator<Item = char>>(c: char, map: fn(char) -> I) -> i64 {
+    let mut mapped = map(c);
+    match (mapped.next(), mapped.next()) {
+        (Some(m), None) => m as i64,
+        _ => c as i64,
+    }
+}
+
 fn char_arg(v: &Value) -> char {
     match v {
         Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{0}'),
@@ -3148,21 +3184,41 @@ fn b_cast(vm: &mut VM, _argc: u8) -> Value {
         }),
         "short" => Value::Int(cast_to_i64(&v) as i16 as i64),
         "byte" => Value::Int(cast_to_i64(&v) as i8 as i64),
-        // javars models a `char` as a one-character string, so `(char) 65` is
-        // "A" rather than 65.
-        "char" => {
-            let code = cast_to_i64(&v) as u16;
-            Value::str(
-                char::from_u32(code as u32)
-                    .unwrap_or('\u{fffd}')
-                    .to_string(),
-            )
-        }
+        // A `char` is a 16-bit *unsigned* integral value, so `(char) -1` is
+        // 65535 — the one narrowing cast that does not sign-extend.
+        "char" => Value::Int(i64::from(cast_to_i64(&v) as u16)),
         // `float` shares `double`'s representation here (see BUGS.md), so the
         // cast only has to make an integral operand floating.
         "float" | "double" => Value::float(as_f64(&v)),
         // `boolean` and every reference type keep their representation.
         _ => v,
+    }
+}
+
+/// [`JCHR_STR`] — Java's string conversion of a `char` code point. An integer
+/// becomes the one-character String; a `char[]` converts element-wise (a fresh
+/// array, so the operand is not mutated); anything else passes through, which
+/// keeps the builtin safe to emit on a statically-`char` expression whose value
+/// turned out to be `null`.
+fn b_chr_str(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match &v {
+        Value::Obj(_) => match array_items(&v) {
+            Some(items) => Value::Obj(heap_alloc(HostObj::Array(
+                items.iter().map(char_to_string).collect(),
+            ))),
+            None => v,
+        },
+        _ => char_to_string(&v),
+    }
+}
+
+/// One `char` code point as its one-character String. A non-integer passes
+/// through, so a `null` (or an already-boxed `Character`) is left alone.
+fn char_to_string(v: &Value) -> Value {
+    match v {
+        Value::Int(n) => Value::str(char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string()),
+        other => other.clone(),
     }
 }
 

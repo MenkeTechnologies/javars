@@ -850,6 +850,7 @@ impl Compiler {
         let wrap = self.compound_wraps(Some(ty), value);
         self.emit_global_get(&global, line);
         self.emit_compound(op, value, target, wrap, line)?;
+        self.emit_narrow_to(Some(ty), line);
         self.emit_global_set(&global, line);
         Ok(())
     }
@@ -1177,6 +1178,7 @@ impl Compiler {
             Expr::Float(_) => Some("double".to_string()),
             Expr::Bool(_) => Some("boolean".to_string()),
             Expr::Str(_) => Some("String".to_string()),
+            Expr::Char(_) => Some("char".to_string()),
             Expr::This => self.this_class.clone(),
             Expr::Var(name) => self.bare_var_type(name),
             Expr::Unary { op, rhs } => match op {
@@ -1232,6 +1234,18 @@ impl Compiler {
                 let e2 = self.expr_java_type(els);
                 if t == e2 {
                     return t;
+                }
+                // JLS 15.25: `char` paired with an `int` *constant* that fits in
+                // a `char` keeps the conditional's type at `char`, so
+                // `flag ? 'a' : 98` prints `a`/`b` rather than 97/98. A
+                // non-constant `int` promotes as usual.
+                let fits_char = |e: &Expr| matches!(e, Expr::Int(n) if (0..=0xFFFF).contains(n));
+                if (t.as_deref() == Some("char") && e2.as_deref() == Some("int") && fits_char(els))
+                    || (e2.as_deref() == Some("char")
+                        && t.as_deref() == Some("int")
+                        && fits_char(then))
+                {
+                    return Some("char".to_string());
                 }
                 let tr = t.as_deref().and_then(numeric_rank)?;
                 let er = e2.as_deref().and_then(numeric_rank)?;
@@ -1301,6 +1315,15 @@ impl Compiler {
                 // call whose declared return type is known.
                 if let Expr::Var(class) = recv.as_ref() {
                     if is_static_class(class) && !self.is_declared_var(class) {
+                        // `Arrays.copyOf`/`copyOfRange` return an array of the
+                        // *source's* element type, which is what keeps a
+                        // `char[]` copy rendering as characters.
+                        if class == "Arrays"
+                            && matches!(method.as_str(), "copyOf" | "copyOfRange")
+                            && !args.is_empty()
+                        {
+                            return self.expr_java_type(&args[0]);
+                        }
                         if let Some(t) = static_call_java_type(class, method) {
                             return Some(t.to_string());
                         }
@@ -1357,8 +1380,9 @@ impl Compiler {
                     | ("trim", 0)
                     | ("concat", 1)
                     | ("replace", 2)
-                    | ("repeat", 1)
-                    | ("charAt", 1) => Some("String".to_string()),
+                    | ("repeat", 1) => Some("String".to_string()),
+                    ("charAt", 1) => Some("char".to_string()),
+                    ("toCharArray", 0) => Some("char[]".to_string()),
                     _ => None,
                 }
             }
@@ -1865,11 +1889,47 @@ impl Compiler {
     // `CallBuiltin` would abort trace recording and cost hot loops their JIT.
 
     /// True when `ty` is a static type whose arithmetic Java performs at 32-bit
-    /// `int` width. `byte`/`short` operands promote to `int` before any binary
-    /// operation, so they qualify; `long` (64-bit), `char` (a one-character
-    /// string in javars, not an integer), and an unknown type do not.
+    /// `int` width. `byte`/`short`/`char` operands promote to `int` before any
+    /// binary operation, so they qualify; `long` (64-bit) and an unknown type do
+    /// not.
     fn is_int_width(ty: Option<&str>) -> bool {
-        matches!(ty, Some("int" | "short" | "byte"))
+        matches!(ty, Some("int" | "short" | "byte" | "char"))
+    }
+
+    /// True when `e`'s static Java type is `char`. A `char` runs as its code
+    /// point, so this is the flag that says "convert to a one-character String
+    /// before this value crosses into a String or a `Character` box".
+    fn is_char_expr(&self, e: &Expr) -> bool {
+        self.expr_java_type(e).as_deref() == Some("char")
+    }
+
+    /// True when `e`'s static Java type is `char[]` — the array `toCharArray`
+    /// returns, whose elements are code points.
+    fn is_char_array_expr(&self, e: &Expr) -> bool {
+        self.expr_java_type(e).as_deref() == Some("char[]")
+    }
+
+    /// Evaluate `e` and, when its static type is `char` (or `char[]`), apply
+    /// Java's string conversion — the code point becomes the one-character
+    /// String. Every other expression is emitted unchanged, so this is safe to
+    /// use anywhere a value flows into a String or an erased (`Object`)
+    /// position.
+    fn emit_char_string(&mut self, e: &Expr) -> Result<(), String> {
+        self.expr(e)?;
+        if self.is_char_expr(e) || self.is_char_array_expr(e) {
+            self.b.emit(Op::CallBuiltin(crate::host::JCHR_STR, 1), 0);
+        }
+        Ok(())
+    }
+
+    /// True when `lhs + rhs` is Java's *string* concatenation rather than
+    /// arithmetic: one operand is a `String`, or one is a class instance whose
+    /// `toString()` the concatenation would call.
+    fn is_string_concat(&self, lhs: &Expr, rhs: &Expr) -> bool {
+        let is_str = |e: &Expr| {
+            self.expr_java_type(e).as_deref() == Some("String") || self.expr_class(e).is_some()
+        };
+        is_str(lhs) || is_str(rhs)
     }
 
     /// True when both operands of a binary arithmetic operation are statically
@@ -1896,6 +1956,35 @@ impl Compiler {
         self.b.emit(Op::Shr, line);
     }
 
+    /// Narrow the value on top of the stack to a sub-`int` declared type. A
+    /// compound assignment and `++`/`--` carry an *implicit narrowing cast* back
+    /// to the target's type (JLS 15.26.2), so `byte b = 100; b += 100;` is -56
+    /// and `char c = 65535; c++;` is 0. `byte`/`short` sign-extend with the same
+    /// native shift pair `emit_wrap32` uses; `char` is unsigned, so it masks.
+    /// Every other type (including `int`, whose wrap is `emit_wrap32`'s job) is
+    /// left alone.
+    fn emit_narrow_to(&mut self, ty: Option<&str>, line: u32) {
+        match ty {
+            Some("byte") => {
+                self.b.emit(Op::LoadInt(56), line);
+                self.b.emit(Op::Shl, line);
+                self.b.emit(Op::LoadInt(56), line);
+                self.b.emit(Op::Shr, line);
+            }
+            Some("short") => {
+                self.b.emit(Op::LoadInt(48), line);
+                self.b.emit(Op::Shl, line);
+                self.b.emit(Op::LoadInt(48), line);
+                self.b.emit(Op::Shr, line);
+            }
+            Some("char") => {
+                self.b.emit(Op::LoadInt(0xFFFF), line);
+                self.b.emit(Op::BitAnd, line);
+            }
+            _ => {}
+        }
+    }
+
     /// The declared type name of the field `name` on `recv`'s static class, when
     /// both are statically known.
     fn field_type_name(&self, recv: &Expr, name: &str) -> Option<String> {
@@ -1910,6 +1999,9 @@ impl Compiler {
             Expr::Int(_) | Expr::Long(_) => NumType::Int,
             Expr::Float(_) => NumType::Float,
             Expr::Str(_) | Expr::Bool(_) => NumType::Other,
+            // `char` is integral, so `'a' / 2` truncates like any other `int`
+            // division.
+            Expr::Char(_) => NumType::Int,
             Expr::Var(name) => self.lookup_type(name),
             Expr::Unary { op, rhs } => match op {
                 // `-x` keeps the operand's numeric type; `~x` is always
@@ -2627,6 +2719,8 @@ impl Compiler {
                     _ => {
                         self.emit_get(name, line);
                         self.emit_compound(*op, value, l, wrap, line)?;
+                        let decl = self.var_decl_type(name).map(str::to_string);
+                        self.emit_narrow_to(decl.as_deref(), line);
                     }
                 }
                 self.emit_set(name, line);
@@ -3516,13 +3610,17 @@ impl Compiler {
         if let Some((class, ty)) = self.static_field_owner(name) {
             return self.static_assign(&class, &ty, name, op, &Expr::Int(1), 0);
         }
-        let wrap = self.var_decl_type(name) == Some("int");
+        let decl = self.var_decl_type(name).map(str::to_string);
+        let wrap = decl.as_deref() == Some("int");
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
         self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
         if wrap {
             self.emit_wrap32(0);
         }
+        // `++` carries the same implicit narrowing cast a compound assignment
+        // does, so `char c = 65535; c++;` is 0 rather than 65536.
+        self.emit_narrow_to(decl.as_deref(), 0);
         self.emit_set(name, 0);
         Ok(())
     }
@@ -3554,6 +3652,9 @@ impl Compiler {
     /// evaluate normally (the host's `java_str` renders the default `Class@hash`
     /// form, which is what `String.valueOf(obj)` still gets — see BUGS.md).
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
+        if self.is_char_expr(e) {
+            return self.emit_char_string(e);
+        }
         let Some(rc) = self.expr_class(e) else {
             return self.expr(e);
         };
@@ -3640,6 +3741,11 @@ impl Compiler {
             Expr::Str(s) => {
                 let c = self.b.add_constant(Value::str(s.clone()));
                 self.b.emit(Op::LoadConst(c), 0);
+            }
+            // A `char` runs as its code point; the static type is what turns it
+            // back into a one-character String at a string conversion.
+            Expr::Char(c) => {
+                self.b.emit(Op::LoadInt(*c as i64), 0);
             }
             Expr::Bool(b) => {
                 self.b
@@ -3870,8 +3976,16 @@ impl Compiler {
         }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
+                // A static whose parameter renders the value as text takes the
+                // `char`'s one-character String; `Math.max(c, 5)` and the
+                // `Character` predicates take the code point unchanged.
+                let stringify = takes_char_as_string(class, method);
                 for a in args {
-                    self.expr(a)?;
+                    if stringify {
+                        self.emit_char_string(a)?;
+                    } else {
+                        self.expr(a)?;
+                    }
                 }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
@@ -3913,18 +4027,22 @@ impl Compiler {
             .is_some()
         {
             self.expr(recv)?;
+            // A collection element is a *boxed* `Character`, which javars models
+            // as the one-character String — so it prints and compares like Java's.
             for a in args {
-                self.expr(a)?;
+                self.emit_char_string(a)?;
             }
             let name_c = self.b.add_constant(Value::str(method.to_string()));
             self.b.emit(Op::LoadConst(name_c), line);
             self.emit_raising_builtin(crate::host::JCOLL_DISPATCH, args.len() as u8 + 2, line);
             return Ok(());
         }
-        // Otherwise a `String` method.
+        // Otherwise a `String` method. Every `String` method that takes a `char`
+        // (`indexOf`, `replace`, `concat`, …) accepts its one-character String
+        // spelling, and the ones taking an index take an `int` this leaves alone.
         self.expr(recv)?;
         for a in args {
-            self.expr(a)?;
+            self.emit_char_string(a)?;
         }
         let name_c = self.b.add_constant(Value::str(method.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
@@ -3966,7 +4084,9 @@ impl Compiler {
         // one is exactly the conversion `String.valueOf` performs.
         if !self.classes.contains_key(class) && class == "String" {
             match args.first() {
-                Some(a) => self.expr(a)?,
+                // A `char[]` argument is a code-point array; `String.valueOf`
+                // concatenates its *characters*, so convert element-wise first.
+                Some(a) => self.emit_char_string(a)?,
                 None => {
                     let empty = self.b.add_constant(Value::str(String::new()));
                     self.b.emit(Op::LoadConst(empty), line);
@@ -4116,6 +4236,7 @@ impl Compiler {
             .unwrap_or(NumType::Other);
         let wrap = self.compound_wraps(elem_ty.as_deref(), value);
         self.emit_compound(op, value, elem_t, wrap, line)?;
+        self.emit_narrow_to(elem_ty.as_deref(), line);
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -4167,6 +4288,7 @@ impl Compiler {
         self.emit_get(&obj_t, line);
         self.emit_field_get(name, line);
         self.emit_compound(op, value, field_ty, wrap, line)?;
+        self.emit_narrow_to(field_ty_name.as_deref(), line);
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -4223,7 +4345,10 @@ impl Compiler {
             self.expr(value)?;
             self.emit_div(target, r, value, line);
         } else {
-            if op == AssignOp::Add {
+            // `s += x` on a String target is concatenation, so the operand takes
+            // Java's string conversion; a numeric target makes it arithmetic,
+            // which is what keeps `int n = 0; n += c;` adding code points.
+            if op == AssignOp::Add && target == NumType::Other {
                 self.emit_stringified(value)?;
             } else {
                 self.expr(value)?;
@@ -4399,11 +4524,11 @@ impl Compiler {
             }
             return Ok(());
         }
-        // `+` with a class-typed operand is string concatenation, and Java
-        // concatenation calls the operand's `toString()` — dispatch it here the
-        // same way `println(obj)` does. For every other operator (and every
-        // non-class operand) this is exactly `expr`.
-        if op == BinOp::Add {
+        // `+` with a String or class-typed operand is string concatenation, and
+        // Java concatenation applies its string conversion to the other operand
+        // — the operand's `toString()` for an object, the one-character String
+        // for a `char`. Arithmetic `+` (which is what `'a' + 1` is) must not.
+        if op == BinOp::Add && self.is_string_concat(lhs, rhs) {
             self.emit_stringified(lhs)?;
             self.emit_stringified(rhs)?;
         } else {
@@ -4691,6 +4816,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
         | Expr::Long(_)
         | Expr::Float(_)
         | Expr::Str(_)
+        | Expr::Char(_)
         | Expr::Bool(_)
         | Expr::Var(_)
         | Expr::This
@@ -4812,6 +4938,20 @@ fn is_static_class(name: &str) -> bool {
     )
 }
 
+/// True when a stdlib static renders a `char` argument as text, so the code
+/// point has to be converted to its one-character String first. `String`'s
+/// statics all do (`valueOf`, `format`, `join`); `Arrays`'s rendering pair does,
+/// which is what makes `Arrays.toString(s.toCharArray())` print `[a, b, c]`;
+/// `List.of`/`Set.of` box their elements. `Math` and the `Character` predicates
+/// take the code point itself and are deliberately absent.
+fn takes_char_as_string(class: &str, method: &str) -> bool {
+    match class {
+        "String" | "List" | "Set" | "Collections" => true,
+        "Arrays" => matches!(method, "toString" | "deepToString" | "asList"),
+        _ => false,
+    }
+}
+
 /// The declared Java return type of a known stdlib static call, or `None` when
 /// javars does not model it statically. `Math.abs`/`max`/`min` are deliberately
 /// absent: their result is `int` or `double` depending on the argument, and
@@ -4828,6 +4968,16 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
         ("Boolean", "parseBoolean") => "boolean",
+        // `Character.toUpperCase(char)` returns a `char`, so its result keeps
+        // rendering as a character rather than as a code point.
+        ("Character", "toUpperCase") | ("Character", "toLowerCase") => "char",
+        ("Character", "toString") => "String",
+        ("Character", "getNumericValue") => "int",
+        (
+            "Character",
+            "isDigit" | "isLetter" | "isLetterOrDigit" | "isWhitespace" | "isUpperCase"
+            | "isLowerCase",
+        ) => "boolean",
         _ => return None,
     })
 }

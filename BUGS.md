@@ -39,8 +39,29 @@ at the bottom, and are summarized in the section right after this one.
 - **Cast expressions** (`(int) d`, `(byte) n`, `(char) 65`, `(Object) x`). Java's
   narrowing primitive conversions are real value changes: floating → integral
   *saturates* (`(int) 1e18` is `Integer.MAX_VALUE`) and truncates toward zero,
-  and the integral narrowings are two's-complement. Widening and identity casts
-  emit the operand alone, so `(int) i` stays native.
+  and the integral narrowings are two's-complement — except `(char)`, which is
+  *unsigned* 16-bit, so `(char) -1` is 65535. Widening and identity casts emit
+  the operand alone, so `(int) i` stays native.
+- **`char` arithmetic.** A `char` is Java's 16-bit integral type, not a string:
+  `"abc".charAt(2) + 1` is 100, `'z' - 'a'` is 25, and `c - '0'` reads a digit.
+  It runs as its code point and takes Java's *string conversion* (JLS 5.1.11)
+  back to the one-character String at every boundary where Java applies one —
+  `println(c)`, `"x" + c`, `String.valueOf`/`format`/`join`, a `String`-method
+  argument (`indexOf('l')`, `replace('l', 'L')`), and boxing into a collection.
+  A `char[]` (from `toCharArray()`, a `{'a', 'b'}` literal, or `Arrays.copyOf`)
+  holds code points, so its elements do arithmetic and `Arrays.sort` orders them
+  numerically, while `Arrays.toString`, `new String(cs)`, and `String.valueOf(cs)`
+  still render characters. `Character.toUpperCase`/`toLowerCase` return a `char`
+  (Java's one-to-one code-point map, so `ß` is left alone), and the predicates
+  take one. `switch` on a `char`, `char` fields/parameters/returns, and the
+  conditional's constant rule (`flag ? 'a' : 98` stays a `char`, JLS 15.25) all
+  follow.
+- **A compound assignment narrows back to its target's width.** JLS 15.26.2
+  makes `b += 100` on a `byte` mean `b = (byte) (b + 100)`, so it overflows at
+  the *target's* width, not at `int`'s: `byte` and `short` sign-extend (`-56`,
+  `-32768`), `char` masks to 16 unsigned bits (`65535` + 1 is 0). Applies to
+  every compound operator and to `++`/`--`, on a local, a field, a `static`, and
+  an array element.
 - **The whole integer-literal syntax.** Decimal, hex (`0x1F`), binary
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
@@ -79,8 +100,8 @@ at the bottom, and are summarized in the section right after this one.
   `split`/`replaceAll`/`replaceFirst`/`matches` (see the regex entry below).
   `x.getClass()` evaluates to the runtime class *name*, over which `getName`
   and `getSimpleName` are `String` methods.
-  Index/length semantics use Unicode scalar (`char`) positions — exact
-  for ASCII/BMP, one unit per astral char (see the `char` simplification below).
+  Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
+  one unit per astral character (which Java counts as two UTF-16 units).
 - **Reference arrays.** `new T[n]` (default-valued), `{…}` literals (and
   `new T[]{…}`), get/set indexing (`a[i]`, `a[i] = v`, compound `a[i] += v`,
   `a[i]++`), and `a.length`. Arrays are heap objects (`Value::Obj` handles into a
@@ -389,17 +410,22 @@ known.
 - **No widening *value* conversion.** Overload *resolution* uses static types
   (so `f(int)` vs `f(double)` picks correctly), but the argument value is not
   coerced: an `int` bound to a `double` parameter (or `double d = 7;`) keeps its
-  integer value, so it prints `7`, not `7.0`. A `char` argument is a one-character
-  string (see below), so it selects a `String` overload rather than an `int` one.
+  integer value, so it prints `7`, not `7.0`.
 - **`==` on objects is reference identity; on strings it compares by value.**
   Object and array handles (`Value::Obj`) are identity-comparable, so `x == y`,
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
-- **`char` literals are one-character strings**, not an integer `char` type.
-  A consequence: `"abc".charAt(2) + 1` concatenates to `c1` where Java promotes
-  the `char` to its code point and prints `100`. `(int) c` and `(char) n` do
-  convert, so the code point is reachable explicitly.
+- **A boxed `Character` is a one-character String.** The `char` *type* is a real
+  16-bit integral value (see the "`char` arithmetic" entry under "Implemented"),
+  but javars boxes no primitive, so a `char` entering an erased position — a
+  `List<Character>` element, a `Map<Character, …>` key — is stored as its
+  one-character String instead of as a `Character` object. That is what makes
+  `System.out.println(list)` print `[p, q]` like Java's. The visible difference
+  is `==` on two boxed values: Java compares `Character` *references* (and
+  caches the ASCII range, so `Character.valueOf('a') == Character.valueOf('a')`
+  is true), javars compares the strings by value — the same String-`==` model
+  above.
 - **A reference cast is a no-op, so there is no `ClassCastException`.** The host
   heap already carries each object's class and javars does not box primitives, so
   `(Integer) o` on a `String` has no representation to change and no boxed type

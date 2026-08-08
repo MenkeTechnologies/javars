@@ -2120,6 +2120,7 @@ impl Parser {
         let starts_operand = match at(j + 1) {
             Tok::Ident(w) => w != "instanceof",
             Tok::Str(_)
+            | Tok::Char(_)
             | Tok::Int(_)
             | Tok::Long(_)
             | Tok::Float(_)
@@ -2218,6 +2219,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.advance();
                 Ok(Expr::Str(s))
+            }
+            Tok::Char(c) => {
+                self.advance();
+                Ok(Expr::Char(c))
             }
             Tok::True => {
                 self.advance();

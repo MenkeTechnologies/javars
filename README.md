@@ -184,7 +184,12 @@ Implemented and checked against the reference `java`:
   `<< >> >>>` with Java's per-width distance masking; unary `-`, `!`, `~`, and
   `++`/`--` in both prefix and postfix value position; cast expressions with
   Java's saturating and two's-complement narrowing conversions; parenthesised
-  grouping; Java's `+` string concatenation.
+  grouping; Java's `+` string concatenation. A `char` is the 16-bit *integral*
+  type it is in Java — `"abc".charAt(2) + 1` is 100 and `c - '0'` reads a digit
+  — and takes Java's string conversion back to a one-character String wherever
+  one applies (`println`, `+` with a String, `String.valueOf`, a `String`-method
+  argument). A compound assignment narrows back to its target's width, so
+  `byte b = 100; b += 100;` is -56.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
   `for (init; cond; update)` (with comma-separated init and update clauses), the
   enhanced `for (T x : arr)` (over an array or a collection), `break`,

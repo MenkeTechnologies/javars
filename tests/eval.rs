@@ -2096,3 +2096,145 @@ fn colon_form_switch_expression_yields() {
     assert!(ok);
     assert_eq!(out, "22\n13\n");
 }
+
+#[test]
+fn char_arithmetic_promotes_to_int_and_renders_as_a_character() {
+    // Java's `char` is an *integral* type: `charAt` yields a code point, so
+    // `+ 1` is arithmetic (100) and not concatenation, while the same value
+    // reaching a `println` or a String renders as the character. Both halves
+    // have to hold at once — modeling a `char` as a one-character string gets
+    // the rendering right and every arithmetic answer wrong.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\".charAt(2) + 1);\
+         System.out.println(\"abc\".charAt(2));\
+         System.out.println('a' + 'b');\
+         System.out.println('z' - 'a');\
+         System.out.println((char) ('a' + 1));\
+         System.out.println(\"x\" + 'y' + 1);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "100\nc\n195\n25\nb\nxy1\n");
+}
+
+#[test]
+fn char_code_point_indexing_idioms() {
+    // The two idioms that make `char` arithmetic worth having: `c - 'a'` as an
+    // array index, and `c - '0'` to read a digit. Both are silently wrong when
+    // a `char` concatenates. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "String w = \"banana\";\
+         int[] f = new int[26];\
+         for (int i = 0; i < w.length(); i++) f[w.charAt(i) - 'a']++;\
+         System.out.println(f[0] + \",\" + f[13]);\
+         int sum = 0;\
+         for (char c : \"51234\".toCharArray()) sum += c - '0';\
+         System.out.println(sum);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3,2\n15\n");
+}
+
+#[test]
+fn char_mutation_wraps_at_sixteen_unsigned_bits() {
+    // `++` and `+=` on a `char` carry an implicit narrowing cast back to
+    // `char`, which is *unsigned* 16-bit — so `(char) -1` is 65535 and 65535++
+    // is 0, where a signed narrowing would give -1. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "char c = 'a';\
+         c++;\
+         System.out.println(c);\
+         c += 2;\
+         System.out.println(c + \",\" + (int) c);\
+         char big = (char) 70000;\
+         System.out.println((int) big);\
+         char neg = (char) -1;\
+         System.out.println((int) neg);\
+         char over = 65535;\
+         over++;\
+         System.out.println((int) over);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "b\nd,100\n4464\n65535\n0\n");
+}
+
+#[test]
+fn char_array_round_trips_through_string_and_arrays() {
+    // A `char[]` holds code points, so it sorts numerically and its elements do
+    // arithmetic — but `Arrays.toString`, `new String(cs)`, and
+    // `String.valueOf(cs)` all still render the characters.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "char[] cs = \"dcb\".toCharArray();\
+         java.util.Arrays.sort(cs);\
+         System.out.println(java.util.Arrays.toString(cs));\
+         System.out.println(new String(cs));\
+         System.out.println(String.valueOf(cs));\
+         System.out.println(cs[0] + 1);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "[b, c, d]\nbcd\nbcd\n99\n");
+}
+
+#[test]
+fn char_flows_through_character_statics_and_string_methods() {
+    // `Character.toUpperCase` returns a `char` (so its result is still both a
+    // number and a character), the `String` methods that take a `char` accept
+    // one, and `%c`/`%s`/`%d` each see the right thing.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Character.toUpperCase('h') + \",\" + Character.toUpperCase('h') % 10);\
+         System.out.println(Character.isDigit('7') + \",\" + Character.getNumericValue('9'));\
+         System.out.println(String.format(\"%c|%s|%d\", 'A', 'B', (int) 'C'));\
+         System.out.println(\"Hello\".indexOf('l') + \",\" + \"Hello\".replace('l', 'L'));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "H,2\ntrue,9\nA|B|67\n2,HeLLo\n");
+}
+
+#[test]
+fn compound_assignment_narrows_back_to_a_subint_target() {
+    // JLS 15.26.2: `b += 100` on a `byte` is `b = (byte) (b + 100)`, so it
+    // overflows at the *target's* width rather than at `int`'s — for a local, a
+    // field, and an array element alike. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "byte b = 100;\
+         b += 100;\
+         System.out.println(b);\
+         short s = 32767;\
+         s++;\
+         System.out.println(s);\
+         byte q = -1;\
+         q >>>= 1;\
+         System.out.println(q);\
+         byte[] ba = {126};\
+         ba[0] += 5;\
+         System.out.println(ba[0]);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "-56\n-32768\n-1\n-125\n");
+}
+
+#[test]
+fn boxed_char_in_a_collection_and_the_conditional_constant_rule() {
+    // A `char` entering a collection is boxed to a `Character`, which javars
+    // models as the one-character String — so a `List<Character>` prints its
+    // characters while a `Map<Character, Integer>` still holds real ints. JLS
+    // 15.25 also keeps `flag ? 'a' : 98` typed `char`, because 98 is a constant
+    // that fits one. Verified against OpenJDK 26.
+    let (out, ok) = run("import java.util.*;\n\
+         public class T { public static void main(String[] args) {\
+         List<Character> l = new ArrayList<>();\
+         l.add('p');\
+         l.add('q');\
+         System.out.println(l + \"|\" + l.get(0) + \"|\" + l.contains('q'));\
+         Map<Character, Integer> m = new LinkedHashMap<>();\
+         for (char c : \"cab\".toCharArray()) m.put(c, (int) c);\
+         System.out.println(m);\
+         System.out.println(m.get('a'));\
+         System.out.println(true ? 'a' : 98);\
+         System.out.println(false ? 'a' : 98);\
+         } }");
+    assert!(ok);
+    assert_eq!(out, "[p, q]|p|true\n{c=99, a=97, b=98}\n97\na\nb\n");
+}

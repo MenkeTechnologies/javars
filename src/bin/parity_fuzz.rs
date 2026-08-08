@@ -20,8 +20,10 @@
 //! (`fault`), the cleanup blocks a jump has to run (`finally`),
 //! try-with-resources close ordering (`resource`), `enum` identity, ordering,
 //! per-constant state and constant bodies (`enum`), class-level `static` field
-//! storage and initialization order (`static`), and the members a `record`
-//! derives from its components (`record`). Pure random bytes only produce
+//! storage and initialization order (`static`), the members a `record` derives
+//! from its components (`record`), and the two-sided `char` boundary where an
+//! integral code point has to do arithmetic *and* render as a character
+//! (`char`). Pure random bytes only produce
 //! mutual parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
@@ -36,8 +38,8 @@
 //!         javac local slot, which javars cannot reproduce — the `fault` mode
 //!         raises every *other* runtime fault and prints its message),
 //!       - widening *value* conversion (`double d = 7;` printing `7` not `7.0`),
-//!       - `char` as a one-character string,
-//!       - `==` identity on non-string objects,
+//!       - `==` identity on non-string objects (including two boxed
+//!         `Character`s, which javars compares by value),
 //!       - `int` arithmetic whose operand types are not statically known (the
 //!         `overflow` mode uses only statically `int`-typed operands, which is
 //!         exactly the subset javars wraps).
@@ -102,6 +104,9 @@ const DBLS: &[&str] = &[
     "1.0e-7",
     "123456789.0",
 ];
+/// `char` literals for the `char` mode: letters at both cases, a digit, a
+/// space, and `~` so the code points span the printable ASCII range.
+const CHARS: &[&str] = &["a", "b", "z", "A", "Z", "0", "9", " ", "~"];
 const STRS: &[&str] = &[
     "\"\"",
     "\"a\"",
@@ -862,6 +867,67 @@ fn g_labelflow(r: &mut Rng) -> String {
     }
 }
 
+/// `char` — the boundary between Java's *integral* `char` and its string
+/// conversion. Arithmetic on a `char` promotes to `int` (`'a' + 1` is 98), while
+/// a `char` reaching a String, a `println`, or a collection element renders as
+/// the character. Both sides have to be right at once, which is what makes this
+/// worth generating: an implementation that models a `char` as a one-character
+/// string passes every rendering probe and fails every arithmetic one.
+fn g_char(r: &mut Rng) -> String {
+    let c = pick(r, CHARS);
+    let d = pick(r, CHARS);
+    // A third char guaranteed distinct from `c`: `switch` rejects duplicate
+    // case labels at compile time, so the two arms must not collide.
+    let e = CHARS[(CHARS.iter().position(|x| x == c).unwrap_or(0) + 1) % CHARS.len()];
+    let s = pick(r, STRS);
+    let n = pick(r, &["0", "1", "2", "7", "32", "-1"]);
+    match r.below(20) {
+        // Arithmetic and promotion.
+        0 => p(format!("'{c}' + {n}")),
+        1 => p(format!("'{c}' - '{d}'")),
+        2 => p(format!("'{c}' * 2 + '{d}'")),
+        3 => p(format!("(char) ('{c}' + {n})")),
+        4 => p(format!("'{c}' & 0x0F | '{d}' ^ 3")),
+        // String conversion.
+        5 => p(format!("\"[\" + '{c}' + \"]\" + {n}")),
+        6 => p(format!("'{c}' + \"\" + '{d}'")),
+        7 => p(format!("String.valueOf('{c}') + String.format(\"%c%s\", '{d}', '{c}')")),
+        // Casts both ways.
+        8 => p(format!("(int) '{c}' + (int) '{d}'")),
+        9 => p(format!(
+            "(char) ({} + {n})",
+            c.chars().next().unwrap_or('a') as u32
+        )),
+        10 => p(format!("(long) '{c}' + (double) '{d}'")),
+        // `charAt` and the code-point idioms built on it.
+        11 => format!(
+            "{{ String s = {s}; int t = 0; for (int i = 0; i < s.length(); i++) t += s.charAt(i) - 'a'; System.out.println(t); }}"
+        ),
+        12 => format!("{{ String s = {s}; System.out.println(s.isEmpty() ? '?' : s.charAt(0)); }}"),
+        13 => format!(
+            "{{ String s = {s}; String o = \"\"; for (char x : s.toCharArray()) o += (char) (x + {n}); System.out.println(o); }}"
+        ),
+        14 => format!("System.out.println(Arrays.toString({s}.toCharArray()));"),
+        // Mutation: `++`, compound assign, and the 16-bit `char` width.
+        15 => format!(
+            "{{ char v = '{c}'; v++; v += {n}; System.out.println(v + \"|\" + (int) v); }}"
+        ),
+        // Comparison and `switch`.
+        16 => p(format!("('{c}' < '{d}') + \",\" + ('{c}' == '{d}')")),
+        17 => format!(
+            "{{ char v = '{d}'; switch (v) {{ case '{e}': System.out.println(\"e\"); break; case '{c}': System.out.println(\"c\"); break; default: System.out.println(\"?\"); }} }}"
+        ),
+        // `Character` statics, whose results are `char` again.
+        18 => p(format!(
+            "Character.toUpperCase('{c}') + \"/\" + Character.isDigit('{c}') + \"/\" + Character.toLowerCase('{d}')"
+        )),
+        // A boxed `Character` in a collection.
+        _ => format!(
+            "{{ List<Character> l = new ArrayList<>(); l.add('{c}'); l.add('{d}'); System.out.println(l + \"|\" + l.get(0) + \"|\" + l.contains('{c}')); }}"
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -971,6 +1037,7 @@ enum Mode {
     Literal,
     Printf,
     LabelFlow,
+    Char,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1010,6 +1077,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Literal,
     Mode::Printf,
     Mode::LabelFlow,
+    Mode::Char,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1051,6 +1119,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Literal => "literal",
         Mode::Printf => "printf",
         Mode::LabelFlow => "labelflow",
+        Mode::Char => "char",
     }
 }
 
@@ -1104,6 +1173,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Literal => g_literal(r),
         Mode::Printf => g_printf(r),
         Mode::LabelFlow => g_labelflow(r),
+        Mode::Char => g_char(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
