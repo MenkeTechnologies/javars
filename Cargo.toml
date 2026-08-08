@@ -70,6 +70,15 @@ fusevm = { version = "0.17.0", features = ["jit", "jit-disk-cache", "aot", "ffi"
 
 thiserror = "2.0"
 
+# `String.split`/`replaceAll`/`replaceFirst`/`matches` take a
+# `java.util.regex` pattern. Java's flavour is backtracking — it has
+# backreferences (`\1`) and lookaround (`(?<=…)`), which the linear-time `regex`
+# crate's automaton rejects outright — so the engine has to be `fancy-regex`,
+# which layers a backtracking VM over `regex` for exactly those constructs.
+# `src/regex.rs` translates the Java source into fancy-regex syntax and rejects
+# the constructs whose meaning would not survive the translation.
+fancy-regex = "0.18"
+
 # LSP (`java --lsp`) + DAP (`java --dap`) over stdio. libc gives the DAP server a
 # pipe + dup2 to capture the debuggee's stdout (System.out.print[ln]) so program
 # output streams as `output` events instead of corrupting the JSON-RPC channel.

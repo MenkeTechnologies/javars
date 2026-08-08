@@ -362,8 +362,9 @@ fn raise(vm: &mut VM, f: Fault) -> Value {
         ffi_fault(
             vm,
             format!(
-                "Exception in thread \"main\" java.lang.{}: {}",
-                f.class, f.msg
+                "Exception in thread \"main\" {}: {}",
+                crate::prelude::qualified_throwable(f.class).unwrap_or_else(|| f.class.to_string()),
+                f.msg
             ),
         );
         return Value::Undef;
@@ -581,11 +582,8 @@ fn throwable_str(v: &Value) -> String {
         let h = h.borrow();
         match h.get(*id as usize) {
             Some(HostObj::Instance { class, fields }) => {
-                let name = if crate::prelude::is_throwable(class) {
-                    format!("java.lang.{class}")
-                } else {
-                    class.clone()
-                };
+                let name =
+                    crate::prelude::qualified_throwable(class).unwrap_or_else(|| class.clone());
                 match fields.get("detailMessage") {
                     Some(m) if !matches!(m, Value::Undef) => format!("{name}: {}", java_str(m)),
                     _ => name,
@@ -1873,11 +1871,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // two accessors land here: the simple name is that string, and the
         // qualified name adds `java.lang.` for the modeled JDK types.
         ("getSimpleName", 0) => Ok(Value::str(s.to_string())),
-        ("getName", 0) => Ok(Value::str(if crate::prelude::is_throwable(s) {
-            format!("java.lang.{s}")
-        } else {
-            s.to_string()
-        })),
+        ("getName", 0) => Ok(Value::str(
+            crate::prelude::qualified_throwable(s).unwrap_or_else(|| s.to_string()),
+        )),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
@@ -1887,39 +1883,31 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
         ("formatted", _) => java_format(s, args),
-        // Java's `split` drops *trailing* empty fields (but not interior ones).
-        ("split", 1) => {
-            let pat = literal_pattern(&args[0].as_str_cow(), "split")?;
-            let mut parts: Vec<&str> = if pat.is_empty() {
-                s.split("").filter(|p| !p.is_empty()).collect()
-            } else {
-                s.split(pat.as_str()).collect()
-            };
-            while parts.last().is_some_and(|p| p.is_empty()) {
-                parts.pop();
-            }
+        // The four `java.util.regex` methods, on the engine in `crate::regex`.
+        // `split(regex)` is `split(regex, 0)`: trailing empty fields are dropped
+        // (interior ones are not), and a no-match returns the whole input.
+        ("split", 1) | ("split", 2) => {
+            let compiled = crate::regex::compile(&args[0].as_str_cow());
+            let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
+            let limit = args.get(1).map_or(0, Value::to_int);
+            let parts = pat.split(s, limit).map_err(engine_fault)?;
             Ok(Value::Obj(heap_alloc(HostObj::Array(
-                parts
-                    .into_iter()
-                    .map(|p| Value::str(p.to_string()))
-                    .collect(),
+                parts.into_iter().map(Value::str).collect(),
             ))))
         }
-        ("replaceAll", 2) => {
-            let pat = literal_pattern(&args[0].as_str_cow(), "replaceAll")?;
-            Ok(Value::str(s.replace(pat.as_str(), &args[1].as_str_cow())))
+        ("replaceAll", 2) | ("replaceFirst", 2) => {
+            let compiled = crate::regex::compile(&args[0].as_str_cow());
+            let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
+            let out = pat
+                .replace(s, &args[1].as_str_cow(), method == "replaceFirst")
+                .map_err(replacement_fault)?;
+            Ok(Value::str(out))
         }
-        ("replaceFirst", 2) => {
-            let pat = literal_pattern(&args[0].as_str_cow(), "replaceFirst")?;
-            Ok(Value::str(s.replacen(
-                pat.as_str(),
-                &args[1].as_str_cow(),
-                1,
-            )))
-        }
+        // `matches` matches the whole input, not a substring of it.
         ("matches", 1) => {
-            let pat = literal_pattern(&args[0].as_str_cow(), "matches")?;
-            Ok(Value::bool(s == pat))
+            let compiled = crate::regex::compile_whole(&args[0].as_str_cow());
+            let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
+            Ok(Value::bool(pat.matches_whole(s).map_err(engine_fault)?))
         }
         ("contains", 1) => Ok(Value::bool(s.contains(args[0].as_str_cow().as_ref()))),
         ("equals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
@@ -2401,16 +2389,28 @@ fn char_last_index_of(hay: &str, needle: &str, from: i64) -> i64 {
 /// overwhelmingly common single-separator call is, and which the JDK itself
 /// fast-paths. A pattern that would need real matching is reported rather than
 /// silently treated as a literal and answered wrong.
-fn literal_pattern(pat: &str, method: &str) -> Result<String, Fault> {
-    const META: &[char] = &[
-        '\\', '.', '[', ']', '{', '}', '(', ')', '*', '+', '?', '^', '$', '|',
-    ];
-    if pat.contains(META) {
-        return Err(Fault::internal(format!(
-            "javars: `String.{method}` supports only a literal pattern, not `{pat}`"
-        )));
+fn pattern_fault(msg: &str) -> Fault {
+    Fault::java("PatternSyntaxException", msg)
+}
+
+/// A replacement string Java rejects: a dangling `\`, a bare `$`, or a
+/// reference to a group the pattern does not have. Java raises
+/// `IllegalArgumentException` for the malformed forms and
+/// `IndexOutOfBoundsException` for the missing group, and the message text
+/// distinguishes them.
+fn replacement_fault(msg: String) -> Fault {
+    if msg.starts_with("No group") {
+        Fault::java("IndexOutOfBoundsException", msg)
+    } else {
+        Fault::java("IllegalArgumentException", msg)
     }
-    Ok(pat.to_string())
+}
+
+/// The matching engine giving up (its backtrack limit), which is not a Java
+/// outcome at all — Java would either answer or overflow its own stack. javars
+/// reports rather than guessing.
+fn engine_fault(msg: String) -> Fault {
+    Fault::internal(format!("javars: regular expression failed: {msg}"))
 }
 
 /// Java's `Math.floorDiv`: integer division rounded toward negative infinity

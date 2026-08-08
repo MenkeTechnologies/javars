@@ -928,6 +928,121 @@ fn g_char(r: &mut Rng) -> String {
     }
 }
 
+/// The `java.util.regex` patterns the `regex` mode draws from. Every one is a
+/// construct javars translates rather than refuses, and the pool deliberately
+/// mixes the places where Java's *defaults* differ from the engine's — ASCII
+/// `\d`/`\w`/`\s`/`\b`, ASCII `(?i)` folding, `.` against a `\r`, and a `$` that
+/// sits before a final line terminator.
+const PATTERNS: &[&str] = &[
+    ",",
+    "\\\\.",
+    "\\\\d",
+    "\\\\d+",
+    "\\\\D",
+    "\\\\w",
+    "\\\\W+",
+    "\\\\s",
+    "\\\\s+",
+    "\\\\S",
+    "[abc]",
+    "[^abc]",
+    "[a-z]",
+    "[0-9]+",
+    "[-.]",
+    "[\\\\w.]",
+    "a|b",
+    "ab?",
+    "a*",
+    "a+?",
+    "(a)(b)",
+    "(?:ab)+",
+    "(?<g>a)b",
+    "a.c",
+    ".",
+    "^a",
+    "a$",
+    "$",
+    "\\\\ba",
+    "a\\\\b",
+    "\\\\B",
+    "(?i)a",
+    "(?i)[a-c]",
+    "(?i:AB)",
+    "(?s)a.b",
+    "\\\\Qa.c\\\\E",
+    "\\\\p{Upper}",
+    "\\\\p{Digit}+",
+    "\\\\h",
+    "\\\\R",
+    "a{2}",
+    "a{1,2}",
+    "(a)\\\\1",
+    "a(?=b)",
+    "(?<=a)b",
+    "x(?!y)",
+    "",
+    "\\\\u0061",
+];
+
+/// The subjects the `regex` mode matches against — ASCII, non-ASCII (where the
+/// ASCII-only defaults show), embedded line terminators (where `$` and `.` do),
+/// and the empty string.
+const SUBJECTS: &[&str] = &[
+    "\"\"",
+    "\"a\"",
+    "\"abc\"",
+    "\"aabbcc\"",
+    "\"a,b,,c\"",
+    "\"a1b22c\"",
+    "\"a b\\tc\"",
+    "\"Hello World\"",
+    "\"AbC\"",
+    "\"a.b.c\"",
+    "\"2024-01-31\"",
+    "\"naïve café\"",
+    "\"abc\\n\"",
+    "\"a\\nb\"",
+    "\"a\\rb\"",
+    "\"x-y_z\"",
+    "\"aaa\"",
+];
+
+/// The replacement strings, covering Java's `$n` / `${name}` grammar and its
+/// backslash escaping (which is not the `regex` crate's).
+const REPLACEMENTS: &[&str] = &[
+    "\"-\"",
+    "\"\"",
+    "\"[$0]\"",
+    "\"<$1>\"",
+    "\"$1$1\"",
+    "\"\\\\$\"",
+    "\"x\"",
+    "\"\\\\\\\\\"",
+];
+
+/// `java.util.regex` through `String.split`/`replaceAll`/`replaceFirst`/
+/// `matches` — the pattern *translation* as much as the engine, since Java's
+/// defaults and fancy-regex's disagree on `\d`, `\b`, `(?i)`, `.`, and `$`.
+fn g_regex(r: &mut Rng) -> String {
+    let pat = pick(r, PATTERNS);
+    let s = pick(r, SUBJECTS);
+    let rep = pick(r, REPLACEMENTS);
+    match r.below(7) {
+        0 => format!("System.out.println(Arrays.toString({s}.split(\"{pat}\")) + \"/\" + {s}.split(\"{pat}\").length);"),
+        1 => format!(
+            "System.out.println(Arrays.toString({s}.split(\"{pat}\", {})));",
+            r.below(4) as i64 - 1
+        ),
+        2 => p(format!("{s}.replaceAll(\"{pat}\", {rep})")),
+        3 => p(format!("{s}.replaceFirst(\"{pat}\", {rep})")),
+        4 => p(format!("{s}.matches(\"{pat}\")")),
+        5 => p(format!("{s}.matches(\"{pat}\") + \"|\" + {s}.replaceAll(\"{pat}\", \"#\")")),
+        _ => format!(
+            "try {{ System.out.println({s}.replaceAll(\"{pat}\", {rep})); }} catch (RuntimeException e) {{ System.out.println(e.getClass().getSimpleName()); }}"
+        ),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -1038,6 +1153,7 @@ enum Mode {
     Printf,
     LabelFlow,
     Char,
+    Regex,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1078,6 +1194,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Printf,
     Mode::LabelFlow,
     Mode::Char,
+    Mode::Regex,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1120,6 +1237,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Printf => "printf",
         Mode::LabelFlow => "labelflow",
         Mode::Char => "char",
+        Mode::Regex => "regex",
     }
 }
 
@@ -1174,6 +1292,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Printf => g_printf(r),
         Mode::LabelFlow => g_labelflow(r),
         Mode::Char => g_char(r),
+        Mode::Regex => g_regex(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

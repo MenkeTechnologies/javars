@@ -103,8 +103,9 @@ cargo build
 
 `javars` is a standalone Rust crate (an explicit empty `[workspace]` keeps it
 independent of the meta repo). `fusevm` is pulled from crates.io with the `jit`,
-`jit-disk-cache`, and `aot` features. Run the tests with `cargo test` (no JDK
-required).
+`jit-disk-cache`, `aot`, and `ffi` features, and `fancy-regex` supplies the
+backtracking engine behind `java.util.regex`. Run the tests with `cargo test`
+(no JDK required).
 
 #### Zsh tab completion
 
@@ -233,6 +234,16 @@ Implemented and checked against the reference `java`:
   `equals`, `equalsIgnoreCase`, `compareTo`, `compareToIgnoreCase`,
   `toUpperCase`, `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`,
   `replace`, `repeat` (chainable).
+- **Regular expressions** — `split` (with `limit`), `replaceAll`,
+  `replaceFirst`, and `matches` run real `java.util.regex` patterns on
+  `fancy-regex`, whose backtracking VM is what makes Java's backreferences and
+  lookaround expressible. `src/regex.rs` translates the Java source first,
+  because the two flavours' *defaults* differ where it changes answers: Java's
+  `\d`/`\w`/`\s`/`\b` are ASCII-only, its `(?i)` folds ASCII only, its `.`
+  excludes five line terminators, and its default-mode `$` matches before a
+  final one. A construct with no faithful translation (a possessive quantifier,
+  an atomic group, a Unicode block) raises `PatternSyntaxException` naming it
+  rather than compiling into a different language.
 - **Lambdas and functional interfaces** — `() -> e`, `x -> e`,
   `(a, b) -> { … }`, and the explicitly-typed `(int a, String b) -> …`. A lambda
   compiles to a heap closure carrying a by-value snapshot of the enclosing

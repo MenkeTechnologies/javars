@@ -52,11 +52,29 @@ pub const THROWABLES: &[(&str, &str)] = &[
         "StringIndexOutOfBoundsException",
         "IndexOutOfBoundsException",
     ),
+    // The one modeled throwable that does not live in `java.lang` — see
+    // [`qualified_throwable`].
+    ("PatternSyntaxException", "IllegalArgumentException"),
 ];
 
-/// True when `name` is one of the modeled `java.lang` throwables.
+/// True when `name` is one of the modeled JDK throwables.
 pub fn is_throwable(name: &str) -> bool {
     THROWABLES.iter().any(|(n, _)| *n == name)
+}
+
+/// The fully-qualified name of a modeled throwable, which is what
+/// `getClass().getName()`, `Throwable.toString()`, and the uncaught-exception
+/// report print. All but one live in `java.lang`; `PatternSyntaxException` is
+/// `java.util.regex`, and printing it under the wrong package would be a visible
+/// difference from Java for a program that ever prints a caught one.
+pub fn qualified_throwable(name: &str) -> Option<String> {
+    if !is_throwable(name) {
+        return None;
+    }
+    Some(match name {
+        "PatternSyntaxException" => format!("java.util.regex.{name}"),
+        _ => format!("java.lang.{name}"),
+    })
 }
 
 /// The modeled functional interfaces: `(name, declared single abstract method)`.

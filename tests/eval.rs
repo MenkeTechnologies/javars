@@ -2238,3 +2238,127 @@ fn boxed_char_in_a_collection_and_the_conditional_constant_rule() {
     assert!(ok);
     assert_eq!(out, "[p, q]|p|true\n{c=99, a=97, b=98}\n97\na\nb\n");
 }
+
+#[test]
+fn regex_split_honours_javas_field_rules() {
+    // `split` is specified, not merely "cut at each match": trailing empty
+    // fields go and interior ones stay, a no-match yields the whole input as one
+    // field, a zero-width match at index 0 produces no leading empty field, and
+    // a positive limit caps the number of applications.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "String[] a = \"a1b22c333d\".split(\"\\\\d+\");\
+         System.out.println(a.length + \":\" + String.join(\"|\", a));\
+         System.out.println(String.join(\"|\", \"a,b,,c\".split(\",\")) + \"/\"\
+             + \"a,b,,\".split(\",\").length + \"/\"\
+             + \"\".split(\",\").length + \"/\"\
+             + \"aaa\".split(\"a\").length);\
+         System.out.println(String.join(\"|\", \"abc\".split(\"\")) + \"/\"\
+             + String.join(\"|\", \"a,b,c,d\".split(\",\", 2)));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "4:a|b|c|d\na|b||c/2/1/0\na|b|c/a|b,c,d\n");
+}
+
+#[test]
+fn regex_replacement_uses_javas_dollar_and_backslash_grammar() {
+    // The replacement string is Java's grammar, not the engine's: `$n` and
+    // `${name}` reference groups and `\` escapes the next character, so `\\$`
+    // is a literal `$`. Zero-width matches still advance.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"2024-01-31\".replaceAll(\"(\\\\d+)-(\\\\d+)-(\\\\d+)\", \"$3/$2/$1\"));\
+         System.out.println(\"john smith\".replaceAll(\"(\\\\w+) (\\\\w+)\", \"$2, $1\"));\
+         System.out.println(\"aaa\".replaceAll(\"a*\", \"-\") + \"/\" + \"abc\".replaceAll(\"\", \"-\"));\
+         System.out.println(\"a.b\".replaceAll(\"\\\\.\", \"\\\\$\") + \"/\" + \"x\".replaceAll(\"x\", \"\\\\\\\\\"));\
+         System.out.println(\"abc\".replaceFirst(\"(?<first>a)\", \"[${first}]\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "31/01/2024\nsmith, john\n--/-a-b-c-\na$b/\\\n[a]bc\n");
+}
+
+#[test]
+fn regex_matches_anchors_the_whole_input() {
+    // `matches` matches the entire input, so `"abc".matches("ab")` is false and
+    // `"a\n".matches("a")` is false too — the trailing terminator is part of the
+    // input. Backreferences and lookahead need the backtracking engine.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\".matches(\"a.c\") + \",\" + \"abc\".matches(\"ab\") + \",\"\
+             + \"a\\n\".matches(\"a\") + \",\" + \"xyx\".matches(\"(x)y\\\\1\") + \",\"\
+             + \"foo123\".matches(\"[a-z]+(?=\\\\d)\\\\d+\"));\
+         System.out.println(\"a.c\".matches(\"\\\\Qa.c\\\\E\") + \",\" + \"abc\".matches(\"\\\\Qa.c\\\\E\")\
+             + \",\" + \"A1\".matches(\"\\\\p{Upper}\\\\p{Digit}\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "true,false,false,true,true\ntrue,false,true\n");
+}
+
+#[test]
+fn regex_anchors_and_dot_follow_javas_line_terminators() {
+    // Java's default-mode `$` matches *before* a final line terminator (so
+    // `"abc\n".replaceAll("c$", "X")` replaces), and its `.` excludes every one
+    // of the five terminators, not just `\n` — a `\r` is not matched by `.`
+    // until DOTALL is on. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\\n\".replaceAll(\"c$\", \"X\").trim() + \",\"\
+             + \"abc\".replaceAll(\"$\", \"|\") + \",\"\
+             + \"a\\rb\".replaceAll(\"a.b\", \"X\").length() + \",\"\
+             + \"a\\nb\".replaceAll(\"(?s)a.b\", \"X\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "abX,abc|,3,X\n");
+}
+
+#[test]
+fn regex_predefined_classes_and_case_folding_are_ascii_only() {
+    // Java leaves UNICODE_CHARACTER_CLASS and UNICODE_CASE off by default, so
+    // `\w`/`\d`/`\b` are ASCII and `(?i)` folds ASCII only — the opposite of the
+    // engine's defaults, and the difference is a wrong answer rather than an
+    // error, which is why the translation pins them.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"naïve café\".replaceAll(\"\\\\b\", \"|\"));\
+         System.out.println(\"naïve\".replaceAll(\"\\\\w\", \".\") + \",\" + \"١٢٣\".replaceAll(\"\\\\d\", \".\"));\
+         System.out.println(\"ÄÖÜ\".replaceAll(\"(?i)ä\", \"x\") + \",\" + \"STRASSE\".matches(\"(?i)strasse\")\
+             + \",\" + \"AbC\".matches(\"(?i)[a-c]+\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "|na|ï|ve| |caf|é\n..ï..,١٢٣\nÄÖÜ,true,true\n");
+}
+
+#[test]
+fn regex_errors_are_the_throwables_java_raises() {
+    // A malformed pattern is a `java.util.regex.PatternSyntaxException` — the
+    // one modeled throwable outside `java.lang`, so its qualified name has to
+    // carry the right package — and a replacement naming a group the pattern
+    // does not have is an `IndexOutOfBoundsException`.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "try { \"x\".matches(\"(\"); } catch (RuntimeException e) { System.out.println(e.getClass().getName()); }\
+         try { \"x\".replaceAll(\"x\", \"$9\"); } catch (RuntimeException e) { System.out.println(e.getClass().getSimpleName()); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.regex.PatternSyntaxException\nIndexOutOfBoundsException\n"
+    );
+}
+
+#[test]
+fn an_untranslatable_regex_construct_is_refused_by_name() {
+    // javars's standing rule applied to regular expressions: a construct with no
+    // faithful translation (a possessive quantifier never gives back what it
+    // consumed; the engine's greedy one does) is reported rather than compiled
+    // into a different language. OpenJDK *accepts* these — this is the
+    // deliberate difference, and the message has to name which construct.
+    let (out, ok) = run(&wrap(
+        "try { System.out.println(\"aab\".matches(\"a*+b\")); }\
+         catch (RuntimeException e) { System.out.println(e.getMessage().split(\"\\n\")[0]); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "javars supports no equivalent of *+ (possessive quantifier) near index 0\n"
+    );
+}

@@ -56,6 +56,26 @@ at the bottom, and are summarized in the section right after this one.
   take one. `switch` on a `char`, `char` fields/parameters/returns, and the
   conditional's constant rule (`flag ? 'a' : 98` stays a `char`, JLS 15.25) all
   follow.
+- **Regular expressions.** `String.split`/`replaceAll`/`replaceFirst`/`matches`
+  run real `java.util.regex` patterns on `fancy-regex` (`src/regex.rs`), whose
+  backtracking VM is what makes Java's backreferences (`(a)\1`) and lookaround
+  (`(?<=a)b`) expressible at all — the linear-time `regex` crate rejects both by
+  construction. Java's *defaults* are not the engine's, and every place they
+  differ is rewritten rather than documented, because each would otherwise be a
+  silently different answer: `\d`/`\w`/`\s`/`\b` are ASCII-only in Java
+  (`"١٢٣".replaceAll("\\d", ".")` changes nothing) where the engine's are
+  Unicode-aware; `(?i)` folds ASCII only (`"Ä".matches("(?i)ä")` is false), so it
+  is expanded into the pattern and the engine's own flag dropped; `.` excludes
+  all five of Java's line terminators, not just `\n`; and a default-mode `$` also
+  matches *before* a final terminator, so `"abc\n".replaceAll("c$", "X")`
+  replaces. `\Q…\E`, `\h`/`\v`/`\R`, `\Z`, `\uHHHH`, and the POSIX `\p{Alpha}`
+  names are translated too. On top of the engine, the three methods' specified
+  behaviour: `split`'s trailing-empty removal, its leading zero-width-match rule,
+  and its `limit`; the `$n`/`${name}` replacement grammar with Java's `\`
+  escaping (which is not the `regex` crate's); and `matches`'s whole-region
+  anchoring. A malformed pattern raises `java.util.regex.PatternSyntaxException`
+  and a replacement naming an absent group raises `IndexOutOfBoundsException`,
+  both catchable.
 - **A compound assignment narrows back to its target's width.** JLS 15.26.2
   makes `b += 100` on a `byte` mean `b = (byte) (b + 100)`, so it overflows at
   the *target's* width, not at `int`'s: `byte` and `short` sign-extend (`-56`,
@@ -96,8 +116,9 @@ at the bottom, and are summarized in the section right after this one.
   `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`, `replace`,
   `repeat`, `indexOf(t, from)`, `lastIndexOf`, `codePointAt`, `strip`,
   `stripLeading`, `stripTrailing`, `isBlank`, `hashCode`, `intern`,
-  `contentEquals`, `toCharArray`, `formatted`, and the literal-pattern
-  `split`/`replaceAll`/`replaceFirst`/`matches` (see the regex entry below).
+  `contentEquals`, `toCharArray`, `formatted`, and the four
+  `java.util.regex` methods `split`/`replaceAll`/`replaceFirst`/`matches` (see
+  the regular-expression entry below).
   `x.getClass()` evaluates to the runtime class *name*, over which `getName`
   and `getSimpleName` are `String` methods.
   Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
@@ -361,12 +382,20 @@ known.
   `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
   `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
   as are the `Math.PI`/`Math.E` constants.
-- **Regular expressions.** `String.split`/`replaceAll`/`replaceFirst`/`matches`
-  accept only a pattern with no metacharacter (`\ . [ ] { } ( ) * + ? ^ $ |`),
-  which is the single-separator call the JDK itself fast-paths. A pattern that
-  would need real matching is reported ("supports only a literal pattern")
-  rather than treated as a literal and answered wrong. javars links no regex
-  engine.
+- **The regular-expression constructs with no faithful translation.** Regular
+  expressions themselves are implemented (see the entry under "Implemented");
+  what is refused — as a `PatternSyntaxException` naming the construct — is the
+  tail that `fancy-regex` cannot reproduce: possessive quantifiers (`a*+`),
+  atomic groups (`(?>…)`), `\G`, `\X`, `\cX`, `\N{…}`, `\0n` octal escapes,
+  conditionals `(?(1)…)`, Unicode *blocks* (`\p{InGreek}`) and the
+  `\p{javaLowerCase}` predicates, and the `(?m)`/`(?x)`/`(?d)`/`(?u)`/`(?U)`
+  flags. OpenJDK *accepts* every one of these, so this is a deliberate
+  difference: the engine would compile most of them into a subtly different
+  language (`(?m)$` matches before a `\n` where Java's matches before any of its
+  five line terminators; `(?x)` ignores whitespace inside a character class in
+  Java but not in the engine), and a named error beats a silently different
+  answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
+  four `String` methods are the whole surface.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
