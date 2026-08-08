@@ -788,7 +788,26 @@ fn g_shift(r: &mut Rng) -> String {
 fn g_cast(r: &mut Rng) -> String {
     let d = pick(r, DBLS);
     let i = pick(r, INTS);
-    match r.below(8) {
+    // The boxed values a *reference* cast is applied to, and the target types
+    // it is applied with. Every failing pair here is between `java.lang` types,
+    // whose `ClassCastException` message javars reproduces exactly; the
+    // user-class pairs print the exception's class instead, because Java's
+    // message names its class loader by identity hash.
+    // A boxed `char` is deliberately absent: javars models a `Character` as the
+    // one-character String it prints as, so a cast that fails on one names
+    // `java.lang.String` in its message. That is a documented simplification,
+    // not a finding.
+    const BOXED: &[&str] = &["\"hi\"", "42", "3.5", "true"];
+    const TARGETS: &[&str] = &[
+        "String",
+        "Integer",
+        "Double",
+        "Boolean",
+        "Number",
+        "CharSequence",
+        "Object",
+    ];
+    match r.below(12) {
         0 => p(format!("(int) {d}")),
         1 => p(format!("(long) {d}")),
         2 => p(format!("(int) -{d}")),
@@ -796,7 +815,33 @@ fn g_cast(r: &mut Rng) -> String {
         4 => p(format!("(short) ({i} * 5000)")),
         5 => p(format!("(double) {i} / 2")),
         6 => p(format!("(char) (65 + {})", r.below(20))),
-        _ => p(format!("(int) 1e18 + {i}")),
+        7 => p(format!("(int) 1e18 + {i}")),
+        // A reference cast between JDK types: succeeds, or throws with the
+        // message Java prints.
+        8 | 9 => {
+            let val = pick(r, BOXED);
+            let target = pick(r, TARGETS);
+            format!(
+                "{{ Object o = {val}; try {{ System.out.println(({target}) o); }} catch (ClassCastException e) {{ System.out.println(e.getMessage()); }} }}"
+            )
+        }
+        // A downcast in a user hierarchy: the exception's *class*, since its
+        // message names the launcher's class loader.
+        10 => {
+            let src = pick(r, &["new Left()", "new Right()", "new Base()"]);
+            let target = pick(r, &["Left", "Right", "Base", "Marker", "Object"]);
+            format!(
+                "{{ Base b = {src}; try {{ System.out.println(({target}) b); }} catch (ClassCastException e) {{ System.out.println(\"CCE \" + e.getClass().getSimpleName()); }} }}"
+            )
+        }
+        // A `null` casts to anything, and a cast does not erase what the
+        // operand is — `println((Object) left)` still finds `Left.toString`.
+        _ => {
+            let src = pick(r, &["new Left()", "new Right()"]);
+            format!(
+                "{{ Base n = null; System.out.println((Base) n); System.out.println((Object) {src}); }}"
+            )
+        }
     }
 }
 
@@ -1102,6 +1147,12 @@ const SUPPORT_CLASS: &str = concat!(
     // The functional interfaces the lambda probes target. A user-declared
     // single-abstract-method interface is exactly what the JDK's own
     // `java.util.function` types are, so these exercise the same path.
+    // A hierarchy for the reference-cast probes: a base, two siblings, and an
+    // interface only one of them implements, so a downcast can succeed or throw.
+    "class Base { public String toString() { return \"B\"; } }\n",
+    "class Left extends Base { public String toString() { return \"L\"; } }\n",
+    "class Right extends Base implements Marker { public String toString() { return \"R\"; } }\n",
+    "interface Marker { }\n",
     "interface Calc { int of(int a, int b); }\n",
     "interface Str1 { String of(String s); }\n",
     "interface Pred1 { boolean of(int a); }\n",

@@ -41,7 +41,7 @@ enum NumType {
 /// for `var` and unknown types, whose category is inferred from an initializer.
 fn numtype_of_ty(ty: &str) -> Option<NumType> {
     match ty {
-        "int" | "long" | "short" | "byte" | "char" => Some(NumType::Int),
+        "int" | "long" | "short" | "byte" | "char" | "Character" => Some(NumType::Int),
         "float" | "double" => Some(NumType::Float),
         "boolean" | "String" => Some(NumType::Other),
         _ => None,
@@ -1110,6 +1110,17 @@ impl Compiler {
                 self.classes.contains_key(ty).then(|| ty.to_string())
             }
             Expr::NewObject { class, .. } => Some(class.clone()),
+            // A cast states the class outright, which is how `((Animal) x)`
+            // reaches `Animal`'s methods and how `println((Dog) a)` finds the
+            // `toString` override.
+            Expr::Cast { ty, expr, .. } => self
+                .classes
+                .contains_key(ty)
+                .then(|| ty.clone())
+                // A cast to a type javars does not model as a class (`Object`)
+                // does not erase what the operand is, so `println((Object) dog)`
+                // still finds `Dog`'s `toString`.
+                .or_else(|| self.expr_class(expr)),
             // An element of a class-typed array (`Shape[] → Shape`).
             Expr::Index { array, .. } => {
                 let arr_ty = self.expr_array_type(array)?;
@@ -1893,14 +1904,17 @@ impl Compiler {
     /// binary operation, so they qualify; `long` (64-bit) and an unknown type do
     /// not.
     fn is_int_width(ty: Option<&str>) -> bool {
-        matches!(ty, Some("int" | "short" | "byte" | "char"))
+        matches!(ty, Some("int" | "short" | "byte" | "char" | "Character"))
     }
 
     /// True when `e`'s static Java type is `char`. A `char` runs as its code
     /// point, so this is the flag that says "convert to a one-character String
     /// before this value crosses into a String or a `Character` box".
     fn is_char_expr(&self, e: &Expr) -> bool {
-        self.expr_java_type(e).as_deref() == Some("char")
+        matches!(
+            self.expr_java_type(e).as_deref(),
+            Some("char" | "Character")
+        )
     }
 
     /// True when `e`'s static Java type is `char[]` — the array `toCharArray`
@@ -1977,7 +1991,7 @@ impl Compiler {
                 self.b.emit(Op::LoadInt(48), line);
                 self.b.emit(Op::Shr, line);
             }
-            Some("char") => {
+            Some("char" | "Character") => {
                 self.b.emit(Op::LoadInt(0xFFFF), line);
                 self.b.emit(Op::BitAnd, line);
             }
@@ -2370,6 +2384,17 @@ impl Compiler {
     /// lowers exactly as it did before.
     fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
         if !matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
+            // A `char` bound to a reference-typed slot (`Object o = 'x';`, an
+            // `Object` parameter, an `Object`-returning method) is *boxed* in
+            // Java, so it renders as a character from then on — javars models
+            // the box as the one-character String. `Character` is excluded
+            // because javars keeps it as the primitive, which is what makes
+            // `Character c = 'x'; c + 1` the 121 Java's unboxing gives.
+            if target.is_some_and(|t| is_reference_type(t) && t != "Character")
+                && self.is_char_expr(e)
+            {
+                return self.emit_char_string(e);
+            }
             return self.expr(e);
         }
         let saved = std::mem::replace(&mut self.lambda_target, target.map(str::to_string));
@@ -3651,6 +3676,11 @@ impl Compiler {
     /// string concatenation (`"x " + obj`) honour the override. Otherwise
     /// evaluate normally (the host's `java_str` renders the default `Class@hash`
     /// form, which is what `String.valueOf(obj)` still gets — see BUGS.md).
+    ///
+    /// The dispatch is keyed on the receiver's *runtime* class even when the
+    /// static type already declares `toString`, because that is also the test
+    /// that catches a `null`: Java's string conversion of a null reference is
+    /// the text "null", not a call on nothing.
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
         if self.is_char_expr(e) {
             return self.emit_char_string(e);
@@ -3658,12 +3688,6 @@ impl Compiler {
         let Some(rc) = self.expr_class(e) else {
             return self.expr(e);
         };
-        if self.has_instance_method(&rc, "toString", 0) {
-            return self.dispatch_instance_method(e, &rc, "toString", &[], 0);
-        }
-        // The static type declares no `toString` (an interface, or a base class
-        // that never overrides it) but some subtype does — so the override is
-        // still reachable, keyed on the receiver's runtime class.
         let overriders = self.to_string_overriders(&rc);
         if overriders.is_empty() {
             return self.expr(e);
@@ -4651,8 +4675,9 @@ impl Compiler {
     /// javars already represents identically is emitted as the operand alone, so
     /// the common `(int) i` stays native. A *reference* cast has no runtime
     /// effect here: the host heap already carries each object's class and
-    /// javars does not box primitives, so there is no representation to change
-    /// (and therefore no `ClassCastException` — see BUGS.md).
+    /// javars does not box primitives, so it changes no representation — but it
+    /// is still *checked*, and a cast the runtime class does not satisfy throws
+    /// `ClassCastException` the way Java's does.
     fn cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
         let src = self.expr_java_type(e);
         let identity = matches!(
@@ -4666,13 +4691,37 @@ impl Compiler {
             ty,
             "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
         );
-        if identity || !primitive {
+        if !primitive {
+            return self.reference_cast(ty, e, line);
+        }
+        if identity {
             return self.expr(e);
         }
         self.expr(e)?;
         let c = self.b.add_constant(Value::str(ty.to_string()));
         self.b.emit(Op::LoadConst(c), line);
         self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
+        Ok(())
+    }
+
+    /// Lower `(RefType) expr` — a *checked* reference cast.
+    ///
+    /// The cast changes no representation (the host heap already carries each
+    /// object's class), so all it can do is verify one. It is emitted only when
+    /// javars can name the runtime class exactly: a user class or interface, or
+    /// one of the `java.lang` types its value model distinguishes. `Object` is
+    /// always satisfied, and an unknown name — a type *variable* after erasure,
+    /// a collection interface, an array type — is passed through rather than
+    /// checked, because a check javars cannot decide must not invent a failure.
+    fn reference_cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
+        self.expr(e)?;
+        let checkable = self.classes.contains_key(ty) || is_checkable_jdk_type(ty);
+        if !checkable {
+            return Ok(());
+        }
+        let c = self.b.add_constant(Value::str(ty.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        self.emit_raising_builtin(crate::host::JCHECKCAST, 2, line);
         Ok(())
     }
 
@@ -4845,7 +4894,7 @@ fn mangle_static(name: &str, param_tys: &[String]) -> String {
 fn numeric_rank(ty: &str) -> Option<u32> {
     Some(match ty {
         "byte" => 1,
-        "short" | "char" => 2,
+        "short" | "char" | "Character" => 2,
         "int" => 3,
         "long" => 4,
         "float" => 5,
@@ -4935,6 +4984,27 @@ fn is_static_class(name: &str) -> bool {
             | "Collections"
             | "List"
             | "Set"
+    )
+}
+
+/// True when a cast to `ty` is one javars can decide: a `java.lang` type its
+/// value model tells apart from the others. `Object` is deliberately absent —
+/// every value satisfies it, so the check would only cost ops — and so are the
+/// collection interfaces and array types, whose element types javars erases.
+fn is_checkable_jdk_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "String"
+            | "Integer"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "Double"
+            | "Float"
+            | "Boolean"
+            | "Character"
+            | "Number"
+            | "CharSequence"
     )
 }
 

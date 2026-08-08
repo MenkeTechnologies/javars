@@ -213,6 +213,15 @@ pub const JCAST: u16 = 734;
 /// through unchanged.
 pub const JCHR_STR: u16 = 735;
 
+/// A checked *reference* cast, `(RefType) value`. Stack `[value, typeName]`
+/// (`typeName` on top); `argc == 2`. The cast changes no representation — the
+/// host heap already carries each object's class — so all it does is verify
+/// one, raising `ClassCastException` when the runtime class is not the target
+/// or a subtype of it. `null` casts to anything, and a value whose runtime
+/// class javars cannot name exactly (an array, a collection, a lambda) passes
+/// through unchecked rather than inventing a failure.
+pub const JCHECKCAST: u16 = 736;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -466,6 +475,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JUSHR, b_ushr);
     vm.register_builtin(JCAST, b_cast);
     vm.register_builtin(JCHR_STR, b_chr_str);
+    vm.register_builtin(JCHECKCAST, b_checkcast);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -3219,6 +3229,111 @@ fn char_to_string(v: &Value) -> Value {
     match v {
         Value::Int(n) => Value::str(char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string()),
         other => other.clone(),
+    }
+}
+
+/// [`JCHECKCAST`] — the reference cast's runtime check.
+fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let value = args.first().cloned().unwrap_or(Value::Undef);
+    let target = args
+        .get(1)
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    // `(Anything) null` succeeds in Java; so does a cast javars cannot decide.
+    let Some(runtime) = runtime_class(&value) else {
+        return value;
+    };
+    if cast_allowed(&runtime, &target, &value) {
+        return value;
+    }
+    raise(
+        vm,
+        Fault::java("ClassCastException", cast_message(&runtime, &target)),
+    );
+    Value::Undef
+}
+
+/// The runtime class name of a value, when javars's value model names one
+/// exactly. `None` for `null` and for the values whose class it erases — an
+/// array (whose element type is gone), a collection, a lambda — where a check
+/// could only guess.
+fn runtime_class(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Undef => return None,
+        Value::Str(_) => "String".to_string(),
+        Value::Int(_) => "Integer".to_string(),
+        Value::Float(_) => "Double".to_string(),
+        Value::Bool(_) => "Boolean".to_string(),
+        Value::Obj(id) => {
+            return HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HostObj::Instance { class, .. }) => Some(class.clone()),
+                _ => None,
+            })
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a value of runtime class `runtime` may be cast to `target`.
+///
+/// A user class walks the same supertype graph `instanceof` does. The
+/// `java.lang` types are decided from the value model, which is why the
+/// *integral* wrappers all answer yes to each other: `int`, `long`, `short`,
+/// `byte` are one `Value::Int` here, so javars cannot prove a cast between them
+/// wrong and does not pretend to. It can prove `(String) anInteger` wrong, and
+/// that is the cast programs actually write.
+fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
+    if target == "Object" || runtime == target {
+        return true;
+    }
+    match runtime {
+        "String" => {
+            matches!(
+                target,
+                "CharSequence" | "Comparable" | "Serializable" // A boxed `Character` is the one-character String javars models it
+                                                               // as, so a cast back to `Character` has to be allowed.
+            ) || (target == "Character" && value.as_str_cow().chars().count() == 1)
+        }
+        "Integer" => matches!(
+            target,
+            "Long" | "Short" | "Byte" | "Character" | "Number" | "Comparable" | "Serializable"
+        ),
+        "Double" => matches!(target, "Float" | "Number" | "Comparable" | "Serializable"),
+        "Boolean" => matches!(target, "Comparable" | "Serializable"),
+        // A user class or interface: the declared supertype graph decides.
+        _ => is_subclass_of(runtime, target),
+    }
+}
+
+/// Java's `ClassCastException` detail message.
+///
+/// The leading `class X cannot be cast to class Y` is exact. Java appends a
+/// parenthetical naming each class's module and class loader, which is
+/// reproducible only when both are JDK types — for a user class the launcher's
+/// loader is identified by an identity hash javars has no counterpart for — so
+/// that clause is emitted for the JDK pair and dropped otherwise, the same
+/// bounded omission `NullPointerException`'s provenance clause already makes.
+fn cast_message(runtime: &str, target: &str) -> String {
+    let qual = |n: &str| crate::prelude::qualified_throwable(n).unwrap_or_else(|| jdk_name(n));
+    let (r, t) = (qual(runtime), qual(target));
+    let head = format!("class {r} cannot be cast to class {t}");
+    if r.starts_with("java.") && t.starts_with("java.") {
+        format!("{head} ({r} and {t} are in module java.base of loader 'bootstrap')")
+    } else {
+        head
+    }
+}
+
+/// The qualified name of a modeled `java.lang` type, or the bare name of a user
+/// class.
+fn jdk_name(n: &str) -> String {
+    match n {
+        "String" | "Integer" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean"
+        | "Character" | "Number" | "CharSequence" | "Comparable" | "Object" => {
+            format!("java.lang.{n}")
+        }
+        other => other.to_string(),
     }
 }
 

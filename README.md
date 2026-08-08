@@ -184,7 +184,9 @@ Implemented and checked against the reference `java`:
   non-short-circuiting logical operators on booleans), and the shifts
   `<< >> >>>` with Java's per-width distance masking; unary `-`, `!`, `~`, and
   `++`/`--` in both prefix and postfix value position; cast expressions with
-  Java's saturating and two's-complement narrowing conversions; parenthesised
+  Java's saturating and two's-complement narrowing conversions (a *reference*
+  cast is checked against the receiver's runtime class and throws
+  `ClassCastException`); parenthesised
   grouping; Java's `+` string concatenation. A `char` is the 16-bit *integral*
   type it is in Java — `"abc".charAt(2) + 1` is 100 and `c - '0'` reads a digit
   — and takes Java's string conversion back to a one-character String wherever

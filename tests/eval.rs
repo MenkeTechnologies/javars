@@ -2362,3 +2362,68 @@ fn an_untranslatable_regex_construct_is_refused_by_name() {
         "javars supports no equivalent of *+ (possessive quantifier) near index 0\n"
     );
 }
+
+#[test]
+fn a_bad_reference_cast_between_jdk_types_throws_with_javas_message() {
+    // A reference cast changes no representation here — the host heap already
+    // carries each object's class — but it is *checked*, and the `java.lang`
+    // types javars's value model tells apart produce Java's exact detail
+    // message, module-and-loader clause included.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "Object s = \"hi\";\
+         Object n = 42;\
+         try { Integer x = (Integer) s; System.out.println(x); }\
+         catch (ClassCastException e) { System.out.println(e.getMessage()); }\
+         try { String x = (String) n; System.out.println(x); }\
+         catch (ClassCastException e) { System.out.println(e.getMessage()); }\
+         System.out.println((String) s);\
+         System.out.println((Integer) n + 1);\
+         System.out.println((Number) n);\
+         System.out.println((CharSequence) s);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "class java.lang.String cannot be cast to class java.lang.Integer \
+         (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\n\
+         class java.lang.Integer cannot be cast to class java.lang.String \
+         (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')\n\
+         hi\n43\n42\nhi\n"
+    );
+}
+
+#[test]
+fn a_downcast_is_checked_against_the_runtime_class() {
+    // The supertype graph `instanceof` walks is the same one the cast checks, so
+    // a sideways cast throws while an upcast and an identity cast pass the value
+    // through. The message's module-and-loader clause is dropped for a user
+    // class (Java names the launcher's loader by identity hash), so the test
+    // compares the part that is reproducible — which is what a program reads.
+    // A cast also does not erase what the operand is: `println((Object) left)`
+    // still finds `Left.toString`, and a null still converts to "null" rather
+    // than calling `toString` on nothing. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "class Base { public String toString() { return \"B\"; } }\
+         class Left extends Base { public String toString() { return \"L\"; } }\
+         interface Marker { }\
+         class Right extends Base implements Marker { public String toString() { return \"R\"; } }\
+         public class T { public static void main(String[] args) {\
+         Base b = new Left();\
+         try { Right x = (Right) b; System.out.println(x); }\
+         catch (ClassCastException e) { System.out.println(e.getClass().getSimpleName() + \":\" + e.getMessage().split(\" \\\\(\")[0]); }\
+         System.out.println((Left) b);\
+         System.out.println((Base) b);\
+         System.out.println((Object) b);\
+         System.out.println(((Base) new Right()) instanceof Marker);\
+         Base nul = null;\
+         System.out.println((Base) nul);\
+         System.out.println(\"x\" + nul);\
+         } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "ClassCastException:class Left cannot be cast to class Right\nL\nL\nL\ntrue\nnull\nxnull\n"
+    );
+}

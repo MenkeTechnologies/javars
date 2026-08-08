@@ -42,6 +42,16 @@ at the bottom, and are summarized in the section right after this one.
   and the integral narrowings are two's-complement — except `(char)`, which is
   *unsigned* 16-bit, so `(char) -1` is 65535. Widening and identity casts emit
   the operand alone, so `(int) i` stays native.
+- **Checked reference casts.** `(Cat) animal`, `(Integer) o`, `(Marker) x` verify
+  the receiver's *runtime* class against the same supertype graph `instanceof`
+  walks, and throw `ClassCastException` when it does not fit — `class Dog cannot
+  be cast to class Cat`, or Java's full module-and-loader wording when both types
+  are `java.lang` ones. `null` casts to anything, `(Object) x` always passes, and
+  a cast does not erase what the operand is (`println((Object) dog)` still finds
+  `Dog`'s `toString`). The wrapper types javars's value model tells apart
+  (`String`, `Integer`, `Double`, `Boolean`, `Number`, `CharSequence`) are checked
+  too; the ones it cannot (`int` and `long` are one integer here) are allowed
+  rather than guessed at.
 - **`char` arithmetic.** A `char` is Java's 16-bit integral type, not a string:
   `"abc".charAt(2) + 1` is 100, `'z' - 'a'` is 25, and `c - '0'` reads a digit.
   It runs as its code point and takes Java's *string conversion* (JLS 5.1.11)
@@ -455,11 +465,18 @@ known.
   caches the ASCII range, so `Character.valueOf('a') == Character.valueOf('a')`
   is true), javars compares the strings by value — the same String-`==` model
   above.
-- **A reference cast is a no-op, so there is no `ClassCastException`.** The host
-  heap already carries each object's class and javars does not box primitives, so
-  `(Integer) o` on a `String` has no representation to change and no boxed type
-  to check — it passes the value through where Java throws. A *primitive* cast is
-  a real conversion (above).
+- **A `ClassCastException` message drops the module-and-loader clause for a user
+  class, and a cast javars cannot decide passes through.** Reference casts *are*
+  checked (see "Checked reference casts" under "Implemented"), with two bounded
+  gaps. Java appends `(X and Y are in unnamed module of loader
+  com.sun.tools.javac.launcher.MemoryClassLoader @<identity hash>)` to a
+  user-class message, which javars has no counterpart for, so it ends after
+  `class X cannot be cast to class Y`; between two `java.lang` types the whole
+  message is exact. And a value whose class javars erases — an array (element
+  type gone), a collection, a lambda — passes any cast rather than inventing a
+  failure, so `(String) anIntArray` succeeds where Java throws. A boxed
+  `Character` is the one-character String javars models it as, so a failing cast
+  from one names `java.lang.String` and `(String) aBoxedChar` succeeds.
 - **`float` shares `double`'s width.** There is no 32-bit float representation,
   so `(float) x` only makes an integral operand floating and `1.0f / 3.0f` prints
   `0.3333333333333333` where Java prints `0.33333334`.
