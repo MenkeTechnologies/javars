@@ -14,7 +14,9 @@ at the bottom, and are summarized in the section right after this one.
   fall-through between groups and grouped labels (`case 1: case 2:`). `break`
   and `continue`, including the labeled forms (`outer: for (…) { break outer; }`)
   — a labeled `break` exits the named loop/`switch`, a labeled `continue` steps
-  the named loop.
+  the named loop. A `for` header takes comma-separated init and update clauses
+  (`for (int i = 0, j = n; i < j; i++, j--)`), where the init's later declarators
+  reuse the first one's type.
 - **The enhanced `for`** (`for (String s : arr)`, `for (var v : arr)`) over an
   array or a collection — including a `T[][]` row (`for (int[] row : grid)`), an
   empty array, a `List`/`Set`/`keySet()`/`values()`, and labeled
@@ -23,14 +25,45 @@ at the bottom, and are summarized in the section right after this one.
   iterable emits exactly the ops it always did; a collection is snapshotted into
   an array first, which is also what makes the loop safe against a body that
   mutates the collection.
+- **The full operator set.** Arithmetic, comparison, and the short-circuiting
+  `&&`/`||`, plus the bitwise `&`/`|`/`^`/`~` (which are Java's
+  *non-short-circuiting logical* operators on `boolean` operands) and the shifts
+  `<<`/`>>`/`>>>`. A shift masks its distance to the **left** operand's width — 5
+  bits for `int`, 6 for `long`, so `1 << 33` is `1 << 1` — and only that operand
+  is promoted, so `1 << 2L` is still an `int`. `>>>` zero-fills at the operand's
+  width. Every compound form (`&=`, `|=`, `^=`, `<<=`, `>>=`, `>>>=`) applies the
+  same rules. `>>` lexes as one token, and the generic-argument skippers weigh a
+  closer by how many `>` it spells, so `List<List<String>>` still parses.
+- **`++`/`--` in value position.** The post-form evaluates to the value the
+  variable held, the pre-form to the value it takes.
+- **Cast expressions** (`(int) d`, `(byte) n`, `(char) 65`, `(Object) x`). Java's
+  narrowing primitive conversions are real value changes: floating → integral
+  *saturates* (`(int) 1e18` is `Integer.MAX_VALUE`) and truncates toward zero,
+  and the integral narrowings are two's-complement. Widening and identity casts
+  emit the operand alone, so `(int) i` stays native.
+- **The whole integer-literal syntax.** Decimal, hex (`0x1F`), binary
+  (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
+  a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
+  `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
-  `ceil`/`round` (with Java's int-vs-double overload result typing),
-  `Integer.parseInt` (with radix)/`valueOf`/`toString` (with radix),
-  `Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`, `String.format`
-  (a `Formatter` subset: `%d %s %S %f %b %B %x %X %o %c %%`, `%n`, the `-`/`0`/`+`
-  flags, width, and `.precision`), and `Arrays.toString` (shallow). Malformed
-  numeric input faults like `NumberFormatException`; an unregistered static
-  method is an error. `System.err.print[ln]` writes to stderr.
+  `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees` (with
+  Java's int-vs-double overload result typing) and the `Math.PI`/`Math.E`
+  constants; the `Integer`/`Long`/`Short`/`Byte`/`Double` `MAX_VALUE`/`MIN_VALUE`
+  constants plus `Double.NaN` and the infinities; `Integer.parseInt` (with
+  radix)/`valueOf`/`toString` (with radix)/`toBinaryString`/`toHexString`/
+  `toOctalString`/`compare`/`max`/`min`/`sum`/`signum` and the `Long`
+  equivalents; `Double.parseDouble`/`valueOf`/`toString`/`compare`/`isNaN`/
+  `isInfinite`; `Boolean.parseBoolean`/`toString`/`compare`; the `Character`
+  predicates and case conversions; `String.valueOf`/`join`/`format`; and
+  `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
+  `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
+  %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, the `-`/`0`/`+`/`,`/`(`
+  flags, width, `.precision`, and explicit argument indexes (`%2$s`); `%f` rounds
+  HALF_UP on the double's exact value, as Java's `Formatter` does.
+  `System.out.printf` (and the `System.err` form) is that same formatter with no
+  trailing newline. Malformed numeric input faults like `NumberFormatException`;
+  an unregistered static method is an error. `System.err.print[ln]` writes to
+  stderr.
 - **User-defined `static` methods.** `static <ret> name(<params>) { … }` lowers
   to fusevm's native `Op::Call` frame ABI — parameters and locals live in call-
   frame slots, so recursion, mutual recursion, and forward references all work.
@@ -40,7 +73,13 @@ at the bottom, and are summarized in the section right after this one.
   receivers through the host: `length`, `isEmpty`, `charAt`, `substring`,
   `indexOf`, `contains`, `equals`, `equalsIgnoreCase`, `toUpperCase`,
   `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`, `replace`,
-  `repeat`. Index/length semantics use Unicode scalar (`char`) positions — exact
+  `repeat`, `indexOf(t, from)`, `lastIndexOf`, `codePointAt`, `strip`,
+  `stripLeading`, `stripTrailing`, `isBlank`, `hashCode`, `intern`,
+  `contentEquals`, `toCharArray`, `formatted`, and the literal-pattern
+  `split`/`replaceAll`/`replaceFirst`/`matches` (see the regex entry below).
+  `x.getClass()` evaluates to the runtime class *name*, over which `getName`
+  and `getSimpleName` are `String` methods.
+  Index/length semantics use Unicode scalar (`char`) positions — exact
   for ASCII/BMP, one unit per astral char (see the `char` simplification below).
 - **Reference arrays.** `new T[n]` (default-valued), `{…}` literals (and
   `new T[]{…}`), get/set indexing (`a[i]`, `a[i] = v`, compound `a[i] += v`,
@@ -106,7 +145,9 @@ at the bottom, and are summarized in the section right after this one.
   `new Box<>()`, and library type arguments (`List<String>`, `Map<K, V>`) all
   parse and run with type arguments erased at runtime, exactly like `javac`.
 - **Exceptions.** `throw <expr>;`, `try`/`catch`/`finally`, multiple `catch`
-  arms (first matching type wins), and a `throws` clause (parsed and discarded —
+  arms (first matching type wins) including the multi-catch `catch (A | B e)`
+  (whose alternatives are tested in order against the throwable's class), and a
+  `throws` clause (parsed and discarded —
   javars has no checked-exception analysis). The thrown object unwinds real
   fusevm call frames: a `throw` several methods deep lands in the caller's
   handler, and a `finally` runs on both the normal and the exceptional path. The
@@ -240,8 +281,11 @@ at the bottom, and are summarized in the section right after this one.
   out last, so an arm after it still matches), a `throw` arm, and a block arm
   whose `yield` supplies the value — running any `finally` it leaves on the way
   out, exactly as `return` does. `yield` is a keyword only inside an arm body,
-  so a variable or method named `yield` still works. The classic colon form,
-  with its fall-through, is untouched.
+  so a variable or method named `yield` still works. A switch *expression* also
+  accepts the classic `case X:` arm — every such arm must complete with `yield`
+  or `throw`, so only an empty one falls through, and that just groups its labels
+  onto the next arm. The classic colon form as a *statement*, with its
+  fall-through, is untouched.
 - **`String.compareTo` / `compareToIgnoreCase`**, returning Java's *difference*
   (the first differing `char`, else the length difference) rather than only its
   sign — programs print the number, so the sign alone would be wrong.
@@ -281,24 +325,40 @@ known.
 - **`hashCode()`**, including a `record`'s derived one. A record supplies its
   accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
   ("class `Pt` has no method `hashCode`") rather than a wrong number.
-- **Most of the standard library.** The `Math`/`Integer`/`Long`/`Boolean`/
-  `String`/`Arrays`/`Collections` statics listed above, the `String` instance
-  methods, and the `java.util` collections are the whole library surface — no
-  `Math` constants (`Math.PI`), no boxed-type methods beyond the listed statics,
-  no `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no `String.split`/`join`,
-  no I/O.
+- **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
+  `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above, the
+  `String` instance methods, and the `java.util` collections are the whole
+  library surface — no boxed-type methods beyond the listed statics, no
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O.
+- **`Math`'s transcendentals** (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`,
+  `atan2`, `exp`, `log`, `log10`, `cbrt`, `hypot`, `sinh`/`cosh`/`tanh`). The JDK
+  answers these from its own fdlibm-derived implementation and permits a 1-ulp
+  error; Rust's libm does not reproduce it bit-for-bit. A 180-value differential
+  sweep against OpenJDK 26 diverged in the last digit for every one of them
+  (`sin` 14/180, `cbrt` 25/180, `tan` 5/10), so they are left out: an
+  unregistered static is a clear error, a silently different last digit is not.
+  `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
+  `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
+  as are the `Math.PI`/`Math.E` constants.
+- **Regular expressions.** `String.split`/`replaceAll`/`replaceFirst`/`matches`
+  accept only a pattern with no metacharacter (`\ . [ ] { } ( ) * + ? ^ $ |`),
+  which is the single-separator call the JDK itself fast-paths. A pattern that
+  would need real matching is reported ("supports only a literal pattern")
+  rather than treated as a literal and answered wrong. javars links no regex
+  engine.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
   `when` clauses). The arrow form itself is implemented (above); it is pattern
   labels that are not.
 - **`Enum.compareTo`, `EnumSet`, `EnumMap`.**
-- **Multi-catch** (`catch (A | B e)`) — rejected, not mis-parsed (the lexer has
-  no single `|` token, so it fails lexically).
-- **Sealed types, inner (non-`static`) classes, anonymous classes** other than
-  the enum-constant body form, and **cast expressions** (`(Object) x`).
-- **Fully-qualified type names in code** (`java.util.function.Supplier<T> s`).
-  An `import` line is skipped, and the simple name is what resolves.
+- **Sealed types, inner (non-`static`) classes,** and **anonymous classes** other
+  than the enum-constant body form.
+- **Fully-qualified type names in *declaration* position**
+  (`java.util.function.Supplier<T> s`). An `import` line is skipped, and the
+  simple name is what resolves. A qualified *static call* does work
+  (`java.util.Arrays.sort(x)`), because the package prefix is dropped and the
+  simple name dispatches.
 
 ## Modeled with a documented simplification
 
@@ -337,6 +397,21 @@ known.
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
 - **`char` literals are one-character strings**, not an integer `char` type.
+  A consequence: `"abc".charAt(2) + 1` concatenates to `c1` where Java promotes
+  the `char` to its code point and prints `100`. `(int) c` and `(char) n` do
+  convert, so the code point is reachable explicitly.
+- **A reference cast is a no-op, so there is no `ClassCastException`.** The host
+  heap already carries each object's class and javars does not box primitives, so
+  `(Integer) o` on a `String` has no representation to change and no boxed type
+  to check — it passes the value through where Java throws. A *primitive* cast is
+  a real conversion (above).
+- **`float` shares `double`'s width.** There is no 32-bit float representation,
+  so `(float) x` only makes an integral operand floating and `1.0f / 3.0f` prints
+  `0.3333333333333333` where Java prints `0.33333334`.
+- **`Double.toString` of a subnormal can differ in the last digit.** javars
+  renders `Double.MIN_VALUE` as `5.0E-324` where Java prints `4.9E-324`: Java's
+  shortest-round-trip algorithm and Rust's disagree at the very bottom of the
+  exponent range. Normal-range doubles agree.
 - **Floating `/` routes through a builtin.** Statically-integral division keeps
   the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating or
   statically-unknown operand routes through `JDIV`, because Java floating

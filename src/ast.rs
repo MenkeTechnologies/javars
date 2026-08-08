@@ -242,9 +242,13 @@ pub enum StmtKind {
     DoWhile { body: Vec<Stmt>, cond: Expr },
     /// `for (init; cond; update) { .. }` — the C-style loop.
     For {
-        init: Option<Box<Stmt>>,
+        /// The init clause, which Java lets be a comma-separated list — either
+        /// several declarators of one type (`int i = 0, j = n`) or several
+        /// expression statements. Empty when the clause is.
+        init: Vec<Stmt>,
         cond: Option<Expr>,
-        update: Option<Box<Stmt>>,
+        /// The update clause, likewise a comma-separated list (`i++, j--`).
+        update: Vec<Stmt>,
         body: Vec<Stmt>,
     },
     /// `for (T x : arr) { .. }` — the enhanced (`for-each`) loop. Java defines
@@ -315,8 +319,10 @@ pub struct SwitchGroup {
 /// `catch (RuntimeException e)` shadows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatchArm {
-    /// The caught type's name (`RuntimeException`, a user class, …).
-    pub ty: String,
+    /// The caught type names (`RuntimeException`, a user class, …). A
+    /// multi-catch (`catch (A | B e)`) lists more than one; the arm runs when
+    /// the throwable matches any of them.
+    pub types: Vec<String>,
     /// The bound exception variable.
     pub name: String,
     pub body: Vec<Stmt>,
@@ -331,6 +337,18 @@ pub enum AssignOp {
     Mul,
     Div,
     Mod,
+    /// `&=`
+    BitAnd,
+    /// `|=`
+    BitOr,
+    /// `^=`
+    BitXor,
+    /// `<<=`
+    Shl,
+    /// `>>=`
+    Shr,
+    /// `>>>=`
+    Ushr,
 }
 
 /// A Java expression.
@@ -372,11 +390,27 @@ pub enum Expr {
         err: bool,
         arg: Option<Box<Expr>>,
     },
-    /// Post-increment / post-decrement of a variable (`i++`, `i--`), evaluated
-    /// as a statement today. The bool is `true` for `++`.
+    /// Post-increment / post-decrement of a variable (`i++`, `i--`). As an
+    /// expression it yields the value the variable held *before* the update; the
+    /// bool is `true` for `++`.
     PostIncDec {
         name: String,
         inc: bool,
+    },
+    /// Pre-increment / pre-decrement of a variable (`++i`, `--i`) — updates
+    /// first and yields the *new* value. The bool is `true` for `++`.
+    PreIncDec {
+        name: String,
+        inc: bool,
+    },
+    /// A cast, `(ty) expr`. Java's narrowing primitive conversions are real
+    /// value changes (`(int) 3.9` is 3, `(byte) 200` is -56), so the target type
+    /// is kept rather than erased; a reference cast is a no-op at runtime here,
+    /// because the host heap already carries each object's class.
+    Cast {
+        ty: String,
+        expr: Box<Expr>,
+        line: u32,
     },
     /// A bare-identifier function call `name(args...)`. Slice 1 declares no
     /// user methods, so the only calls that reach the compiler are the inline
@@ -519,6 +553,8 @@ pub enum LambdaBody {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x` — bitwise complement of an integral operand.
+    BitNot,
 }
 
 /// Binary operators.
@@ -537,4 +573,16 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `&` — bitwise AND on integers, non-short-circuit AND on booleans.
+    BitAnd,
+    /// `|` — bitwise OR on integers, non-short-circuit OR on booleans.
+    BitOr,
+    /// `^` — bitwise XOR on integers, "not equal" on booleans.
+    BitXor,
+    /// `<<` — left shift.
+    Shl,
+    /// `>>` — arithmetic (sign-propagating) right shift.
+    Shr,
+    /// `>>>` — logical (zero-fill) right shift.
+    Ushr,
 }

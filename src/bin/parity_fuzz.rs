@@ -748,6 +748,120 @@ fn g_varinfer(r: &mut Rng) -> String {
     }
 }
 
+/// `&`, `|`, `^`, `~` — bitwise on integral operands, non-short-circuiting
+/// logical on booleans (where the result must print `true`/`false`, not 0/1).
+fn g_bitwise(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let op = pick(r, &["&", "|", "^"]);
+    match r.below(5) {
+        0 => p(format!("{a} {op} {b}")),
+        1 => p(format!("~{a}")),
+        2 => p(format!("{} {op} {}", pick(r, BOOLS), pick(r, BOOLS))),
+        3 => p(format!("({a} {op} {b}) + 1")),
+        _ => format!("{{ long v = {a}L; v {op}= {b}; System.out.println(v); }}"),
+    }
+}
+
+/// `<<`, `>>`, `>>>` — the distance is masked to the *left* operand's width
+/// (5 bits for `int`, 6 for `long`), and only `int` narrows afterwards.
+fn g_shift(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    // Distances deliberately past the width, so the mask is exercised.
+    let n = pick(r, &["0", "1", "3", "16", "31", "32", "33", "63", "64"]);
+    let op = pick(r, &["<<", ">>", ">>>"]);
+    match r.below(4) {
+        0 => p(format!("{a} {op} {n}")),
+        1 => p(format!("{a}L {op} {n}")),
+        2 => format!("{{ int v = {a}; v {op}= {n}; System.out.println(v); }}"),
+        _ => format!("{{ long v = {a}L; v {op}= {n}; System.out.println(v); }}"),
+    }
+}
+
+/// Narrowing and widening primitive casts — the saturating float→integral rule
+/// and the two's-complement integral narrowings.
+fn g_cast(r: &mut Rng) -> String {
+    let d = pick(r, DBLS);
+    let i = pick(r, INTS);
+    match r.below(8) {
+        0 => p(format!("(int) {d}")),
+        1 => p(format!("(long) {d}")),
+        2 => p(format!("(int) -{d}")),
+        3 => p(format!("(byte) ({i} * 37)")),
+        4 => p(format!("(short) ({i} * 5000)")),
+        5 => p(format!("(double) {i} / 2")),
+        6 => p(format!("(char) (65 + {})", r.below(20))),
+        _ => p(format!("(int) 1e18 + {i}")),
+    }
+}
+
+/// `i++` / `++i` / `i--` / `--i` in *value* position, where the pre- and
+/// post-forms differ in what the expression evaluates to.
+fn g_incdec(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    match r.below(5) {
+        0 => format!("{{ int v = {a}; System.out.println(v++ + \",\" + v); }}"),
+        1 => format!("{{ int v = {a}; System.out.println(++v + \",\" + v); }}"),
+        2 => format!("{{ int v = {a}; System.out.println(v-- + \",\" + v); }}"),
+        3 => format!("{{ int v = {a}; System.out.println(--v + \",\" + v); }}"),
+        _ => "{ int t = 0; for (int x = 0, y = 5; x < y; x++, y--) { t += x + y; } System.out.println(t); }"
+            .to_string(),
+    }
+}
+
+/// Hex, binary, octal, and `_`-separated integer literals — including the
+/// bit-pattern reading that makes `0xFFFFFFFF` the `int` -1.
+fn g_literal(r: &mut Rng) -> String {
+    p(pick(
+        r,
+        &[
+            "0x1F",
+            "0xFF",
+            "0xFFFFFFFF",
+            "0xFFFFFFFFFFFFFFFFL",
+            "0X7fffffff",
+            "0b1010",
+            "0b1111_0000",
+            "0B1",
+            "017",
+            "0777",
+            "1_000_000",
+            "1_2_3",
+            "0x7FL",
+        ],
+    )
+    .to_string())
+}
+
+/// `System.out.printf` / `String.format` beyond the plain conversions: the
+/// grouping and parenthesis flags, argument indexes, and `%e`/`%g`/`%h`.
+fn g_printf(r: &mut Rng) -> String {
+    let i = pick(r, INTS);
+    let d = pick(r, DBLS);
+    match r.below(9) {
+        0 => format!("System.out.printf(\"%d|%s%n\", {i}, {});", pick(r, STRS)),
+        1 => p(format!("String.format(\"%,d\", {i} * 100000)")),
+        2 => p(format!("String.format(\"%(d\", {i})")),
+        3 => p("String.format(\"%2$s-%1$s\", \"a\", \"b\")".to_string()),
+        4 => p(format!("String.format(\"%e\", {d})")),
+        5 => p(format!("String.format(\"%E\", {d})")),
+        6 => p(format!("String.format(\"%.3f\", {d})")),
+        7 => p(format!("String.format(\"%08.2f\", {d})")),
+        _ => p(format!("String.format(\"%,.2f\", {d} * 1000)")),
+    }
+}
+
+/// Labeled `break`/`continue` out of nested loops, including from inside a
+/// `try` whose `finally` must still run on the way out.
+fn g_labelflow(r: &mut Rng) -> String {
+    match r.below(4) {
+        0 => "{ outer: for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) { if (j == 1) continue outer; System.out.print(i + \":\" + j + \" \"); } } System.out.println(); }".to_string(),
+        1 => "{ up: for (int i = 0; i < 4; i++) { for (int j = 0; j < 4; j++) { if (i * j > 2) break up; System.out.print(i * j); } } System.out.println(); }".to_string(),
+        2 => "{ lp: for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) { try { if (j == 1) continue lp; System.out.print(\"b\" + i + j); } finally { System.out.print(\"f\" + i + j); } } } System.out.println(); }".to_string(),
+        _ => "{ int k = 0; ex: while (true) { k++; try { if (k > 2) break ex; } finally { System.out.print(\"w\" + k); } } System.out.println(k); }".to_string(),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -850,6 +964,13 @@ enum Mode {
     Collection,
     SwitchExpr,
     VarInfer,
+    Bitwise,
+    Shift,
+    Cast,
+    IncDec,
+    Literal,
+    Printf,
+    LabelFlow,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -882,6 +1003,13 @@ const CONCRETE: &[Mode] = &[
     Mode::Collection,
     Mode::SwitchExpr,
     Mode::VarInfer,
+    Mode::Bitwise,
+    Mode::Shift,
+    Mode::Cast,
+    Mode::IncDec,
+    Mode::Literal,
+    Mode::Printf,
+    Mode::LabelFlow,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -916,6 +1044,13 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Collection => "collection",
         Mode::SwitchExpr => "switchexpr",
         Mode::VarInfer => "varinfer",
+        Mode::Bitwise => "bitwise",
+        Mode::Shift => "shift",
+        Mode::Cast => "cast",
+        Mode::IncDec => "incdec",
+        Mode::Literal => "literal",
+        Mode::Printf => "printf",
+        Mode::LabelFlow => "labelflow",
     }
 }
 
@@ -962,6 +1097,13 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Collection => g_collection(r),
         Mode::SwitchExpr => g_switchexpr(r),
         Mode::VarInfer => g_varinfer(r),
+        Mode::Bitwise => g_bitwise(r),
+        Mode::Shift => g_shift(r),
+        Mode::Cast => g_cast(r),
+        Mode::IncDec => g_incdec(r),
+        Mode::Literal => g_literal(r),
+        Mode::Printf => g_printf(r),
+        Mode::LabelFlow => g_labelflow(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

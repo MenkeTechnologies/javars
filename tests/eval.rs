@@ -1812,3 +1812,287 @@ fn long_literals_are_not_wrapped_at_32_bits() {
     assert!(ok);
     assert_eq!(out, "6000000000\n6000000000\n9000000000\n2147483648\n");
 }
+
+#[test]
+fn bitwise_operators_follow_java_widths() {
+    // `&`/`|`/`^`/`~` on integers are bitwise; on booleans they are the
+    // non-short-circuiting logical operators, whose result must print
+    // `true`/`false` rather than the 0/1 an integer op would leave. Verified
+    // against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(5 & 3);\
+         System.out.println(5 | 3);\
+         System.out.println(5 ^ 3);\
+         System.out.println(~5);\
+         System.out.println(-1 & 0xFF);\
+         System.out.println(true & false);\
+         System.out.println(true | false);\
+         System.out.println(true ^ true);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "1\n7\n6\n-6\n255\nfalse\ntrue\nfalse\n");
+}
+
+#[test]
+fn shift_distance_is_masked_to_the_left_operands_width() {
+    // Java masks the shift distance to 5 bits for `int` and 6 for `long`, so
+    // `1 << 33` is `1 << 1`; `>>>` zero-fills at the operand's width, which is
+    // why `-8 >>> 1` and `-8L >>> 1` differ. Only the left operand is promoted,
+    // so `1 << 2L` stays an `int`. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(1 << 31);\
+         System.out.println(1 << 33);\
+         System.out.println(1L << 40);\
+         System.out.println(-8 >> 1);\
+         System.out.println(-8 >>> 1);\
+         System.out.println(-8L >>> 1);\
+         int v = 1; v <<= 3; v |= 1; v &= 14; v ^= 3;\
+         System.out.println(v);\
+         long w = -8L; w >>>= 1;\
+         System.out.println(w);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "-2147483648\n2\n1099511627776\n-4\n2147483644\n9223372036854775804\n11\n9223372036854775804\n"
+    );
+}
+
+#[test]
+fn nested_generic_type_arguments_still_parse_after_shift_lexing() {
+    // `>>` is one token now, so `List<List<String>>` closes its two type
+    // argument lists with a single `Tok::Shr`. Every generic-skipping depth
+    // counter has to weigh a closer by how many `>` it spells, or this fails to
+    // parse. Verified against OpenJDK 26.
+    let (out, ok) = run("import java.util.List; import java.util.ArrayList;\
+         public class T { public static void main(String[] a) {\
+         List<List<String>> m = new ArrayList<>();\
+         m.add(new ArrayList<>()); m.get(0).add(\"q\");\
+         System.out.println(m); } }");
+    assert!(ok);
+    assert_eq!(out, "[[q]]\n");
+}
+
+#[test]
+fn radix_and_underscore_literals() {
+    // Hex and binary literals are read as a *bit pattern* at the literal's
+    // width, so `0xFFFFFFFF` is the `int` -1 while the `L`-suffixed form is the
+    // `long` -1; a leading `0` is octal; `_` separates digits. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(0x1F);\
+         System.out.println(0xFFFFFFFF);\
+         System.out.println(0xFFFFFFFFFFFFFFFFL);\
+         System.out.println(0b1111_0000);\
+         System.out.println(017);\
+         System.out.println(1_000_000);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "31\n-1\n-1\n240\n15\n1000000\n");
+}
+
+#[test]
+fn narrowing_casts_saturate_and_wrap_like_java() {
+    // `double` → integral saturates (`(int) 1e18` is `Integer.MAX_VALUE`) and
+    // truncates toward zero; the integral narrowings are two's-complement; and
+    // `(double) 7 / 2` is a floating division because the cast retypes the left
+    // operand. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println((int) 3.99);\
+         System.out.println((int) -3.99);\
+         System.out.println((int) 1e18);\
+         System.out.println((long) 1e18);\
+         System.out.println((byte) 200);\
+         System.out.println((short) 70000);\
+         System.out.println((char) 65);\
+         System.out.println((double) 7 / 2);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3\n-3\n2147483647\n1000000000000000000\n-56\n4464\nA\n3.5\n"
+    );
+}
+
+#[test]
+fn pre_and_post_increment_differ_in_value_position() {
+    // The post-form evaluates to the value the variable *held*, the pre-form to
+    // the value it *takes* — the whole reason both spellings exist. Verified
+    // against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "int a = 5; System.out.println(a++ + \",\" + a);\
+         int b = 5; System.out.println(++b + \",\" + b);\
+         int c = 5; System.out.println(c-- + \",\" + c);\
+         int d = 5; System.out.println(--d + \",\" + d);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5,6\n6,6\n5,4\n4,4\n");
+}
+
+#[test]
+fn for_header_takes_comma_separated_clauses() {
+    // Both the init and the update clause are lists; the init's later
+    // declarators reuse the first one's type. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "int t = 0; for (int i = 0, j = 10; i < j; i++, j--) { t += i + j; }\
+         System.out.println(t);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "50\n");
+}
+
+#[test]
+fn multi_catch_matches_any_listed_type() {
+    // `catch (A | B e)` runs one body for either type, and the alternatives are
+    // tested in order against the throwable's class. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "try { throw new IllegalArgumentException(\"m\"); }\
+         catch (IllegalStateException | IllegalArgumentException e) {\
+             System.out.println(\"first \" + e.getMessage()); }\
+         try { throw new IllegalStateException(\"n\"); }\
+         catch (IllegalStateException | IllegalArgumentException e) {\
+             System.out.println(\"second \" + e.getMessage()); }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "first m\nsecond n\n");
+}
+
+#[test]
+fn labeled_jumps_out_of_a_try_run_the_finally() {
+    // A labeled `break`/`continue` that leaves a `try` has to run the cleanup
+    // on the way out *and* land on the outer loop — the shape that broke the
+    // sibling frontends. `return` from inside a `try` in a loop must exit the
+    // method rather than spin. Verified against OpenJDK 26.
+    let (out, ok) = run("public class T {\
+         static int f() { for (int i = 0; i < 10; i++) {\
+             try { if (i == 3) return i; } finally { System.out.print(\"f\" + i); } }\
+             return -1; }\
+         public static void main(String[] a) {\
+         outer: for (int i = 0; i < 2; i++) { for (int j = 0; j < 3; j++) {\
+             try { if (j == 1) continue outer; System.out.print(\"b\" + i + j); }\
+             finally { System.out.print(\"c\" + i + j); } } }\
+         System.out.println();\
+         int k = 0; ex: while (true) { k++;\
+             try { if (k > 2) break ex; } finally { System.out.print(\"w\" + k); } }\
+         System.out.println(k);\
+         System.out.println(f()); } }");
+    assert!(ok);
+    assert_eq!(out, "b00c00c01b10c10c11\nw1w2w33\nf0f1f2f33\n");
+}
+
+#[test]
+fn format_flags_indexes_and_scientific_conversions() {
+    // The grouping and parenthesis flags, explicit argument indexes (which do
+    // not advance the implicit cursor), `%e`'s two-digit signed exponent, and
+    // `%f`'s HALF_UP rounding — where Rust's own formatter rounds half-to-even
+    // and would print `2` for `%.0f` of 2.5. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(String.format(\"%,d\", 1234567));\
+         System.out.println(String.format(\"%(d\", -5));\
+         System.out.println(String.format(\"%2$s %1$s\", \"a\", \"b\"));\
+         System.out.println(String.format(\"%e|%E\", 1234.5678, -1.5));\
+         System.out.println(String.format(\"%.0f,%.0f,%.3f\", 2.5, 3.5, -1.5));\
+         System.out.println(String.format(\"%08.2f\", 3.5));\
+         System.out.printf(\"pf %d %s%n\", 7, \"x\");",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1,234,567\n(5)\nb a\n1.234568e+03|-1.500000E+00\n3,4,-1.500\n00003.50\npf 7 x\n"
+    );
+}
+
+#[test]
+fn wrapper_class_constants_and_long_wraparound() {
+    // The `java.lang` `static final`s are folded to their literal value, and
+    // `long` arithmetic that overflows `i64` wraps two's-complement instead of
+    // escaping to a wider representation. `Math.abs(int)` overflows the same
+    // way. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Integer.MAX_VALUE + \",\" + Integer.MIN_VALUE);\
+         System.out.println(Long.MAX_VALUE + 1);\
+         System.out.println(Long.MIN_VALUE - 1);\
+         System.out.println(Double.MAX_VALUE);\
+         System.out.println(Math.abs(Integer.MIN_VALUE));\
+         System.out.println(Math.floorDiv(-7, 2) + \",\" + Math.floorMod(-7, 2));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2147483647,-2147483648\n-9223372036854775808\n9223372036854775807\n1.7976931348623157E308\n-2147483648\n-4,1\n"
+    );
+}
+
+#[test]
+fn array_statics_sort_copy_and_render_nested() {
+    // `Arrays.sort`/`fill` mutate the caller's array in place; `copyOf` pads
+    // with the element type's default; `deepToString` recurses where
+    // `toString` does not. Verified against OpenJDK 26.
+    let (out, ok) = run("import java.util.Arrays;\
+         public class T { public static void main(String[] a) {\
+         int[] x = {5, 3, 1, 4}; Arrays.sort(x);\
+         System.out.println(Arrays.toString(x));\
+         System.out.println(Arrays.toString(Arrays.copyOf(x, 6)));\
+         System.out.println(Arrays.toString(Arrays.copyOfRange(x, 1, 3)));\
+         int[] f = new int[3]; Arrays.fill(f, 7);\
+         System.out.println(Arrays.toString(f));\
+         System.out.println(Arrays.binarySearch(x, 4));\
+         int[][] m = new int[2][3]; m[1][2] = 9;\
+         System.out.println(Arrays.deepToString(m)); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[1, 3, 4, 5]\n[1, 3, 4, 5, 0, 0]\n[3, 4]\n[7, 7, 7]\n2\n[[0, 0, 0], [0, 0, 9]]\n"
+    );
+}
+
+#[test]
+fn string_search_split_and_regexless_replace() {
+    // The offset searches, the char-array round trip, and the literal-pattern
+    // subset of `split` (which drops trailing empty fields but keeps interior
+    // ones). Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"Hello\".indexOf(\"l\", 3) + \",\" + \"Hello\".lastIndexOf(\"l\"));\
+         System.out.println(\"  pad  \".strip() + \"|\" + \"  \".isBlank());\
+         System.out.println(\"abc\".hashCode());\
+         System.out.println(new String(\"ab\".toCharArray()));\
+         System.out.println(\"a,b,,c\".split(\",\").length + \",\" + \"a,b,,c\".split(\",\")[2] + \"|\");\
+         System.out.println(\"a,b,,\".split(\",\").length);\
+         System.out.println(String.join(\"-\", \"a\", \"b\", \"c\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3,3\npad|true\n96354\nab\n4,|\n2\na-b-c\n");
+}
+
+#[test]
+fn get_class_reports_the_runtime_class_name() {
+    // `getClass()` has no `Class` object behind it here: it evaluates to the
+    // runtime class *name*, over which `getName`/`getSimpleName` are String
+    // methods. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "Exception e = new IllegalStateException(\"x\");\
+         System.out.println(e.getClass().getName());\
+         System.out.println(e.getClass().getSimpleName());",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.lang.IllegalStateException\nIllegalStateException\n"
+    );
+}
+
+#[test]
+fn colon_form_switch_expression_yields() {
+    // A switch *expression* accepts the classic `case X:` arm as well as the
+    // arrow form; an empty colon arm groups its labels onto the next one.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "int v = switch (2) { case 2: yield 22; default: yield 0; };\
+         System.out.println(v);\
+         int w = switch (3) { case 1: case 3: yield 13; default: yield 0; };\
+         System.out.println(w);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "22\n13\n");
+}

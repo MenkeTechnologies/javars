@@ -187,6 +187,21 @@ pub const JCOLL_DISPATCH: u16 = 731;
 /// not prove the iterable is already an array, so array loops are unchanged.
 pub const JITER_ARRAY: u16 = 732;
 
+/// `>>>` — the logical (zero-fill) right shift. Stack `[value, count, width]`
+/// (`width` on top, 32 or 64); `argc == 3`. fusevm's `Op::Shr` is always
+/// arithmetic on 64 bits, so an `int` `>>>` — which must zero-fill at 32 — has
+/// no native spelling; the compiler has already masked `count` to the operand's
+/// width before the call.
+pub const JUSHR: u16 = 733;
+
+/// A narrowing primitive cast, `(ty) value`. Stack `[value, tyName]`
+/// (`tyName` on top); `argc == 2`. Java's narrowing conversions are real value
+/// changes: `(int) 3.9` truncates toward zero, `(int) 1e18` *saturates* to
+/// `Integer.MAX_VALUE`, `(byte) 200` wraps to -56, and `(char) 65` is the
+/// one-character string javars models a `char` as. Widening and identity casts
+/// never reach here — the compiler emits the operand alone.
+pub const JCAST: u16 = 734;
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -436,6 +451,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JINSTANCEOF, b_instanceof);
     vm.register_builtin(JCLASSOF, b_classof);
     vm.register_builtin(JDIV, b_div);
+    vm.register_builtin(JUSHR, b_ushr);
+    vm.register_builtin(JCAST, b_cast);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -1796,6 +1813,96 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("substring", 1) => substring(s, args[0].to_int(), char_len()),
         ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),
         ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &args[0].as_str_cow()))),
+        // `indexOf(t, from)` starts the search at `from`; the result is still an
+        // index into the whole string.
+        ("indexOf", 2) => {
+            let from = args[1].to_int().max(0) as usize;
+            let tail: String = s.chars().skip(from).collect();
+            let hit = char_index_of(&tail, &args[0].as_str_cow());
+            Ok(Value::Int(if hit < 0 { -1 } else { hit + from as i64 }))
+        }
+        ("lastIndexOf", 1) => Ok(Value::Int(char_last_index_of(
+            s,
+            &args[0].as_str_cow(),
+            char_len(),
+        ))),
+        ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
+            s,
+            &args[0].as_str_cow(),
+            args[1].to_int(),
+        ))),
+        ("codePointAt", 1) => {
+            let i = args[0].to_int();
+            match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
+                Some(c) => Ok(Value::Int(c as i64)),
+                None => Err(Fault::java(
+                    "StringIndexOutOfBoundsException",
+                    format!("Index {i} out of bounds for length {}", char_len()),
+                )),
+            }
+        }
+        // `strip` follows Unicode whitespace where `trim` cuts at U+0020; Rust's
+        // `trim` is the Unicode one, so `trim` keeps its own ASCII-control rule
+        // above and these three use the Unicode definition.
+        ("strip", 0) => Ok(Value::str(s.trim().to_string())),
+        ("stripLeading", 0) => Ok(Value::str(s.trim_start().to_string())),
+        ("stripTrailing", 0) => Ok(Value::str(s.trim_end().to_string())),
+        ("isBlank", 0) => Ok(Value::bool(s.trim().is_empty())),
+        ("hashCode", 0) => Ok(Value::Int(
+            java_hash(&Value::str(s.to_string())).unwrap_or(0).into(),
+        )),
+        // Interning is unobservable here: javars compares strings by value.
+        ("intern", 0) | ("toString", 0) => Ok(Value::str(s.to_string())),
+        ("contentEquals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
+        // `x.getClass()` evaluates to the runtime class *name*, so `Class`'s own
+        // two accessors land here: the simple name is that string, and the
+        // qualified name adds `java.lang.` for the modeled JDK types.
+        ("getSimpleName", 0) => Ok(Value::str(s.to_string())),
+        ("getName", 0) => Ok(Value::str(if crate::prelude::is_throwable(s) {
+            format!("java.lang.{s}")
+        } else {
+            s.to_string()
+        })),
+        ("toCharArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+            s.chars().map(|c| Value::str(c.to_string())).collect(),
+        )))),
+        // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
+        // the format string.
+        ("formatted", _) => java_format(s, args),
+        // Java's `split` drops *trailing* empty fields (but not interior ones).
+        ("split", 1) => {
+            let pat = literal_pattern(&args[0].as_str_cow(), "split")?;
+            let mut parts: Vec<&str> = if pat.is_empty() {
+                s.split("").filter(|p| !p.is_empty()).collect()
+            } else {
+                s.split(pat.as_str()).collect()
+            };
+            while parts.last().is_some_and(|p| p.is_empty()) {
+                parts.pop();
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Array(
+                parts
+                    .into_iter()
+                    .map(|p| Value::str(p.to_string()))
+                    .collect(),
+            ))))
+        }
+        ("replaceAll", 2) => {
+            let pat = literal_pattern(&args[0].as_str_cow(), "replaceAll")?;
+            Ok(Value::str(s.replace(pat.as_str(), &args[1].as_str_cow())))
+        }
+        ("replaceFirst", 2) => {
+            let pat = literal_pattern(&args[0].as_str_cow(), "replaceFirst")?;
+            Ok(Value::str(s.replacen(
+                pat.as_str(),
+                &args[1].as_str_cow(),
+                1,
+            )))
+        }
+        ("matches", 1) => {
+            let pat = literal_pattern(&args[0].as_str_cow(), "matches")?;
+            Ok(Value::bool(s == pat))
+        }
         ("contains", 1) => Ok(Value::bool(s.contains(args[0].as_str_cow().as_ref()))),
         ("equals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
         ("equalsIgnoreCase", 1) => {
@@ -2017,6 +2124,28 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // Java `Math.round(double)` = `(long) Math.floor(a + 0.5d)` — ties round
         // toward positive infinity (round(-2.5) == -2), unlike Rust's `round`.
         ("Math", "round", 1) => Ok(Value::Int((args[0].to_float() + 0.5).floor() as i64)),
+        // `Math.floorDiv`/`floorMod` round toward negative infinity, unlike `/`
+        // and `%` which truncate toward zero: `floorDiv(-7, 2)` is -4.
+        ("Math", "floorDiv", 2) => floor_div(args[0].to_int(), args[1].to_int()).map(Value::Int),
+        ("Math", "floorMod", 2) => {
+            let (a, b) = (args[0].to_int(), args[1].to_int());
+            floor_div(a, b).map(|q| Value::Int(a - q * b))
+        }
+        ("Math", "signum", 1) => Ok(Value::float(match args[0].to_float() {
+            f if f > 0.0 => 1.0,
+            f if f < 0.0 => -1.0,
+            f => f,
+        })),
+        // The transcendentals (`sin`/`cos`/`tan`/`atan`/`atan2`/`exp`/`log`/
+        // `log10`/`cbrt`/`hypot`) are deliberately absent. The JDK permits them
+        // a 1-ulp error and answers from its own fdlibm-derived implementation,
+        // which Rust's libm does not reproduce bit-for-bit: a 180-value
+        // differential sweep against OpenJDK 26 diverged in the last digit for
+        // every one of them (`sin` 14/180, `cbrt` 25/180, `tan` 5/10). An
+        // unregistered method is a clear error; a silently different last digit
+        // is not, so they stay out until a StrictMath port can answer exactly.
+        ("Math", "toRadians", 1) => Ok(Value::float(args[0].to_float().to_radians())),
+        ("Math", "toDegrees", 1) => Ok(Value::float(args[0].to_float().to_degrees())),
 
         // ── java.lang.Integer / Long ──
         ("Integer", "parseInt", 1) => parse_int_radix(&args[0].as_str_cow(), 10, true),
@@ -2036,6 +2165,79 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             args[0].to_int(),
             args[1].to_int(),
         ))),
+        // The unsigned radix renderings read the value as a *bit pattern* at its
+        // declared width — `Integer.toHexString(-1)` is "ffffffff" and
+        // `Long.toHexString(-1L)` is sixteen f's.
+        ("Integer", "toBinaryString", 1) => {
+            Ok(Value::str(format!("{:b}", args[0].to_int() as i32 as u32)))
+        }
+        ("Integer", "toHexString", 1) => {
+            Ok(Value::str(format!("{:x}", args[0].to_int() as i32 as u32)))
+        }
+        ("Integer", "toOctalString", 1) => {
+            Ok(Value::str(format!("{:o}", args[0].to_int() as i32 as u32)))
+        }
+        ("Long", "toBinaryString", 1) => Ok(Value::str(format!("{:b}", args[0].to_int() as u64))),
+        ("Long", "toHexString", 1) => Ok(Value::str(format!("{:x}", args[0].to_int() as u64))),
+        ("Long", "toOctalString", 1) => Ok(Value::str(format!("{:o}", args[0].to_int() as u64))),
+        ("Integer" | "Long", "compare", 2) => Ok(Value::Int(cmp_to_int(
+            args[0].to_int().cmp(&args[1].to_int()),
+        ))),
+        ("Integer" | "Long", "max", 2) => Ok(Value::Int(args[0].to_int().max(args[1].to_int()))),
+        ("Integer" | "Long", "min", 2) => Ok(Value::Int(args[0].to_int().min(args[1].to_int()))),
+        ("Integer" | "Long", "sum", 2) => {
+            Ok(Value::Int(args[0].to_int().wrapping_add(args[1].to_int())))
+        }
+        ("Integer" | "Long", "signum", 1) => Ok(Value::Int(args[0].to_int().signum())),
+        ("Long", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
+        ("Long", "valueOf", 1) => match &args[0] {
+            Value::Str(s) => parse_int_radix(s, 10, false),
+            other => Ok(Value::Int(other.to_int())),
+        },
+
+        // ── java.lang.Double ──
+        ("Double", "parseDouble", 1) | ("Double", "valueOf", 1) => {
+            let s = args[0].as_str_cow();
+            match s.trim().parse::<f64>() {
+                Ok(f) => Ok(Value::float(f)),
+                Err(_) => Err(Fault::java(
+                    "java.lang.NumberFormatException",
+                    // Java quotes the offending text but not the word `For`.
+                    format!("For input string: \"{s}\""),
+                )),
+            }
+        }
+        ("Double" | "Float", "toString", 1) => Ok(Value::str(format_double(args[0].to_float()))),
+        ("Double", "compare", 2) => Ok(Value::Int(cmp_to_int(
+            args[0]
+                .to_float()
+                .partial_cmp(&args[1].to_float())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        ))),
+        ("Double", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
+        ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
+
+        // ── java.lang.Character ──
+        // javars models a `char` as a one-character string, so each predicate
+        // reads the receiver's first character.
+        ("Character", "isDigit", 1) => Ok(Value::bool(char_arg(&args[0]).is_ascii_digit())),
+        ("Character", "isLetter", 1) => Ok(Value::bool(char_arg(&args[0]).is_alphabetic())),
+        ("Character", "isLetterOrDigit", 1) => {
+            Ok(Value::bool(char_arg(&args[0]).is_alphanumeric()))
+        }
+        ("Character", "isWhitespace", 1) => Ok(Value::bool(char_arg(&args[0]).is_whitespace())),
+        ("Character", "isUpperCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_uppercase())),
+        ("Character", "isLowerCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_lowercase())),
+        ("Character", "toUpperCase", 1) => {
+            Ok(Value::str(char_arg(&args[0]).to_uppercase().to_string()))
+        }
+        ("Character", "toLowerCase", 1) => {
+            Ok(Value::str(char_arg(&args[0]).to_lowercase().to_string()))
+        }
+        ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
+        ("Character", "getNumericValue", 1) => Ok(Value::Int(
+            char_arg(&args[0]).to_digit(36).map_or(-1, i64::from),
+        )),
 
         // ── java.lang.Boolean ──
         ("Boolean", "parseBoolean", 1) => Ok(Value::bool(
@@ -2043,22 +2245,234 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         )),
 
         // ── java.lang.String ──
-        // `String.valueOf(x)` renders any value with Java's `println` rules.
-        ("String", "valueOf", 1) => Ok(Value::str(java_str(&args[0]))),
+        // `String.valueOf(x)` renders any value with Java's `println` rules —
+        // except a `char[]`, whose overload concatenates the characters rather
+        // than printing the array.
+        ("String", "valueOf", 1) => Ok(Value::str(match array_items(&args[0]) {
+            Some(items) => items.iter().map(java_str).collect::<String>(),
+            None => java_str(&args[0]),
+        })),
         // `String.format(fmt, args…)` — printf-style formatting (subset).
         ("String", "format", _) if !args.is_empty() => {
             let fmt = args[0].as_str_cow().into_owned();
             java_format(&fmt, &args[1..])
         }
 
+        // `String.join(sep, a, b, …)` and `String.join(sep, array)`.
+        ("String", "join", n) if n >= 2 => {
+            let sep = args[0].as_str_cow().into_owned();
+            let parts: Vec<String> = match (array_items(&args[1]), n) {
+                (Some(items), 2) => items.iter().map(java_str).collect(),
+                _ => args[1..].iter().map(java_str).collect(),
+            };
+            Ok(Value::str(parts.join(&sep)))
+        }
+
+        // ── java.lang.Boolean ──
+        ("Boolean", "toString", 1) => Ok(Value::str(java_str(&args[0]))),
+        ("Boolean", "compare", 2) => Ok(Value::Int(cmp_to_int(
+            args[0].is_truthy().cmp(&args[1].is_truthy()),
+        ))),
+
         // ── java.util.Arrays ──
         // `Arrays.toString(a)` — shallow `[e0, e1, …]` (null → "null").
         ("Arrays", "toString", 1) => Ok(Value::str(arrays_to_string(&args[0]))),
+        // `Arrays.deepToString(a)` recurses into nested arrays, which is what a
+        // rectangular `int[][]` needs.
+        ("Arrays", "deepToString", 1) => Ok(Value::str(arrays_deep_to_string(&args[0]))),
+        // `Arrays.sort(a)` sorts in place, so it mutates the heap array and
+        // returns nothing.
+        ("Arrays", "sort", 1) => {
+            array_mutate(&args[0], |a| a.sort_by(natural_cmp))?;
+            Ok(Value::Undef)
+        }
+        ("Arrays", "fill", 2) => {
+            let v = args[1].clone();
+            array_mutate(&args[0], |a| a.fill(v))?;
+            Ok(Value::Undef)
+        }
+        ("Arrays", "equals", 2) => match (array_items(&args[0]), array_items(&args[1])) {
+            (Some(x), Some(y)) => Ok(Value::bool(
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(p, q)| natural_cmp(p, q) == std::cmp::Ordering::Equal),
+            )),
+            _ => Ok(Value::bool(false)),
+        },
+        // `Arrays.copyOf` pads with the element type's default when it grows.
+        // javars erases the element type at runtime, so the pad is inferred from
+        // element 0's kind — the only evidence available — and is `null` for an
+        // empty source.
+        ("Arrays", "copyOf", 2) => {
+            let items = array_items(&args[0]).unwrap_or_default();
+            let n = args[1].to_int().max(0) as usize;
+            let pad = element_default(&items);
+            let mut out = items;
+            out.resize(n, pad);
+            Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
+        }
+        ("Arrays", "copyOfRange", 3) => {
+            let items = array_items(&args[0]).unwrap_or_default();
+            let (from, to) = (
+                args[1].to_int().max(0) as usize,
+                args[2].to_int().max(0) as usize,
+            );
+            let pad = element_default(&items);
+            let mut out: Vec<Value> = items
+                .get(from..to.min(items.len()))
+                .unwrap_or_default()
+                .to_vec();
+            out.resize(to.saturating_sub(from), pad);
+            Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
+        }
+        // `Arrays.binarySearch` returns `-(insertion point) - 1` when absent,
+        // exactly as the JDK does.
+        ("Arrays", "binarySearch", 2) => {
+            let items = array_items(&args[0]).unwrap_or_default();
+            Ok(Value::Int(
+                match items.binary_search_by(|p| natural_cmp(p, &args[1])) {
+                    Ok(i) => i as i64,
+                    Err(i) => -(i as i64) - 1,
+                },
+            ))
+        }
+        // `Arrays.hashCode(a)` — the JDK's documented `31 * result + e` fold,
+        // seeded at 1, wrapping at 32 bits.
+        ("Arrays", "hashCode", 1) => {
+            let items = array_items(&args[0]).unwrap_or_default();
+            let h = items.iter().fold(1i32, |acc, e| {
+                acc.wrapping_mul(31).wrapping_add(java_hash(e).unwrap_or(0))
+            });
+            Ok(Value::Int(h as i64))
+        }
 
         _ => Err(Fault::internal(format!(
             "javars: unsupported static method `{class}.{method}` with {} argument(s)",
             args.len()
         ))),
+    }
+}
+
+/// The last index (in characters) at which `needle` starts at or before
+/// `from`, or -1. Java's `lastIndexOf` counts an empty needle as `from` itself.
+fn char_last_index_of(hay: &str, needle: &str, from: i64) -> i64 {
+    let chars: Vec<char> = hay.chars().collect();
+    let pat: Vec<char> = needle.chars().collect();
+    if pat.is_empty() {
+        return from.clamp(0, chars.len() as i64);
+    }
+    let start = from.min(chars.len() as i64 - pat.len() as i64);
+    (0..=start.max(-1))
+        .rev()
+        .find(|&i| chars[i as usize..].starts_with(&pat))
+        .unwrap_or(-1)
+}
+
+/// The literal text a `String` regex argument matches, for the pattern subset
+/// javars supports.
+///
+/// javars links no regex engine, so `split`/`replaceAll`/`replaceFirst`/
+/// `matches` accept only patterns with no metacharacter — which is what the
+/// overwhelmingly common single-separator call is, and which the JDK itself
+/// fast-paths. A pattern that would need real matching is reported rather than
+/// silently treated as a literal and answered wrong.
+fn literal_pattern(pat: &str, method: &str) -> Result<String, Fault> {
+    const META: &[char] = &[
+        '\\', '.', '[', ']', '{', '}', '(', ')', '*', '+', '?', '^', '$', '|',
+    ];
+    if pat.contains(META) {
+        return Err(Fault::internal(format!(
+            "javars: `String.{method}` supports only a literal pattern, not `{pat}`"
+        )));
+    }
+    Ok(pat.to_string())
+}
+
+/// Java's `Math.floorDiv`: integer division rounded toward negative infinity
+/// rather than toward zero, so `floorDiv(-7, 2)` is -4 where `-7 / 2` is -3.
+fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
+    if b == 0 {
+        return Err(Fault::java("java.lang.ArithmeticException", "/ by zero"));
+    }
+    let q = a.wrapping_div(b);
+    // One correction step when the signs differ and the division was inexact.
+    Ok(if a % b != 0 && (a ^ b) < 0 { q - 1 } else { q })
+}
+
+/// The `-1`/`0`/`1` an `Integer.compare`-style method returns.
+fn cmp_to_int(o: std::cmp::Ordering) -> i64 {
+    match o {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// The `char` a `Character.*` argument names. javars models a `char` as a
+/// one-character string, and a numeric argument is a code point.
+fn char_arg(v: &Value) -> char {
+    match v {
+        Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{0}'),
+        other => other.as_str_cow().chars().next().unwrap_or('\u{0}'),
+    }
+}
+
+/// A copy of the elements of `v` when it is a heap array, else `None`.
+fn array_items(v: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Array(a)) => Some(a.clone()),
+        _ => None,
+    })
+}
+
+/// Run `f` over `v`'s elements *in place* — what the mutating `Arrays` statics
+/// (`sort`, `fill`) need, since they return `void` and are observed through the
+/// caller's own handle.
+fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault> {
+    let Value::Obj(id) = v else {
+        return Err(Fault::java(
+            "java.lang.NullPointerException",
+            "null array".to_string(),
+        ));
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Array(a)) => {
+            f(a);
+            Ok(())
+        }
+        _ => Err(Fault::java(
+            "java.lang.NullPointerException",
+            "null array".to_string(),
+        )),
+    })
+}
+
+/// The value `Arrays.copyOf` pads a grown copy with. The element type is erased
+/// at runtime, so it is read off element 0: a numeric array pads with its zero,
+/// a boolean array with `false`, and anything else (including an empty source)
+/// with `null`.
+fn element_default(items: &[Value]) -> Value {
+    match items.first() {
+        Some(Value::Int(_)) => Value::Int(0),
+        Some(Value::Float(_)) => Value::float(0.0),
+        Some(Value::Bool(_)) => Value::bool(false),
+        _ => Value::Undef,
+    }
+}
+
+/// `Arrays.deepToString(a)` — like [`arrays_to_string`] but recursing into
+/// nested arrays, which is what a rectangular `int[][]` needs.
+fn arrays_deep_to_string(v: &Value) -> String {
+    match array_items(v) {
+        Some(items) => {
+            let inner: Vec<String> = items.iter().map(arrays_deep_to_string).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        None => java_str(v),
     }
 }
 
@@ -2096,22 +2510,50 @@ fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
             out.push(c);
             continue;
         }
+        // An explicit argument index, `%2$s`. It is digits followed by `$`, so
+        // it can only be told from a width by scanning past the digits first.
+        let mut lead = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                lead.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let mut explicit_index: Option<usize> = None;
+        if chars.peek() == Some(&'$') {
+            chars.next();
+            // Java indexes arguments from 1.
+            explicit_index = lead.parse::<usize>().ok().map(|n| n.saturating_sub(1));
+            lead.clear();
+        }
         // flags
         let mut left = false;
         let mut zero = false;
         let mut plus = false;
+        let mut group = false;
+        let mut parens = false;
+        // A leading `0` already consumed as part of `lead` is the zero-pad flag,
+        // not a width digit — Java has no zero-width conversion.
+        if lead.starts_with('0') {
+            zero = true;
+            lead.remove(0);
+        }
         while let Some(&f) = chars.peek() {
             match f {
                 '-' => left = true,
                 '0' => zero = true,
                 '+' => plus = true,
-                ' ' | '#' | ',' | '(' => {}
+                ',' => group = true,
+                '(' => parens = true,
+                ' ' | '#' => {}
                 _ => break,
             }
             chars.next();
         }
         // width
-        let mut width = String::new();
+        let mut width = lead;
         while let Some(&d) = chars.peek() {
             if d.is_ascii_digit() {
                 width.push(d);
@@ -2143,11 +2585,26 @@ fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
             '%' => out.push('%'),
             'n' => out.push('\n'),
             _ => {
-                let arg = args.get(argi).ok_or_else(|| {
+                // An explicit `%n$` index does not advance the implicit cursor,
+                // which is what lets `%2$s %1$s` repeat and reorder arguments.
+                let idx = explicit_index.unwrap_or(argi);
+                let arg = args.get(idx).ok_or_else(|| {
                     Fault::internal("javars: String.format: not enough arguments")
                 })?;
-                argi += 1;
-                let (s, numeric) = format_conversion(conv, arg, prec, plus)?;
+                if explicit_index.is_none() {
+                    argi += 1;
+                }
+                let (mut s, numeric) = format_conversion(conv, arg, prec, plus)?;
+                if group && numeric {
+                    s = group_digits(&s);
+                }
+                // The `(` flag wraps a negative number in parentheses instead of
+                // showing its minus sign.
+                if parens && numeric {
+                    if let Some(rest) = s.strip_prefix('-') {
+                        s = format!("({rest})");
+                    }
+                }
                 out.push_str(&pad(&s, width_n, left, zero && numeric));
             }
         }
@@ -2163,6 +2620,8 @@ fn format_conversion(
     prec: Option<usize>,
     plus: bool,
 ) -> Result<(String, bool), Fault> {
+    // The `+` flag shows an explicit sign on a *non-negative* number; a negative
+    // one carries its own `-` from the rendering below.
     let sign = |neg: bool| {
         if neg {
             ""
@@ -2172,6 +2631,17 @@ fn format_conversion(
             ""
         }
     };
+    // Renderings that build from `x.abs()` need the sign put back explicitly.
+    let signed = |x: f64, body: String| {
+        format!(
+            "{}{body}",
+            if x.is_sign_negative() {
+                "-"
+            } else {
+                sign(false)
+            }
+        )
+    };
     match conv {
         'd' => {
             let n = arg.to_int();
@@ -2179,11 +2649,7 @@ fn format_conversion(
         }
         'f' => {
             let x = arg.to_float();
-            let p = prec.unwrap_or(6);
-            Ok((
-                format!("{}{x:.p$}", sign(x.is_sign_negative() && x != 0.0)),
-                true,
-            ))
+            Ok((signed(x, fixed_half_up(x, prec.unwrap_or(6))), true))
         }
         's' => {
             let mut s = java_str(arg);
@@ -2204,11 +2670,147 @@ fn format_conversion(
         'x' => Ok((format!("{:x}", arg.to_int()), true)),
         'X' => Ok((format!("{:X}", arg.to_int()), true)),
         'o' => Ok((format!("{:o}", arg.to_int()), true)),
-        'c' => Ok((java_str(arg), false)),
+        'c' => Ok((
+            match arg {
+                // `%c` on an integer renders its code point as a character.
+                Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
+                other => java_str(other),
+            },
+            false,
+        )),
+        // Java's `%e` always writes a two-digit exponent with an explicit sign
+        // (`1.234568e+03`), where Rust's `{:e}` writes `1.234568e3`.
+        'e' | 'E' => {
+            let x = arg.to_float();
+            // `sci_notation` already carries a negative sign; only the `+` flag's
+            // explicit plus has to be added.
+            let s = sci_notation(x, prec.unwrap_or(6));
+            let s = if x.is_sign_negative() {
+                s
+            } else {
+                format!("{}{s}", sign(false))
+            };
+            Ok((if conv == 'E' { s.to_uppercase() } else { s }, true))
+        }
+        // `%g` picks fixed or scientific by the value's magnitude; Java's
+        // precision counts *significant* digits and defaults to 6.
+        'g' | 'G' => {
+            let x = arg.to_float();
+            let p = prec.unwrap_or(6).max(1);
+            let s = if x != 0.0 && (x.abs() < 1e-4 || x.abs() >= 10f64.powi(p as i32)) {
+                sci_notation(x, p - 1)
+            } else {
+                let exp = if x == 0.0 {
+                    0
+                } else {
+                    x.abs().log10().floor() as i32
+                };
+                format!("{:.*}", (p as i32 - 1 - exp).max(0) as usize, x)
+            };
+            // Both branches already carry a negative sign.
+            let s = if x.is_sign_negative() {
+                s
+            } else {
+                format!("{}{s}", sign(false))
+            };
+            Ok((if conv == 'G' { s.to_uppercase() } else { s }, true))
+        }
+        // `%h` is the argument's `hashCode()` in hex, or "null".
+        'h' | 'H' => {
+            let s = match arg {
+                Value::Undef => "null".to_string(),
+                other => format!("{:x}", java_hash(other).unwrap_or(0) as u32),
+            };
+            Ok((if conv == 'H' { s.to_uppercase() } else { s }, false))
+        }
         other => Err(Fault::internal(format!(
             "javars: String.format: unsupported conversion `%{other}`"
         ))),
     }
+}
+
+/// Java's `%f` rendering: fixed-point with `prec` decimals, rounded HALF_UP on
+/// the double's *exact* decimal value.
+///
+/// Rust's `{:.p}` rounds half-to-even, so `%.0f` of 2.5 is 2 there and 3 in
+/// Java. The exact value is materialised well past `prec` (a double's decision
+/// digit is nowhere near that far out), the digit after the cut decides, and the
+/// carry is propagated through the decimal string.
+fn fixed_half_up(x: f64, prec: usize) -> String {
+    if !x.is_finite() {
+        return java_str(&Value::float(x));
+    }
+    let exact = format!("{:.*}", prec + 30, x.abs());
+    let point = exact.find('.').unwrap_or(exact.len());
+    let cut = point + if prec == 0 { 0 } else { prec + 1 };
+    let round_up = exact[cut..]
+        .chars()
+        .find(char::is_ascii_digit)
+        .is_some_and(|c| c >= '5');
+    let mut digits: Vec<u8> = exact[..cut].bytes().collect();
+    if round_up {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            match digits[i] {
+                b'.' => continue,
+                b'9' => digits[i] = b'0',
+                d => {
+                    digits[i] = d + 1;
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8(digits).unwrap_or_default()
+}
+
+/// Java's `%e` rendering: `<mantissa>e<sign><at least two exponent digits>`,
+/// carrying the value's own sign.
+fn sci_notation(x: f64, prec: usize) -> String {
+    let neg = if x.is_sign_negative() { "-" } else { "" };
+    if x == 0.0 {
+        return format!("{neg}{:.*}e+00", prec, 0.0);
+    }
+    let mut exp = x.abs().log10().floor() as i32;
+    let mut mant = x.abs() / 10f64.powi(exp);
+    // Rounding the mantissa can carry it to 10.0, which belongs to the next
+    // exponent (`9.99e2` at one digit of precision is `1.0e3`).
+    if format!("{mant:.prec$}").starts_with("10") {
+        mant /= 10.0;
+        exp += 1;
+    }
+    format!(
+        "{neg}{mant:.prec$}e{}{:02}",
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
+}
+
+/// Insert Java's `,` grouping separators into the integer part of a rendered
+/// number, leaving any sign and fractional part alone.
+fn group_digits(s: &str) -> String {
+    let (sign, rest) = match s.strip_prefix(['-', '+']) {
+        Some(r) => (&s[..1], r),
+        None => ("", s),
+    };
+    let (int_part, frac) = match rest.find('.') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let digits: Vec<char> = int_part.chars().collect();
+    let mut grouped = String::new();
+    for (i, c) in digits.iter().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*c);
+    }
+    format!("{sign}{grouped}{frac}")
 }
 
 /// Java `%b`: `true` for a `true` Boolean, `false` for `false`/`null`, `true`
@@ -2459,6 +3061,24 @@ fn format_double(f: f64) -> String {
 /// value comparisons against strings; all-numeric arithmetic never reaches here
 /// (it stays on the native fast path and the JIT).
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    // Two integers only reach the hook when the operation overflowed `i64`.
+    // Java's `long` arithmetic is two's-complement and wraps silently, so
+    // `Long.MAX_VALUE + 1` is `Long.MIN_VALUE` — not a promotion to a wider
+    // representation.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        let wrapped = match op {
+            NumOp::Add => Some(x.wrapping_add(*y)),
+            NumOp::Sub => Some(x.wrapping_sub(*y)),
+            NumOp::Mul => Some(x.wrapping_mul(*y)),
+            _ => None,
+        };
+        if let Some(v) = wrapped {
+            return Ok(Value::Int(v));
+        }
+    }
+    if let (NumOp::Neg, Value::Int(x)) = (op, a) {
+        return Ok(Value::Int(x.wrapping_neg()));
+    }
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
         // Java's value-to-string rules.
@@ -2493,6 +3113,85 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.stack.pop().unwrap_or(Value::Undef);
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     Value::float(as_f64(&a) / as_f64(&b))
+}
+
+/// `>>>` — zero-fill right shift at `width` bits (32 for `int`, 64 for `long`).
+/// See [`JUSHR`].
+fn b_ushr(vm: &mut VM, _argc: u8) -> Value {
+    let width = as_i64(&vm.stack.pop().unwrap_or(Value::Undef));
+    let count = as_i64(&vm.stack.pop().unwrap_or(Value::Undef)) as u32;
+    let value = as_i64(&vm.stack.pop().unwrap_or(Value::Undef));
+    if width == 32 {
+        Value::Int(((value as u32) >> count) as i32 as i64)
+    } else {
+        Value::Int(((value as u64) >> count) as i64)
+    }
+}
+
+/// A narrowing primitive cast. See [`JCAST`].
+///
+/// Rust's `as` between a float and an integer saturates and maps NaN to 0,
+/// which is exactly Java's narrowing rule for `double`/`float` → `int`/`long`;
+/// the integral narrowings are plain two's-complement truncations.
+fn b_cast(vm: &mut VM, _argc: u8) -> Value {
+    let ty = vm.stack.pop().unwrap_or(Value::Undef);
+    let ty = ty.as_str_cow().into_owned();
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match ty.as_str() {
+        "int" => Value::Int(match &v {
+            Value::Float(f) => *f as i32 as i64,
+            other => as_i64(other) as i32 as i64,
+        }),
+        "long" => Value::Int(match &v {
+            Value::Float(f) => *f as i64,
+            other => as_i64(other),
+        }),
+        "short" => Value::Int(cast_to_i64(&v) as i16 as i64),
+        "byte" => Value::Int(cast_to_i64(&v) as i8 as i64),
+        // javars models a `char` as a one-character string, so `(char) 65` is
+        // "A" rather than 65.
+        "char" => {
+            let code = cast_to_i64(&v) as u16;
+            Value::str(
+                char::from_u32(code as u32)
+                    .unwrap_or('\u{fffd}')
+                    .to_string(),
+            )
+        }
+        // `float` shares `double`'s representation here (see BUGS.md), so the
+        // cast only has to make an integral operand floating.
+        "float" | "double" => Value::float(as_f64(&v)),
+        // `boolean` and every reference type keep their representation.
+        _ => v,
+    }
+}
+
+/// The 64-bit value a narrowing integral cast starts from: a floating operand
+/// truncates toward zero first, and a `char` (a one-character string) yields its
+/// code point.
+fn cast_to_i64(v: &Value) -> i64 {
+    match v {
+        Value::Float(f) => *f as i64,
+        other => as_i64(other),
+    }
+}
+
+/// Coerce a value to `i64`. A one-character string is a `char`, and its code
+/// point is its numeric value — `(int) 'a'` is 97.
+fn as_i64(v: &Value) -> i64 {
+    match v {
+        Value::Int(i) => *i,
+        Value::Float(f) => *f as i64,
+        Value::Bool(b) => i64::from(*b),
+        other => {
+            let s = other.as_str_cow();
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => c as i64,
+                _ => s.parse::<i64>().unwrap_or(0),
+            }
+        }
+    }
 }
 
 /// Coerce a value to `f64` for the floating division path.

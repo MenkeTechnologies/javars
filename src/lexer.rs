@@ -84,7 +84,45 @@ pub enum Tok {
     AndAnd,
     OrOr,
     Not,
+    /// `&` — bitwise AND on integers, non-short-circuit AND on booleans.
+    Amp,
+    /// `|` — bitwise OR on integers, non-short-circuit OR on booleans. Also the
+    /// separator of a multi-catch (`catch (A | B e)`).
+    Pipe,
+    /// `^` — bitwise XOR on integers, logical XOR on booleans.
+    Caret,
+    /// `~` — bitwise complement.
+    Tilde,
+    /// `<<` — left shift.
+    Shl,
+    /// `>>` — arithmetic (sign-propagating) right shift.
+    Shr,
+    /// `>>>` — logical (zero-fill) right shift.
+    Ushr,
+    AmpAssign,
+    PipeAssign,
+    CaretAssign,
+    ShlAssign,
+    ShrAssign,
+    UshrAssign,
     Eof,
+}
+
+impl Tok {
+    /// How many closing `>` of a generic type-argument list this token spells.
+    ///
+    /// The lexer takes the longest match, so `Map<String, List<String>>` ends in
+    /// one [`Tok::Shr`] rather than two [`Tok::Gt`]. Every generic-skipping
+    /// depth counter asks this instead of matching `Gt` alone, so a nested type
+    /// argument closes correctly.
+    pub fn generic_closers(&self) -> i32 {
+        match self {
+            Tok::Gt => 1,
+            Tok::Shr => 2,
+            Tok::Ushr => 3,
+            _ => 0,
+        }
+    }
 }
 
 impl fmt::Display for Tok {
@@ -158,11 +196,56 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
+        // `0x…` / `0X…` hex and `0b…` / `0B…` binary integer literals. Neither
+        // takes a fractional part or an exponent, so they are lexed ahead of the
+        // decimal path rather than inside it. Java reads them as a *bit
+        // pattern*: `0xFFFFFFFF` is the `int` -1 and `0xFFFFFFFFFFFFFFFFL` is the
+        // `long` -1, so the digits are parsed unsigned and then reinterpreted at
+        // the literal's width.
+        if c == '0'
+            && i + 1 < bytes.len()
+            && matches!(bytes[i + 1], b'x' | b'X' | b'b' | b'B')
+            && i + 2 < bytes.len()
+            && (bytes[i + 2] as char).is_ascii_alphanumeric()
+        {
+            let radix = if matches!(bytes[i + 1], b'x' | b'X') {
+                16
+            } else {
+                2
+            };
+            i += 2;
+            let start = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let mut digits = src[start..i].replace('_', "");
+            // Only `L`/`l` is a suffix here — `d`/`f` are hex *digits*, and Java
+            // has no `d`/`f`-suffixed hex integer literal.
+            let is_long = digits.ends_with(['L', 'l']);
+            if is_long {
+                digits.pop();
+            }
+            let bits = u64::from_str_radix(&digits, radix)
+                .map_err(|_| format!("javars: bad integer literal `{digits}` on line {line}"))?;
+            let v = if is_long {
+                bits as i64
+            } else {
+                bits as u32 as i32 as i64
+            };
+            out.push(Token {
+                kind: if is_long { Tok::Long(v) } else { Tok::Int(v) },
+                line,
+            });
+            continue;
+        }
+
         // numbers (int or float)
         if c.is_ascii_digit() {
             let start = i;
             let mut is_float = false;
-            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+            while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
                 i += 1;
             }
             if i < bytes.len()
@@ -172,7 +255,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             {
                 is_float = true;
                 i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
                     i += 1;
                 }
             }
@@ -208,7 +291,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
                 i += 1;
             }
-            let text = &src[start..num_end];
+            // Java lets `_` separate digits anywhere inside a literal
+            // (`1_000_000`, `3.141_592`); it carries no value, so it is dropped
+            // before parsing.
+            let text = src[start..num_end].replace('_', "");
+            let text = text.as_str();
             if is_float {
                 let v: f64 = text
                     .parse()
@@ -218,9 +305,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     line,
                 });
             } else {
-                let v: i64 = text
-                    .parse()
-                    .map_err(|_| format!("javars: bad integer literal `{text}` on line {line}"))?;
+                // A leading `0` on a multi-digit integer is Java's octal form:
+                // `017` is 15. `0` itself stays decimal zero.
+                let v: i64 = if text.len() > 1 && text.starts_with('0') {
+                    i64::from_str_radix(&text[1..], 8)
+                        .map_err(|_| format!("javars: bad octal literal `{text}` on line {line}"))?
+                } else {
+                    text.parse().map_err(|_| {
+                        format!("javars: bad integer literal `{text}` on line {line}")
+                    })?
+                };
                 out.push(Token {
                     kind: if is_long { Tok::Long(v) } else { Tok::Int(v) },
                     line,
@@ -291,51 +385,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         } else {
             ""
         };
-        let (kind, adv) = match two {
-            "+=" => (Tok::PlusAssign, 2),
-            "-=" => (Tok::MinusAssign, 2),
-            "*=" => (Tok::StarAssign, 2),
-            "/=" => (Tok::SlashAssign, 2),
-            "%=" => (Tok::PercentAssign, 2),
-            "++" => (Tok::PlusPlus, 2),
-            "--" => (Tok::MinusMinus, 2),
-            "==" => (Tok::EqEq, 2),
-            "!=" => (Tok::NotEq, 2),
-            "<=" => (Tok::Le, 2),
-            ">=" => (Tok::Ge, 2),
-            "&&" => (Tok::AndAnd, 2),
-            "||" => (Tok::OrOr, 2),
-            // `->` cannot collide with `-` followed by `>`: Java has no prefix
-            // `>`, so a `-`/`>` adjacency is only ever the arrow. `::` likewise
-            // cannot collide with the ternary/label `:`.
-            "->" => (Tok::Arrow, 2),
-            "::" => (Tok::ColonColon, 2),
-            _ => match c {
-                '{' => (Tok::LBrace, 1),
-                '}' => (Tok::RBrace, 1),
-                '(' => (Tok::LParen, 1),
-                ')' => (Tok::RParen, 1),
-                '[' => (Tok::LBracket, 1),
-                ']' => (Tok::RBracket, 1),
-                ';' => (Tok::Semi, 1),
-                ',' => (Tok::Comma, 1),
-                '.' => (Tok::Dot, 1),
-                '?' => (Tok::Question, 1),
-                ':' => (Tok::Colon, 1),
-                '=' => (Tok::Assign, 1),
-                '+' => (Tok::Plus, 1),
-                '-' => (Tok::Minus, 1),
-                '*' => (Tok::Star, 1),
-                '/' => (Tok::Slash, 1),
-                '%' => (Tok::Percent, 1),
-                '<' => (Tok::Lt, 1),
-                '>' => (Tok::Gt, 1),
-                '!' => (Tok::Not, 1),
-                other => {
-                    return Err(format!(
-                        "javars: unexpected character `{other}` on line {line}"
-                    ))
-                }
+        let three = src.get(i..i + 3).unwrap_or("");
+        let four = src.get(i..i + 4).unwrap_or("");
+        let (kind, adv) = match four {
+            ">>>=" => (Tok::UshrAssign, 4),
+            _ => match three {
+                ">>>" => (Tok::Ushr, 3),
+                ">>=" => (Tok::ShrAssign, 3),
+                "<<=" => (Tok::ShlAssign, 3),
+                _ => lex_short(two, c, line)?,
             },
         };
         out.push(Token { kind, line });
@@ -347,6 +405,73 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         line,
     });
     Ok(out)
+}
+
+/// Match the one- and two-character operators and punctuation.
+///
+/// Split out of [`lex`] so the three- and four-character shift-assignment forms
+/// can be tried first without nesting the whole table another level deep.
+fn lex_short(two: &str, c: char, line: u32) -> Result<(Tok, usize), String> {
+    Ok(match two {
+        "+=" => (Tok::PlusAssign, 2),
+        "-=" => (Tok::MinusAssign, 2),
+        "*=" => (Tok::StarAssign, 2),
+        "/=" => (Tok::SlashAssign, 2),
+        "%=" => (Tok::PercentAssign, 2),
+        "++" => (Tok::PlusPlus, 2),
+        "--" => (Tok::MinusMinus, 2),
+        "==" => (Tok::EqEq, 2),
+        "!=" => (Tok::NotEq, 2),
+        "<=" => (Tok::Le, 2),
+        ">=" => (Tok::Ge, 2),
+        "&&" => (Tok::AndAnd, 2),
+        "||" => (Tok::OrOr, 2),
+        "&=" => (Tok::AmpAssign, 2),
+        "|=" => (Tok::PipeAssign, 2),
+        "^=" => (Tok::CaretAssign, 2),
+        "<<" => (Tok::Shl, 2),
+        // `>>` is lexed here rather than being left as two `Gt`s, so the
+        // shift is a single token; the generic-argument skippers ask
+        // [`Tok::generic_closers`] instead of matching `Gt`, which is what
+        // keeps `List<List<String>>` parsing.
+        ">>" => (Tok::Shr, 2),
+        // `->` cannot collide with `-` followed by `>`: Java has no prefix
+        // `>`, so a `-`/`>` adjacency is only ever the arrow. `::` likewise
+        // cannot collide with the ternary/label `:`.
+        "->" => (Tok::Arrow, 2),
+        "::" => (Tok::ColonColon, 2),
+        _ => match c {
+            '{' => (Tok::LBrace, 1),
+            '}' => (Tok::RBrace, 1),
+            '(' => (Tok::LParen, 1),
+            ')' => (Tok::RParen, 1),
+            '[' => (Tok::LBracket, 1),
+            ']' => (Tok::RBracket, 1),
+            ';' => (Tok::Semi, 1),
+            ',' => (Tok::Comma, 1),
+            '.' => (Tok::Dot, 1),
+            '?' => (Tok::Question, 1),
+            ':' => (Tok::Colon, 1),
+            '=' => (Tok::Assign, 1),
+            '+' => (Tok::Plus, 1),
+            '-' => (Tok::Minus, 1),
+            '*' => (Tok::Star, 1),
+            '/' => (Tok::Slash, 1),
+            '%' => (Tok::Percent, 1),
+            '<' => (Tok::Lt, 1),
+            '>' => (Tok::Gt, 1),
+            '!' => (Tok::Not, 1),
+            '&' => (Tok::Amp, 1),
+            '|' => (Tok::Pipe, 1),
+            '^' => (Tok::Caret, 1),
+            '~' => (Tok::Tilde, 1),
+            other => {
+                return Err(format!(
+                    "javars: unexpected character `{other}` on line {line}"
+                ))
+            }
+        },
+    })
 }
 
 fn keyword_or_ident(word: &str) -> Tok {

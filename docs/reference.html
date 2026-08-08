@@ -293,7 +293,7 @@ for (final String s : names) { System.out.println(s); }</code></pre>
         <article class="doc-entry" id="doc-contextual-keywords-19">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-19">#</a> <code>catch</code></h3>
           <pre><code class="lang-java">catch (E e) { … }   |   catch (final E e) { … }</code></pre>
-          <p>Handles a pending throwable whose runtime class is <code>E</code> or a subclass — the same supertype walk <code>instanceof</code> uses. Arms are tested in source order. Multi-catch (<code>catch (A | B e)</code>) is not supported: <code>|</code> is not a token this lexer produces.</p>
+          <p>Handles a pending throwable whose runtime class is <code>E</code> or a subclass — the same supertype walk <code>instanceof</code> uses. Arms are tested in source order. A multi-catch (<code>catch (A | B e)</code>) lists alternative types before the one bound variable; its alternatives are tested in order and share the one body, and the variable's static type is the first of them (Java uses their least upper bound, which javars does not compute).</p>
           <pre><code class="lang-java">catch (NumberFormatException e) { System.out.println(e.getMessage()); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-20">
@@ -614,50 +614,117 @@ String s = "a"; s += "b";   // "ab"</code></pre>
         <article class="doc-entry" id="doc-operators-22">
           <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>++</code></h3>
           <pre><code class="lang-java">name++;   |   a[i]++;   |   obj.f++;</code></pre>
-          <p>Post-increment, narrowing back to 32 bits when the target is <code>int</code>. javars accepts it only in *statement* position: <code>i++</code> used as a value, and the prefix form <code>++i</code>, are rejected at parse time.</p>
-          <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { }</code></pre>
+          <p>Post-increment, narrowing back to 32 bits when the target is <code>int</code>. In value position it evaluates to the value the variable *held*, with the update applied after; the prefix form <code>++i</code> updates first and evaluates to the new value.</p>
+          <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { }
+int v = 5; System.out.println(v++ + "," + v);   // 5,6
+int w = 5; System.out.println(++w + "," + w);   // 6,6</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-23">
           <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>--</code></h3>
           <pre><code class="lang-java">name--;   |   a[i]--;   |   obj.f--;</code></pre>
-          <p>Post-decrement, with the same statement-only restriction as <code>++</code>.</p>
-          <pre><code class="lang-java">int n = 3; n--;   // 2</code></pre>
+          <p>Post-decrement, with the same value-position rule as <code>++</code>: <code>n--</code> evaluates to the old value, <code>--n</code> to the new one.</p>
+          <pre><code class="lang-java">int n = 3; n--;   // 2
+int m = 3; System.out.println(--m);   // 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-24">
-          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>?:</code></h3>
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>&amp;</code></h3>
+          <pre><code class="lang-java">a &amp; b</code></pre>
+          <p>Bitwise AND on integral operands (fusevm's native <code>Op::BitAnd</code>), and Java's *non-short-circuiting* logical AND on <code>boolean</code> operands — where the result must stay a boolean rather than the 0/1 an integer op would leave, so it lowers to <code>Op::LogAnd</code> instead. The operand types decide which.</p>
+          <pre><code class="lang-java">System.out.println(5 &amp; 3);        // 1
+System.out.println(true &amp; false); // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>|</code></h3>
+          <pre><code class="lang-java">a | b</code></pre>
+          <p>Bitwise OR, and the non-short-circuiting logical OR on booleans — the mirror of <code>&amp;</code>. Also the separator of a multi-catch's alternative types.</p>
+          <pre><code class="lang-java">System.out.println(5 | 3);       // 7
+System.out.println(true | false); // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>^</code></h3>
+          <pre><code class="lang-java">a ^ b</code></pre>
+          <p>Bitwise XOR on integers; on two booleans it is exactly "they differ", lowered to <code>Op::NumNe</code> so the result prints <code>true</code>/<code>false</code>.</p>
+          <pre><code class="lang-java">System.out.println(5 ^ 3);       // 6
+System.out.println(true ^ true); // false</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>~</code></h3>
+          <pre><code class="lang-java">~a</code></pre>
+          <p>Bitwise complement of an integral operand (<code>Op::BitNot</code>). Unary numeric promotion widens <code>byte</code>/<code>short</code>/<code>char</code> to <code>int</code> and leaves <code>long</code> alone.</p>
+          <pre><code class="lang-java">System.out.println(~5);   // -6</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>&lt;&lt;</code></h3>
+          <pre><code class="lang-java">a &lt;&lt; n</code></pre>
+          <p>Left shift. Java masks the distance to the width of the **left** operand — 5 bits for <code>int</code>, 6 for <code>long</code> — so <code>1 &lt;&lt; 33</code> is <code>1 &lt;&lt; 1</code>; only that operand is promoted, so <code>1 &lt;&lt; 2L</code> is still an <code>int</code>. The mask is emitted explicitly because fusevm's <code>Op::Shl</code> always masks to 6 bits, and an <code>int</code> result is narrowed afterwards.</p>
+          <pre><code class="lang-java">System.out.println(1 &lt;&lt; 31);  // -2147483648
+System.out.println(1 &lt;&lt; 33);  // 2
+System.out.println(1L &lt;&lt; 40); // 1099511627776</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>&gt;&gt;</code></h3>
+          <pre><code class="lang-java">a &gt;&gt; n</code></pre>
+          <p>Arithmetic (sign-propagating) right shift, with the same width masking as <code>&lt;&lt;</code>. Lexed as one token, which is why every generic-argument skipper weighs a closing token by how many <code>&gt;</code> it spells — otherwise <code>List&lt;List&lt;String&gt;&gt;</code> would not parse.</p>
+          <pre><code class="lang-java">System.out.println(-8 &gt;&gt; 1);   // -4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-30">
+          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>&gt;&gt;&gt;</code></h3>
+          <pre><code class="lang-java">a &gt;&gt;&gt; n</code></pre>
+          <p>Logical (zero-fill) right shift. Java zero-fills at the operand's width, which fusevm has no native op for — <code>Op::Shr</code> is always arithmetic on 64 bits — so this routes through the <code>JUSHR</code> builtin with the width the compiler determined.</p>
+          <pre><code class="lang-java">System.out.println(-8 &gt;&gt;&gt; 1);   // 2147483644
+System.out.println(-8L &gt;&gt;&gt; 1);  // 9223372036854775804</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-31">
+          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>&amp;=  |=  ^=  &lt;&lt;=  &gt;&gt;=  &gt;&gt;&gt;=</code></h3>
+          <pre><code class="lang-java">target &amp;= expr;   |   target &lt;&lt;= expr;   |   target &gt;&gt;&gt;= expr;</code></pre>
+          <p>The bitwise and shift compound assignments, on any of the three assignable targets. Each applies the same rules as its binary form: the shifts mask their distance to the *target's* width and <code>&gt;&gt;&gt;=</code> zero-fills at it, and <code>&amp;=</code>/<code>|=</code>/<code>^=</code> stay logical when the operand is a boolean.</p>
+          <pre><code class="lang-java">int v = 1; v &lt;&lt;= 3; v |= 1; v &amp;= 14; v ^= 3;
+System.out.println(v);   // 11</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-32">
+          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>(type) expr</code></h3>
+          <pre><code class="lang-java">(int) d   |   (byte) n   |   (char) code   |   (Object) x</code></pre>
+          <p>A cast. Java's narrowing primitive conversions are real value changes and route through the <code>JCAST</code> builtin: floating to integral *saturates* (<code>(int) 1e18</code> is <code>Integer.MAX_VALUE</code>) and truncates toward zero, and the integral narrowings are two's-complement. A widening or identity cast emits the operand alone, so <code>(int) i</code> stays native. A reference cast is a no-op (see <code>ClassCastException</code>). <code>(char) n</code> produces the one-character string javars models a <code>char</code> as.</p>
+          <pre><code class="lang-java">System.out.println((int) 3.99);    // 3
+System.out.println((byte) 200);    // -56
+System.out.println((char) 65);     // A
+System.out.println((double) 7 / 2); // 3.5</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-33">
+          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>?:</code></h3>
           <pre><code class="lang-java">cond ? a : b</code></pre>
           <p>The conditional expression. Exactly one arm is evaluated; the untaken arm's code is jumped over, so a side effect in it never runs.</p>
           <pre><code class="lang-java">String label = n &gt; 4 ? "big" : "small";</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-25">
-          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>-&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-34">
+          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>-&gt;</code></h3>
           <pre><code class="lang-java">(params) -&gt; expr   |   (params) -&gt; { … }   |   p -&gt; expr</code></pre>
           <p>The lambda arrow, and the arrow form of <code>switch</code>. A lambda becomes a heap closure that snapshots every enclosing local by value at the point the literal runs, which is observationally exact because Java only permits capture of effectively-final locals.</p>
           <pre><code class="lang-java">Function&lt;Object,Object&gt; up = s -&gt; s + "!";
 System.out.println(up.apply("hi"));   // hi!</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-26">
-          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>::</code></h3>
+        <article class="doc-entry" id="doc-operators-35">
+          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>::</code></h3>
           <pre><code class="lang-java">Type::member   |   value::method   |   this::method</code></pre>
           <p>The method-reference separator. Every form is desugared in the compiler into an equivalent lambda with synthesized parameter names, so a method reference and the lambda it stands for share one code path.</p>
           <pre><code class="lang-java">Function&lt;Object,Object&gt; up = String::toUpperCase;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-27">
-          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>[]</code></h3>
+        <article class="doc-entry" id="doc-operators-36">
+          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>[]</code></h3>
           <pre><code class="lang-java">array[index]</code></pre>
           <p>Array subscript, through <code>JARRAY_GET</code> for a read and <code>JARRAY_SET</code> for a write. Both are bounds-checked; an out-of-range index raises <code>ArrayIndexOutOfBoundsException</code> carrying Java's <code>Index N out of bounds for length M</code> message, and a null array raises a NullPointerException.</p>
           <pre><code class="lang-java">int[] a = {1, 2, 3};
 System.out.println(a[1]);   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-28">
-          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>.</code></h3>
+        <article class="doc-entry" id="doc-operators-37">
+          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>.</code></h3>
           <pre><code class="lang-java">recv.field   |   recv.method(args)   |   Class.staticMember</code></pre>
           <p>Member access. A field read routes through <code>JFIELD_GET</code> (which also serves an array's <code>.length</code>), an instance call through the receiver's dispatch chain, and a static member through the owning class's chunk global. A <code>null</code> receiver raises a NullPointerException naming the operation.</p>
           <pre><code class="lang-java">System.out.println(p.x);
 System.out.println(arr.length);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-29">
-          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>()</code></h3>
+        <article class="doc-entry" id="doc-operators-38">
+          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>()</code></h3>
           <pre><code class="lang-java">name(args)   |   recv.name(args)   |   Class.name(args)</code></pre>
           <p>Invocation. A bare name resolves to a user <code>static</code> method (choosing the overload with the lowest assignment cost) or, in a program carrying an inline <code>rust { … }</code> block, to an FFI export dispatched by name. Every call site in a program that uses exceptions also carries a pending-exception check.</p>
           <pre><code class="lang-java">System.out.println(Helper.twice(3));</code></pre>
@@ -930,7 +997,7 @@ System.out.println();</code></pre>
         <article class="doc-entry" id="doc-static-library-17">
           <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>String.format</code></h3>
           <pre><code class="lang-java">String String.format(String fmt, Object... args)</code></pre>
-          <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f b B x X o c %</code> and <code>%n</code>, the flags <code>-</code> <code>0</code> <code>+</code>, an optional width, and an optional <code>.precision</code>. An unsupported conversion is reported rather than rendered wrong.</p>
+          <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f e E g G b B h H x X o c %</code> and <code>%n</code>, the flags <code>-</code> <code>0</code> <code>+</code> <code>,</code> <code>(</code>, an optional width, an optional <code>.precision</code>, and explicit argument indexes (<code>%2$s</code>). <code>%f</code> rounds HALF_UP on the double's exact value, as Java does. <code>System.out.printf</code> is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.</p>
           <pre><code class="lang-java">System.out.println(String.format("%05.2f|%-6s|%+d", 3.14159, "ab", 7));   // 03.14|ab    |+7</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-18">
@@ -1388,7 +1455,7 @@ xs.set(0, 9);   // fine
         <article class="doc-entry" id="doc-throwables-10">
           <h3><a class="doc-anchor" href="#doc-throwables-10">#</a> <code>ClassCastException</code></h3>
           <pre><code class="lang-java">class ClassCastException extends RuntimeException</code></pre>
-          <p>Declared and catchable, but never raised: javars does not implement cast expressions, so there is no narrowing conversion to fail.</p>
+          <p>Declared and catchable, but never raised: a *reference* cast is a no-op here — the host heap already carries each object's class and javars does not box primitives, so there is no representation to change and nothing to check. Primitive casts are real conversions and cannot fail.</p>
           <pre><code class="lang-java">catch (ClassCastException e) { System.out.println(e); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-throwables-11">

@@ -1180,9 +1180,16 @@ impl Compiler {
             Expr::This => self.this_class.clone(),
             Expr::Var(name) => self.bare_var_type(name),
             Expr::Unary { op, rhs } => match op {
-                UnOp::Neg => self.expr_java_type(rhs),
+                // Unary numeric promotion (JLS 5.6.1): `-x` and `~x` widen
+                // `byte`/`short`/`char` to `int` and leave every other type
+                // alone — a `double` operand stays `double`.
+                UnOp::Neg | UnOp::BitNot => match self.expr_java_type(rhs).as_deref() {
+                    Some("byte" | "short" | "char") => Some("int".to_string()),
+                    other => other.map(|s| s.to_string()),
+                },
                 UnOp::Not => Some("boolean".to_string()),
             },
+            Expr::Cast { ty, .. } => Some(ty.clone()),
             Expr::Binary { op, lhs, rhs } => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     let l = self.expr_java_type(lhs);
@@ -1196,6 +1203,27 @@ impl Compiler {
                     let lr = l.as_deref().and_then(numeric_rank)?;
                     let rr = r.as_deref().and_then(numeric_rank)?;
                     Some(rank_name(lr.max(rr)).to_string())
+                }
+                // `&`/`|`/`^` are bitwise on integral operands and logical on
+                // booleans; the operand type decides which.
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    let l = self.expr_java_type(lhs);
+                    let r = self.expr_java_type(rhs);
+                    if l.as_deref() == Some("boolean") || r.as_deref() == Some("boolean") {
+                        return Some("boolean".to_string());
+                    }
+                    let lr = l.as_deref().and_then(numeric_rank)?;
+                    let rr = r.as_deref().and_then(numeric_rank)?;
+                    Some(rank_name(lr.max(rr)).to_string())
+                }
+                // A shift promotes only its *left* operand — `1L << 2` is a
+                // `long`, but `1 << 2L` is still an `int`.
+                BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
+                    match self.expr_java_type(lhs).as_deref() {
+                        Some("long") => Some("long".to_string()),
+                        Some(t) if numeric_rank(t).is_some() => Some("int".to_string()),
+                        _ => None,
+                    }
                 }
                 _ => Some("boolean".to_string()),
             },
@@ -1212,6 +1240,9 @@ impl Compiler {
             Expr::Field { recv, name } => {
                 if name == "length" {
                     return Some("int".to_string());
+                }
+                if let Some((_, ty)) = self.wrapper_constant_ref(e) {
+                    return Some(ty.to_string());
                 }
                 if let Some(class) = self.enum_constant_ref(e) {
                     return Some(class);
@@ -1243,7 +1274,9 @@ impl Compiler {
                 SwitchArmBody::Expr(e) => self.expr_java_type(e),
                 SwitchArmBody::Block(_) => None,
             }),
-            Expr::PostIncDec { name, .. } => self.bare_var_type(name),
+            Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } => {
+                self.bare_var_type(name)
+            }
             Expr::Call { name, args, .. } => {
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -1879,11 +1912,26 @@ impl Compiler {
             Expr::Str(_) | Expr::Bool(_) => NumType::Other,
             Expr::Var(name) => self.lookup_type(name),
             Expr::Unary { op, rhs } => match op {
-                // `-x` keeps the operand's numeric type; `!b` is boolean.
+                // `-x` keeps the operand's numeric type; `~x` is always
+                // integral; `!b` is boolean.
                 UnOp::Neg => self.expr_type(rhs),
+                UnOp::BitNot => NumType::Int,
                 UnOp::Not => NumType::Other,
             },
+            // A cast states the type outright.
+            Expr::Cast { ty, .. } => numtype_of_ty(ty).unwrap_or(NumType::Other),
             Expr::Binary { op, lhs, rhs } => match op {
+                // Shifts and bitwise ops on integral operands stay integral;
+                // `&`/`|`/`^` on booleans do not, which `expr_java_type`
+                // distinguishes.
+                BinOp::Shl | BinOp::Shr | BinOp::Ushr => NumType::Int,
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    if self.expr_type(lhs) == NumType::Int && self.expr_type(rhs) == NumType::Int {
+                        NumType::Int
+                    } else {
+                        NumType::Other
+                    }
+                }
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                     let l = self.expr_type(lhs);
                     let r = self.expr_type(rhs);
@@ -1900,7 +1948,7 @@ impl Compiler {
                 // Comparisons and logical ops yield `boolean`.
                 _ => NumType::Other,
             },
-            Expr::PostIncDec { name, .. } => self.lookup_type(name),
+            Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } => self.lookup_type(name),
             Expr::Println { .. } => NumType::Other,
             // A conditional expression's numeric category is the promotion of
             // its two result branches (Java's conditional-expression typing).
@@ -2572,35 +2620,14 @@ impl Compiler {
                         let target = self.var_decl_type(name).map(str::to_string);
                         self.expr_targeted(value, target.as_deref())?;
                     }
-                    AssignOp::Div => {
-                        // `x /= e` — integer division truncates when both `x`
-                        // and `e` are statically integral (Java `int /= int`).
-                        self.emit_get(name, line);
-                        let r = self.expr_type(value);
-                        self.expr(value)?;
-                        self.emit_div(l, r, value, line);
-                    }
+                    // `x <op>= e` → `x = x <op> e`, through the one shared
+                    // lowering that also handles `/=`'s int truncation, `%=`'s
+                    // zero check, the shifts' width masking, and the logical
+                    // `&=`/`|=`/`^=` on booleans.
                     _ => {
-                        // `x <op>= e` → x = x <op> e. `+=` onto a String
-                        // concatenates, so the operand honours `toString()`.
                         self.emit_get(name, line);
-                        if *op == AssignOp::Add {
-                            self.emit_stringified(value)?;
-                        } else {
-                            self.expr(value)?;
-                        }
-                        // `x %= 0` throws, exactly like `x / 0`.
-                        if *op == AssignOp::Mod
-                            && l == NumType::Int
-                            && self.expr_type(value) == NumType::Int
-                        {
-                            self.emit_zero_divisor_check(value, line);
-                        }
-                        self.b.emit(compound_op(*op), line);
+                        self.emit_compound(*op, value, l, wrap, line)?;
                     }
-                }
-                if wrap {
-                    self.emit_wrap32(line);
                 }
                 self.emit_set(name, line);
                 Ok(())
@@ -2794,14 +2821,14 @@ impl Compiler {
 
     fn for_stmt(
         &mut self,
-        init: &Option<Box<Stmt>>,
+        init: &[Stmt],
         cond: &Option<Expr>,
-        update: &Option<Box<Stmt>>,
+        update: &[Stmt],
         body: &[Stmt],
     ) -> Result<(), String> {
         let label = self.pending_label.take();
-        if let Some(init) = init {
-            self.stmt(init)?;
+        for s in init {
+            self.stmt(s)?;
         }
         let top = self.b.current_pos();
         let jf = match cond {
@@ -2820,8 +2847,8 @@ impl Compiler {
         // step label: the continue target is the update clause (or the loop-top
         // re-test when there is no update).
         let step = self.b.current_pos();
-        if let Some(update) = update {
-            self.stmt(update)?;
+        for s in update {
+            self.stmt(s)?;
         }
         self.b.emit(Op::Jump(top), 0);
         let end = self.b.current_pos();
@@ -3019,13 +3046,32 @@ impl Compiler {
         });
         let mut matched_jumps = Vec::new();
         for arm in catches {
-            self.emit_get(&exc_t, line);
-            let c = self.b.add_constant(Value::str(arm.ty.clone()));
-            self.b.emit(Op::LoadConst(c), line);
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
-            let jf = self.b.emit(Op::JumpIfFalse(0), line);
-            self.declare_local(&arm.name, &arm.ty, NumType::Other);
+            // A multi-catch's alternatives are tested in order: any hit jumps
+            // straight to the shared body, and only the last miss skips the arm.
+            let mut hits = Vec::new();
+            let mut jf = None;
+            let last = arm.types.len().saturating_sub(1);
+            for (i, ty) in arm.types.iter().enumerate() {
+                self.emit_get(&exc_t, line);
+                let c = self.b.add_constant(Value::str(ty.clone()));
+                self.b.emit(Op::LoadConst(c), line);
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
+                if i == last {
+                    jf = Some(self.b.emit(Op::JumpIfFalse(0), line));
+                } else {
+                    hits.push(self.b.emit(Op::JumpIfTrue(0), line));
+                }
+            }
+            let jf = jf.expect("a catch arm always names at least one type");
+            let body_start = self.b.current_pos();
+            for h in hits {
+                self.b.patch_jump(h, body_start);
+            }
+            // The bound variable's static type is the first alternative; Java
+            // types a multi-catch parameter as the alternatives' least upper
+            // bound, which javars does not compute.
+            self.declare_local(&arm.name, &arm.types[0], NumType::Other);
             self.emit_get(&exc_t, line);
             self.emit_set(&arm.name, line);
             for s in &arm.body {
@@ -3663,9 +3709,16 @@ impl Compiler {
                 self.emit_raising_builtin(crate::host::JARRAY_GET, 2, 0);
             }
             Expr::Field { recv, name } => {
+                // `Integer.MAX_VALUE` / `Math.PI` / … — a `static final` of a
+                // `java.lang` type javars does not model as a class, folded to
+                // its literal value.
+                if let Some((v, _)) = self.wrapper_constant_ref(e) {
+                    let c = self.b.add_constant(v);
+                    self.b.emit(Op::LoadConst(c), 0);
+                }
                 // `Color.RED` names an enum constant's singleton, not a field of
                 // a value — there is no receiver to evaluate.
-                if let Some(class) = self.enum_constant_ref(e) {
+                else if let Some(class) = self.enum_constant_ref(e) {
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if let Some((class, _)) = self.static_field_ref(e) {
                     // `T.n` names a `static` field's shared cell — the receiver
@@ -3696,8 +3749,12 @@ impl Compiler {
                     UnOp::Not => {
                         self.b.emit(Op::LogNot, 0);
                     }
+                    UnOp::BitNot => {
+                        self.b.emit(Op::BitNot, 0);
+                    }
                 }
             }
+            Expr::Cast { ty, expr, line } => self.cast(ty, expr, *line)?,
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
             Expr::Ternary { cond, then, els } => self.ternary(cond, then, els)?,
             // Println/PostIncDec in value position are handled as statements;
@@ -3717,6 +3774,19 @@ impl Compiler {
                     self.emit_get(name, 0);
                 }
                 self.post_inc_dec(name, *inc)?;
+            }
+            Expr::PreIncDec { name, inc } => {
+                // Value position: apply the mutation first, then read back the
+                // new value — the only difference from `PostIncDec`.
+                self.post_inc_dec(name, *inc)?;
+                if self.implicit_this_field(name).is_some() {
+                    self.emit_this(0);
+                    self.emit_field_get(name, 0);
+                } else if let Some((class, _)) = self.static_field_owner(name) {
+                    self.emit_global_get(&static_global(&class, name), 0);
+                } else {
+                    self.emit_get(name, 0);
+                }
             }
             Expr::Call { name, args, line } => self.call(name, args, *line)?,
             Expr::MethodCall {
@@ -3752,6 +3822,23 @@ impl Compiler {
         // `Integer.parseInt`, `String.valueOf`) is a static stdlib call: the
         // receiver is not a value, so it is not evaluated. Args, then the class
         // and method names, are handed to the static-dispatch builtin.
+        // `x.getClass()` — javars has no `Class` object, so the call evaluates
+        // to the receiver's runtime class *name*, and `Class`'s two accessors
+        // (`getName`, `getSimpleName`) are String methods over it. A user class
+        // that declares its own `getClass` is not shadowed, because Java forbids
+        // overriding it.
+        if method == "getClass" && args.is_empty() {
+            self.expr(recv)?;
+            self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
+            return Ok(());
+        }
+        // A fully-qualified stdlib receiver (`java.util.Arrays.sort(x)`) names
+        // exactly the class its simple name does — javars keys every type on the
+        // simple name, so the package qualifier is dropped and the call re-enters
+        // through the ordinary static path.
+        if let Some(simple) = qualified_static_class(recv) {
+            return self.method_call(&Expr::Var(simple), method, args, line);
+        }
         // `Color.values()` / `Color.valueOf(s)` — the two statics every enum has.
         // They are compiler-generated because javars keeps no per-class static
         // method table.
@@ -3796,6 +3883,17 @@ impl Compiler {
                     args.len() as u8 + 2,
                     line,
                 );
+                // `Math.abs(int)` is the one `Math` overload that overflows:
+                // `Math.abs(Integer.MIN_VALUE)` is `Integer.MIN_VALUE`, because
+                // negating it does not fit an `int`. The host has no argument
+                // width to work from, so the narrowing is emitted here.
+                if class == "Math"
+                    && method == "abs"
+                    && args.len() == 1
+                    && Self::is_int_width(self.expr_java_type(&args[0]).as_deref())
+                {
+                    self.emit_wrap32(line);
+                }
                 return Ok(());
             }
         }
@@ -3863,6 +3961,24 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        // `new String(cs)` / `new String(s)` / `new String()` — javars models a
+        // `String` as a primitive value rather than an instance, so constructing
+        // one is exactly the conversion `String.valueOf` performs.
+        if !self.classes.contains_key(class) && class == "String" {
+            match args.first() {
+                Some(a) => self.expr(a)?,
+                None => {
+                    let empty = self.b.add_constant(Value::str(String::new()));
+                    self.b.emit(Op::LoadConst(empty), line);
+                }
+            }
+            let class_c = self.b.add_constant(Value::str("String".to_string()));
+            self.b.emit(Op::LoadConst(class_c), line);
+            let method_c = self.b.add_constant(Value::str("valueOf".to_string()));
+            self.b.emit(Op::LoadConst(method_c), line);
+            self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 3, line);
+            return Ok(());
+        }
         // `new ArrayList<>()` / `new HashMap<>(other)` — a `java.util`
         // collection, allocated by the host rather than laid out as an instance.
         // A user class of the same name wins, because `self.classes` is checked
@@ -4074,7 +4190,35 @@ impl Compiler {
         wrap32: bool,
         line: u32,
     ) -> Result<(), String> {
-        if op == AssignOp::Div {
+        if matches!(op, AssignOp::Shl | AssignOp::Shr | AssignOp::Ushr) {
+            // Same width rule as the binary shifts: the distance is masked to
+            // the *target's* width, and `>>>` zero-fills at it. `wrap32` is
+            // exactly "the target is `int`-wide", and the shared narrowing
+            // below finishes the job.
+            self.expr(value)?;
+            self.b.emit(Op::LoadInt(if wrap32 { 31 } else { 63 }), line);
+            self.b.emit(Op::BitAnd, line);
+            match op {
+                AssignOp::Shl => self.b.emit(Op::Shl, line),
+                AssignOp::Shr => self.b.emit(Op::Shr, line),
+                _ => {
+                    self.b.emit(Op::LoadInt(if wrap32 { 32 } else { 64 }), line);
+                    self.b.emit(Op::CallBuiltin(crate::host::JUSHR, 3), line)
+                }
+            };
+        } else if matches!(op, AssignOp::BitAnd | AssignOp::BitOr | AssignOp::BitXor)
+            && self.expr_type(value) != NumType::Int
+        {
+            // `b &= c` on booleans is the logical form, and its result must
+            // stay a boolean rather than the 0/1 an integer op would leave.
+            self.expr(value)?;
+            let vop = match op {
+                AssignOp::BitAnd => Op::LogAnd,
+                AssignOp::BitOr => Op::LogOr,
+                _ => Op::NumNe,
+            };
+            self.b.emit(vop, line);
+        } else if op == AssignOp::Div {
             let r = self.expr_type(value);
             self.expr(value)?;
             self.emit_div(target, r, value, line);
@@ -4234,6 +4378,13 @@ impl Compiler {
             }
             _ => {}
         }
+        // Shifts and the bitwise trio need Java's operand widths, which the
+        // generic path below has no way to express.
+        match op {
+            BinOp::Shl | BinOp::Shr | BinOp::Ushr => return self.shift(op, lhs, rhs),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => return self.bitwise(op, lhs, rhs),
+            _ => {}
+        }
         // `/` truncation is decided from the operands' static types.
         if let BinOp::Div = op {
             let l = self.expr_type(lhs);
@@ -4280,6 +4431,12 @@ impl Compiler {
             BinOp::Ge => Op::NumGe,
             BinOp::Div => unreachable!("handled above"),
             BinOp::And | BinOp::Or => unreachable!("handled above"),
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Ushr => unreachable!("handled above"),
         };
         self.b.emit(vop, 0);
         // An `int` arithmetic result wraps at 32 bits. Comparisons yield a
@@ -4289,6 +4446,108 @@ impl Compiler {
         {
             self.emit_wrap32(0);
         }
+        Ok(())
+    }
+
+    /// `Integer.MAX_VALUE` / `Double.NaN` / `Math.PI` / … — the value and Java
+    /// type of a `static final` constant on a `java.lang` type, when `e` names
+    /// one. A user class of the same name shadows it.
+    fn wrapper_constant_ref(&self, e: &Expr) -> Option<(Value, &'static str)> {
+        let Expr::Field { recv, name } = e else {
+            return None;
+        };
+        let Expr::Var(class) = &**recv else {
+            return None;
+        };
+        if self.classes.contains_key(class) {
+            return None;
+        }
+        wrapper_constant(class, name)
+    }
+
+    /// Lower `&`, `|`, `^`.
+    ///
+    /// On integral operands these are the bitwise operators and fusevm's native
+    /// ops match exactly (both sides are already inside their Java width, and
+    /// `&`/`|`/`^` cannot widen a value). On `boolean` operands they are Java's
+    /// *non-short-circuiting* logical operators, and the result has to stay a
+    /// boolean rather than the 0/1 an integer op would leave.
+    fn bitwise(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        let boolean = self.expr_java_type(lhs).as_deref() == Some("boolean")
+            || self.expr_java_type(rhs).as_deref() == Some("boolean");
+        self.expr(lhs)?;
+        self.expr(rhs)?;
+        let vop = match (op, boolean) {
+            (BinOp::BitAnd, true) => Op::LogAnd,
+            (BinOp::BitOr, true) => Op::LogOr,
+            // `^` on two booleans is exactly "they differ".
+            (_, true) => Op::NumNe,
+            (BinOp::BitAnd, false) => Op::BitAnd,
+            (BinOp::BitOr, false) => Op::BitOr,
+            (_, false) => Op::BitXor,
+        };
+        self.b.emit(vop, 0);
+        Ok(())
+    }
+
+    /// Lower `<<`, `>>`, `>>>`.
+    ///
+    /// Java masks the shift distance to the width of the *left* operand — 5 bits
+    /// for `int` (so `1 << 33` is `1 << 1`), 6 for `long` — and promotes only
+    /// that operand, so `1 << 2L` is still an `int`. fusevm's `Shl`/`Shr` always
+    /// mask to 6 bits and work on 64 bits, so the mask is emitted explicitly and
+    /// an `int` result is narrowed afterwards. `>>>` zero-fills at the operand's
+    /// width, which no fusevm op carries, so it routes through the host.
+    fn shift(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        let long = self.expr_java_type(lhs).as_deref() == Some("long");
+        self.expr(lhs)?;
+        self.expr(rhs)?;
+        self.b.emit(Op::LoadInt(if long { 63 } else { 31 }), 0);
+        self.b.emit(Op::BitAnd, 0);
+        if op == BinOp::Ushr {
+            self.b.emit(Op::LoadInt(if long { 64 } else { 32 }), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JUSHR, 3), 0);
+            return Ok(());
+        }
+        self.b
+            .emit(if op == BinOp::Shl { Op::Shl } else { Op::Shr }, 0);
+        if !long {
+            self.emit_wrap32(0);
+        }
+        Ok(())
+    }
+
+    /// Lower `(ty) expr`.
+    ///
+    /// Java's *narrowing* primitive conversions are real value changes —
+    /// `(int) 3.9` is 3, `(byte) 200` is -56, `(int) 1e18` saturates to
+    /// `Integer.MAX_VALUE` — so those route through the host, which applies the
+    /// conversion at the right width. A widening or identity cast between types
+    /// javars already represents identically is emitted as the operand alone, so
+    /// the common `(int) i` stays native. A *reference* cast has no runtime
+    /// effect here: the host heap already carries each object's class and
+    /// javars does not box primitives, so there is no representation to change
+    /// (and therefore no `ClassCastException` — see BUGS.md).
+    fn cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
+        let src = self.expr_java_type(e);
+        let identity = matches!(
+            (ty, src.as_deref()),
+            ("int", Some("int" | "short" | "byte"))
+                | ("long", Some("int" | "long" | "short" | "byte"))
+                | ("double" | "float", Some("double" | "float"))
+                | ("boolean", Some("boolean"))
+        );
+        let primitive = matches!(
+            ty,
+            "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
+        );
+        if identity || !primitive {
+            return self.expr(e);
+        }
+        self.expr(e)?;
+        let c = self.b.add_constant(Value::str(ty.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
         Ok(())
     }
 
@@ -4367,12 +4626,9 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
             update,
             body,
         } => {
-            init.as_deref()
-                .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+            body_has_ffi(init)
                 || cond.as_ref().is_some_and(expr_has_ffi)
-                || update
-                    .as_deref()
-                    .is_some_and(|s| body_has_ffi(std::slice::from_ref(s)))
+                || body_has_ffi(update)
                 || body_has_ffi(body)
         }
         StmtKind::ForEach { iter, body, .. } => expr_has_ffi(iter) || body_has_ffi(body),
@@ -4402,6 +4658,8 @@ fn expr_has_ffi(e: &Expr) -> bool {
     match e {
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
+        Expr::Cast { expr, .. } => expr_has_ffi(expr),
+        Expr::PreIncDec { .. } => false,
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Ternary { cond, then, els } => {
             expr_has_ffi(cond) || expr_has_ffi(then) || expr_has_ffi(els)
@@ -4517,6 +4775,26 @@ fn array_elem_numtype(array_ty: &str) -> NumType {
 
 /// True when `name` is a stdlib class whose methods javars dispatches
 /// statically (rather than treating `name` as a value/receiver).
+/// The simple name of a fully-qualified stdlib class reference
+/// (`java.util.Arrays` → `Arrays`), when `e` is a dotted chain rooted at a
+/// package name.
+///
+/// Only `java`/`javax` roots qualify, so an ordinary field access on a user
+/// expression can never be mistaken for a package path.
+fn qualified_static_class(e: &Expr) -> Option<String> {
+    fn is_package(e: &Expr) -> bool {
+        match e {
+            Expr::Var(v) => v == "java" || v == "javax",
+            Expr::Field { recv, .. } => is_package(recv),
+            _ => false,
+        }
+    }
+    let Expr::Field { recv, name } = e else {
+        return None;
+    };
+    (is_package(recv) && is_static_class(name)).then(|| name.clone())
+}
+
 fn is_static_class(name: &str) -> bool {
     matches!(
         name,
@@ -4667,14 +4945,49 @@ fn is_breakable(s: &Stmt) -> bool {
     )
 }
 
+/// The value and Java type of a `static final` constant on a `java.lang` type
+/// (`Integer.MAX_VALUE`, `Double.NaN`, `Math.PI`, …).
+///
+/// javars does not model the wrapper classes as classes, so these are folded to
+/// their literal value at compile time rather than read from a field.
+fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
+    Some(match (class, name) {
+        ("Integer", "MAX_VALUE") => (Value::Int(i32::MAX as i64), "int"),
+        ("Integer", "MIN_VALUE") => (Value::Int(i32::MIN as i64), "int"),
+        ("Long", "MAX_VALUE") => (Value::Int(i64::MAX), "long"),
+        ("Long", "MIN_VALUE") => (Value::Int(i64::MIN), "long"),
+        ("Short", "MAX_VALUE") => (Value::Int(i16::MAX as i64), "short"),
+        ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), "short"),
+        ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), "byte"),
+        ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), "byte"),
+        ("Double", "MAX_VALUE") => (Value::float(f64::MAX), "double"),
+        // The smallest positive *subnormal* double, 4.9E-324 — Java's
+        // `Double.MIN_VALUE` is not `f64::MIN`.
+        ("Double", "MIN_VALUE") => (Value::float(f64::from_bits(1)), "double"),
+        ("Double", "POSITIVE_INFINITY") => (Value::float(f64::INFINITY), "double"),
+        ("Double", "NEGATIVE_INFINITY") => (Value::float(f64::NEG_INFINITY), "double"),
+        ("Double", "NaN") => (Value::float(f64::NAN), "double"),
+        ("Math", "PI") => (Value::float(std::f64::consts::PI), "double"),
+        ("Math", "E") => (Value::float(std::f64::consts::E), "double"),
+        _ => return None,
+    })
+}
+
 fn compound_op(op: AssignOp) -> Op {
     match op {
         AssignOp::Add => Op::Add,
         AssignOp::Sub => Op::Sub,
         AssignOp::Mul => Op::Mul,
         AssignOp::Mod => Op::Mod,
-        // `/=` is lowered separately so it can truncate int division.
+        AssignOp::BitAnd => Op::BitAnd,
+        AssignOp::BitOr => Op::BitOr,
+        AssignOp::BitXor => Op::BitXor,
+        // `/=` is lowered separately so it can truncate int division, and the
+        // shifts so they can mask the distance to the target's width.
         AssignOp::Div => unreachable!("`/=` lowers through the div-typing path"),
+        AssignOp::Shl | AssignOp::Shr | AssignOp::Ushr => {
+            unreachable!("shift assignments lower through the width-masking path")
+        }
         AssignOp::Assign => unreachable!("plain assign never lowers through compound_op"),
     }
 }

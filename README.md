@@ -75,8 +75,10 @@ overrides). **Interfaces** (abstract + `default` methods, multiple
 implements, interface inheritance, polymorphic dispatch), **method overloading
 by parameter type** (most-specific resolution for methods and constructors), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
-X>`, the diamond, erased library type args) all run. `String.format` (a
-`Formatter` subset) and `Arrays.toString` round out the stdlib essentials; the
+X>`, the diamond, erased library type args) all run. `String.format` and
+`System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %b
+%B %h %H %x %X %o %c`, the `-`/`0`/`+`/`,`/`(` flags, width, precision, and
+argument indexes) and the `Arrays` statics round out the stdlib essentials; the
 wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). **Exceptions**
 (`throw`/`try`/`catch`/`finally`, try-with-resources, and javars's own runtime
 faults raised as catchable throwables), **`static` fields and `static { }`
@@ -175,13 +177,19 @@ Implemented and checked against the reference `java`:
   (`i++`, `i--`). A `var` records the *type* it infers, so `var i = 7; i / 2`
   truncates and `var big = 100000; big * big` wraps — including the element type
   of a `var` enhanced-`for` over an array literal.
-- **Expressions** — integer / floating / string / char / boolean literals; the
-  binary operators `+ - * / %`, `== != < > <= >=`, `&& ||` (short-circuiting);
-  unary `-` and `!`; parenthesised grouping; Java's `+` string concatenation.
+- **Expressions** — integer (decimal, `0x`, `0b`, octal, `_`-separated) /
+  floating / string / char / boolean literals; the binary operators `+ - * / %`,
+  `== != < > <= >=`, `&& ||` (short-circuiting), the bitwise `& | ^` (Java's
+  non-short-circuiting logical operators on booleans), and the shifts
+  `<< >> >>>` with Java's per-width distance masking; unary `-`, `!`, `~`, and
+  `++`/`--` in both prefix and postfix value position; cast expressions with
+  Java's saturating and two's-complement narrowing conversions; parenthesised
+  grouping; Java's `+` string concatenation.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
-  `for (init; cond; update)`, the enhanced `for (T x : arr)` (over an array or a
-  collection), `break`, `continue`, and `return` (a bare `return;` ends `main`;
-  `return <expr>;` returns a value from a method).
+  `for (init; cond; update)` (with comma-separated init and update clauses), the
+  enhanced `for (T x : arr)` (over an array or a collection), `break`,
+  `continue`, and `return` (a bare `return;` ends `main`; `return <expr>;`
+  returns a value from a method).
 - **Arrow `switch`** — as an expression
   (`int r = switch (x) { case 1, 2 -> 10; default -> { … yield v; } };`) and as
   a statement. Multi-label arms, `enum`/`String`/`int` discriminants, a `throw`
@@ -337,12 +345,14 @@ This release: `main`, locals, arithmetic / comparison / logic, Java
 integer-vs-float division, the ternary `?:` operator, `if` / `while` /
 `do`-`while` / `for` / `switch` (with fall-through, on `int` and `String`) /
 `break` / `continue` (including labeled `break outer;` / `continue outer;`) /
-`return`, `System.out`/`System.err` `print[ln]`, string concatenation,
+`return`, the bitwise and shift operators (`& | ^ ~ << >> >>>` and their
+compound forms), cast expressions, `++`/`--` in value position, `System.out`/`System.err` `print[ln]`, string concatenation,
 user-defined `static` methods (recursion, parameters, value returns over
 fusevm's `Op::Call` frame ABI), `String` instance methods, a first slice of the
-standard library (`Math.*`, `Integer.parseInt`/`valueOf`/`toString`,
-`Long.parseLong`, `Boolean.parseBoolean`, `String.valueOf`, `String.format`,
-`Arrays.toString`), **reference arrays** including **multi-dimensional**
+standard library (`Math.*`, the `Integer`/`Long`/`Double` parsing, radix, and
+constant statics, `Boolean.parseBoolean`, the `Character` predicates,
+`String.valueOf`/`join`/`format`, `System.out.printf`, and the `Arrays`
+statics including `sort`/`fill`/`copyOf`/`deepToString`), **reference arrays** including **multi-dimensional**
 (default-valued `new T[n]` / `new T[m][n]`, `{…}` and nested `{{…},{…}}` literals,
 get/set indexing, `.length` at each level, and reference/aliasing semantics on a
 host-owned object heap keyed by `Value::Obj`), a **class/object model** (instance

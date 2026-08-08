@@ -689,15 +689,16 @@ impl Parser {
         loop {
             match self.peek() {
                 Tok::Lt => depth += 1,
-                Tok::Gt => {
-                    depth -= 1;
-                    if depth == 0 {
+                // A nested type argument closes with `>>`/`>>>`, which the lexer
+                // takes as one shift token — so a closer is worth however many
+                // `>` it spells.
+                t if t.generic_closers() > 0 => {
+                    depth -= t.generic_closers();
+                    if depth <= 0 {
                         self.advance();
                         return;
                     }
                 }
-                // `>=`/`>>`-style tokens never appear inside a type-arg list from
-                // this lexer (it emits single `>`); stop defensively at EOF.
                 Tok::Eof => return,
                 _ => {}
             }
@@ -1298,11 +1299,11 @@ impl Parser {
         if matches!(self.toks[j].kind, Tok::Lt) {
             let mut depth = 0;
             while j < self.toks.len() {
-                match self.toks[j].kind {
+                match &self.toks[j].kind {
                     Tok::Lt => depth += 1,
-                    Tok::Gt => {
-                        depth -= 1;
-                        if depth == 0 {
+                    t if t.generic_closers() > 0 => {
+                        depth -= t.generic_closers();
+                        if depth <= 0 {
                             j += 1;
                             break;
                         }
@@ -1364,12 +1365,7 @@ impl Parser {
                 body,
             });
         }
-        let init = if self.is(&Tok::Semi) {
-            None
-        } else {
-            let line = self.line();
-            Some(Box::new(Stmt::new(line, self.simple_statement(false)?)))
-        };
+        let init = self.for_clause(&Tok::Semi)?;
         self.eat(&Tok::Semi)?;
         let cond = if self.is(&Tok::Semi) {
             None
@@ -1377,12 +1373,7 @@ impl Parser {
             Some(self.expression()?)
         };
         self.eat(&Tok::Semi)?;
-        let update = if self.is(&Tok::RParen) {
-            None
-        } else {
-            let line = self.line();
-            Some(Box::new(Stmt::new(line, self.simple_statement(false)?)))
-        };
+        let update = self.for_clause(&Tok::RParen)?;
         self.eat(&Tok::RParen)?;
         let body = self.braced_or_single()?;
         Ok(StmtKind::For {
@@ -1391,6 +1382,52 @@ impl Parser {
             update,
             body,
         })
+    }
+
+    /// Parse a `for` header's init or update clause — a comma-separated list of
+    /// simple statements, terminated by `end` (`;` for init, `)` for update).
+    ///
+    /// Java lets the init clause declare several variables of one type
+    /// (`for (int i = 0, j = n; …)`), where only the first declarator names the
+    /// type; the rest reuse it, so the type is carried across the commas.
+    fn for_clause(&mut self, end: &Tok) -> Result<Vec<Stmt>, String> {
+        let mut out = Vec::new();
+        if self.is(end) {
+            return Ok(out);
+        }
+        let line = self.line();
+        let first = self.simple_statement(false)?;
+        let decl_ty = match &first {
+            StmtKind::Local { ty, .. } => Some(ty.clone()),
+            _ => None,
+        };
+        out.push(Stmt::new(line, first));
+        while self.is(&Tok::Comma) {
+            self.advance();
+            let line = self.line();
+            match &decl_ty {
+                // A continued declarator: `j = n` or a bare `j`.
+                Some(ty) => {
+                    let name = self.ident()?;
+                    let init = if self.is(&Tok::Assign) {
+                        self.advance();
+                        Some(self.expression()?)
+                    } else {
+                        None
+                    };
+                    out.push(Stmt::new(
+                        line,
+                        StmtKind::Local {
+                            ty: ty.clone(),
+                            name,
+                            init,
+                        },
+                    ));
+                }
+                None => out.push(Stmt::new(line, self.simple_statement(false)?)),
+            }
+        }
+        Ok(out)
     }
 
     /// Parse `try [(resources)] { .. } catch (Type name) { .. }* [finally { .. }]`.
@@ -1417,13 +1454,19 @@ impl Parser {
             if matches!(self.peek(), Tok::Ident(w) if w == "final") {
                 self.advance();
             }
-            let ty = self.type_name()?;
+            // `catch (A | B e)` — a multi-catch lists alternative types before
+            // the one bound variable.
+            let mut types = vec![self.type_name()?];
+            while self.is(&Tok::Pipe) {
+                self.advance();
+                types.push(self.type_name()?);
+            }
             let name = self.ident()?;
             self.eat(&Tok::RParen)?;
             self.eat(&Tok::LBrace)?;
             let arm_body = self.block()?;
             catches.push(CatchArm {
-                ty,
+                types,
                 name,
                 body: arm_body,
             });
@@ -1742,6 +1785,9 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         self.eat(&Tok::LBrace)?;
         let mut arms = Vec::new();
+        // Labels of colon-form arms with an empty body, waiting to be folded
+        // into the next arm that has one (`case 1: case 2: yield x;`).
+        let mut grouped: Vec<Expr> = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             let mut labels = Vec::new();
             let mut is_default = false;
@@ -1759,6 +1805,35 @@ impl Parser {
                         break;
                     }
                 }
+            }
+            // Java allows both arm forms in a switch *expression*: `case X ->`
+            // and the classic `case X:`. In the colon form every arm must
+            // complete with `yield` or `throw`, so there is no fall-through
+            // value to model — only an empty arm falls through, and that just
+            // groups its labels onto the next one.
+            if self.is(&Tok::Colon) {
+                self.advance();
+                self.switch_expr_depth += 1;
+                let mut stmts = Vec::new();
+                while !self.is(&Tok::Case)
+                    && !self.is(&Tok::Default)
+                    && !self.is(&Tok::RBrace)
+                    && !self.is(&Tok::Eof)
+                {
+                    stmts.push(self.statement()?);
+                }
+                self.switch_expr_depth -= 1;
+                if stmts.is_empty() && !is_default {
+                    grouped.extend(labels);
+                    continue;
+                }
+                labels.splice(0..0, grouped.drain(..));
+                arms.push(SwitchArm {
+                    labels,
+                    is_default,
+                    body: SwitchArmBody::Block(stmts),
+                });
+                continue;
             }
             self.eat(&Tok::Arrow)?;
             // Inside an arm body `yield` is a keyword; outside it stays an
@@ -1825,7 +1900,8 @@ impl Parser {
         loop {
             // `instanceof` is a relational operator (binding power 4) whose
             // right-hand side is a type name, not an expression.
-            if matches!(self.peek(), Tok::Ident(w) if w == "instanceof") && 4 >= min_bp {
+            if matches!(self.peek(), Tok::Ident(w) if w == "instanceof") && BP_RELATIONAL >= min_bp
+            {
                 self.advance();
                 let class = self.ident()?;
                 lhs = Expr::InstanceOf {
@@ -1936,6 +2012,12 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        // A cast shares its opening `(` with a parenthesized expression, so it
+        // is probed (without consuming anything on a miss) before the prefix
+        // operators — `(int) -x` is a cast of a negation, not a negation.
+        if let Some(cast) = self.try_cast()? {
+            return Ok(cast);
+        }
         match self.peek() {
             Tok::Minus => {
                 self.advance();
@@ -1944,6 +2026,11 @@ impl Parser {
                     rhs: Box::new(self.unary()?),
                 })
             }
+            // Java's unary `+` is a no-op on an already-promoted operand.
+            Tok::Plus => {
+                self.advance();
+                self.unary()
+            }
             Tok::Not => {
                 self.advance();
                 Ok(Expr::Unary {
@@ -1951,8 +2038,110 @@ impl Parser {
                     rhs: Box::new(self.unary()?),
                 })
             }
+            Tok::Tilde => {
+                self.advance();
+                Ok(Expr::Unary {
+                    op: UnOp::BitNot,
+                    rhs: Box::new(self.unary()?),
+                })
+            }
+            // `++i` / `--i`: update first, and the expression's value is the
+            // *new* one.
+            Tok::PlusPlus | Tok::MinusMinus => {
+                let inc = self.is(&Tok::PlusPlus);
+                self.advance();
+                let name = self.ident()?;
+                Ok(Expr::PreIncDec { name, inc })
+            }
             _ => self.postfix(),
         }
+    }
+
+    /// Parse `(Type) operand` if the cursor is at one, else leave the cursor
+    /// untouched and return `None`.
+    ///
+    /// `(x)` opens both a cast and a parenthesized expression, and only what
+    /// follows the `)` tells them apart. Java's rule, reproduced here: a
+    /// *primitive* type name is always a cast (`(int) -x`), while a reference
+    /// type name is a cast only when the next token can start an operand —
+    /// `(a) - b` is a subtraction, `(a) b` and `(Integer) o` are casts.
+    fn try_cast(&mut self) -> Result<Option<Expr>, String> {
+        if !self.is(&Tok::LParen) {
+            return Ok(None);
+        }
+        let at = |j: usize| self.toks.get(j).map(|t| &t.kind).unwrap_or(&Tok::Eof);
+        let mut j = self.pos + 1;
+        let Tok::Ident(head) = at(j) else {
+            return Ok(None);
+        };
+        // A qualified name (`java.util.List`) keys on its simple name, which is
+        // what every other javars type lookup uses.
+        let mut name = head.clone();
+        j += 1;
+        while matches!(at(j), Tok::Dot) {
+            let Tok::Ident(seg) = at(j + 1) else {
+                return Ok(None);
+            };
+            name = seg.clone();
+            j += 2;
+        }
+        // Type arguments are erased, so they only have to be stepped over.
+        if matches!(at(j), Tok::Lt) {
+            let mut depth = 0;
+            loop {
+                match at(j) {
+                    Tok::Lt => depth += 1,
+                    Tok::Eof => return Ok(None),
+                    t if t.generic_closers() > 0 => {
+                        depth -= t.generic_closers();
+                        if depth <= 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        while matches!(at(j), Tok::LBracket) && matches!(at(j + 1), Tok::RBracket) {
+            name.push_str("[]");
+            j += 2;
+        }
+        if !matches!(at(j), Tok::RParen) {
+            return Ok(None);
+        }
+        let primitive = matches!(
+            name.as_str(),
+            "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
+        );
+        // `instanceof` reads as an identifier but continues the *enclosing*
+        // expression, so it must not be mistaken for a cast operand.
+        let starts_operand = match at(j + 1) {
+            Tok::Ident(w) => w != "instanceof",
+            Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Long(_)
+            | Tok::Float(_)
+            | Tok::True
+            | Tok::False
+            | Tok::LParen
+            | Tok::Not
+            | Tok::Tilde
+            | Tok::New => true,
+            _ => false,
+        };
+        if !primitive && !starts_operand {
+            return Ok(None);
+        }
+        let line = self.toks[j].line;
+        self.pos = j + 1;
+        let expr = self.unary()?;
+        Ok(Some(Expr::Cast {
+            ty: name,
+            expr: Box::new(expr),
+            line,
+        }))
     }
 
     /// Parse a primary followed by any postfix chain: `.method(args)` instance
@@ -2072,15 +2261,13 @@ impl Parser {
                 }
                 let line = self.line();
                 self.advance();
-                // post-inc/dec as an expression value is not modeled; only as a
-                // statement (handled in simple_statement). A trailing ++/-- here
-                // is treated as the variable's value with the mutation deferred
-                // — reject to avoid silently wrong semantics.
+                // `i++` / `i--` in value position: the expression's value is the
+                // variable's *old* value, with the update applied after (the
+                // compiler's `Expr::PostIncDec` arm emits exactly that order).
                 if matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus) {
-                    return Err(format!(
-                        "javars: `{name}++`/`--` is only supported as a statement yet (line {})",
-                        self.line()
-                    ));
+                    let inc = self.is(&Tok::PlusPlus);
+                    self.advance();
+                    return Ok(Expr::PostIncDec { name, inc });
                 }
                 // `name(args...)` — a call. The compiler resolves it: the FFI
                 // desugar target `__rust_compile(...)` and `rust { ... }`-exported
@@ -2234,13 +2421,30 @@ impl Parser {
             }
         };
         self.eat(&Tok::Dot)?;
+        let line = self.line();
         let method = self.ident()?;
+        // `printf(fmt, args…)` is `print(String.format(fmt, args…))` — the same
+        // formatter, no trailing newline. Desugaring here keeps one formatting
+        // implementation instead of two.
+        if method == "printf" || method == "format" {
+            let args = self.call_args()?;
+            return Ok(Expr::Println {
+                newline: false,
+                err,
+                arg: Some(Box::new(Expr::MethodCall {
+                    recv: Box::new(Expr::Var("String".to_string())),
+                    method: "format".to_string(),
+                    args,
+                    line,
+                })),
+            });
+        }
         let newline = match method.as_str() {
             "println" => true,
             "print" => false,
             _ => {
                 return Err(format!(
-                "javars: only `System.{stream}.println`/`print` are supported, not `{method}` (line {})",
+                "javars: only `System.{stream}.println`/`print`/`printf` are supported, not `{method}` (line {})",
                 self.line()
             ))
             }
@@ -2277,26 +2481,46 @@ fn assign_op(t: &Tok) -> Option<AssignOp> {
         Tok::StarAssign => AssignOp::Mul,
         Tok::SlashAssign => AssignOp::Div,
         Tok::PercentAssign => AssignOp::Mod,
+        Tok::AmpAssign => AssignOp::BitAnd,
+        Tok::PipeAssign => AssignOp::BitOr,
+        Tok::CaretAssign => AssignOp::BitXor,
+        Tok::ShlAssign => AssignOp::Shl,
+        Tok::ShrAssign => AssignOp::Shr,
+        Tok::UshrAssign => AssignOp::Ushr,
         _ => return None,
     })
 }
 
+/// Binding power of `instanceof`, which [`Parser::binary`] handles inline
+/// because its right-hand side is a type name rather than an expression. Java
+/// puts it at the relational level, alongside `<` and `>`.
+const BP_RELATIONAL: u8 = 7;
+
 /// Binary operator + its binding power (higher binds tighter).
+///
+/// The ladder is Java's, loosest first: `||`, `&&`, `|`, `^`, `&`, equality,
+/// relational (+ `instanceof`), shift, additive, multiplicative.
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
     Some(match t {
         Tok::OrOr => (BinOp::Or, 1),
         Tok::AndAnd => (BinOp::And, 2),
-        Tok::EqEq => (BinOp::Eq, 3),
-        Tok::NotEq => (BinOp::Ne, 3),
-        Tok::Lt => (BinOp::Lt, 4),
-        Tok::Gt => (BinOp::Gt, 4),
-        Tok::Le => (BinOp::Le, 4),
-        Tok::Ge => (BinOp::Ge, 4),
-        Tok::Plus => (BinOp::Add, 5),
-        Tok::Minus => (BinOp::Sub, 5),
-        Tok::Star => (BinOp::Mul, 6),
-        Tok::Slash => (BinOp::Div, 6),
-        Tok::Percent => (BinOp::Mod, 6),
+        Tok::Pipe => (BinOp::BitOr, 3),
+        Tok::Caret => (BinOp::BitXor, 4),
+        Tok::Amp => (BinOp::BitAnd, 5),
+        Tok::EqEq => (BinOp::Eq, 6),
+        Tok::NotEq => (BinOp::Ne, 6),
+        Tok::Lt => (BinOp::Lt, BP_RELATIONAL),
+        Tok::Gt => (BinOp::Gt, BP_RELATIONAL),
+        Tok::Le => (BinOp::Le, BP_RELATIONAL),
+        Tok::Ge => (BinOp::Ge, BP_RELATIONAL),
+        Tok::Shl => (BinOp::Shl, 8),
+        Tok::Shr => (BinOp::Shr, 8),
+        Tok::Ushr => (BinOp::Ushr, 8),
+        Tok::Plus => (BinOp::Add, 9),
+        Tok::Minus => (BinOp::Sub, 9),
+        Tok::Star => (BinOp::Mul, 10),
+        Tok::Slash => (BinOp::Div, 10),
+        Tok::Percent => (BinOp::Mod, 10),
         _ => return None,
     })
 }
