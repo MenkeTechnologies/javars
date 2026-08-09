@@ -184,7 +184,14 @@ at the bottom, and are summarized in the section right after this one.
   `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
   %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, the `-`/`0`/`+`/`,`/`(`
   flags, width, `.precision`, and explicit argument indexes (`%2$s`); `%f` rounds
-  HALF_UP on the double's exact value, as Java's `Formatter` does.
+  HALF_UP on the double's exact value, as Java's `Formatter` does. Each
+  conversion is type-checked against its argument's boxed class the way
+  `java.util.Formatter` is, so `String.format("%.2f", 3)` raises
+  `java.util.IllegalFormatConversionException: f != java.lang.Integer` instead of
+  formatting the `int`; a `null` argument prints as `null` under every
+  conversion but `%b`. The value model cannot tell an `Integer` from a `Long`
+  from a `char`, so the compiler sends each argument's static Java type along
+  with the values.
   `System.out.printf` (and the `System.err` form) is that same formatter with no
   trailing newline. Malformed numeric input faults like `NumberFormatException`;
   an unregistered static method is an error. `System.err.print[ln]` writes to
@@ -551,7 +558,14 @@ known.
   `Stream.of`, the intermediate operations (`map`, `filter`, `sorted`,
   `distinct`, `limit`), and the terminals (`collect`, `count`, `sum`, `reduce`,
   `findFirst`, `anyMatch`). Naming any of them is a compile error, not a wrong
-  answer.
+  answer: `list.stream()` is `unsupported List method 'stream'`,
+  `Arrays.stream(a)` is `unsupported static method 'Arrays.stream'`, and
+  `IntStream`/`Stream` are `cannot find symbol`. That last one was *not* true
+  until the undeclared-name check landed — `IntStream.range(0, 3).sum()` used to
+  reach the runtime and report
+  `NullPointerException: Cannot read field "util"` / `Cannot invoke
+  "String.range()"`, because an unmodeled class name was just an undeclared
+  variable reading `null`.
 
   The obstacle is not the pipeline shape, it is *where a lambda can be called
   from*: a host builtin cannot re-enter the VM (the same limit that keeps an
@@ -566,14 +580,16 @@ known.
   exists to prevent.
 
   The `default` and `static` members the JDK's functional interfaces carry are
-  implemented (above); `Comparator.comparing`/`naturalOrder`/`reverseOrder` are
-  the exception. They order *arbitrary* elements by their natural ordering, and
-  the only `compareTo` a prelude body could call on an element it cannot type is
-  the `String` one, which compares every operand as text — -2 for the `Integer`s
-  3 and 5 where Java answers -1, and it never reaches a user class's own
-  `compareTo` at all (see the dynamic-receiver entry under "Modeled with a
-  documented simplification"). Writing them would order most programs' data
-  wrongly, which is worse than the compile error they raise now.
+  all implemented, `Comparator.comparing`/`naturalOrder`/`reverseOrder`
+  included. They order *arbitrary* elements by their natural ordering, which was
+  out of reach while the only `compareTo` a prelude body could call on an element
+  it cannot type was the `String` one; with the erased receiver now dispatching
+  on the runtime class they are the JDK's own bodies, transliterated
+  (`(a, b) -> a.compareTo(b)` and so on). The same lambda is what the compiler
+  supplies for a sort that names no comparator — `Collections.sort(l)`,
+  `l.sort(null)` — because the host's natural order knows numbers and strings
+  and answered "equal" for everything else, so a `List` of a user `Comparable`
+  came back in insertion order.
 - **`hashCode()` on a user class**, including a `record`'s derived one. A record
   supplies its accessors, `toString`, and `equals`; calling `hashCode()` is a
   compile error ("class `Pt` has no method `hashCode`") rather than a wrong
@@ -623,7 +639,10 @@ known.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
   `when` clauses). The arrow form itself is implemented (above); it is pattern
   labels that are not.
-- **`Enum.compareTo`, `EnumSet`, `EnumMap`.**
+- **`EnumSet`, `EnumMap`.** `Enum.compareTo` *is* supplied — it is `final` in
+  Java and is the ordinal difference, so it is synthesized onto every enum
+  alongside `name`/`ordinal`/`toString`/`equals`, which is also what makes
+  `Collections.sort` of an enum list work.
 - **Sealed types, inner (non-`static`) classes,** and **anonymous classes** other
   than the enum-constant body form.
 
@@ -633,6 +652,9 @@ known.
   diagnostics and for overload resolution / `/`-truncation typing, but do not gate
   execution — the runtime is dynamically typed on the fusevm value model.
   Definite-assignment and type errors that `javac` would reject may run.
+  *Resolution* is checked, though: a name nothing declares is
+  `javars: cannot find symbol: \`n\``, not a `null`. It used to read the unset
+  cell, so `undefinedVar` printed `null` and `undefinedVar + 1` printed `null1`.
 - **Class initialization is eager, not lazy.** Java initializes a class the
   first time it is used; javars runs *every* class's `static` field initializers
   and `static { … }` blocks once, before `main`, in source-declaration order
@@ -718,7 +740,11 @@ known.
   see which slots are text conversions. When the format is not a literal there is
   nothing to scan, and the numeric conversions are kept exact at the cost of
   `%s`. Every literal format string, which is what programs write, is exact on
-  both sides.
+  both sides. The same gap narrows the conversion type check: an argument whose
+  static type the compiler could not infer is classified from its runtime value,
+  which reads every integer as `Integer` and every float as `Double` — such an
+  argument still throws exactly where Java throws, but a `Long`/`Float`/
+  `Character` one names the wrong class in the detail message.
 - **Floating `/` routes through a builtin.** Statically-integral division keeps
   the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating or
   statically-unknown operand routes through `JDIV`, because Java floating
@@ -774,15 +800,25 @@ known.
   declared with its class — which is how the overwhelming majority of Java is
   written — is on the static path and unaffected.
 
-  `compareTo` is the one such method that answers a *number* rather than falling
-  back to identity, and it is the sharpest edge of this boundary: a dynamically
-  typed receiver takes the `String` comparison, so it renders both operands as
-  text and compares those. It agrees with Java on `String` operands and diverges
-  on every other: `((Comparable) o).compareTo(p)` is -2 for the `Integer`s 3 and
-  5 (Java's `Integer.compareTo` answers the *sign*, -1), and -1 for two `Pt`s
-  whose own `compareTo` answers 5, because the user body is never reached. This
-  is also why `Comparator.comparing`/`naturalOrder`/`reverseOrder` are left out
-  rather than written in the prelude — see the entry under "Not implemented".
+  A *method call* on such a receiver no longer takes that fall, though: the
+  compiler emits a dispatch chain keyed on the receiver's runtime class over
+  every concrete user class declaring that name and arity, with the `String`
+  method as the last arm (`Compiler::emit_erased_call`). So
+  `list.get(0).compareTo(x)` and `Comparator.comparing(P::n)`'s key extractor
+  reach the class's own body. What remains on the host side is *rendering* —
+  `toString()` reached through `java_str` from a collection, an array, or `+`
+  concatenation — because `fusevm`'s numeric hook is a plain `fn` with no `VM`
+  to re-enter.
+
+  `compareTo` additionally has to answer a *number*, and the boxed types do not
+  agree on which: `Integer`/`Long`/`Double`/`Float` answer the sign,
+  `Byte`/`Short`/`Character` the arithmetic difference, `Boolean` is
+  `false < true`, and `String` is the first differing `char`. The receiver's
+  static Java type therefore rides along to `JCOMPARE_TO` as a tag, and the
+  runtime value classifies the ones the compiler could not name. Before that,
+  every non-`String` `compareTo` compared two `toString`s as text —
+  `Integer.valueOf(10).compareTo(9)` answered -8 (`'1' - '9'`) where Java
+  answers 1, and a user `Pt` whose own `compareTo` returns 5 answered -1.
 - **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
   spreads a *reference* array (`String[]` → a 3-element list) but not a
   primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element

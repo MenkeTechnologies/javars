@@ -261,7 +261,11 @@ Implemented and checked against the reference `java`:
   receivers: `length`, `isEmpty`, `charAt`, `substring`, `indexOf`, `contains`,
   `equals`, `equalsIgnoreCase`, `compareTo`, `compareToIgnoreCase`,
   `toUpperCase`, `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`,
-  `replace`, `repeat` (chainable).
+  `replace`, `repeat` (chainable). `compareTo` is not one of them for a
+  non-`String` receiver: every boxed primitive and every user `Comparable`
+  declares it with a different answer (the sign, the arithmetic difference, or a
+  user body), so it dispatches on the receiver's static type and, when that is
+  erased, on its runtime class.
 - **Regular expressions** — `split` (with `limit`), `replaceAll`,
   `replaceFirst`, and `matches` run real `java.util.regex` patterns on
   `fancy-regex`, whose backtracking VM is what makes Java's backreferences and
@@ -292,7 +296,10 @@ Implemented and checked against the reference `java`:
   constructors, `Arrays.asList`, `List.of`/`Set.of`, and
   `Collections.sort`/`reverse`/`max`/`min`. They are heap objects like arrays, so
   reference semantics hold; the enhanced `for` iterates them; `sort` and
-  `forEach` take a lambda. `HashMap`/`HashSet` iterate in Java's **real bucket
+  `forEach` take a lambda. A sort is a stable merge sort driven by the
+  comparator; naming none (`Collections.sort(l)`, `l.sort(null)`) orders by the
+  element's own `compareTo`, and `Comparator.naturalOrder`/`reverseOrder`/
+  `comparing` build that comparator explicitly. `HashMap`/`HashSet` iterate in Java's **real bucket
   order** — `(capacity - 1) & (h ^ (h >>> 16))` over a power-of-two table,
   reproduced exactly rather than approximated with insertion order.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
@@ -435,10 +442,11 @@ Next waves, in priority order:
 
 1. **Streams** — `.stream().map(…).filter(…)`, `IntStream.range`, the
    `collect`/`reduce`/`findFirst` terminals. The lambdas they take already work,
-   as do the functional interfaces' `default` composition methods
-   (`Function.andThen`, `Predicate.negate`, `Comparator.reversed`); what is
-   missing is the compile-time pipeline fusion a stream needs, because a host
-   builtin cannot re-enter the VM to call a stage's closure per element.
+   as do the functional interfaces' `default` composition methods and statics
+   (`Function.andThen`, `Predicate.negate`, `Comparator.reversed`/
+   `naturalOrder`/`comparing`); what is missing is the compile-time pipeline
+   fusion a stream needs, because a host builtin cannot re-enter the VM to call
+   a stage's closure per element.
 2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
    class literals (`C.class`), `Iterator`/`entrySet`, and wider stdlib coverage
    (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived

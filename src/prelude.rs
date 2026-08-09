@@ -56,6 +56,9 @@ pub const THROWABLES: &[(&str, &str)] = &[
     // [`qualified_throwable`].
     ("PatternSyntaxException", "IllegalArgumentException"),
     ("ConcurrentModificationException", "RuntimeException"),
+    ("NoSuchElementException", "RuntimeException"),
+    ("IllegalFormatException", "IllegalArgumentException"),
+    ("IllegalFormatConversionException", "IllegalFormatException"),
 ];
 
 /// True when `name` is one of the modeled JDK throwables.
@@ -75,7 +78,10 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
     }
     Some(match name {
         "PatternSyntaxException" => format!("java.util.regex.{name}"),
-        "ConcurrentModificationException" => format!("java.util.{name}"),
+        "ConcurrentModificationException"
+        | "NoSuchElementException"
+        | "IllegalFormatException"
+        | "IllegalFormatConversionException" => format!("java.util.{name}"),
         _ => format!("java.lang.{name}"),
     })
 }
@@ -173,7 +179,10 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
         "Comparator",
         "int compare(Object a, Object b)",
         "default Comparator reversed() { return (a, b) -> this.compare(b, a); } \
-         default Comparator thenComparing(Comparator other) { return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return other.compare(a, b); }; }",
+         default Comparator thenComparing(Comparator other) { return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return other.compare(a, b); }; } \
+         static Comparator naturalOrder() { return (a, b) -> a.compareTo(b); } \
+         static Comparator reverseOrder() { return (a, b) -> b.compareTo(a); } \
+         static Comparator comparing(Function key) { return (a, b) -> key.apply(a).compareTo(key.apply(b)); }",
     ),
     ("IntSupplier", "int getAsInt()", ""),
     (

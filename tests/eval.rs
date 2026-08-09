@@ -3089,3 +3089,238 @@ fn super_outside_an_instance_method_and_an_absent_superclass_member_are_errors()
         "expected a compile diagnostic, got: {err:?}"
     );
 }
+
+#[test]
+fn compare_to_answers_by_the_receivers_type_not_by_its_text() {
+    // Every `compareTo` on a receiver javars could not resolve to a user class
+    // used to run `String.compareTo` over the two operands' `toString`s. That
+    // is a *wrong number*, not an error: `Integer.valueOf(10).compareTo(9)`
+    // answered `-8` (`'1' - '9'`) where Java answers `1`, and a `Float`'s
+    // `1.5f.compareTo(9.5f)` answered `-8` where Java answers `-1`.
+    //
+    // The boxed types do not even agree with each other, which is why the
+    // static type has to reach the runtime: `Integer`/`Long`/`Double`/`Float`
+    // answer the *sign*, `Byte`/`Short`/`Character` the arithmetic difference.
+    // Every expectation below is OpenJDK 21's own output.
+    let (out, ok) = run(&wrap(
+        "Integer i = 3; Long lg = 10L; Double d = 1.5; Character ch = 'a';\
+         Boolean bo = true; Short sh = 3; Byte by = 3; Float f = 1.5f;\
+         System.out.println(i.compareTo(5));\
+         System.out.println(lg.compareTo(3L));\
+         System.out.println(d.compareTo(2.5));\
+         System.out.println(ch.compareTo('c'));\
+         System.out.println(bo.compareTo(false));\
+         System.out.println(sh.compareTo((short) 9));\
+         System.out.println(by.compareTo((byte) 9));\
+         System.out.println(f.compareTo(9.5f));\
+         System.out.println(Integer.valueOf(10).compareTo(9));\
+         System.out.println(\"Hello\".compareTo(\"Hellp\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "-1\n1\n-1\n-2\n1\n-6\n-6\n-1\n1\n-1\n");
+}
+
+#[test]
+fn compare_to_on_an_erased_receiver_reaches_the_elements_own_body() {
+    // A `List.get` result has no static type, so `l.get(0).compareTo(l.get(1))`
+    // is the erased case. It used to compare `"Pt1"` with `"Pt2"` as text and
+    // answer -1 no matter what the class's own `compareTo` returned; here that
+    // body answers a fixed 5, so the text reading is unmistakable. The
+    // `List<Integer>` line pins the other half: -1, not the `'3' - '5'` of -2.
+    let (out, ok) = run("import java.util.*;\
+         public class T {\
+         static class Pt implements Comparable<Pt> {\
+         int x; Pt(int x) { this.x = x; }\
+         public int compareTo(Pt o) { return 5; }\
+         public String toString() { return \"Pt\" + x; } }\
+         public static void main(String[] a) {\
+         List<Pt> l = new ArrayList<>(); l.add(new Pt(1)); l.add(new Pt(2));\
+         System.out.println(l.get(0).compareTo(l.get(1)));\
+         List<Integer> li = new ArrayList<>(); li.add(3); li.add(5);\
+         System.out.println(li.get(0).compareTo(li.get(1)));\
+         System.out.println(li.get(1).compareTo(li.get(0)));\
+         List<String> ls = new ArrayList<>(); ls.add(\"abc\"); ls.add(\"abd\");\
+         System.out.println(ls.get(0).compareTo(ls.get(1))); } }");
+    assert!(ok);
+    assert_eq!(out, "5\n-1\n1\n-1\n");
+}
+
+#[test]
+fn double_compare_to_is_a_total_order_over_nan_and_negative_zero() {
+    // `Double.compareTo` is not `<`: it puts `NaN` above every value and
+    // `-0.0` below `0.0`, which is what makes a `List<Double>` sort
+    // deterministically. Verified against OpenJDK 21.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Double.valueOf(0.0).compareTo(-0.0));\
+         System.out.println(Double.valueOf(-0.0).compareTo(0.0));\
+         System.out.println(Double.valueOf(Double.NaN).compareTo(1.0));\
+         System.out.println(Double.valueOf(1.0).compareTo(Double.NaN));\
+         System.out.println(Double.valueOf(Double.NaN).compareTo(Double.NaN));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "1\n-1\n1\n-1\n0\n");
+}
+
+#[test]
+fn an_enums_compare_to_is_its_ordinal_difference() {
+    // `Enum.compareTo` is `final` in Java and is declaration-order difference,
+    // which is also what makes an enum list sortable. Naming it used to be a
+    // compile error ("class `E` has no method `compareTo`").
+    let (out, ok) = run("import java.util.*;\
+         public class T { enum E { A, B, C }\
+         public static void main(String[] a) {\
+         System.out.println(E.A.compareTo(E.C));\
+         System.out.println(E.C.compareTo(E.A));\
+         System.out.println(E.B.compareTo(E.B));\
+         List<E> l = new ArrayList<>(List.of(E.C, E.A, E.B));\
+         Collections.sort(l);\
+         System.out.println(l); } }");
+    assert!(ok);
+    assert_eq!(out, "-2\n2\n0\n[A, B, C]\n");
+}
+
+#[test]
+fn a_sort_with_no_comparator_orders_by_the_elements_own_compare_to() {
+    // `Collections.sort(l)` and `l.sort(null)` order by `compareTo`. The host's
+    // natural order knows numbers and strings and answered "equal" for anything
+    // else, so a list of a user `Comparable` came back in insertion order — the
+    // reversing `compareTo` below makes that indistinguishable from "sorted"
+    // unless the element's own body actually runs.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class T {\
+         static class Pt implements Comparable<Pt> {\
+         int x; Pt(int x) { this.x = x; }\
+         public int compareTo(Pt o) { return Integer.compare(o.x, x); }\
+         public String toString() { return \"Pt\" + x; } }\
+         static String show(List<Pt> l) { String s = \"\"; for (Pt p : l) { s = s + p + \" \"; } return s.trim(); }\
+         public static void main(String[] a) {\
+         List<Pt> l = new ArrayList<>(); l.add(new Pt(1)); l.add(new Pt(3)); l.add(new Pt(2));\
+         Collections.sort(l); System.out.println(show(l));\
+         List<Pt> m = new ArrayList<>(); m.add(new Pt(1)); m.add(new Pt(3)); m.add(new Pt(2));\
+         m.sort(null); System.out.println(show(m)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "Pt3 Pt2 Pt1\nPt3 Pt2 Pt1\n");
+}
+
+#[test]
+fn comparator_statics_order_by_the_elements_natural_ordering() {
+    // `Comparator.naturalOrder`/`reverseOrder`/`comparing` were absent because
+    // the only `compareTo` a prelude body could reach was the `String` one. The
+    // record case also pins that `comparing`'s key extractor — a method
+    // reference whose parameter has no static type — reaches the record's own
+    // accessor rather than being read as a `String` method.
+    let (out, ok) = run(
+        "import java.util.*; import java.util.function.*;\
+         public class T { record P(String n, int a) {}\
+         static String show(List<P> l) { String s = \"\"; for (P p : l) { s = s + p.n() + p.a() + \" \"; } return s.trim(); }\
+         public static void main(String[] x) {\
+         List<Integer> li = new ArrayList<>(List.of(3, 1, 10, 2));\
+         li.sort(Comparator.naturalOrder()); System.out.println(li);\
+         li.sort(Comparator.reverseOrder()); System.out.println(li);\
+         List<P> lp = new ArrayList<>(List.of(new P(\"b\", 2), new P(\"a\", 3), new P(\"c\", 1)));\
+         lp.sort(Comparator.comparing(P::n)); System.out.println(show(lp));\
+         lp.sort(Comparator.comparing(P::a)); System.out.println(show(lp));\
+         lp.sort(Comparator.comparing(P::n).reversed()); System.out.println(show(lp)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[1, 2, 3, 10]\n[10, 3, 2, 1]\na3 b2 c1\nc1 b2 a3\nc1 b2 a3\n"
+    );
+}
+
+#[test]
+fn sorting_is_stable_across_the_merge_passes() {
+    // `List.sort` is specified stable. Twelve elements over three keys puts the
+    // merge through four passes with runs of every width, so a merge that took
+    // ties from the right run instead of the left would reorder them.
+    let (out, ok) = run("import java.util.*; import java.util.function.*;\
+         public class T { record R(String k, int v) {}\
+         public static void main(String[] a) {\
+         List<R> l = new ArrayList<>();\
+         for (int i = 0; i < 12; i++) { l.add(new R(\"k\" + (i % 3), i)); }\
+         l.sort(Comparator.comparing(R::k));\
+         String s = \"\"; for (R r : l) { s = s + r.k() + r.v() + \" \"; }\
+         System.out.println(s.trim()); } }");
+    assert!(ok);
+    assert_eq!(out, "k00 k03 k06 k09 k11 k14 k17 k110 k22 k25 k28 k211\n");
+}
+
+#[test]
+fn a_format_conversion_rejects_an_argument_of_the_wrong_boxed_type() {
+    // `java.util.Formatter` type-checks each conversion against the argument's
+    // boxed class. `String.format("%.2f", 3)` formatted the `int` as `3.00`
+    // where Java throws — a silently accepted wrong-typed argument. The detail
+    // messages are Java's own, which is why the static type has to reach the
+    // runtime: one `Value::Int` stands for `Integer`, `Long` and `char` alike.
+    let (out, ok) = run(&wrap(
+        "int i = 3; long lg = 3L; double d = 3.5; float f = 3.5f; char c = 'A'; String s = \"x\";\
+         try { System.out.println(String.format(\"%.2f\", i)); } catch (Exception e) { System.out.println(e); }\
+         try { System.out.println(String.format(\"%f\", lg)); } catch (Exception e) { System.out.println(e); }\
+         try { System.out.println(String.format(\"%d\", d)); } catch (Exception e) { System.out.println(e); }\
+         try { System.out.println(String.format(\"%x\", f)); } catch (Exception e) { System.out.println(e); }\
+         try { System.out.println(String.format(\"%d\", c)); } catch (Exception e) { System.out.println(e); }\
+         try { System.out.println(String.format(\"%c\", s)); } catch (Exception e) { System.out.println(e); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.IllegalFormatConversionException: f != java.lang.Integer\n\
+         java.util.IllegalFormatConversionException: f != java.lang.Long\n\
+         java.util.IllegalFormatConversionException: d != java.lang.Double\n\
+         java.util.IllegalFormatConversionException: x != java.lang.Float\n\
+         java.util.IllegalFormatConversionException: d != java.lang.Character\n\
+         java.util.IllegalFormatConversionException: c != java.lang.String\n"
+    );
+}
+
+#[test]
+fn the_conversions_that_accept_their_argument_still_do() {
+    // The other half of the type check: the combinations Java accepts must not
+    // start throwing. `%s` and `%b` take anything, `%c` takes a `char` or an
+    // integral code point, and a `null` prints as `null` under every conversion
+    // but `%b` — with the width and precision still applied.
+    let (out, ok) = run(&wrap(
+        "int i = 3; double d = 3.5; char c = 'A'; Object n = null;\
+         System.out.println(String.format(\"%d|%.2f|%c|%s|%b\", i, d, c, i, i));\
+         System.out.println(String.format(\"%c|%,d|%05.1f\", 66, 1234567, d));\
+         System.out.println(String.format(\"[%.2s][%6s][%-6d][%06.2f][%S][%b]\", n, n, n, n, n, n));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "3|3.50|A|3|true\nB|1,234,567|003.5\n[nu][  null][null  ][    nu][NULL][false]\n"
+    );
+}
+
+#[test]
+fn an_undeclared_name_is_a_compile_error_not_a_null() {
+    // A bare name nothing declares used to read an unset cell and evaluate to
+    // `null`, so `undefinedVar` printed `null` and `undefinedVar + 1` printed
+    // `null1` — a typo becoming output. It is also what made an unmodeled class
+    // a *runtime* failure: `IntStream.range(0, 3)` reported
+    // `NullPointerException: Cannot invoke "String.range()"`, which is neither
+    // Java's answer nor the honest "javars does not model this" error.
+    for src in [
+        "System.out.println(undefinedVar);",
+        "int y = undefinedVar + 1; System.out.println(y);",
+        "System.out.println(Foo.bar());",
+        "System.out.println(IntStream.range(0, 3).sum());",
+    ] {
+        let (_, err, ok) = run_streams(&wrap(src));
+        assert!(!ok, "must not run: {src}");
+        assert!(
+            err.contains("cannot find symbol"),
+            "expected a compile diagnostic for {src:?}, got: {err:?}"
+        );
+    }
+    // The `null` literal reaches the compiler as a bare name too, and must keep
+    // resolving to nothing.
+    let (out, ok) = run(&wrap(
+        "String s = null; System.out.println(s == null); Object o = null; System.out.println(o);",
+    ));
+    assert!(ok);
+    assert_eq!(out, "true\nnull\n");
+}

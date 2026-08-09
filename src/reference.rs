@@ -1630,8 +1630,29 @@ pub const REFERENCE: &[Entry] = &[
         "ConcurrentModificationException",
         "Throwables",
         "class ConcurrentModificationException extends RuntimeException",
-        "Raised by a `List.subList` view whose backing list was structurally modified behind it — an `add`, a `remove`, or a `Collections.sort` (which bumps Java's `modCount` even though the length is unchanged). It is the one modeled throwable outside `java.lang` besides `PatternSyntaxException`, and prints as `java.util.ConcurrentModificationException`.",
+        "Raised by a `List.subList` view whose backing list was structurally modified behind it — an `add`, a `remove`, or a `Collections.sort` (which bumps Java's `modCount` even though the length is unchanged). One of the modeled throwables outside `java.lang`, and prints as `java.util.ConcurrentModificationException`.",
         "List<Integer> l = new ArrayList<>(List.of(1, 2, 3));\nList<Integer> v = l.subList(0, 2);\nl.add(4);\n// v.get(0);   // ConcurrentModificationException",
+    ),
+    (
+        "NoSuchElementException",
+        "Throwables",
+        "class NoSuchElementException extends RuntimeException",
+        "Raised by `Collections.max`/`min` on an empty collection. Java's carries no detail message there, and neither does this one; it prints as `java.util.NoSuchElementException`.",
+        "try { Collections.max(new ArrayList<>()); } catch (NoSuchElementException e) { System.out.println(e); }",
+    ),
+    (
+        "IllegalFormatException",
+        "Throwables",
+        "class IllegalFormatException extends IllegalArgumentException",
+        "The base of the `java.util.Formatter` failures. It is not thrown directly; catching it catches the conversion mismatch below.",
+        "try { String.format(\"%d\", 1.5); } catch (IllegalFormatException e) { System.out.println(\"bad format\"); }",
+    ),
+    (
+        "IllegalFormatConversionException",
+        "Throwables",
+        "class IllegalFormatConversionException extends IllegalFormatException",
+        "Raised when a `String.format`/`printf` conversion does not accept its argument's boxed type — `%d` of a `Double`, `%f` of an `Integer`, `%c` of a `String`. The detail message is Java's `<conversion> != <class>`.",
+        "try { System.out.println(String.format(\"%.2f\", 3)); } catch (IllegalFormatConversionException e) { System.out.println(e.getMessage()); }   // f != java.lang.Integer",
     ),
     // ── Functional Interfaces: `prelude.rs` `FUNCTIONAL`. Each is declared to
     //    javars as an ordinary one-method interface, so a lambda assigned to one
@@ -1716,9 +1737,9 @@ pub const REFERENCE: &[Entry] = &[
     (
         "Comparator",
         "Functional Interfaces",
-        "interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); }",
-        "An ordering, and the type `List.sort` and the two-argument `Collections.sort` accept. The `int` return is kept rather than erased, because the sort reads its sign. `reversed` and `thenComparing` are declared; the `comparing`/`naturalOrder`/`reverseOrder` statics are not, because they order arbitrary keys by an element's own `compareTo`, which javars has no dispatch for.",
-        "xs.sort((a, b) -> a.length() - b.length());",
+        "interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); }",
+        "An ordering, and the type `List.sort` and the two-argument `Collections.sort` accept. The `int` return is kept rather than erased, because the sort reads its sign. The three statics order elements by their own `compareTo`, which reaches a user `Comparable`'s body through the receiver's runtime class. A sort naming no comparator uses `naturalOrder()`.",
+        "xs.sort(Comparator.comparing(P::name).reversed());",
     ),
     (
         "IntSupplier",

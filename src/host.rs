@@ -252,6 +252,36 @@ pub const JF32_STR: u16 = 738;
 /// arithmetic in javars that does.
 pub const JF32_ARITH: u16 = 739;
 
+/// `Comparable.compareTo` on a receiver that is not a user class instance.
+/// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
+///
+/// Every boxed type spells `compareTo` differently and the answers are not
+/// interchangeable: `Integer`/`Long` return the *sign* only, `Byte`/`Short`/
+/// `Character` return the arithmetic difference, `Double`/`Float` go through
+/// `Double.compare` (so `NaN` sorts above everything and `-0.0` below `0.0`),
+/// `Boolean` is `false < true`, and `String` is the first differing `char`'s
+/// difference. Routing them all through the `String` method — which is what
+/// happened before this builtin existed — answered `Integer.valueOf(10)
+/// .compareTo(9)` with `-8` (`'1' - '9'`) where Java answers `1`.
+///
+/// `tag` is the receiver's static Java type when the compiler knew it, else the
+/// empty string, in which case the runtime value picks the rule.
+pub const JCOMPARE_TO: u16 = 740;
+
+/// `String.format(fmt, args…)`. Stack `[fmt, arg0, …, argN, tags]` (`tags` on
+/// top); `argc == N + 2`.
+///
+/// `java.util.Formatter` type-checks every conversion against the *boxed class*
+/// of its argument and throws `IllegalFormatConversionException` on a mismatch
+/// — `%d` of a `Double`, `%f` of an `Integer`, `%c` of a `String`. fusevm's
+/// value model cannot supply that class: one `Value::Int` stands for `Integer`,
+/// `Long`, `Short`, `Byte` and `char` alike. So the compiler, which does know
+/// each argument's static Java type, sends the boxed class names along in
+/// `tags` — one per argument, `\x1f`-separated, an empty entry where the type
+/// was not inferable (a lambda parameter, an erased `List.get`). The runtime
+/// value picks the class for those.
+pub const JFORMAT: u16 = 741;
+
 /// The [`JF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -552,6 +582,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JF32, b_f32);
     vm.register_builtin(JF32_STR, b_f32_str);
     vm.register_builtin(JF32_ARITH, b_f32_arith);
+    vm.register_builtin(JCOMPARE_TO, b_compare_to);
+    vm.register_builtin(JFORMAT, b_format);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -1800,21 +1832,45 @@ fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Valu
         return Err(Fault::internal("javars: `sort` needs a Comparator lambda"));
     }
     // `sort_by` needs a total order it can trust; a user comparator may not give
-    // one, so an insertion sort is used instead — stable, and it can never panic
-    // on an inconsistent comparator the way `sort_by` can.
-    let mut out: Vec<Value> = Vec::with_capacity(items.len());
-    for it in items {
-        let mut at = out.len();
-        for (i, existing) in out.iter().enumerate() {
-            let r = invoke_closure(vm, cmp, &[existing.clone(), it.clone()]);
-            if r.to_int() > 0 {
-                at = i;
-                break;
+    // one, so a bottom-up merge sort is used instead — stable (which `List.sort`
+    // is specified to be), n log n, and it can never panic on an inconsistent
+    // comparator the way `sort_by` can. Every sort that names no comparator now
+    // arrives here too, because the compiler supplies `(a, b) -> a.compareTo(b)`
+    // for those (see `natural_order_comparator`), so this is the one sort in the
+    // frontend and its cost is the one that matters.
+    let n = items.len();
+    let mut buf: Vec<Value> = items.clone();
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            let (mut i, mut j) = (lo, mid);
+            for slot in lo..hi {
+                // Take from the left run unless the right one compares strictly
+                // smaller — the tie going left is what makes the merge stable.
+                let take_left = if i >= mid {
+                    false
+                } else if j >= hi {
+                    true
+                } else {
+                    invoke_closure(vm, cmp, &[items[j].clone(), items[i].clone()]).to_int() >= 0
+                };
+                if take_left {
+                    buf[slot] = items[i].clone();
+                    i += 1;
+                } else {
+                    buf[slot] = items[j].clone();
+                    j += 1;
+                }
             }
+            lo = hi;
         }
-        out.insert(at, it);
+        std::mem::swap(&mut items, &mut buf);
+        width *= 2;
     }
-    Ok(out)
+    Ok(items)
 }
 
 /// Invoke `clo` with `args` through the closure-call path, discarding the arity
@@ -2212,6 +2268,83 @@ fn compare_strings(a: &str, b: &str, fold_case: bool) -> i64 {
     x.len() as i64 - y.len() as i64
 }
 
+/// `Double.compare`/`Float.compare`: the numeric order, except that it is a
+/// *total* order — `NaN` compares greater than every other value including
+/// itself, and `-0.0` compares less than `0.0`. Java gets both by falling back
+/// to the raw bit pattern once `<` and `>` have both said no, which is what
+/// `total_cmp` does; ordering by `f64` bits agrees with ordering by `f32` bits
+/// on every value a `float` can hold, so one routine serves both.
+fn double_compare(a: f64, b: f64) -> i64 {
+    match a.total_cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// [`JCOMPARE_TO`] — `compareTo` on a boxed primitive or a `String`.
+fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
+    let tag = vm
+        .stack
+        .pop()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let b = vm.stack.pop().unwrap_or(Value::Undef);
+    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    // Java's own `Integer.compareTo(null)` is an NPE, and so is a call on a
+    // `null` receiver. Both report the same way every other javars NPE does.
+    if matches!(a, Value::Undef) {
+        return raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                "Cannot invoke \"java.lang.Comparable.compareTo(Object)\" because the receiver is null",
+            ),
+        );
+    }
+    // A class instance here means no user class declares a one-argument
+    // `compareTo`, so there is no body to run — `javac` would have rejected the
+    // call. Say so rather than comparing the object's default `toString`.
+    if let Value::Obj(id) = a {
+        let class = HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Instance { class, .. }) => Some(class.clone()),
+            _ => None,
+        });
+        if let Some(class) = class {
+            return raise(
+                vm,
+                Fault::internal(format!(
+                    "javars: class `{class}` does not declare `compareTo`"
+                )),
+            );
+        }
+    }
+    Value::Int(match tag.as_str() {
+        // Sign only: `Integer.compare` is `(x < y) ? -1 : ((x == y) ? 0 : 1)`.
+        "Integer" | "int" | "Long" | "long" => as_i64(&a).cmp(&as_i64(&b)) as i64,
+        // Difference: `Character.compareTo` is `this.value - other.value`, and
+        // `Byte`/`Short` are the same subtraction. `as_i64` reads a boxed
+        // `Character` in either of the two shapes javars stores it in — the code
+        // point, and the one-character String a collection element carries.
+        "Character" | "char" | "Short" | "short" | "Byte" | "byte" => as_i64(&a) - as_i64(&b),
+        "Double" | "double" | "Float" | "float" => double_compare(as_f64(&a), as_f64(&b)),
+        "Boolean" | "boolean" => i64::from(a.is_truthy()) - i64::from(b.is_truthy()),
+        "String" | "CharSequence" => compare_strings(&a.as_str_cow(), &b.as_str_cow(), false),
+        // The compiler could not name the receiver's type — an erased
+        // `List.get` result is the usual reason. The runtime values decide, and
+        // `Integer` is the reading a bare integer gets, being the box a literal
+        // autoboxes to.
+        _ => match (&a, &b) {
+            (Value::Str(_), _) | (_, Value::Str(_)) => {
+                compare_strings(&a.as_str_cow(), &b.as_str_cow(), false)
+            }
+            (Value::Float(_), _) | (_, Value::Float(_)) => double_compare(as_f64(&a), as_f64(&b)),
+            (Value::Bool(_), Value::Bool(_)) => i64::from(a.is_truthy()) - i64::from(b.is_truthy()),
+            _ => as_i64(&a).cmp(&as_i64(&b)) as i64,
+        },
+    })
+}
+
 /// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
 /// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
 /// consistent with javars's existing "a `char` literal is a one-character
@@ -2303,7 +2436,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         )))),
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
-        ("formatted", _) => java_format(s, args),
+        ("formatted", _) => java_format(s, args, &[]),
         // The four `java.util.regex` methods, on the engine in `crate::regex`.
         // `split(regex)` is `split(regex, 0)`: trailing empty fields are dropped
         // (interior ones are not), and a no-match returns the whole input.
@@ -2708,7 +2841,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `String.format(fmt, args…)` — printf-style formatting (subset).
         ("String", "format", _) if !args.is_empty() => {
             let fmt = args[0].as_str_cow().into_owned();
-            java_format(&fmt, &args[1..])
+            java_format(&fmt, &args[1..], &[])
         }
 
         // `String.join(sep, a, b, …)`, `String.join(sep, array)`, and
@@ -2983,7 +3116,7 @@ fn arrays_to_string(v: &Value) -> String {
 /// (zero-pad), `+` (leading sign) flags, an optional width, and an optional
 /// `.precision` (decimals for `f`, max length for `s`). Unsupported conversions
 /// surface an error rather than a wrong string.
-fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
+fn java_format(fmt: &str, args: &[Value], tags: &[&str]) -> Result<Value, Fault> {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     let mut argi = 0usize;
@@ -3076,6 +3209,7 @@ fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
                 if explicit_index.is_none() {
                     argi += 1;
                 }
+                check_conversion(conv, arg, tags.get(idx).copied().unwrap_or(""))?;
                 let (mut s, numeric) = format_conversion(conv, arg, prec, plus)?;
                 if group && numeric {
                     s = group_digits(&s);
@@ -3092,6 +3226,113 @@ fn java_format(fmt: &str, args: &[Value]) -> Result<Value, Fault> {
         }
     }
     Ok(Value::str(out))
+}
+
+/// The boxed class `java.util.Formatter` sees for one argument: the static Java
+/// type the compiler recorded when it had one, else the class the runtime value
+/// implies. `None` for `null`, which every conversion accepts and prints as
+/// `null`.
+fn boxed_class(tag: &str, v: &Value) -> Option<&'static str> {
+    if matches!(v, Value::Undef) {
+        return None;
+    }
+    Some(match tag {
+        "int" | "Integer" => "java.lang.Integer",
+        "long" | "Long" => "java.lang.Long",
+        "short" | "Short" => "java.lang.Short",
+        "byte" | "Byte" => "java.lang.Byte",
+        "char" | "Character" => "java.lang.Character",
+        "double" | "Double" => "java.lang.Double",
+        "float" | "Float" => "java.lang.Float",
+        "boolean" | "Boolean" => "java.lang.Boolean",
+        "String" => "java.lang.String",
+        // No static type. The value model collapses `Integer`/`Long`/`Short`/
+        // `Byte` onto one variant and `Double`/`Float` onto another, so the
+        // widest of each group is the reading — `Integer` for an integer,
+        // because that is what a literal autoboxes to.
+        _ => match v {
+            Value::Int(_) => "java.lang.Integer",
+            Value::Float(_) => "java.lang.Double",
+            Value::Bool(_) => "java.lang.Boolean",
+            Value::Str(_) => "java.lang.String",
+            // A heap object's class is not one the conversion table rejects.
+            _ => return None,
+        },
+    })
+}
+
+/// Reject a conversion whose argument is the wrong boxed type, the way
+/// `java.util.Formatter` does — `%d` takes the integral boxes only, `%f` the
+/// floating ones only, `%c` a `Character` or an integral code point. `%s`,
+/// `%b`, and `%h` take anything, and a `null` argument prints as `null` under
+/// every conversion rather than throwing.
+///
+/// Without this, `String.format("%.2f", 3)` answered `3.00` where Java throws:
+/// a silently-formatted wrong-typed argument instead of the program's real
+/// behaviour.
+fn check_conversion(conv: char, arg: &Value, tag: &str) -> Result<(), Fault> {
+    let integral = [
+        "java.lang.Integer",
+        "java.lang.Long",
+        "java.lang.Short",
+        "java.lang.Byte",
+    ];
+    let ok = |cls: &str| -> bool {
+        match conv {
+            'd' | 'x' | 'X' | 'o' => integral.contains(&cls),
+            'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' => {
+                matches!(cls, "java.lang.Double" | "java.lang.Float")
+            }
+            'c' | 'C' => {
+                cls == "java.lang.Character"
+                    // javars models a `char` value as a one-character String
+                    // wherever it has crossed into text (a collection element,
+                    // a `%s` slot), so a String whose type the compiler could
+                    // not name is a `char` as often as it is a `String`. Only a
+                    // *declared* `String` is rejected here; see `check_char`.
+                    || integral.contains(&cls)
+            }
+            _ => true,
+        }
+    };
+    let Some(cls) = boxed_class(tag, arg) else {
+        return Ok(());
+    };
+    if ok(cls) {
+        return Ok(());
+    }
+    // The unknown-tag `%c` case: a bare String could be javars's `char`
+    // spelling, so it is only rejected when the compiler named the type.
+    if matches!(conv, 'c' | 'C') && tag.is_empty() {
+        return Ok(());
+    }
+    Err(Fault::java(
+        "IllegalFormatConversionException",
+        format!("{conv} != {cls}"),
+    ))
+}
+
+/// [`JFORMAT`] — `String.format` with the compiler's per-argument type tags.
+fn b_format(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let tag_blob = args
+        .last()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let tags: Vec<&str> = if tag_blob.is_empty() {
+        Vec::new()
+    } else {
+        tag_blob.split('\x1f').collect()
+    };
+    let fmt = args
+        .first()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let body = &args[1..args.len().saturating_sub(1)];
+    match java_format(&fmt, body, &tags) {
+        Ok(v) => v,
+        Err(f) => raise(vm, f),
+    }
 }
 
 /// Render one `String.format` conversion. Returns the rendered text and whether
@@ -3113,6 +3354,17 @@ fn format_conversion(
             ""
         }
     };
+    // Every `Formatter.print*` starts with `if (arg == null) print("null")`, so
+    // a `null` renders as the four characters under every conversion — width and
+    // precision still apply, and it is not numeric, so `%08d` of `null` pads
+    // with spaces. `%b`/`%B` are the exception: they answer `false`.
+    if matches!(arg, Value::Undef) && !matches!(conv, 'b' | 'B') {
+        let mut s: String = "null".chars().take(prec.unwrap_or(4)).collect();
+        if conv.is_ascii_uppercase() {
+            s = s.to_uppercase();
+        }
+        return Ok((s, false));
+    }
     // Renderings that build from `x.abs()` need the sign put back explicitly.
     let signed = |x: f64, body: String| {
         format!(

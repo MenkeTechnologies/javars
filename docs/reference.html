@@ -1517,11 +1517,29 @@ try { System.out.println(a[5]); } catch (ArrayIndexOutOfBoundsException e) { Sys
         <article class="doc-entry" id="doc-throwables-16">
           <h3><a class="doc-anchor" href="#doc-throwables-16">#</a> <code>ConcurrentModificationException</code></h3>
           <pre><code class="lang-java">class ConcurrentModificationException extends RuntimeException</code></pre>
-          <p>Raised by a <code>List.subList</code> view whose backing list was structurally modified behind it — an <code>add</code>, a <code>remove</code>, or a <code>Collections.sort</code> (which bumps Java's <code>modCount</code> even though the length is unchanged). It is the one modeled throwable outside <code>java.lang</code> besides <code>PatternSyntaxException</code>, and prints as <code>java.util.ConcurrentModificationException</code>.</p>
+          <p>Raised by a <code>List.subList</code> view whose backing list was structurally modified behind it — an <code>add</code>, a <code>remove</code>, or a <code>Collections.sort</code> (which bumps Java's <code>modCount</code> even though the length is unchanged). One of the modeled throwables outside <code>java.lang</code>, and prints as <code>java.util.ConcurrentModificationException</code>.</p>
           <pre><code class="lang-java">List&lt;Integer&gt; l = new ArrayList&lt;&gt;(List.of(1, 2, 3));
 List&lt;Integer&gt; v = l.subList(0, 2);
 l.add(4);
 // v.get(0);   // ConcurrentModificationException</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-17">
+          <h3><a class="doc-anchor" href="#doc-throwables-17">#</a> <code>NoSuchElementException</code></h3>
+          <pre><code class="lang-java">class NoSuchElementException extends RuntimeException</code></pre>
+          <p>Raised by <code>Collections.max</code>/<code>min</code> on an empty collection. Java's carries no detail message there, and neither does this one; it prints as <code>java.util.NoSuchElementException</code>.</p>
+          <pre><code class="lang-java">try { Collections.max(new ArrayList&lt;&gt;()); } catch (NoSuchElementException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-18">
+          <h3><a class="doc-anchor" href="#doc-throwables-18">#</a> <code>IllegalFormatException</code></h3>
+          <pre><code class="lang-java">class IllegalFormatException extends IllegalArgumentException</code></pre>
+          <p>The base of the <code>java.util.Formatter</code> failures. It is not thrown directly; catching it catches the conversion mismatch below.</p>
+          <pre><code class="lang-java">try { String.format("%d", 1.5); } catch (IllegalFormatException e) { System.out.println("bad format"); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-19">
+          <h3><a class="doc-anchor" href="#doc-throwables-19">#</a> <code>IllegalFormatConversionException</code></h3>
+          <pre><code class="lang-java">class IllegalFormatConversionException extends IllegalFormatException</code></pre>
+          <p>Raised when a <code>String.format</code>/<code>printf</code> conversion does not accept its argument's boxed type — <code>%d</code> of a <code>Double</code>, <code>%f</code> of an <code>Integer</code>, <code>%c</code> of a <code>String</code>. The detail message is Java's <code>&lt;conversion&gt; != &lt;class&gt;</code>.</p>
+          <pre><code class="lang-java">try { System.out.println(String.format("%.2f", 3)); } catch (IllegalFormatConversionException e) { System.out.println(e.getMessage()); }   // f != java.lang.Integer</code></pre>
         </article>
       </section>
 
@@ -1605,9 +1623,9 @@ System.out.println(eq.test("a", "a"));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-12">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-12">#</a> <code>Comparator</code></h3>
-          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); }</code></pre>
-          <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign. <code>reversed</code> and <code>thenComparing</code> are declared; the <code>comparing</code>/<code>naturalOrder</code>/<code>reverseOrder</code> statics are not, because they order arbitrary keys by an element's own <code>compareTo</code>, which javars has no dispatch for.</p>
-          <pre><code class="lang-java">xs.sort((a, b) -&gt; a.length() - b.length());</code></pre>
+          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); }</code></pre>
+          <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign. The three statics order elements by their own <code>compareTo</code>, which reaches a user <code>Comparable</code>'s body through the receiver's runtime class. A sort naming no comparator uses <code>naturalOrder()</code>.</p>
+          <pre><code class="lang-java">xs.sort(Comparator.comparing(P::name).reversed());</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-13">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-13">#</a> <code>IntSupplier</code></h3>

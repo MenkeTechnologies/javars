@@ -28,6 +28,11 @@ const RUST_COMPILE: &str = "__rust_compile";
 /// constructor chaining is a separate [`Expr::Call`] shape.)
 const SUPER: &str = "super";
 
+/// Java's `null` literal reaches the compiler as a bare name (the lexer has no
+/// null token), and reading the never-assigned cell is exactly `Value::Undef` —
+/// so it is a name that legitimately resolves to nothing.
+const NULL_LITERAL: &str = "null";
+
 /// The static numeric category of an expression, used to reproduce Java's
 /// binary numeric promotion. Java's `/` truncates when both operands are
 /// integral and divides as floating point when either is `float`/`double`; the
@@ -4324,6 +4329,18 @@ impl Compiler {
                     self.emit_field_get(name, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
                     self.emit_global_get(&static_global(&class, name), 0);
+                } else if !self.is_declared_var(name) && name != NULL_LITERAL {
+                    // Nothing declares this name. Java's answer is "cannot find
+                    // symbol"; javars read the unset cell instead and got
+                    // `null`, so `undefinedVar` printed `null` and
+                    // `undefinedVar + 1` printed `null1` — a typo becoming
+                    // output rather than a diagnostic. It is also what made
+                    // naming an unmodeled class a *runtime* failure:
+                    // `IntStream.range(0, 3)` reported
+                    // `NullPointerException: Cannot invoke "String.range()"`,
+                    // because `IntStream` is, to javars, just an undeclared
+                    // name.
+                    return Err(format!("javars: cannot find symbol: `{name}`"));
                 } else {
                     self.emit_get(name, 0);
                 }
@@ -4496,6 +4513,34 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
             return Ok(());
         }
+        // A sort with no comparator orders by the elements' own `compareTo`,
+        // which only a Java-level call can reach — the host's `natural_cmp`
+        // knows numbers and strings and answers "equal" for everything else, so
+        // a `List` of a user `Comparable` came back in its original order. The
+        // missing comparator is supplied here instead, as the same
+        // `(a, b) -> a.compareTo(b)` lambda `Comparator.naturalOrder()` is.
+        if method == "sort" {
+            let collections_sort = matches!(recv, Expr::Var(c) if c == "Collections")
+                && !self.is_declared_var("Collections");
+            let explicit_null = |e: &Expr| matches!(e, Expr::Var(n) if n == NULL_LITERAL);
+            let natural = if collections_sort {
+                match args {
+                    [l] => Some(vec![l.clone(), natural_order_comparator(line)]),
+                    [l, c] if explicit_null(c) => {
+                        Some(vec![l.clone(), natural_order_comparator(line)])
+                    }
+                    _ => None,
+                }
+            } else {
+                match args {
+                    [c] if explicit_null(c) => Some(vec![natural_order_comparator(line)]),
+                    _ => None,
+                }
+            };
+            if let Some(args) = natural {
+                return self.method_call(recv, method, &args, line);
+            }
+        }
         // `super.method(args)` is the one call that must NOT go through the
         // virtual dispatch chain: it names the superclass's implementation of a
         // method the receiver's own class overrides. It is intercepted here,
@@ -4587,6 +4632,24 @@ impl Compiler {
                         self.expr(a)?;
                     }
                 }
+                // `java.util.Formatter` rejects a conversion whose argument is
+                // the wrong boxed type, and only the compiler knows which box
+                // each argument is — `Value::Int` is `Integer`, `Long`,
+                // `Short`, `Byte` and `char` all at once. So `String.format`
+                // gets its own builtin, taking the static types alongside the
+                // values. An argument whose type javars could not infer sends
+                // an empty tag and is classified from its runtime value.
+                if text_slots.is_some() {
+                    let tags: Vec<String> = args
+                        .iter()
+                        .skip(1)
+                        .map(|a| self.expr_java_type(a).unwrap_or_default())
+                        .collect();
+                    let tags_c = self.b.add_constant(Value::str(tags.join("\x1f")));
+                    self.b.emit(Op::LoadConst(tags_c), line);
+                    self.emit_raising_builtin(crate::host::JFORMAT, args.len() as u8 + 1, line);
+                    return Ok(());
+                }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
                 let method_c = self.b.add_constant(Value::str(method.to_string()));
@@ -4673,17 +4736,163 @@ impl Compiler {
             self.emit_raising_builtin(crate::host::JCOLL_DISPATCH, args.len() as u8 + 2, line);
             return Ok(());
         }
-        // Otherwise a `String` method. Every `String` method that takes a `char`
-        // (`indexOf`, `replace`, `concat`, …) accepts its one-character String
-        // spelling, and the ones taking an index take an `int` this leaves alone.
-        self.expr(recv)?;
-        for a in args {
-            self.emit_char_string(a)?;
+        self.emit_erased_call(recv, method, args, line)
+    }
+
+    /// Lower `recv.method(args)` where the receiver's static class is **not** a
+    /// user class — a boxed primitive, a `String`, an erased `List.get` result,
+    /// a lambda parameter, an `Object` upcast.
+    ///
+    /// Two things can be true of such a receiver at runtime that the static type
+    /// does not say, and both used to be answered wrongly:
+    ///
+    ///   * It may be an instance of a user class. `Comparator.comparing(P::n)`
+    ///     calls `n()` on a lambda parameter; `list.get(0).compareTo(x)` calls a
+    ///     user `Comparable`'s own method. Both reached [`crate::host::JSTR_DISPATCH`]
+    ///     and were answered by the `String` method of that name — a wrong
+    ///     answer for `compareTo` (two `toString`s compared as text) and an
+    ///     "unsupported String method" for everything else. So the receiver's
+    ///     *runtime* class is read and matched against every concrete user class
+    ///     declaring that name and arity, exactly as virtual dispatch does when
+    ///     the static class is known.
+    ///   * For `compareTo` specifically, the boxed type decides the answer, so
+    ///     the receiver's static Java type rides along to
+    ///     [`crate::host::JCOMPARE_TO`] as a tag.
+    ///
+    /// The `String` method remains the last arm, which is what keeps a genuine
+    /// `String` receiver — and the collection and closure receivers
+    /// `b_str_dispatch` resolves at runtime — behaving as before.
+    fn emit_erased_call(
+        &mut self,
+        recv: &Expr,
+        method: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        let tag = self.expr_java_type(recv).unwrap_or_default();
+        let is_compare = method == "compareTo" && args.len() == 1;
+        // A `char`/`Character` receiver compares as a code point, so `compareTo`
+        // keeps its argument a number; every other call keeps the
+        // one-character-String spelling the rest of the frontend uses.
+        let raw_args = is_compare && matches!(tag.as_str(), "char" | "Character");
+        // The concrete user classes declaring this name and arity, as
+        // (runtime class, subroutine). A receiver the compiler already typed as
+        // a boxed primitive or a `String` can never be one of them.
+        let param_tys: Vec<String> = vec!["Object".to_string(); args.len()];
+        // An erasure (`Object`, or no inferred type at all) is what leaves the
+        // door open; a receiver already typed as a boxed primitive, a `String`
+        // or a collection is never a user instance and needs no chain.
+        let erased = !matches!(
+            tag.as_str(),
+            "int"
+                | "long"
+                | "short"
+                | "byte"
+                | "char"
+                | "boolean"
+                | "double"
+                | "float"
+                | "Integer"
+                | "Long"
+                | "Short"
+                | "Byte"
+                | "Character"
+                | "Boolean"
+                | "Double"
+                | "Float"
+                | "String"
+                | "CharSequence"
+        ) && collection_kind(&tag).is_none();
+        let mut targets: Vec<(String, String)> = if erased {
+            self.classes
+                .iter()
+                .filter(|(_, ci)| !ci.is_interface)
+                .map(|(k, _)| k.clone())
+                .filter_map(|k| {
+                    self.resolve_instance_sig(&k, method, &param_tys)
+                        .map(|(m, _)| (k, m))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        targets.sort();
+        // The last arm: `compareTo`'s typed comparison, or the `String` method.
+        let fallback = |c: &mut Self| {
+            if is_compare {
+                let tag_c = c.b.add_constant(Value::str(tag.clone()));
+                c.b.emit(Op::LoadConst(tag_c), line);
+                c.emit_raising_builtin(crate::host::JCOMPARE_TO, 3, line);
+            } else {
+                let name_c = c.b.add_constant(Value::str(method.to_string()));
+                c.b.emit(Op::LoadConst(name_c), line);
+                // argc counts the receiver, the arguments, and the method name.
+                c.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
+            }
+        };
+        if targets.is_empty() {
+            self.expr(recv)?;
+            for a in args {
+                if raw_args {
+                    self.expr(a)?;
+                } else {
+                    self.emit_char_string(a)?;
+                }
+            }
+            fallback(self);
+            return Ok(());
         }
-        let name_c = self.b.add_constant(Value::str(method.to_string()));
-        self.b.emit(Op::LoadConst(name_c), line);
-        // argc counts the receiver, the arguments, and the method-name string.
-        self.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
+        // Evaluate receiver and arguments once, then branch on the runtime class.
+        let recv_t = self.temp();
+        self.expr(recv)?;
+        self.emit_set(&recv_t, line);
+        let arg_ts: Vec<String> = args
+            .iter()
+            .map(|a| {
+                let t = self.temp();
+                if raw_args {
+                    self.expr(a)?;
+                } else {
+                    self.emit_char_string(a)?;
+                }
+                self.emit_set(&t, line);
+                Ok(t)
+            })
+            .collect::<Result<_, String>>()?;
+        let class_t = self.temp();
+        self.emit_get(&recv_t, line);
+        self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
+        self.emit_set(&class_t, line);
+        let argc = args.len() as u8 + 1;
+        let mut end_jumps = Vec::new();
+        for (class, mangled) in &targets {
+            self.emit_get(&class_t, line);
+            let cc = self.b.add_constant(Value::str(class.clone()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::StrEq, line);
+            let skip = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_get(&recv_t, line);
+            for t in &arg_ts {
+                self.emit_get(t, line);
+            }
+            let idx = self.b.add_name(mangled);
+            self.b.emit(Op::Call(idx, argc), line);
+            self.emit_exc_check(line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(skip, next);
+        }
+        // Not one of them: a `String`, a boxed primitive, a collection, or a
+        // closure — all of which the fallback resolves.
+        self.emit_get(&recv_t, line);
+        for t in &arg_ts {
+            self.emit_get(t, line);
+        }
+        fallback(self);
+        let end = self.b.current_pos();
+        for j in end_jumps {
+            self.b.patch_jump(j, end);
+        }
         Ok(())
     }
 
@@ -5901,6 +6110,26 @@ fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
 /// `expr_java_type`. The one place that distinction changes an *answer* is
 /// `List.remove`, where the wrapper picks `remove(Object)` and the primitive
 /// picks `remove(int)`, so it is recognised syntactically here.
+/// The comparator `Comparator.naturalOrder()` denotes, as a lambda expression:
+/// `(a, b) -> a.compareTo(b)`. Synthesized for the sorts that name no
+/// comparator, so they order by the element's own `compareTo` through the same
+/// erased-receiver dispatch every other `compareTo` call uses. The `#` in the
+/// parameter names is not a legal Java identifier character, so they cannot
+/// collide with (or be shadowed by) a user variable.
+fn natural_order_comparator(line: u32) -> Expr {
+    let (a, b) = ("#cmp0".to_string(), "#cmp1".to_string());
+    Expr::Lambda {
+        params: vec![a.clone(), b.clone()],
+        body: LambdaBody::Expr(Box::new(Expr::MethodCall {
+            recv: Box::new(Expr::Var(a)),
+            method: "compareTo".to_string(),
+            args: vec![Expr::Var(b)],
+            line,
+        })),
+        line,
+    }
+}
+
 fn is_boxing_call(e: &Expr) -> bool {
     matches!(
         e,

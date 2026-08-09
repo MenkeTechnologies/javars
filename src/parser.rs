@@ -650,6 +650,41 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
             methods.push(reader(method, field, ret));
         }
     }
+    // `Enum.compareTo` is the difference of the two ordinals — declaration
+    // order — and is `final` in Java, so an enum never supplies its own. That
+    // makes every enum a `Comparable`, which is what lets `Collections.sort` of
+    // an enum list and a bare `a.compareTo(b)` between constants both work.
+    if !methods
+        .iter()
+        .any(|m| m.name == "compareTo" && m.params.len() == 1)
+    {
+        methods.push(Method {
+            name: "compareTo".to_string(),
+            owner: owner.to_string(),
+            params: vec![Param {
+                ty: owner.to_string(),
+                name: "other".to_string(),
+                varargs: false,
+            }],
+            ret: "int".to_string(),
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Field {
+                        recv: Box::new(Expr::This),
+                        name: ENUM_ORDINAL.to_string(),
+                    }),
+                    rhs: Box::new(Expr::Field {
+                        recv: Box::new(Expr::Var("other".to_string())),
+                        name: ENUM_ORDINAL.to_string(),
+                    }),
+                })),
+            )],
+            is_abstract: false,
+            line,
+        });
+    }
     // `Enum.equals` is identity — constants are singletons, so `==` is exactly
     // it, and `final` in Java (never overridden).
     if !methods
