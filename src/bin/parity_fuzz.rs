@@ -29,8 +29,14 @@
 //! (`object`). Pure random bytes only produce
 //! mutual parse errors that agree on both sides and teach nothing.
 //!
-//! Four modes exist specifically because a *shape* the rest of the generator
+//! Five modes exist specifically because a *shape* the rest of the generator
 //! could not emit hid a wrong answer behind an otherwise clean sweep:
+//!   * `super` — the qualified `super.method(args)` / `super.field`. Not one
+//!     probe in the generator wrote `super.` before this mode existed, so the
+//!     whole form was unreachable: it reached the runtime as a call on a null
+//!     receiver and every sweep was clean anyway. Its support chain declares the
+//!     same method at three levels, so a `super` that dispatched virtually would
+//!     recurse rather than answer.
 //!   * `staticref` — a **qualified** `C.m(…)` where a second, unrelated class
 //!     also declares `m`. With one static name per program, a resolver that
 //!     ignores the receiver is indistinguishable from a correct one; with two,
@@ -1525,6 +1531,56 @@ fn g_listview(r: &mut Rng) -> String {
     }
 }
 
+/// `super.member` — the qualified access that names the **superclass's**
+/// implementation of something the receiver's own class overrides.
+///
+/// It is the one call in Java that must NOT dispatch virtually, and a generator
+/// that never writes `super.` cannot tell a correct lowering from no lowering at
+/// all: every probe here would still be reachable through a plain `this.`, and
+/// most would then either recurse forever or answer the override's value. The
+/// support chain (`SupA`/`SupB`/`SupC`) is built so each shape has a distinct
+/// wrong answer — see its comment in [`SUPPORT_CLASS`].
+fn g_super(r: &mut Rng) -> String {
+    let n = pick(r, &["0", "1", "2", "7", "-3"]);
+    let s = pick(r, &["\"x\"", "\"\"", "\"zz\""]);
+    match r.below(16) {
+        // The whole chain: `SupC.f` → `SupB.f` → `SupA.f`. A virtual `super`
+        // re-enters `SupC.f` and never returns.
+        0 => format!("System.out.println(new SupC().f({n}));"),
+        // Entering the same chain through the *base* static type — the override
+        // is selected virtually, and only then does `super` stop being virtual.
+        1 => format!("{{ SupA a = new SupC(); System.out.println(a.f({n})); }}"),
+        2 => format!("{{ SupB b = new SupC(); System.out.println(b.f({n}) + \" \" + new SupB().f({n})); }}"),
+        // `super.toString()` at two levels, plus `super.tag()` reaching the
+        // grandparent's body past a parent that does not declare it.
+        3 => "System.out.println(new SupC().toString());".to_string(),
+        4 => "System.out.println(new SupB() + \" \" + new SupA());".to_string(),
+        // The callee reached by `super` still dispatches its own unqualified
+        // calls virtually, so `kind()` sees `SupC`'s `tag()`.
+        5 => "System.out.println(new SupC().kind() + \" \" + new SupB().kind());".to_string(),
+        // Overload selection happens at the superclass: a `double` argument
+        // picks `f(double)`, an `int` picks `f(int)`.
+        6 => format!("System.out.println(new SupC().fd() + \" \" + new SupC().f({n}));"),
+        // A variadic `super` call, both spellings: an array that passes through
+        // unpacked and a loose argument list that packs.
+        7 => format!("System.out.println(new SupC().vs({n}, 2));"),
+        8 => format!("{{ int[] a = {{{n}, 4}}; System.out.println(new SupC().vs(a)); }}"),
+        9 => "System.out.println(new SupC().vs());".to_string(),
+        // `super.field`, read / compound-assigned / incremented.
+        10 => "System.out.println(new SupC().bump());".to_string(),
+        11 => format!("{{ SupC c = new SupC(); c.bump(); System.out.println(c.f({n}) + \" \" + c); }}"),
+        // `super` inside a lambda body (which outlives the frame it captured)
+        // and behind a method reference.
+        12 => format!("System.out.println(new SupC().lam({n}).of());"),
+        13 => format!("System.out.println(new SupC().mref().of({s}) + new SupC().echo({s}));"),
+        // `super.equals` where the superclass is the implicit `java.lang.Object`
+        // — reference identity, which is deterministic (its `toString` and
+        // `hashCode` are not, and are left ungenerated).
+        14 => format!("{{ SupObj o = new SupObj({n}); System.out.println(o.sameAs(o) + \" \" + o.sameAs(new SupObj({n}))); }}"),
+        _ => format!("{{ SupA[] xs = {{new SupA(), new SupB(), new SupC()}}; String t = \"\"; for (SupA a : xs) t += a.f({n}) + \",\"; System.out.println(t); }}"),
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -1648,6 +1704,56 @@ const SUPPORT_CLASS: &str = concat!(
     "class Qderiv extends Qbase {\n",
     "    static String kind() { return \"deriv\"; }\n",
     "}\n",
+    // A three-level chain for the `super` mode. Every member here exists to make
+    // one wrong lowering of `super.m(...)` observable:
+    //   * `f` is declared at all three levels, so dispatching `super.f` on the
+    //     receiver's runtime class re-enters `SupC.f` and never terminates.
+    //   * `tag` is declared on `SupA` and `SupC` but NOT on `SupB`, so
+    //     `super.tag()` from `SupC` has to walk past the parent to the
+    //     grandparent's body.
+    //   * `kind`'s body calls an unqualified `tag()`, which must still dispatch
+    //     *virtually* back down to `SupC` — `super` de-virtualizes exactly one
+    //     call, not the whole callee.
+    //   * `f(int)`/`f(double)` are an overload pair, `vs` is variadic, and `n`
+    //     is a field, so `super.` is exercised at each of the forms that resolve
+    //     differently from a plain `this.`.
+    // No field is re-declared down the chain: field *hiding* is a documented
+    // BUGS.md simplification, and generating it would only reproduce it.
+    "class SupA {\n",
+    "    int n = 3;\n",
+    "    String tag() { return \"A\"; }\n",
+    "    String kind() { return \"k:\" + tag(); }\n",
+    "    String echo(String s) { return \"A\" + s; }\n",
+    "    int f(int x) { return x + 1; }\n",
+    "    int f(double x) { return 100; }\n",
+    "    int vs(int... xs) { int t = 0; for (int v : xs) t += v; return t; }\n",
+    "    public String toString() { return \"A<\" + n + \">\"; }\n",
+    "}\n",
+    "class SupB extends SupA {\n",
+    "    int f(int x) { return super.f(x) * 10; }\n",
+    "    public String toString() { return \"B[\" + super.toString() + \"]\"; }\n",
+    "}\n",
+    "class SupC extends SupB {\n",
+    "    String tag() { return \"C\"; }\n",
+    "    String kind() { return \"C/\" + super.kind(); }\n",
+    "    String echo(String s) { return \"C\" + s; }\n",
+    "    int f(int x) { return super.f(x) + 2; }\n",
+    "    int vs(int... xs) { return super.vs(xs) + super.vs(1, 2); }\n",
+    "    public String toString() { return \"C{\" + super.toString() + \",\" + super.tag() + \"}\"; }\n",
+    "    int fd() { return super.f(2.5); }\n",
+    "    int bump() { super.n += 4; super.n++; return super.n + this.n; }\n",
+    "    Sup0 lam(int k) { return () -> super.f(k) + 7; }\n",
+    "    Str1 mref() { return super::echo; }\n",
+    "}\n",
+    // A class whose superclass is the implicit `java.lang.Object`, so
+    // `super.equals` is Object's reference identity. Its `toString`/`hashCode`
+    // are deliberately not reachable here: both render an identity hash, which
+    // differs between runs of the same JVM and so has no deterministic answer.
+    "class SupObj {\n",
+    "    int v;\n",
+    "    SupObj(int v) { this.v = v; }\n",
+    "    boolean sameAs(Object o) { return super.equals(o); }\n",
+    "}\n",
 );
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1700,6 +1806,7 @@ enum Mode {
     ListOp,
     Varargs,
     ListView,
+    Super,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1750,6 +1857,7 @@ const CONCRETE: &[Mode] = &[
     Mode::ListOp,
     Mode::Varargs,
     Mode::ListView,
+    Mode::Super,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1802,6 +1910,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ListOp => "listop",
         Mode::Varargs => "varargs",
         Mode::ListView => "listview",
+        Mode::Super => "super",
     }
 }
 
@@ -1866,6 +1975,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::ListOp => g_listop(r),
         Mode::Varargs => g_varargs(r),
         Mode::ListView => g_listview(r),
+        Mode::Super => g_super(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
