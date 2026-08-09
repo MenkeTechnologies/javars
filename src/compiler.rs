@@ -21,6 +21,13 @@ use std::collections::HashMap;
 /// [`crate::rust_ffi`]).
 const RUST_COMPILE: &str = "__rust_compile";
 
+/// `super` reaches the parser as an ordinary identifier, so both of its
+/// expression forms — `super.field` and `super.method(args)` — arrive as an
+/// [`Expr::Var`] receiver. It is a Java reserved word, so no user declaration
+/// can ever produce this name and no shadowing check is needed. (`super(args)`
+/// constructor chaining is a separate [`Expr::Call`] shape.)
+const SUPER: &str = "super";
+
 /// The static numeric category of an expression, used to reproduce Java's
 /// binary numeric promotion. Java's `/` truncates when both operands are
 /// integral and divides as floating point when either is `float`/`double`; the
@@ -1244,9 +1251,25 @@ impl Compiler {
         }
     }
 
+    /// The direct superclass of the class whose body is being compiled — the
+    /// type `super` reads at. `None` outside an instance member, and for a class
+    /// whose parent is the implicit `java.lang.Object` (which javars keeps out
+    /// of the class table on purpose; see `new_object_as`).
+    fn super_class(&self) -> Option<String> {
+        let this = self.this_class.as_deref()?;
+        self.classes.get(this)?.superclass.clone()
+    }
+
     /// The declared type-name of a bare variable read `name`: a local/param/
     /// global declared type, else an instance field of the enclosing `this`.
     fn bare_var_type(&self, name: &str) -> Option<String> {
+        // `super` and `this` are the same object; only the *static* type they
+        // are read at differs. Typing it as the superclass is what resolves
+        // `super.field` and the result type of `super.m()` one level up — and
+        // `super` cannot be shadowed, because it is a Java reserved word.
+        if name == SUPER {
+            return self.super_class();
+        }
         if let Some(t) = self.var_decl_type(name) {
             return Some(t.to_string());
         }
@@ -4281,9 +4304,20 @@ impl Compiler {
                     .emit(if *b { Op::LoadTrue } else { Op::LoadFalse }, 0);
             }
             Expr::Var(name) => {
+                // `super` denotes the same object `this` does, so it evaluates
+                // to the receiver — the superclass view is entirely a
+                // compile-time matter (`bare_var_type` supplies the type,
+                // `super_call` the non-virtual dispatch). Emitting the receiver
+                // is what makes `super.f` read and write `this`'s field cell.
+                if name == SUPER {
+                    if self.this_class.is_none() {
+                        return Err("javars: `super` used outside an instance method".to_string());
+                    }
+                    self.emit_this(0);
+                }
                 // A bare name that is a field of `this` (not a local) reads
                 // `this.name`; otherwise it is a plain local/global.
-                if let Some(class) = self.enclosing_enum_constant(name) {
+                else if let Some(class) = self.enclosing_enum_constant(name) {
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if self.implicit_this_field(name).is_some() {
                     self.emit_this(0); // this
@@ -4461,6 +4495,17 @@ impl Compiler {
             self.expr(recv)?;
             self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
             return Ok(());
+        }
+        // `super.method(args)` is the one call that must NOT go through the
+        // virtual dispatch chain: it names the superclass's implementation of a
+        // method the receiver's own class overrides. It is intercepted here,
+        // ahead of every receiver-typed branch below, because `expr_class` types
+        // a `super` receiver as the superclass — which would otherwise dispatch
+        // it virtually and call the override back on itself. (`getClass` is
+        // above this on purpose: it is `final` in Java, so `super.getClass()` is
+        // `this.getClass()`.)
+        if matches!(recv, Expr::Var(n) if n == SUPER) {
+            return self.super_call(method, args, line);
         }
         // A fully-qualified stdlib receiver (`java.util.Arrays.sort(x)`) names
         // exactly the class its simple name does — javars keys every type on the
@@ -4640,6 +4685,68 @@ impl Compiler {
         // argc counts the receiver, the arguments, and the method-name string.
         self.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
         Ok(())
+    }
+
+    /// Lower `super.method(args)` — a **non-virtual** call to the
+    /// implementation the enclosing class inherits.
+    ///
+    /// Resolution starts at the *declaring* class's superclass, never at the
+    /// receiver's runtime class, which is exactly what lets an override call the
+    /// version it overrides (`String toString() { return "D[" +
+    /// super.toString() + "]"; }` terminates instead of recursing). The body it
+    /// selects is the one visible from the superclass, so a grandparent's method
+    /// is reached when the parent does not declare it.
+    ///
+    /// Everything *inside* that body still dispatches virtually: a `super.m()`
+    /// whose body calls an unqualified `n()` reaches the subclass's `n`, because
+    /// only this one call site is de-virtualized — which is Java's rule.
+    fn super_call(&mut self, method: &str, args: &[Expr], line: u32) -> Result<(), String> {
+        let this_class = self.this_class.clone().ok_or_else(|| {
+            format!("javars: `super` used outside an instance method (line {line})")
+        })?;
+        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        if let Some(sup) = self.super_class() {
+            if let Some(resolved) = self.resolve_instance_call(&sup, method, &arg_tys) {
+                let param_tys = resolved.param_tys;
+                let packed = Self::effective_args(args, &param_tys, resolved.vararg_from);
+                let (mangled, _) = self
+                    .resolve_instance_sig(&sup, method, &param_tys)
+                    .ok_or_else(|| {
+                        format!(
+                            "javars: `{sup}` declares `{method}` but no superclass of \
+                             `{this_class}` supplies a body for it (line {line})"
+                        )
+                    })?;
+                self.emit_this(line); // this (deepest)
+                self.call_args_targeted(&packed, &param_tys)?;
+                let idx = self.b.add_name(&mangled);
+                self.b.emit(Op::Call(idx, packed.len() as u8 + 1), line);
+                self.emit_exc_check(line);
+                return Ok(());
+            }
+        }
+        // No user class up the chain declares it, so Java resolves the call to
+        // `java.lang.Object`'s own member. `Object` has no Java-level body here
+        // (see `new_object_as`), and the host supplies exactly the three
+        // observable ones — reference-identity `equals`, the `Class@hash`
+        // `toString`, and the identity `hashCode`.
+        if matches!(
+            (method, args.len()),
+            ("toString", 0) | ("hashCode", 0) | ("equals", 1)
+        ) {
+            self.emit_this(line);
+            for a in args {
+                self.emit_char_string(a)?;
+            }
+            let name_c = self.b.add_constant(Value::str(method.to_string()));
+            self.b.emit(Op::LoadConst(name_c), line);
+            self.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
+            return Ok(());
+        }
+        Err(format!(
+            "javars: no superclass of `{this_class}` has a method `{method}` taking {} argument(s) (line {line})",
+            args.len()
+        ))
     }
 
     /// Emit `recv.field` read given the receiver value is already on the stack:

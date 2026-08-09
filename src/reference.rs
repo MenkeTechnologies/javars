@@ -333,9 +333,9 @@ pub const REFERENCE: &[Entry] = &[
     (
         "super",
         "Contextual Keywords",
-        "super(args);",
-        "Explicit superclass constructor chaining, and the only `super` form javars implements. The instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. `super.method()` is NOT supported: it parses as a field access on an undefined variable and faults with a NullPointerException at run time.",
-        "class Cat extends Animal { Cat(String s) { super(); sound = s; } }",
+        "super(args); super.method(args); super.field",
+        "Three forms. `super(args)` is explicit superclass constructor chaining: the instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. `super.method(args)` is a **non-virtual** call to the implementation the enclosing class inherits — resolution starts at the declaring class's superclass, never at the receiver's runtime class, which is what lets an override call the version it overrides without recursing; overload selection, varargs packing and a walk past a parent that does not declare the method all happen at that superclass. Everything inside the body it reaches still dispatches virtually, so a `super.m()` whose callee calls an unqualified `n()` reaches the subclass's `n`. `super.field` is the same field cell `this.field` names (javars merges a class's fields with its ancestors', so field *hiding* is not modeled — see BUGS.md). When no user class up the chain declares the member, `super.toString`/`equals`/`hashCode` answer `java.lang.Object`'s.",
+        "class Cat extends Animal { public String toString() { return \"Cat/\" + super.toString(); } }",
     ),
     (
         "yield",

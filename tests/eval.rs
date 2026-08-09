@@ -2975,3 +2975,117 @@ fn functional_interface_default_and_static_members_run_on_a_lambda() {
         "<hi!> <hi>! id\ntrue true true false\n[ccc, bb, a]\n[c, aa, bb]\nA1B1\n12!\n8 7 9\nfalse true false\nb aaa\nuu\nfalse\n"
     );
 }
+
+#[test]
+fn super_method_calls_the_version_it_overrides_rather_than_dispatching_virtually() {
+    // `super.m(...)` is the one call in Java that must NOT dispatch on the
+    // receiver's runtime class: an override that calls it would otherwise
+    // re-enter itself forever. The chain here declares `f` at all three levels
+    // (so a virtual `super` never terminates), declares `tag` on the base and
+    // the leaf but NOT on the middle class (so `super.tag()` has to walk past
+    // the parent to the grandparent's body), and has the base's `kind()` call an
+    // unqualified `tag()` — which must STILL dispatch virtually down to the
+    // leaf, because `super` de-virtualizes exactly one call site and not the
+    // callee it reaches. Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class A {\
+         int n = 3;\
+         String tag() { return \"A\"; }\
+         String kind() { return \"k:\" + tag(); }\
+         int f(int x) { return x + 1; }\
+         int f(double x) { return 100; }\
+         int vs(int... xs) { int t = 0; for (int v : xs) t += v; return t; }\
+         public String toString() { return \"A<\" + n + \">\"; } }\
+         static class B extends A {\
+         int f(int x) { return super.f(x) * 10; }\
+         public String toString() { return \"B[\" + super.toString() + \"]\"; } }\
+         static class C extends B {\
+         String tag() { return \"C\"; }\
+         String kind() { return \"C/\" + super.kind(); }\
+         int f(int x) { return super.f(x) + 2; }\
+         int vs(int... xs) { return super.vs(xs) + super.vs(1, 2); }\
+         int fd() { return super.f(2.5); }\
+         int bump() { super.n += 4; super.n++; return super.n + this.n; }\
+         public String toString() { return \"C{\" + super.toString() + \",\" + super.tag() + \"}\"; } }\
+         public static void main(String[] a) {\
+         A x = new C();\
+         System.out.println(x.f(2) + \" \" + new B().f(2) + \" \" + new A().f(2));\
+         System.out.println(x);\
+         System.out.println(new C().kind() + \" \" + new B().kind());\
+         System.out.println(new C().fd() + \" \" + new C().vs(5, 6) + \" \" + new C().vs());\
+         System.out.println(new C().bump()); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "32 30 3\nC{B[A<3>],A}\nC/k:C k:A\n100 14 3\n16\n");
+}
+
+#[test]
+fn super_reaches_a_field_a_lambda_a_method_reference_and_objects_equals() {
+    // The three shapes besides a plain call that `super` has to reach, plus the
+    // fall-through when no user class declares the member. `super.n` is the
+    // receiver's own field cell; a lambda body carries `this` and so can name
+    // `super`; `super::echo` binds the superclass's body non-virtually; and a
+    // class whose parent is the implicit `java.lang.Object` resolves
+    // `super.equals` to reference identity (its `toString`/`hashCode` are left
+    // out on purpose — both render an identity hash, which has no reproducible
+    // answer). Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         interface Sup0 { int of(); }\
+         interface Str1 { String of(String s); }\
+         static class A { int f(int x) { return x + 1; } String echo(String s) { return \"A\" + s; } }\
+         static class C extends A {\
+         int f(int x) { return 0; }\
+         String echo(String s) { return \"C\" + s; }\
+         Sup0 lam(int k) { return () -> super.f(k) + 7; }\
+         Str1 mref() { return super::echo; } }\
+         static class O { int v; O(int v) { this.v = v; } boolean sameAs(Object o) { return super.equals(o); } }\
+         abstract static class S { abstract double area(); public String toString() { return \"S(\" + area() + \")\"; } }\
+         static class Sq extends S { double s; Sq(double s) { this.s = s; } double area() { return s * s; } public String toString() { return \"Sq/\" + super.toString(); } }\
+         enum Op { PLUS { int apply(int a) { return super.apply(a) + 1; } }, MINUS; int apply(int a) { return a * 2; } }\
+         public static void main(String[] a) {\
+         C c = new C();\
+         System.out.println(c.lam(2).of());\
+         System.out.println(c.mref().of(\"z\") + c.echo(\"z\"));\
+         O o = new O(1);\
+         System.out.println(o.sameAs(o) + \" \" + o.sameAs(new O(1)));\
+         System.out.println(new Sq(3.0));\
+         System.out.println(Op.PLUS.apply(10) + \"/\" + Op.MINUS.apply(10)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "10\nAzCz\ntrue false\nSq/S(9.0)\n21/20\n");
+}
+
+#[test]
+fn super_outside_an_instance_method_and_an_absent_superclass_member_are_errors() {
+    // Both were previously a run-time `NullPointerException` on a null receiver
+    // — `super` reached the compiler as an ordinary undefined name, so the
+    // *class* of the failure was wrong as well as the support. `javac` rejects
+    // both at compile time, so the diagnostic is asserted rather than only the
+    // exit status: a fault that merely happens to be non-zero would satisfy the
+    // status check while still reporting the wrong thing.
+    let (_, err, ok) = run_streams(
+        "public class Main {\
+         static class A { int g() { return 1; } }\
+         static class B extends A { }\
+         public static void main(String[] a) { System.out.println(super.g()); } }",
+    );
+    assert!(!ok, "`super` in a static context must not run");
+    assert!(
+        err.contains("`super` used outside an instance method"),
+        "expected a compile diagnostic, got: {err:?}"
+    );
+
+    let (_, err, ok) = run_streams(
+        "public class Main {\
+         static class A { int g() { return 1; } }\
+         static class B extends A { int h() { return super.nope(); } }\
+         public static void main(String[] a) { System.out.println(new B().h()); } }",
+    );
+    assert!(!ok, "an absent superclass method must not run");
+    assert!(
+        err.contains("no superclass of `B` has a method `nope`"),
+        "expected a compile diagnostic, got: {err:?}"
+    );
+}

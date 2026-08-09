@@ -318,9 +318,9 @@ synchronized (lock) { System.out.println("critical"); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-23">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-23">#</a> <code>super</code></h3>
-          <pre><code class="lang-java">super(args);</code></pre>
-          <p>Explicit superclass constructor chaining, and the only <code>super</code> form javars implements. The instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. <code>super.method()</code> is NOT supported: it parses as a field access on an undefined variable and faults with a NullPointerException at run time.</p>
-          <pre><code class="lang-java">class Cat extends Animal { Cat(String s) { super(); sound = s; } }</code></pre>
+          <pre><code class="lang-java">super(args); super.method(args); super.field</code></pre>
+          <p>Three forms. <code>super(args)</code> is explicit superclass constructor chaining: the instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. <code>super.method(args)</code> is a **non-virtual** call to the implementation the enclosing class inherits — resolution starts at the declaring class's superclass, never at the receiver's runtime class, which is what lets an override call the version it overrides without recursing; overload selection, varargs packing and a walk past a parent that does not declare the method all happen at that superclass. Everything inside the body it reaches still dispatches virtually, so a <code>super.m()</code> whose callee calls an unqualified <code>n()</code> reaches the subclass's <code>n</code>. <code>super.field</code> is the same field cell <code>this.field</code> names (javars merges a class's fields with its ancestors', so field *hiding* is not modeled — see BUGS.md). When no user class up the chain declares the member, <code>super.toString</code>/<code>equals</code>/<code>hashCode</code> answer <code>java.lang.Object</code>'s.</p>
+          <pre><code class="lang-java">class Cat extends Animal { public String toString() { return "Cat/" + super.toString(); } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-24">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-24">#</a> <code>yield</code></h3>

@@ -70,7 +70,8 @@ value returns), `String` instance methods, **reference arrays** including
 literals, indexing, `.length`, and true pass-by-reference/aliasing on a
 host-owned object heap), and a **class/object model** (fields, constructors,
 instance methods, `this`, `new`, field access, single inheritance with
-`extends`/`super(…)`, `instanceof`, virtual method dispatch, and `toString()`
+`extends`, `super(…)` chaining and non-virtual `super.member` access,
+`instanceof`, virtual method dispatch, and `toString()`
 overrides). **Interfaces** (abstract + `default` methods, multiple
 implements, interface inheritance, polymorphic dispatch), **method overloading
 by parameter type** (most-specific resolution for methods and constructors,
@@ -402,7 +403,9 @@ get/set indexing, `.length` at each level, and reference/aliasing semantics on a
 host-owned object heap keyed by `Value::Obj`), a **class/object model** (instance
 fields with initializers, constructors, instance methods dispatched over the
 frame ABI, `this`, `new`, field access `obj.f`, single inheritance with `extends`
-and `super(…)`, `instanceof`, runtime-class virtual dispatch for overrides, and
+and `super(…)`, the non-virtual `super.method(args)`/`super.field` access an
+override uses to reach the version it overrides, `instanceof`, runtime-class
+virtual dispatch for overrides, and
 `toString()` overrides honoured by `println`), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic
 dispatch through an interface type), **method overloading by parameter type**

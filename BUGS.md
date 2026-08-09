@@ -260,6 +260,25 @@ at the bottom, and are summarized in the section right after this one.
   the mangled `Class#method#argc` subroutine over fusevm's `Op::Call` frame ABI
   (`this` in slot 0). When a method is overridden in a subclass, dispatch is
   **virtual** — keyed on the receiver's runtime class via a compile-time chain.
+- **`super.member`.** `super.method(args)` is the one call in Java that must
+  *not* dispatch on the receiver's runtime class, and javars emits it as a direct
+  call to the body resolution finds starting at the **declaring** class's
+  superclass. That is what lets an override call the version it overrides
+  (`public String toString() { return "C{" + super.toString() + "}"; }`
+  terminates instead of recursing), and it walks past a parent that does not
+  declare the method to reach the grandparent's body. Overload selection
+  (`super.f(2.5)` picking `f(double)` over `f(int)`) and varargs packing
+  (`super.vs(xs)` passing an array through unwrapped, `super.vs(1, 2)` packing)
+  both happen at the superclass, like any other call. Only that one call site is
+  de-virtualized: a `super.m()` whose callee calls an unqualified `n()` still
+  reaches the *subclass's* `n`, which is Java's rule. It works from an ordinary
+  method, from inside a lambda body (the closure carries `this`), through a
+  `super::m` method reference, and from an `enum` constant's body to the enum's
+  own method. `super.field` reads and writes the same cell `this.field` does
+  (plain, compound, and `++`/`--`), and when no user class up the chain declares
+  the member, `super.toString`/`equals`/`hashCode` answer `java.lang.Object`'s.
+  `super` outside an instance method, and a member no superclass has, are
+  compile errors — `javac` rejects both too.
 - **Inheritance.** `extends`, `super(…)` constructor chaining, inherited fields
   and methods, method overriding, and `instanceof` (respecting the subclass
   chain). `toString()` overrides are honoured by `System.out.println(obj)`, by
@@ -509,13 +528,18 @@ other than Java is named in "Modeled with a documented simplification" below,
 and each is a deliberate, bounded model rather than a bug found and left.
 
 Some of those simplifications do print a different answer for a program `javac`
-accepts, and it is worth naming which — they are all missing *conversions*
-javars's untyped runtime never performs, not wrong arithmetic:
+accepts, and it is worth naming which. The first two are missing *conversions*
+javars's untyped runtime never performs, not wrong arithmetic; the third is a
+storage-model difference:
 
 - `s.get() / 2` on a `Supplier<Integer>` prints `3.5`, not `3` (the erased
   interface returns `Object`, so javars cannot type the result as `int`).
 - `int` arithmetic whose operand types are not statically known keeps fusevm's
   64-bit result rather than wrapping at 32 bits.
+- A subclass that **re-declares a field its parent already declares** gets one
+  cell rather than two, so the parent's own methods and a parent-typed reference
+  read the subclass's value. See "Field *hiding* collapses to one cell" below
+  for the reproducer and the exact divergence.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -594,12 +618,6 @@ known.
 - **The other collection view methods** (`Map.entrySet`, `List.listIterator`).
   `List.subList` is implemented as a real aliasing view (above); these two are
   not, and an unsupported-method error is the honest answer until they are.
-- **`super.method(args)`** — a qualified call to the superclass's version of an
-  overridden method. `super(args)` (constructor chaining) works; `super.m(…)` in
-  a method body does not, and instead of a compile error it reaches the runtime
-  as a call on a null receiver (`NullPointerException: Cannot invoke
-  "String.m()"`). The error shape is wrong as well as the support: `super` is
-  being lowered as an ordinary name rather than rejected.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
@@ -629,6 +647,28 @@ known.
   `==`, which is value equality for a `String` component (so those agree) but
   reference identity for a user-class or array component (where Java would call
   the component's own `equals`).
+- **Field *hiding* collapses to one cell.** A class's fields are resolved once,
+  ancestors first, into a single per-instance map keyed by name, so a subclass
+  that re-declares a field its parent already declares does not get a second
+  cell — both names address the one slot the subclass's initializer last wrote.
+  Java gives each declaration its own storage and selects between them by the
+  reference's *static* type, so
+
+  ```java
+  class A { int n = 1; String w() { return "A" + n; } }
+  class B extends A { int n = 2; String w() { return "B" + n + "/" + super.n + "/" + super.w(); } }
+  B b = new B(); A a = b;
+  System.out.println(b.w() + " " + a.n + " " + b.n);
+  ```
+
+  prints `B2/1/A1 1 2` on OpenJDK 26 and `B2/2/A2 2 2` here: `super.n`, `a.n`
+  and the parent's own `w()` all see the subclass's value. Fixing it means
+  per-declaring-class field storage plus static-type-directed selection at every
+  read and write, which is a storage-model change rather than a call-site one.
+  It is called out rather than papered over because the wrong answer is a
+  plausible number; field hiding is also the one inheritance shape Java itself
+  discourages, which is why the rest of the model is unaffected. `super.method()`
+  — the far more common qualified access — is exact (see "Implemented").
 - **An unqualified name that is another class's `static` field is unbound**
   rather than a compile error. `javac` rejects reading `v` from outside the
   class declaring `static int v`; javars resolves an unqualified static only
