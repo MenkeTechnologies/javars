@@ -2875,3 +2875,103 @@ fn messageless_host_throwable_has_a_null_detail_message() {
     assert!(ok);
     assert_eq!(out, "[java.lang.UnsupportedOperationException][null]\n");
 }
+#[test]
+fn widening_primitive_conversion_runs_at_every_assignment_site() {
+    // Java's assignment and method-invocation conversions (JLS 5.2/5.3) change
+    // the *value*, so `double d = 7;` prints `7.0`. javars's runtime is
+    // dynamically typed, which means the conversion has to be emitted at each
+    // site the language performs one: a local initializer, a `return`, an
+    // argument, an array literal (typed and untyped), an array-element store, an
+    // instance-field initializer and store, a `static` store, a floating
+    // conditional's integral branch, and a lambda whose interface returns
+    // `double`. `float` additionally rounds to 32 bits (16777217 is not
+    // representable) where `double` keeps a `long`'s nearest value.
+    // Verified byte-for-byte against OpenJDK 21.
+    let (out, ok) = run("public class Main {\
+         static class Box { double v = 3; float w; }\
+         interface F { double of(int a); }\
+         static double half(double x) { return x / 2; }\
+         static double ret(int x) { return x; }\
+         static double sd;\
+         public static void main(String[] a) {\
+         double d = 7;\
+         double e = 3 + 4;\
+         System.out.println(d + \" \" + e + \" \" + half(5) + \" \" + ret(5));\
+         double[] xs = {1, 2};\
+         double[] ys = new double[]{3, 4};\
+         ys[0] = 9;\
+         System.out.println(java.util.Arrays.toString(xs) + \" \" + java.util.Arrays.toString(ys));\
+         Box b = new Box();\
+         System.out.println(b.v + \" \" + b.w);\
+         b.v = 8; b.w = 6;\
+         System.out.println(b.v + \" \" + b.w);\
+         sd = 4;\
+         System.out.println(sd);\
+         System.out.println((true ? 1 : 2.0) + \" \" + (false ? 1 : 2.0));\
+         F f = x -> x;\
+         System.out.println(f.of(4));\
+         float big = 16777217;\
+         double lng = 9007199254740993L;\
+         System.out.println(big + \" \" + lng);\
+         char c = 'A';\
+         double dc = c;\
+         System.out.println(dc);\
+         double[][] g = {{1, 2}, {3, 4}};\
+         System.out.println(java.util.Arrays.deepToString(g)); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "7.0 7.0 2.5 5.0\n[1.0, 2.0] [9.0, 4.0]\n3.0 0.0\n8.0 6.0\n4.0\n1.0 2.0\n4.0\n1.6777216E7 9.007199254740992E15\n65.0\n[[1.0, 2.0], [3.0, 4.0]]\n"
+    );
+}
+
+#[test]
+fn functional_interface_default_and_static_members_run_on_a_lambda() {
+    // The `java.util.function` interfaces carry `default` composition methods and
+    // `static` factories. Reaching one on a *lambda* receiver is the hard half: a
+    // closure's runtime class matches no concrete-class arm of the dispatch
+    // chain, so the interface's own body has to be the arm that runs. Covers the
+    // composition order that distinguishes `andThen` from `compose`, the
+    // short-circuiting `Predicate` combinators, `Comparator.reversed` and
+    // `thenComparing` driving a real `List.sort`, and the primitive-specialized
+    // `Int*` forms. Verified byte-for-byte against OpenJDK 21.
+    let (out, ok) = run(
+        "import java.util.*;\
+         import java.util.function.*;\
+         public class Main {\
+         public static void main(String[] a) {\
+         Function f = s -> s + \"!\";\
+         Function g = s -> \"<\" + s + \">\";\
+         System.out.println(f.andThen(g).apply(\"hi\") + \" \" + f.compose(g).apply(\"hi\") + \" \" + Function.identity().apply(\"id\"));\
+         Predicate even = x -> ((Integer) x) % 2 == 0;\
+         Predicate pos = x -> ((Integer) x) > 0;\
+         System.out.println(even.negate().test(3) + \" \" + even.and(pos).test(4) + \" \" + even.or(pos).test(3) + \" \" + Predicate.not(even).test(4));\
+         Comparator byLen = (x, y) -> ((String) x).length() - ((String) y).length();\
+         Comparator byAlpha = (x, y) -> ((String) x).compareTo((String) y);\
+         List<String> l = new ArrayList<>(Arrays.asList(\"ccc\", \"a\", \"bb\"));\
+         l.sort(byLen.reversed());\
+         System.out.println(l);\
+         List<String> m = new ArrayList<>(Arrays.asList(\"bb\", \"aa\", \"c\"));\
+         m.sort(byLen.thenComparing(byAlpha));\
+         System.out.println(m);\
+         Consumer p = x -> System.out.print(\"A\" + x);\
+         Consumer q = x -> System.out.println(\"B\" + x);\
+         p.andThen(q).accept(1);\
+         BiFunction bf = (x, y) -> \"\" + x + y;\
+         System.out.println(bf.andThen(f).apply(1, 2));\
+         IntUnaryOperator inc = x -> x + 1;\
+         IntUnaryOperator dbl = x -> x * 2;\
+         System.out.println(inc.andThen(dbl).applyAsInt(3) + \" \" + inc.compose(dbl).applyAsInt(3) + \" \" + IntUnaryOperator.identity().applyAsInt(9));\
+         IntPredicate ip = x -> x > 2;\
+         System.out.println(ip.negate().test(5) + \" \" + ip.and(x -> x < 9).test(5) + \" \" + ip.or(x -> x < 0).test(1));\
+         System.out.println(BinaryOperator.minBy(byLen).apply(\"aaa\", \"b\") + \" \" + BinaryOperator.maxBy(byLen).apply(\"aaa\", \"b\"));\
+         System.out.println(UnaryOperator.identity().apply(\"uu\"));\
+         BiPredicate bp = (x, y) -> x.equals(y);\
+         System.out.println(bp.negate().test(\"a\", \"a\")); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "<hi!> <hi>! id\ntrue true true false\n[ccc, bb, a]\n[c, aa, bb]\nA1B1\n12!\n8 7 9\nfalse true false\nb aaa\nuu\nfalse\n"
+    );
+}

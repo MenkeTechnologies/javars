@@ -95,42 +95,114 @@ pub fn qualified_class(name: &str) -> Option<String> {
     qualified_throwable(name)
 }
 
-/// The modeled functional interfaces: `(name, declared single abstract method)`.
+/// The modeled functional interfaces: `(name, declared single abstract method,
+/// the interface's other members)`.
 ///
-/// Each is declared to javars as an ordinary `interface` with exactly one
-/// abstract method, which is all a lambda target needs — the compiler recognises
-/// *any* single-abstract-method interface (user-declared ones included) as a
-/// lambda target, so these entries buy no special case, only the declarations
-/// the JDK would have supplied. Type parameters are erased, so the parameter and
-/// return types below are the erasure Java itself uses (`Object`), except where
-/// the JDK's own signature is primitive (`Predicate.test` → `boolean`,
+/// Each is declared to javars as an ordinary `interface`, whose one *abstract*
+/// method is all a lambda target needs — the compiler recognises *any*
+/// single-abstract-method interface (user-declared ones included) as a lambda
+/// target, so these entries buy no special case, only the declarations the JDK
+/// would have supplied. Type parameters are erased, so the parameter and return
+/// types below are the erasure Java itself uses (`Object`), except where the
+/// JDK's own signature is primitive (`Predicate.test` → `boolean`,
 /// `Comparator.compare` → `int`), which javars keeps so a call participates in
 /// numeric typing.
-pub const FUNCTIONAL: &[(&str, &str)] = &[
-    ("Runnable", "void run()"),
-    ("Callable", "Object call()"),
-    ("Supplier", "Object get()"),
-    ("Consumer", "void accept(Object t)"),
-    ("BiConsumer", "void accept(Object t, Object u)"),
-    ("Function", "Object apply(Object t)"),
-    ("BiFunction", "Object apply(Object t, Object u)"),
-    ("UnaryOperator", "Object apply(Object t)"),
-    ("BinaryOperator", "Object apply(Object t, Object u)"),
-    ("Predicate", "boolean test(Object t)"),
-    ("BiPredicate", "boolean test(Object t, Object u)"),
-    ("Comparator", "int compare(Object a, Object b)"),
-    ("IntSupplier", "int getAsInt()"),
-    ("IntPredicate", "boolean test(int value)"),
-    ("IntConsumer", "void accept(int value)"),
-    ("IntUnaryOperator", "int applyAsInt(int operand)"),
-    ("IntBinaryOperator", "int applyAsInt(int left, int right)"),
-    ("ToIntFunction", "int applyAsInt(Object value)"),
-    ("ToDoubleFunction", "double applyAsDouble(Object value)"),
+///
+/// The third column is the JDK's `default` and `static` members, transliterated
+/// from the bodies `java.util.function` declares. They are ordinary Java, so
+/// they compile through the same paths a user's own `default` method does, and a
+/// *lambda* receiver reaches them because a closure gets its own arm in the
+/// dispatch chain. The JDK's leading `Objects.requireNonNull(after)` is the one
+/// thing dropped: it would pull the whole throwable prelude into every program
+/// that writes a lambda, and composing with `null` still raises the same
+/// `NullPointerException` — at the composed function's first call rather than at
+/// composition (named in `BUGS.md`).
+pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
+    ("Runnable", "void run()", ""),
+    ("Callable", "Object call()", ""),
+    ("Supplier", "Object get()", ""),
+    (
+        "Consumer",
+        "void accept(Object t)",
+        "default Consumer andThen(Consumer after) { return t -> { this.accept(t); after.accept(t); }; }",
+    ),
+    (
+        "BiConsumer",
+        "void accept(Object t, Object u)",
+        "default BiConsumer andThen(BiConsumer after) { return (t, u) -> { this.accept(t, u); after.accept(t, u); }; }",
+    ),
+    (
+        "Function",
+        "Object apply(Object t)",
+        "default Function andThen(Function after) { return t -> after.apply(this.apply(t)); } \
+         default Function compose(Function before) { return v -> this.apply(before.apply(v)); } \
+         static Function identity() { return t -> t; }",
+    ),
+    (
+        "BiFunction",
+        "Object apply(Object t, Object u)",
+        "default BiFunction andThen(Function after) { return (t, u) -> after.apply(this.apply(t, u)); }",
+    ),
+    (
+        "UnaryOperator",
+        "Object apply(Object t)",
+        "static UnaryOperator identity() { return t -> t; }",
+    ),
+    (
+        "BinaryOperator",
+        "Object apply(Object t, Object u)",
+        "static BinaryOperator minBy(Comparator comparator) { return (a, b) -> comparator.compare(a, b) <= 0 ? a : b; } \
+         static BinaryOperator maxBy(Comparator comparator) { return (a, b) -> comparator.compare(a, b) >= 0 ? a : b; }",
+    ),
+    (
+        "Predicate",
+        "boolean test(Object t)",
+        "default Predicate and(Predicate other) { return t -> this.test(t) && other.test(t); } \
+         default Predicate negate() { return t -> !this.test(t); } \
+         default Predicate or(Predicate other) { return t -> this.test(t) || other.test(t); } \
+         static Predicate not(Predicate target) { return target.negate(); }",
+    ),
+    (
+        "BiPredicate",
+        "boolean test(Object t, Object u)",
+        "default BiPredicate and(BiPredicate other) { return (t, u) -> this.test(t, u) && other.test(t, u); } \
+         default BiPredicate negate() { return (t, u) -> !this.test(t, u); } \
+         default BiPredicate or(BiPredicate other) { return (t, u) -> this.test(t, u) || other.test(t, u); }",
+    ),
+    (
+        "Comparator",
+        "int compare(Object a, Object b)",
+        "default Comparator reversed() { return (a, b) -> this.compare(b, a); } \
+         default Comparator thenComparing(Comparator other) { return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return other.compare(a, b); }; }",
+    ),
+    ("IntSupplier", "int getAsInt()", ""),
+    (
+        "IntPredicate",
+        "boolean test(int value)",
+        "default IntPredicate and(IntPredicate other) { return value -> this.test(value) && other.test(value); } \
+         default IntPredicate negate() { return value -> !this.test(value); } \
+         default IntPredicate or(IntPredicate other) { return value -> this.test(value) || other.test(value); }",
+    ),
+    (
+        "IntConsumer",
+        "void accept(int value)",
+        "default IntConsumer andThen(IntConsumer after) { return value -> { this.accept(value); after.accept(value); }; }",
+    ),
+    (
+        "IntUnaryOperator",
+        "int applyAsInt(int operand)",
+        "default IntUnaryOperator compose(IntUnaryOperator before) { return v -> this.applyAsInt(before.applyAsInt(v)); } \
+         default IntUnaryOperator andThen(IntUnaryOperator after) { return v -> after.applyAsInt(this.applyAsInt(v)); } \
+         static IntUnaryOperator identity() { return v -> v; }",
+    ),
+    ("IntBinaryOperator", "int applyAsInt(int left, int right)", ""),
+    ("ToIntFunction", "int applyAsInt(Object value)", ""),
+    ("ToDoubleFunction", "double applyAsDouble(Object value)", ""),
 ];
 
 /// True when `name` is one of the modeled functional interfaces.
 pub fn is_functional(name: &str) -> bool {
-    FUNCTIONAL.iter().any(|(n, _)| *n == name)
+    FUNCTIONAL.iter().any(|(n, _, _)| *n == name)
 }
 
 /// The Java source of the prelude classes the program does not already declare.
@@ -213,21 +285,31 @@ fn merge(prog: &mut Program, src: &str) -> Result<(), String> {
             .into_iter()
             .filter(|c| !c.name.starts_with("__")),
     );
+    // A prelude type's `static` members (`Function.identity`, `Predicate.not`,
+    // `BinaryOperator.minBy`) live in the unit-wide pool a qualified `C.m(…)`
+    // resolves against, not on the class node, so the pool has to be merged too.
+    prog.methods.extend(
+        parsed
+            .methods
+            .into_iter()
+            .filter(|m| !m.owner.starts_with("__")),
+    );
     Ok(())
 }
 
 /// The Java source of the functional interfaces the program does not already
-/// declare. Each is a plain one-method `interface`, so a lambda assigned to it
-/// reaches the compiler's ordinary single-abstract-method lambda target path.
+/// declare. Each is a plain `interface` with one abstract method, so a lambda
+/// assigned to it reaches the compiler's ordinary single-abstract-method lambda
+/// target path, plus the `default`/`static` members the JDK declares alongside.
 fn functional_source(declared: &[String]) -> String {
     let mut src = String::from(
         "public class __JavaUtilFunction { public static void main(String[] a) { } }\n",
     );
-    for (name, sam) in FUNCTIONAL {
+    for (name, sam, members) in FUNCTIONAL {
         if declared.iter().any(|d| d == name) {
             continue;
         }
-        src.push_str(&format!("interface {name} {{ {sam}; }}\n"));
+        src.push_str(&format!("interface {name} {{ {sam}; {members} }}\n"));
     }
     src
 }

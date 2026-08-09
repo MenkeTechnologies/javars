@@ -144,6 +144,22 @@ at the bottom, and are summarized in the section right after this one.
   type on it, and an `import` line is skipped for the same reason. A package
   segment is recognised by starting lowercase and being followed by another name,
   which is what keeps the identical `outer.next.n = 9` shape an expression.
+- **Widening primitive conversion.** Java's assignment and method-invocation
+  conversions (JLS 5.2 / 5.3) change the *value*, not only its static type, so
+  `double d = 7;` stores 7.0 and prints `7.0`. javars's runtime is dynamically
+  typed on the fusevm value model, which means the conversion has to be emitted
+  at each site the language performs one, and it is: a local initializer and
+  assignment, an instance or `static` field's initializer and assignment, an
+  array-element store, a typed (`new double[]{…}`) or untyped (`double[] a =
+  {1, 2}`) array literal, a method or constructor argument, a `return`, a
+  floating conditional's integral branch (`flag ? 1 : 2.0` is 1.0, JLS 15.25),
+  and a lambda whose functional interface returns `float`/`double`. `double`
+  emits the native `Op::TruncFloat` — truncation is the identity on a whole
+  number, so the conversion costs one op and no builtin call, and unlike the
+  `float` path it adds nothing to `--tiers`'s block-JIT-ineligible list.
+  `float` rounds to 32-bit precision through the same host cast `(float) x`
+  uses, because that is a real value change: `float f = 16777217;` is
+  1.6777216E7 where `double d = 16777217;` is 1.6777217E7.
 - **A compound assignment narrows back to its target's width.** JLS 15.26.2
   makes `b += 100` on a `byte` mean `b = (byte) (b + 100)`, so it overflows at
   the *target's* width, not at `int`'s: `byte` and `short` sign-extend (`-56`,
@@ -392,6 +408,23 @@ at the bottom, and are summarized in the section right after this one.
   inside a lambda returns from the *lambda*; `break`/`continue`, `try`/`finally`,
   and a `throw` all work inside one, and an exception it raises unwinds to the
   caller's handler.
+- **The functional interfaces' `default` and `static` members.**
+  `Function.andThen`/`compose`/`identity`, `BiFunction.andThen`,
+  `Predicate.and`/`negate`/`or`/`not`, the `BiPredicate` and `IntPredicate`
+  forms of the same three, `Consumer.andThen`/`BiConsumer.andThen`/
+  `IntConsumer.andThen`, `UnaryOperator.identity`,
+  `IntUnaryOperator.compose`/`andThen`/`identity`,
+  `BinaryOperator.minBy`/`maxBy`, and `Comparator.reversed`/`thenComparing`.
+  Each is the JDK's own body, written in Java in `src/prelude.rs` and compiled
+  through the paths a user's own `default` method already used — no builtin.
+  Reaching one on a *lambda* receiver is the half that needed work: a closure's
+  runtime class matches no concrete-class arm of the dispatch chain, so the
+  interface's own body is emitted as its arm (and as the whole call when no
+  class implements the interface at all). The JDK's leading
+  `Objects.requireNonNull(after)` is the one thing dropped — it would pull the
+  entire throwable prelude into every program that writes a lambda — so
+  composing with `null` raises the same `NullPointerException` at the composed
+  function's first call rather than at composition.
 - **Method references.** `String::length` and `Integer::parseInt` (unbound
   receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
   `this::method` (bound — the receiver is captured), `Point::new`, and
@@ -479,7 +512,6 @@ Some of those simplifications do print a different answer for a program `javac`
 accepts, and it is worth naming which — they are all missing *conversions*
 javars's untyped runtime never performs, not wrong arithmetic:
 
-- `double d = 7;` prints `7`, not `7.0` (no widening value conversion).
 - `s.get() / 2` on a `Supplier<Integer>` prints `3.5`, not `3` (the erased
   interface returns `Object`, so javars cannot type the result as `int`).
 - `int` arithmetic whose operand types are not statically known keeps fusevm's
@@ -509,12 +541,15 @@ known.
   pipeline that silently drops a stage is exactly the failure mode this file
   exists to prevent.
 
-  The `default` methods the JDK's functional interfaces carry
-  (`Function.andThen`/`compose`, `Predicate.negate`/`and`/`or`,
-  `Comparator.reversed`/`comparing`) are absent for a smaller reason: the
-  interfaces javars supplies declare only their single abstract method, so
-  calling a `default` one is a compile error. Lambdas and method references
-  themselves are implemented (above).
+  The `default` and `static` members the JDK's functional interfaces carry are
+  implemented (above); `Comparator.comparing`/`naturalOrder`/`reverseOrder` are
+  the exception. They order *arbitrary* elements by their natural ordering, and
+  the only `compareTo` a prelude body could call on an element it cannot type is
+  the `String` one, which compares every operand as text — -2 for the `Integer`s
+  3 and 5 where Java answers -1, and it never reaches a user class's own
+  `compareTo` at all (see the dynamic-receiver entry under "Modeled with a
+  documented simplification"). Writing them would order most programs' data
+  wrongly, which is worse than the compile error they raise now.
 - **`hashCode()` on a user class**, including a `record`'s derived one. A record
   supplies its accessors, `toString`, and `equals`; calling `hashCode()` is a
   compile error ("class `Pt` has no method `hashCode`") rather than a wrong
@@ -600,10 +635,15 @@ known.
   against the enclosing class and its ancestors, and an unresolved name reads as
   `null` (the same behaviour as an uninitialized local, below). `C.v` is the
   spelling that works, and it is the only one valid Java uses.
-- **No widening *value* conversion.** Overload *resolution* uses static types
-  (so `f(int)` vs `f(double)` picks correctly), but the argument value is not
-  coerced: an `int` bound to a `double` parameter (or `double d = 7;`) keeps its
-  integer value, so it prints `7`, not `7.0`.
+- **A widening conversion needs a statically known *source* type.** The
+  conversion itself is performed (see "Widening primitive conversion" under
+  "Implemented"), but it is emitted only when the value's own type is
+  statically integral, so a value arriving from an erased generic position is
+  left alone: `static <T> T id(T x)` makes `double d = id(7);` print `7`, and
+  `double e = l.get(0);` on a `List<Integer>` prints `9`, where Java unboxes and
+  widens both to `7.0`/`9.0`. This is the same erasure limit as the
+  `s.get() / 2` entry above. Every source javars can type — a literal, a local,
+  a field, an array element, a declared-return method — converts.
 - **`==` on objects is reference identity; on strings it compares by value.**
   Object and array handles (`Value::Obj`) are identity-comparable, so `x == y`,
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
@@ -693,6 +733,16 @@ known.
   because a builtin has no way to call back into the override. A receiver
   declared with its class — which is how the overwhelming majority of Java is
   written — is on the static path and unaffected.
+
+  `compareTo` is the one such method that answers a *number* rather than falling
+  back to identity, and it is the sharpest edge of this boundary: a dynamically
+  typed receiver takes the `String` comparison, so it renders both operands as
+  text and compares those. It agrees with Java on `String` operands and diverges
+  on every other: `((Comparable) o).compareTo(p)` is -2 for the `Integer`s 3 and
+  5 (Java's `Integer.compareTo` answers the *sign*, -1), and -1 for two `Pt`s
+  whose own `compareTo` answers 5, because the user body is never reached. This
+  is also why `Comparator.comparing`/`naturalOrder`/`reverseOrder` are left out
+  rather than written in the prelude — see the entry under "Not implemented".
 - **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
   spreads a *reference* array (`String[]` → a 3-element list) but not a
   primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element

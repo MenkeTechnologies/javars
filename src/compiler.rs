@@ -420,6 +420,10 @@ struct PendingLambda {
     /// when it did not, in which case the parameters are statically untyped and
     /// arithmetic on them falls back to the runtime's own rules.
     param_tys: Vec<String>,
+    /// The target interface's declared *return* type, when the literal's context
+    /// named a target. It drives the assignment conversion on the body's result
+    /// — a `double`-returning single abstract method widens an integral body.
+    ret_ty: Option<String>,
     /// The enclosing locals captured by value, in push order, each with the
     /// declared type and numeric category it had in the enclosing scope (so
     /// `/`-truncation and class-typed dispatch keep working inside the body).
@@ -918,7 +922,8 @@ impl Compiler {
     ) -> Result<(), String> {
         let global = static_global(class, name);
         if op == AssignOp::Assign {
-            self.expr(value)?;
+            let ty = ty.to_string();
+            self.expr_targeted(value, Some(&ty))?;
             self.emit_global_set(&global, line);
             return Ok(());
         }
@@ -2075,19 +2080,44 @@ impl Compiler {
             self.functional_sam(rc),
             Some((sam, arity)) if sam == method && arity == args.len()
         );
-        // Fast path: a single concrete implementation across the whole subtree.
-        // Use the concrete target's mangled name (not the static type's), so an
-        // interface- or abstract-typed receiver still calls a real subroutine.
-        if distinct.len() <= 1 && !lambda_arm {
-            let mangled = targets.first().map(|(_, m)| m.clone()).ok_or_else(|| {
-                format!("javars: no concrete implementation of `{method}` for `{rc}` (line {line})")
-            })?;
-            self.expr(recv)?; // this (deepest)
-            self.call_args_targeted(args, &param_tys)?;
-            let idx = self.b.add_name(&mangled);
-            self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
-            self.emit_exc_check(line);
-            return Ok(());
+        // A functional interface's *other* methods — its `default` ones
+        // (`Predicate.negate`, `Function.andThen`) — are reachable on a lambda
+        // receiver too, and a closure's runtime class matches no concrete-class
+        // arm. The interface's own body is what Java runs for it, so it gets its
+        // own arm keyed on the same closure sentinel.
+        let default_arm: Option<String> = if lambda_arm || self.functional_sam(rc).is_none() {
+            None
+        } else {
+            self.resolve_instance_sig(rc, method, &param_tys)
+                .map(|(m, _)| m)
+        };
+        // Fast path: exactly one body is reachable. That is a single concrete
+        // implementation across the whole subtree — the concrete target's
+        // mangled name, not the static type's, so an interface- or
+        // abstract-typed receiver still calls a real subroutine — or, when no
+        // class implements the interface at all, its own `default` body, which
+        // is the only thing a lambda receiver can run.
+        let only_body = match (targets.first(), &default_arm) {
+            (None, Some(d)) => Some(d.clone()),
+            (Some((_, m)), d) if distinct.len() == 1 && d.as_deref().unwrap_or(m) == m => {
+                Some(m.clone())
+            }
+            _ => None,
+        };
+        if !lambda_arm {
+            if let Some(mangled) = only_body {
+                self.expr(recv)?; // this (deepest)
+                self.call_args_targeted(args, &param_tys)?;
+                let idx = self.b.add_name(&mangled);
+                self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+                self.emit_exc_check(line);
+                return Ok(());
+            }
+            if targets.is_empty() {
+                return Err(format!(
+                    "javars: no concrete implementation of `{method}` for `{rc}` (line {line})"
+                ));
+            }
         }
         // Virtual path: stash receiver + args in temps (single evaluation), read
         // the runtime class, then dispatch.
@@ -2359,6 +2389,60 @@ impl Compiler {
         }
     }
 
+    /// The floating type an assignment of `e` into a `target`-typed slot widens
+    /// to, or `None` when no widening primitive conversion applies.
+    ///
+    /// Java's assignment and method-invocation conversions (JLS 5.2 / 5.3)
+    /// change the *value*, not only its static type: `double d = 7;` stores 7.0
+    /// and prints `7.0`. javars's runtime is dynamically typed on the fusevm
+    /// value model, so the conversion has to be emitted at each site the
+    /// language performs one — every initializer, assignment, array-literal
+    /// element, argument, and `return` whose target is `float`/`double` and
+    /// whose source type is integral.
+    fn widen_target(&self, target: Option<&str>, e: &Expr) -> Option<&'static str> {
+        let t = match target? {
+            "double" => "double",
+            "float" => "float",
+            _ => return None,
+        };
+        let src = self.expr_java_type(e)?;
+        matches!(src.as_str(), "int" | "long" | "short" | "byte" | "char").then_some(t)
+    }
+
+    /// Emit the widening primitive conversion for the value already on top of
+    /// the stack.
+    ///
+    /// `double` is the native `Op::TruncFloat`: it converts its operand to `f64`
+    /// and truncates, and an integral operand is already whole, so the result is
+    /// the same value as a `double` — Java's widening exactly, with no builtin
+    /// call to break the JIT trace. `float` additionally rounds to 32-bit
+    /// precision, which is a real value change (`float f = 16777217;` is
+    /// 1.6777216E7), so it routes through the same host cast `(float) x` uses.
+    fn emit_widen(&mut self, ty: &str, line: u32) {
+        if ty == "float" {
+            let c = self.b.add_constant(Value::str("float".to_string()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
+        } else {
+            self.b.emit(Op::TruncFloat, line);
+        }
+    }
+
+    /// The type a conditional's two branches are promoted to when it is a
+    /// *floating* one — `flag ? 1 : 2.0` is a `double` conditional, so the `int`
+    /// branch widens to 1.0 (JLS 15.25 binary numeric promotion). `None` for
+    /// every other conditional, including the integral ones, whose branches are
+    /// already represented identically.
+    fn ternary_promotion(&self, then: &Expr, els: &Expr) -> Option<&'static str> {
+        let t = numeric_rank(self.expr_java_type(then)?.as_str())?;
+        let e = numeric_rank(self.expr_java_type(els)?.as_str())?;
+        match rank_name(t.max(e)) {
+            "double" => Some("double"),
+            "float" => Some("float"),
+            _ => None,
+        }
+    }
+
     /// The declared type name of the field `name` on `recv`'s static class, when
     /// both are statically known.
     fn field_type_name(&self, recv: &Expr, name: &str) -> Option<String> {
@@ -2577,13 +2661,14 @@ impl Compiler {
         // The interface this lambda implements (when the assignment context
         // named one) types its parameters, so `Calc c = x -> 100 / x;` divides
         // integrally exactly where `int of(int)` says it should.
-        let param_tys: Vec<String> = self
-            .lambda_target
-            .take()
-            .as_deref()
-            .and_then(|t| self.functional_sam_meta(t))
-            .map(|sam| sam.param_tys.clone())
-            .unwrap_or_default();
+        // The interface's declared *return* type comes along for the same
+        // reason: a `double of(int)` lambda widens its body's `int` result, so
+        // `F f = a -> a; f.of(4)` is 4.0 exactly as Java's assignment
+        // conversion on the `return` makes it.
+        let target = self.lambda_target.take();
+        let sam = target.as_deref().and_then(|t| self.functional_sam_meta(t));
+        let param_tys: Vec<String> = sam.map(|s| s.param_tys.clone()).unwrap_or_default();
+        let ret_ty: Option<String> = sam.map(|s| s.ret.clone());
         // Capture every name declared in the enclosing scope that the lambda's
         // own parameters do not shadow. Compiler temps are deliberately not in
         // `declared`, so none are captured.
@@ -2623,6 +2708,7 @@ impl Compiler {
             name_idx,
             params: params.to_vec(),
             param_tys,
+            ret_ty,
             captures,
             captures_this,
             body: body.clone(),
@@ -2686,14 +2772,15 @@ impl Compiler {
         let saved_tries = std::mem::take(&mut self.tries);
         let saved_finallys = std::mem::take(&mut self.finallys);
         let saved_exits = std::mem::take(&mut self.exit_ops);
-        let saved_ret = self.current_ret.take();
+        let saved_ret = std::mem::replace(&mut self.current_ret, pl.ret_ty.clone());
 
         for i in (0..total).rev() {
             self.b.emit(Op::SetSlot(i as u16), line);
         }
         let result = match &pl.body {
-            // An expression body's value is the lambda's result.
-            LambdaBody::Expr(e) => self.expr(e).map(|()| {
+            // An expression body's value is the lambda's result, converted to
+            // the single abstract method's declared return type.
+            LambdaBody::Expr(e) => self.expr_targeted(e, pl.ret_ty.as_deref()).map(|()| {
                 self.b.emit(Op::ReturnValue, line);
             }),
             LambdaBody::Block(stmts) => stmts.iter().try_for_each(|s| self.stmt(s)),
@@ -2741,9 +2828,12 @@ impl Compiler {
         abstracts.next().is_none().then_some(sam)
     }
 
-    /// Lower `e` knowing the type it is being assigned to. Only a lambda (or the
-    /// method reference that desugars to one) reads the target, so anything else
-    /// lowers exactly as it did before.
+    /// Lower `e` knowing the type it is being assigned to — the site of Java's
+    /// *assignment conversion*. A lambda (or the method reference that desugars
+    /// to one) reads the target as its functional interface; an integral
+    /// expression assigned into a `float`/`double` slot is widened; a `char`
+    /// entering a reference slot is boxed; and a bare `{…}` array literal takes
+    /// its element type from the declaration it initializes.
     fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
         if !matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             // A `char` bound to a reference-typed slot (`Object o = 'x';`, an
@@ -2757,7 +2847,25 @@ impl Compiler {
             {
                 return self.emit_char_string(e);
             }
-            return self.expr(e);
+            // `double[] a = {1, 2};` — the untyped literal takes its element
+            // type from the declaration, and every element is assigned into a
+            // slot of that type, so the conversion applies element-wise.
+            if let Expr::ArrayLit {
+                elems,
+                elem_ty: None,
+            } = e
+            {
+                if let Some(el) = target.and_then(|t| t.strip_suffix("[]")) {
+                    let el = el.to_string();
+                    return self.array_lit(elems, Some(&el));
+                }
+            }
+            let widen = self.widen_target(target, e);
+            self.expr(e)?;
+            if let Some(w) = widen {
+                self.emit_widen(w, 0);
+            }
+            return Ok(());
         }
         let saved = std::mem::replace(&mut self.lambda_target, target.map(str::to_string));
         let result = self.expr(e);
@@ -4221,14 +4329,9 @@ impl Compiler {
                     );
                 }
             }
-            Expr::ArrayLit { elems, .. } => {
-                for el in elems {
-                    self.expr(el)?;
-                }
-                self.b.emit(
-                    Op::CallBuiltin(crate::host::JARRAY_LIT, elems.len() as u8),
-                    0,
-                );
+            Expr::ArrayLit { elems, elem_ty } => {
+                let elem_ty = elem_ty.clone();
+                self.array_lit(elems, elem_ty.as_deref())?;
             }
             Expr::Index { array, index } => {
                 self.expr(array)?;
@@ -4668,7 +4771,7 @@ impl Compiler {
             let name_c = self.b.add_constant(Value::str(fname.clone()));
             self.b.emit(Op::LoadConst(name_c), line);
             match finit {
-                Some(e) => self.expr(e)?,
+                Some(e) => self.expr_targeted(e, Some(fty))?,
                 None => self.emit_type_default(fty, line),
             }
             self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
@@ -4712,10 +4815,15 @@ impl Compiler {
         value: &Expr,
         line: u32,
     ) -> Result<(), String> {
+        // The element's declared type decides the assignment conversion, the
+        // compound-`/` truncation, and the 32-bit wrap.
+        let elem_ty = self
+            .expr_array_type(array)
+            .and_then(|t| t.strip_suffix("[]").map(str::to_string));
         if op == AssignOp::Assign {
             self.expr(array)?;
             self.expr(index)?;
-            self.expr(value)?;
+            self.expr_targeted(value, elem_ty.as_deref())?;
             self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
             self.b.emit(Op::Pop, line);
             return Ok(());
@@ -4731,11 +4839,6 @@ impl Compiler {
         self.emit_get(&arr_t, line);
         self.emit_get(&idx_t, line);
         self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
-        // combine with value: the element's declared type decides both the
-        // compound-`/` truncation and the 32-bit wrap.
-        let elem_ty = self
-            .expr_array_type(array)
-            .and_then(|t| t.strip_suffix("[]").map(str::to_string));
         let elem_t = elem_ty
             .as_deref()
             .map(|t| numtype_of_ty(t).unwrap_or(NumType::Other))
@@ -4782,7 +4885,7 @@ impl Compiler {
             self.expr(recv)?;
             let name_c = self.b.add_constant(Value::str(name.to_string()));
             self.b.emit(Op::LoadConst(name_c), line);
-            self.expr(value)?;
+            self.expr_targeted(value, field_ty_name.as_deref())?;
             self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
             self.b.emit(Op::Pop, line);
             return Ok(());
@@ -4986,15 +5089,34 @@ impl Compiler {
     /// Lower `cond ? then : els`. Evaluates `cond`, jumps to the `els` branch
     /// when false, and leaves exactly one branch's value on the stack.
     fn ternary(&mut self, cond: &Expr, then: &Expr, els: &Expr) -> Result<(), String> {
+        // A floating conditional widens whichever branch is integral, so
+        // `flag ? 1 : 2.0` yields 1.0 rather than 1 (JLS 15.25).
+        let promote = self.ternary_promotion(then, els);
         self.expr(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-        self.expr(then)?;
+        self.expr_targeted(then, promote)?;
         let jend = self.b.emit(Op::Jump(0), 0);
         let else_start = self.b.current_pos();
         self.b.patch_jump(jf, else_start);
-        self.expr(els)?;
+        self.expr_targeted(els, promote)?;
         let end = self.b.current_pos();
         self.b.patch_jump(jend, end);
+        Ok(())
+    }
+
+    /// Lower an array literal, each element lowered as an assignment into a slot
+    /// of the array's element type — which is what widens a `double[]`
+    /// literal's integral elements and boxes a `char` into an `Object[]`.
+    /// `elem_ty` is `None` for a bare `{…}` in a position javars cannot type,
+    /// in which case the elements lower untargeted.
+    fn array_lit(&mut self, elems: &[Expr], elem_ty: Option<&str>) -> Result<(), String> {
+        for el in elems {
+            self.expr_targeted(el, elem_ty)?;
+        }
+        self.b.emit(
+            Op::CallBuiltin(crate::host::JARRAY_LIT, elems.len() as u8),
+            0,
+        );
         Ok(())
     }
 

@@ -430,10 +430,12 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **Streams and the functional-interface `default` methods** —
-   `.stream().map(…).filter(…)`, `Function.andThen`, `Predicate.negate`,
-   `Comparator.reversed`. The lambdas they take already work; what is missing is
-   the library on top of them.
+1. **Streams** — `.stream().map(…).filter(…)`, `IntStream.range`, the
+   `collect`/`reduce`/`findFirst` terminals. The lambdas they take already work,
+   as do the functional interfaces' `default` composition methods
+   (`Function.andThen`, `Predicate.negate`, `Comparator.reversed`); what is
+   missing is the compile-time pipeline fusion a stream needs, because a host
+   builtin cannot re-enter the VM to call a stage's closure per element.
 2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
    class literals (`C.class`), `Iterator`/`entrySet`, and wider stdlib coverage
    (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived

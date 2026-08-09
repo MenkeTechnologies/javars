@@ -1550,63 +1550,63 @@ System.out.println(s.get());</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-4">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-4">#</a> <code>Consumer</code></h3>
-          <pre><code class="lang-java">interface Consumer { void accept(Object t); }</code></pre>
-          <p>A one-argument action with no result — the type <code>List.forEach</code> and <code>Set.forEach</code> expect.</p>
+          <pre><code class="lang-java">interface Consumer { void accept(Object t); default Consumer andThen(Consumer after); }</code></pre>
+          <p>A one-argument action with no result — the type <code>List.forEach</code> and <code>Set.forEach</code> expect. <code>andThen</code> runs both actions on the same argument, in order.</p>
           <pre><code class="lang-java">Consumer c = x -&gt; System.out.println(x);
 xs.forEach(c);</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-5">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-5">#</a> <code>BiConsumer</code></h3>
-          <pre><code class="lang-java">interface BiConsumer { void accept(Object t, Object u); }</code></pre>
-          <p>A two-argument action with no result — the type <code>Map.forEach</code> expects, receiving each key and value.</p>
+          <pre><code class="lang-java">interface BiConsumer { void accept(Object t, Object u); default BiConsumer andThen(BiConsumer after); }</code></pre>
+          <p>A two-argument action with no result — the type <code>Map.forEach</code> expects, receiving each key and value. <code>andThen</code> runs both actions on the same pair, in order.</p>
           <pre><code class="lang-java">m.forEach((k, v) -&gt; System.out.println(k + "=" + v));</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-6">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-6">#</a> <code>Function</code></h3>
-          <pre><code class="lang-java">interface Function { Object apply(Object t); }</code></pre>
-          <p>A one-argument transformation. The composition defaults (<code>andThen</code>, <code>compose</code>) are not declared.</p>
+          <pre><code class="lang-java">interface Function { Object apply(Object t); default Function andThen(Function after); default Function compose(Function before); static Function identity(); }</code></pre>
+          <p>A one-argument transformation. <code>f.andThen(g)</code> applies <code>f</code> first, <code>f.compose(g)</code> applies <code>g</code> first, and <code>Function.identity()</code> returns its argument — the JDK's own bodies, so they compose lambdas without any builtin.</p>
           <pre><code class="lang-java">Function f = s -&gt; s + "!";
 System.out.println(f.apply("hi"));   // hi!</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-7">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-7">#</a> <code>BiFunction</code></h3>
-          <pre><code class="lang-java">interface BiFunction { Object apply(Object t, Object u); }</code></pre>
-          <p>A two-argument transformation.</p>
+          <pre><code class="lang-java">interface BiFunction { Object apply(Object t, Object u); default BiFunction andThen(Function after); }</code></pre>
+          <p>A two-argument transformation. <code>andThen</code> feeds its result through a one-argument <code>Function</code>, which is why that parameter is a <code>Function</code> rather than a <code>BiFunction</code>.</p>
           <pre><code class="lang-java">BiFunction add = (a, b) -&gt; a + "/" + b;
 System.out.println(add.apply(1, 2));   // 1/2</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-8">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-8">#</a> <code>UnaryOperator</code></h3>
-          <pre><code class="lang-java">interface UnaryOperator { Object apply(Object t); }</code></pre>
-          <p>A transformation whose argument and result are the same type. Erasure makes its declaration identical to <code>Function</code>'s; the distinct name is what a target type is written as.</p>
+          <pre><code class="lang-java">interface UnaryOperator { Object apply(Object t); static UnaryOperator identity(); }</code></pre>
+          <p>A transformation whose argument and result are the same type. Erasure makes its abstract method identical to <code>Function</code>'s; the distinct name is what a target type is written as.</p>
           <pre><code class="lang-java">UnaryOperator u = s -&gt; s + s;
 System.out.println(u.apply("ab"));   // abab</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-9">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-9">#</a> <code>BinaryOperator</code></h3>
-          <pre><code class="lang-java">interface BinaryOperator { Object apply(Object t, Object u); }</code></pre>
-          <p>A two-argument operator over one type, erased to the same shape as <code>BiFunction</code>.</p>
+          <pre><code class="lang-java">interface BinaryOperator { Object apply(Object t, Object u); static BinaryOperator minBy(Comparator c); static BinaryOperator maxBy(Comparator c); }</code></pre>
+          <p>A two-argument operator over one type, erased to the same shape as <code>BiFunction</code>. <code>minBy</code>/<code>maxBy</code> turn an ordering into the operator that keeps the smaller/larger of its two arguments.</p>
           <pre><code class="lang-java">BinaryOperator pick = (a, b) -&gt; a;
 System.out.println(pick.apply("x", "y"));   // x</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-10">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-10">#</a> <code>Predicate</code></h3>
-          <pre><code class="lang-java">interface Predicate { boolean test(Object t); }</code></pre>
-          <p>A one-argument boolean test. The return type stays primitive rather than erased, so a call participates in javars's numeric typing instead of being an opaque <code>Object</code>.</p>
+          <pre><code class="lang-java">interface Predicate { boolean test(Object t); default Predicate and(Predicate other); default Predicate negate(); default Predicate or(Predicate other); static Predicate not(Predicate target); }</code></pre>
+          <p>A one-argument boolean test. The return type stays primitive rather than erased, so a call participates in javars's numeric typing instead of being an opaque <code>Object</code>. <code>and</code>/<code>or</code> short-circuit exactly as the JDK's bodies do.</p>
           <pre><code class="lang-java">Predicate p = s -&gt; s.equals("yes");
 System.out.println(p.test("yes"));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-11">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-11">#</a> <code>BiPredicate</code></h3>
-          <pre><code class="lang-java">interface BiPredicate { boolean test(Object t, Object u); }</code></pre>
-          <p>A two-argument boolean test.</p>
+          <pre><code class="lang-java">interface BiPredicate { boolean test(Object t, Object u); default BiPredicate and(BiPredicate other); default BiPredicate negate(); default BiPredicate or(BiPredicate other); }</code></pre>
+          <p>A two-argument boolean test, with the same three short-circuiting combinators <code>Predicate</code> carries.</p>
           <pre><code class="lang-java">BiPredicate eq = (a, b) -&gt; a.equals(b);
 System.out.println(eq.test("a", "a"));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-12">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-12">#</a> <code>Comparator</code></h3>
-          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); }</code></pre>
-          <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign.</p>
+          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); }</code></pre>
+          <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign. <code>reversed</code> and <code>thenComparing</code> are declared; the <code>comparing</code>/<code>naturalOrder</code>/<code>reverseOrder</code> statics are not, because they order arbitrary keys by an element's own <code>compareTo</code>, which javars has no dispatch for.</p>
           <pre><code class="lang-java">xs.sort((a, b) -&gt; a.length() - b.length());</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-13">
@@ -1618,22 +1618,22 @@ System.out.println(s.getAsInt() + 1);   // 8</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-14">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-14">#</a> <code>IntPredicate</code></h3>
-          <pre><code class="lang-java">interface IntPredicate { boolean test(int value); }</code></pre>
-          <p>An <code>int</code>-argument boolean test.</p>
+          <pre><code class="lang-java">interface IntPredicate { boolean test(int value); default IntPredicate and(IntPredicate other); default IntPredicate negate(); default IntPredicate or(IntPredicate other); }</code></pre>
+          <p>An <code>int</code>-argument boolean test, with the primitive-specialized forms of <code>Predicate</code>'s three combinators.</p>
           <pre><code class="lang-java">IntPredicate even = n -&gt; n % 2 == 0;
 System.out.println(even.test(4));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-15">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-15">#</a> <code>IntConsumer</code></h3>
-          <pre><code class="lang-java">interface IntConsumer { void accept(int value); }</code></pre>
-          <p>An <code>int</code>-argument action with no result.</p>
+          <pre><code class="lang-java">interface IntConsumer { void accept(int value); default IntConsumer andThen(IntConsumer after); }</code></pre>
+          <p>An <code>int</code>-argument action with no result. <code>andThen</code> runs both actions on the same value, in order.</p>
           <pre><code class="lang-java">IntConsumer show = n -&gt; System.out.println(n);
 show.accept(3);</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-16">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-16">#</a> <code>IntUnaryOperator</code></h3>
-          <pre><code class="lang-java">interface IntUnaryOperator { int applyAsInt(int operand); }</code></pre>
-          <p>An <code>int</code> to <code>int</code> transformation; both sides stay primitive, so the 32-bit wrap applies to arithmetic in the body.</p>
+          <pre><code class="lang-java">interface IntUnaryOperator { int applyAsInt(int operand); default IntUnaryOperator compose(IntUnaryOperator before); default IntUnaryOperator andThen(IntUnaryOperator after); static IntUnaryOperator identity(); }</code></pre>
+          <p>An <code>int</code> to <code>int</code> transformation; both sides stay primitive, so the 32-bit wrap applies to arithmetic in the body. Composes in both directions, and <code>identity()</code> returns its argument.</p>
           <pre><code class="lang-java">IntUnaryOperator sq = n -&gt; n * n;
 System.out.println(sq.applyAsInt(5));   // 25</code></pre>
         </article>
