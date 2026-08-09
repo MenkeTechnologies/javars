@@ -73,7 +73,9 @@ instance methods, `this`, `new`, field access, single inheritance with
 `extends`/`super(…)`, `instanceof`, virtual method dispatch, and `toString()`
 overrides). **Interfaces** (abstract + `default` methods, multiple
 implements, interface inheritance, polymorphic dispatch), **method overloading
-by parameter type** (most-specific resolution for methods and constructors), and
+by parameter type** (most-specific resolution for methods and constructors,
+including Java's variable-arity phase so `T...` parameters take loose
+arguments), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
 X>`, the diamond, erased library type args) all run. `String.format` and
 `System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %b
@@ -404,14 +406,18 @@ and `super(…)`, `instanceof`, runtime-class virtual dispatch for overrides, an
 `toString()` overrides honoured by `println`), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic
 dispatch through an interface type), **method overloading by parameter type**
-(most-specific resolution for methods and constructors), **type-erased
+(most-specific resolution for methods and constructors, plus Java's third —
+variable-arity — phase, so a `T...` parameter is callable with loose arguments
+at every call site), **type-erased
 generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
 diamond), **`static` fields** with `static { }` initializer blocks, **`record`
 types** with their derived accessors / `toString` / `equals`, **abstract
 classes**, **`enum` constants carrying state or bodies**, and **lambdas +
 method references** (heap closures capturing by value, dispatched through any
 single-abstract-method interface), and the **`java.util` collections**
-(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order),
+(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order, and
+`List.subList` as a genuine aliasing view — writes cross in both directions and
+a backing list modified behind it raises `ConcurrentModificationException`),
 **arrow `switch` expressions** with `yield`, and **`java.lang.Object`**
 (`new Object()` as a lock or sentinel, plus the `equals`/`hashCode`/`toString`/
 `getClass` every class inherits from it) — all verified byte-for-byte against

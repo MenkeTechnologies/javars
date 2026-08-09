@@ -1281,9 +1281,16 @@ pub const REFERENCE: &[Entry] = &[
     (
         "remove",
         "List Methods",
-        "T remove(int index)",
-        "Removes and returns the element at `index`. This is the by-index overload, which is the one Java selects for an integral argument; there is no `remove(Object)`, because javars cannot tell a boxed `Integer` from an `int`.",
-        "xs.remove(0);",
+        "T remove(int index) | boolean remove(Object o)",
+        "Both of Java's overloads, chosen at compile time from the argument's *static* type exactly as `javac` chooses them: an `int`/`short`/`byte`/`char` argument removes and returns the element at that index, and any reference argument — a boxed `Integer`, an `Integer.valueOf(x)`, a `String` — removes the first element equal to it and answers whether one was found. An argument javars cannot type statically keeps the by-index reading.",
+        "xs.remove(0);                    // by index\nxs.remove(Integer.valueOf(20));  // by value",
+    ),
+    (
+        "subList",
+        "List Methods",
+        "List<T> subList(int fromIndex, int toIndex)",
+        "A **view** of the half-open range, not a copy: it owns no elements, so writes cross in both directions — `list.set(i, v)` shows through the view and `view.set(i, v)` shows in the list — and `view.add`/`remove`/`clear` splice the backing list itself. A view of a view composes offsets down to the same list. Structurally modifying the backing list *behind* an outstanding view invalidates it, and the next operation on it (or rendering it) raises `ConcurrentModificationException`. `fromIndex < 0` or `toIndex > size()` is an `IndexOutOfBoundsException` naming the offending index; `fromIndex > toIndex` is an `IllegalArgumentException`.",
+        "List<Integer> l = new ArrayList<>(List.of(10, 20, 30, 40));\nList<Integer> v = l.subList(1, 3);\nv.set(0, 99);\nSystem.out.println(l);   // [10, 99, 30, 40]",
     ),
     (
         "clear",
@@ -1618,6 +1625,13 @@ pub const REFERENCE: &[Entry] = &[
         "class StringIndexOutOfBoundsException extends IndexOutOfBoundsException",
         "Raised by `charAt` and both `substring` overloads. `charAt` carries `Index i out of bounds for length n`; `substring` carries `Range [b, e) out of bounds for length n`.",
         "try { \"hi\".charAt(9); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }",
+    ),
+    (
+        "ConcurrentModificationException",
+        "Throwables",
+        "class ConcurrentModificationException extends RuntimeException",
+        "Raised by a `List.subList` view whose backing list was structurally modified behind it — an `add`, a `remove`, or a `Collections.sort` (which bumps Java's `modCount` even though the length is unchanged). It is the one modeled throwable outside `java.lang` besides `PatternSyntaxException`, and prints as `java.util.ConcurrentModificationException`.",
+        "List<Integer> l = new ArrayList<>(List.of(1, 2, 3));\nList<Integer> v = l.subList(0, 2);\nl.add(4);\n// v.get(0);   // ConcurrentModificationException",
     ),
     // ── Functional Interfaces: `prelude.rs` `FUNCTIONAL`. Each is declared to
     //    javars as an ordinary one-method interface, so a lambda assigned to one

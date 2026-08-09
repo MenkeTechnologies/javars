@@ -259,9 +259,27 @@ at the bottom, and are summarized in the section right after this one.
 - **Method overloading by parameter type.** Same-name/same-arity overloads
   differing by parameter type resolve at the call site from the static argument
   types, choosing the most-specific applicable overload (identity < numeric
-  widening < reference upcast; ambiguity is an error). Applies to `static`
-  methods, instance methods (with virtual dispatch keyed on the statically-chosen
-  signature), and constructors.
+  widening < reference upcast < boxing; ambiguity is an error). Applies to
+  `static` methods, instance methods (with virtual dispatch keyed on the
+  statically-chosen signature), and constructors.
+- **Varargs (`T... xs`) in a user-declared method, constructor, or instance
+  method.** `static int sum(int... xs)` is callable as `sum()`, `sum(1)` and
+  `sum(1, 2, 3)`: the trailing arguments are packed into a `T[]` at the call
+  site, which is what the body then sees. Resolution follows Java's phase
+  ordering — the variable-arity phase runs only after both fixed-arity phases
+  find nothing applicable — so a fixed-arity overload always wins at its own
+  arity (`f(int, int)` beats `f(int...)` for `f(1, 2)`), and an argument that
+  already *is* the array matches the declared `T[]` in the fixed-arity phase and
+  passes through unwrapped (`sum(new int[]{1, 2})` is two elements, not one).
+  That same rule is why `f(null)` against `f(Object... xs)` passes `null` as the
+  whole array — the reading `javac` warns about and then compiles. Among two
+  variable-arity candidates the more specific element type wins
+  (`h(String...)` over `h(Object...)`, including for the zero-argument call);
+  mutually-specific ones are ambiguous and select nothing, exactly as `javac`
+  reports for `g(int, int...)` against `g(int...)`. All three call sites pack
+  identically, so a `T...` declaration means the same thing wherever it sits.
+  `main(String... args)` is unaffected: it is the entry point and takes the
+  real argument array.
 - **`static` methods resolve against the class they are called on.** A qualified
   `C.m(args)` is looked up in `C`'s own declarations first and then up its
   superclass chain, so a subclass's `static` *hides* the one it inherits
@@ -402,6 +420,22 @@ at the bottom, and are summarized in the section right after this one.
   `Arrays.asList` is fixed-size and `List.of` immutable, so a structural write
   to either throws `UnsupportedOperationException` exactly as Java's does, and an
   out-of-range `get` throws `IndexOutOfBoundsException` with Java's message.
+- **`List.subList(from, to)` is a real view, not a copy.** It owns no elements:
+  every read and write goes to its window of the backing list, so the aliasing
+  works in *both* directions — `list.set(i, v)` shows through the view, and
+  `view.set(i, v)` shows in the list. Structural changes made *through* the view
+  land in the backing list too (`view.add`/`remove`/`clear` grow, shrink and
+  splice the parent), and a `subList` of a `subList` composes offsets down to
+  the same backing list rather than snapshotting. A structural modification of
+  the backing list made *behind* a view — including `Collections.sort`, which
+  bumps `modCount` without changing the length — invalidates it, and the next
+  operation on it (or rendering it) throws `ConcurrentModificationException`,
+  exactly as Java's `checkForComodification` does. Bounds match Java's two
+  distinct failures: an endpoint outside the list is an
+  `IndexOutOfBoundsException` naming the offending index, a reversed range is an
+  `IllegalArgumentException`. `ConcurrentModificationException` joins the
+  modeled throwable hierarchy, so it can be named in a `catch` clause and prints
+  as `java.util.ConcurrentModificationException`.
 - **`var` type inference.** A `var` local records the *type* it infers, not just
   the value: `var i = 7; i / 2` truncates, `var big = 100000; big * big` wraps at
   32 bits, `var p = new Pt(9, 4); p.sum()` dispatches, and `for (var v : arr)`
@@ -522,24 +556,15 @@ known.
   Java but not in the engine), and a named error beats a silently different
   answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
   four `String` methods are the whole surface.
-- **Varargs in a user-declared method.** `static int sum(int... xs)` *parses* —
-  the parameter becomes an ordinary `int[]` — but the three dots carry no
-  further meaning, so the method has a fixed arity of one and only a call
-  passing an actual array matches it. `sum()`, `sum(1)` and `sum(1, 2, 3)` are
-  all "no `sum` overload matches N argument(s)" compile errors. Closing it is
-  not a library addition: Java resolves a variable-arity call in a third phase
-  that only runs after both fixed-arity phases fail, and the packing of the
-  trailing arguments into an array has to happen at every call site — for
-  `static` methods, instance methods, and constructors alike. A partial version
-  (statics only) would make the same declaration callable or not depending on
-  where it sits, which is worse than one honest error. `main(String... args)` is
-  unaffected: it is the entry point and takes the real argument array.
-- **`List.subList(from, to)`**, and the other view methods (`Map.entrySet`,
-  `List.listIterator`). A view aliases its backing collection in Java —
-  mutating one shows through the other — and javars's collections are heap
-  objects with no aliasing model, so a copy would answer correctly right up
-  until someone wrote through it. An unsupported-method error is the honest
-  answer until views exist.
+- **The other collection view methods** (`Map.entrySet`, `List.listIterator`).
+  `List.subList` is implemented as a real aliasing view (above); these two are
+  not, and an unsupported-method error is the honest answer until they are.
+- **`super.method(args)`** — a qualified call to the superclass's version of an
+  overridden method. `super(args)` (constructor chaining) works; `super.m(…)` in
+  a method body does not, and instead of a compile error it reaches the runtime
+  as a call on a null receiver (`NullPointerException: Cannot invoke
+  "String.m()"`). The error shape is wrong as well as the support: `super` is
+  being lowered as an ordinary name rather than rejected.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded

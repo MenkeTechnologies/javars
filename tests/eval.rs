@@ -2740,3 +2740,138 @@ fn a_subnormal_renders_with_javas_two_digit_widening() {
         "4.9E-324,1.4E-45\n9.9E-324,4.9E-323\n4.2E-45,4.1E-44\n2.2250738585072014E-308,1.1754944E-38\n1.0,0.001,0.1,3.0E7,100.0\n"
     );
 }
+
+// ── Varargs (`T... xs`) ──
+
+/// The phase ordering, not just the packing. Every expectation here was
+/// captured from OpenJDK 26.0.2: a fixed-arity overload wins at its own arity
+/// and loses everywhere else, and an argument that already *is* the array
+/// matches the declared `int[]` in the fixed-arity phase, so it passes through
+/// unwrapped rather than becoming a one-element array.
+#[test]
+fn varargs_resolution_runs_after_both_fixed_arity_phases() {
+    let (out, ok) = run("public class E { \
+         static String f(int a, int b) { return \"fixed2\"; } \
+         static String f(int... xs) { return \"var\" + xs.length; } \
+         static int sum(int... xs) { int t = 0; for (int v : xs) { t += v; } return t; } \
+         public static void main(String[] args) { \
+         System.out.println(f(1, 2) + \" \" + f(1) + \" \" + f(1, 2, 3) + \" \" + f()); \
+         System.out.println(sum(new int[]{4, 5, 6}) + \" \" + sum(1, 2, 3) + \" \" + sum()); } }");
+    assert!(ok);
+    assert_eq!(out, "fixed2 var1 var3 var0\n15 6 0\n");
+}
+
+/// The packing has to happen at all three call sites — a `static`, a
+/// constructor, and an instance method reached through a base-typed reference —
+/// or the same `T...` declaration would be callable depending on where it sits.
+#[test]
+fn varargs_packs_at_static_constructor_and_instance_call_sites() {
+    let (out, ok) = run(
+        "public class E { \
+         static class Bag { int n; Bag(int... xs) { for (int v : xs) { n += v; } } \
+         int plus(int... xs) { int t = n; for (int v : xs) { t += v; } return t; } } \
+         static class Big extends Bag { Big(int... xs) { super(xs); } \
+         int plus(int... xs) { return 100 + n; } } \
+         public static void main(String[] args) { \
+         Bag b = new Bag(1, 2, 3); System.out.println(b.n + \" \" + b.plus(10) + \" \" + b.plus()); \
+         Bag p = new Big(4, 5); System.out.println(p.n + \" \" + p.plus(1)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "6 16 6\n9 109\n");
+}
+
+/// `Object...` against a `null` argument: Java matches the declared `Object[]`
+/// in the fixed-arity phase, so `null` becomes the *whole array* rather than an
+/// array holding it — the reading `javac` warns about and then compiles.
+#[test]
+fn varargs_object_array_takes_a_null_argument_as_the_whole_array() {
+    let (out, ok) = run(
+        "public class E { \
+         static String n(Object... xs) { return xs == null ? \"nullarray\" : \"len\" + xs.length; } \
+         static String k(String... xs) { return \"str\" + xs.length; } \
+         static String k(Object... xs) { return \"obj\" + xs.length; } \
+         public static void main(String[] args) { \
+         System.out.println(n((Object[]) null) + \" \" + n(\"x\") + \" \" + n()); \
+         System.out.println(k(\"a\", \"b\") + \" \" + k(1, 2) + \" \" + k()); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "nullarray len1 len0\nstr2 obj2 str0\n");
+}
+
+// ── `List.subList` views ──
+
+/// A copy would answer every read correctly, so the test that separates a view
+/// from one is a write through each end.
+#[test]
+fn sublist_is_a_view_that_writes_through_in_both_directions() {
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> l = new java.util.ArrayList<>(java.util.List.of(10, 20, 30, 40, 50)); \
+         java.util.List<Integer> s = l.subList(1, 4); \
+         l.set(2, 99); System.out.println(s); \
+         s.set(0, 77); System.out.println(l); \
+         s.add(88); System.out.println(l + \" \" + s); \
+         s.remove(0); System.out.println(l + \" \" + s);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[20, 99, 40]\n[10, 77, 99, 40, 50]\n\
+         [10, 77, 99, 40, 88, 50] [77, 99, 40, 88]\n\
+         [10, 99, 40, 88, 50] [99, 40, 88]\n"
+    );
+}
+
+/// A structural change to the backing list made *behind* the view invalidates
+/// it. `Collections.sort` counts even though the length is unchanged, because
+/// `ArrayList.sort` bumps `modCount` — verified against OpenJDK 26.0.2.
+#[test]
+fn sublist_raises_concurrent_modification_after_the_parent_changes() {
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> l = new java.util.ArrayList<>(java.util.List.of(1, 2, 3)); \
+         java.util.List<Integer> v = l.subList(0, 2); \
+         l.add(4); \
+         try { System.out.println(v.get(0)); } catch (RuntimeException e) { System.out.println(e); } \
+         java.util.List<Integer> q = new java.util.ArrayList<>(java.util.List.of(3, 1, 2)); \
+         java.util.List<Integer> w = q.subList(0, 2); \
+         java.util.Collections.sort(q); \
+         try { System.out.println(\"v \" + w); } catch (RuntimeException e) { System.out.println(e); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.ConcurrentModificationException\njava.util.ConcurrentModificationException\n"
+    );
+}
+
+/// A view of a view composes offsets down to the same backing list rather than
+/// snapshotting, and the endpoints reproduce Java's two distinct failures.
+#[test]
+fn sublist_nests_and_reports_javas_two_bounds_failures() {
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> l = new java.util.ArrayList<>(java.util.List.of(10, 20, 30, 40, 50)); \
+         java.util.List<Integer> s = l.subList(0, 4).subList(1, 3); \
+         s.set(0, 7); System.out.println(l + \" \" + s); \
+         try { l.subList(1, 9); } catch (RuntimeException e) { System.out.println(e); } \
+         try { l.subList(3, 1); } catch (RuntimeException e) { System.out.println(e); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "[10, 7, 30, 40, 50] [7, 30]\n\
+         java.lang.IndexOutOfBoundsException: toIndex = 9\n\
+         java.lang.IllegalArgumentException: fromIndex(3) > toIndex(1)\n"
+    );
+}
+
+/// A throwable raised by the host with no message keeps Java's `null`
+/// `detailMessage`, so it prints as the class name alone rather than with a
+/// bare trailing `": "`.
+#[test]
+fn messageless_host_throwable_has_a_null_detail_message() {
+    let (out, ok) = run(&wrap(
+        "try { java.util.List.of(1, 2).add(3); } \
+         catch (RuntimeException e) { System.out.println(\"[\" + e + \"][\" + e.getMessage() + \"]\"); }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "[java.lang.UnsupportedOperationException][null]\n");
+}

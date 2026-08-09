@@ -1443,6 +1443,88 @@ fn g_listop(r: &mut Rng) -> String {
     }
 }
 
+/// Calls to **user-declared variable-arity** methods, constructors and instance
+/// methods — a shape no other mode emits, because no other mode writes a `...`
+/// parameter at all.
+///
+/// The interesting part is not that `sum(1, 2, 3)` runs; it is *which* of
+/// several declarations a call selects, which Java answers with three ordered
+/// resolution phases. A generator that only ever declared one variadic method
+/// could not tell a correct resolver from one that ignores the ordering, so
+/// every probe here calls into a set where at least two declarations compete:
+/// a fixed-arity overload that must win outright, an array argument that must
+/// pass through unpacked, and element types (`String…`/`Object…`, `int…`/
+/// `double…`) whose specificity decides the winner.
+fn g_varargs(r: &mut Rng) -> String {
+    let n = pick(r, &["1", "2", "7", "-3"]);
+    let s = pick(r, &["\"a\"", "\"b\"", "\"zz\""]);
+    match r.below(16) {
+        // Arity: none, one, several — the same declaration has to take all of
+        // them, and `xs.length` proves what actually arrived.
+        0 => format!("System.out.println(vsum({n}, {n}, {n}));"),
+        1 => format!("System.out.println(vsum({n}));"),
+        2 => "System.out.println(vsum());".to_string(),
+        // An *array* argument matches the declared `int[]` in the fixed-arity
+        // phase, so it is passed straight through rather than wrapped in a
+        // one-element array.
+        3 => format!("{{ int[] a = {{{n}, 4}}; System.out.println(vsum(a)); }}"),
+        4 => format!("System.out.println(vsum(new int[]{{{n}, 5, 6}}));"),
+        // A fixed-arity overload must beat the variadic one for the arity it
+        // declares, and lose for every other.
+        5 => format!("System.out.println(vpick({n}, 2));"),
+        6 => format!("System.out.println(vpick({n}));"),
+        7 => format!("System.out.println(vpick({n}, 2, 3));"),
+        8 => "System.out.println(vpick());".to_string(),
+        // Element-type specificity between two variadic candidates.
+        9 => format!("System.out.println(vkind({s}, {s}));"),
+        10 => format!("System.out.println(vkind({n}, {n}));"),
+        11 => "System.out.println(vkind());".to_string(),
+        // A fixed prefix ahead of the variadic tail, and the zero-length tail.
+        12 => format!("System.out.println(vtag({s}, {n}, {n}));"),
+        13 => format!("System.out.println(vtag({s}));"),
+        // A constructor and an instance method, both variadic, plus the
+        // `(Object[]) null` cast Java passes as the whole array.
+        14 => format!(
+            "{{ Bag b = new Bag({n}, {n}); System.out.println(b.total() + \" \" + b.plus({n})); }}"
+        ),
+        _ => "System.out.println(vnull((Object[]) null) + \" \" + vnull(1, 2));".to_string(),
+    }
+}
+
+/// `List.subList` **views**, whose defining property is that they alias their
+/// backing list rather than copy it.
+///
+/// A copy answers every read correctly, so read-only probes cannot distinguish
+/// one from a view — which is exactly why this mode writes through both ends.
+/// Each probe either mutates the parent and reads the view, mutates the view
+/// and reads the parent, or structurally modifies the parent and then touches
+/// the view, where Java raises `ConcurrentModificationException`.
+fn g_listview(r: &mut Rng) -> String {
+    let v = pick(r, &["7", "8", "99"]);
+    let init = "List<Integer> l = new ArrayList<>(Arrays.asList(10, 20, 30, 40, 50));";
+    match r.below(14) {
+        0 => format!("{{ {init} System.out.println(l.subList(1, 4)); }}"),
+        1 => format!("{{ {init} System.out.println(l.subList(0, 0) + \" \" + l.subList(2, 2).isEmpty()); }}"),
+        2 => format!("{{ {init} System.out.println(l.subList(1, 4).size() + \" \" + l.subList(1, 4).get(1)); }}"),
+        // parent write → visible through the view
+        3 => format!("{{ {init} List<Integer> s = l.subList(1, 4); l.set(2, {v}); System.out.println(s); }}"),
+        4 => format!("{{ {init} List<Integer> s = l.subList(0, 3); l.set(0, {v}); System.out.println(s.get(0) + \" \" + s.contains({v})); }}"),
+        // view write → visible in the parent
+        5 => format!("{{ {init} List<Integer> s = l.subList(1, 3); s.set(0, {v}); System.out.println(l); }}"),
+        6 => format!("{{ {init} List<Integer> s = l.subList(2, 5); s.add({v}); System.out.println(l + \" \" + s); }}"),
+        7 => format!("{{ {init} List<Integer> s = l.subList(1, 4); s.remove(0); System.out.println(l + \" \" + s); }}"),
+        8 => format!("{{ {init} List<Integer> s = l.subList(1, 3); s.clear(); System.out.println(l + \" \" + s.size()); }}"),
+        // a view of a view still reaches the same backing list
+        9 => format!("{{ {init} List<Integer> s = l.subList(0, 4).subList(1, 3); s.set(0, {v}); System.out.println(l + \" \" + s); }}"),
+        // reads that must agree with the equivalent plain list
+        10 => format!("{{ {init} List<Integer> s = l.subList(1, 4); System.out.println(s.indexOf(30) + \" \" + s.equals(Arrays.asList(20, 30, 40))); }}"),
+        11 => format!("{{ {init} List<Integer> s = l.subList(1, 4); int t = 0; for (int x : s) t += x; System.out.println(t); }}"),
+        // a structural change to the parent invalidates the view
+        12 => format!("{{ {init} List<Integer> s = l.subList(1, 3); l.add({v}); try {{ System.out.println(s.get(0)); }} catch (RuntimeException e) {{ System.out.println(e); }} }}"),
+        _ => format!("{{ {init} List<Integer> s = l.subList(1, 3); l.remove(0); try {{ System.out.println(s.size()); }} catch (RuntimeException e) {{ System.out.println(e); }} }}"),
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -1452,6 +1534,19 @@ const SUPPORT: &str = concat!(
     "    static Color next(Color c) { return c == Color.BLUE ? Color.RED : Color.values()[c.ordinal() + 1]; }\n",
     "    static int useCalc(Calc c, int a, int b) { return c.of(a, b); }\n",
     "    static Calc mkAdder(int n) { return (x, y) -> x + y + n; }\n",
+    // Variable-arity declarations for the `varargs` mode. They come in
+    // competing sets on purpose: `vpick` pairs a fixed-arity overload with a
+    // variadic one (the fixed one must win at its own arity and only there),
+    // and `vkind` pairs two variadic ones whose element types decide which is
+    // more specific. A single variadic declaration would be satisfied by a
+    // resolver that ignores the phase ordering entirely.
+    "    static int vsum(int... xs) { int t = 0; for (int v : xs) t += v; return t; }\n",
+    "    static String vpick(int a, int b) { return \"fixed2\"; }\n",
+    "    static String vpick(int... xs) { return \"var\" + xs.length; }\n",
+    "    static String vkind(String... xs) { return \"str\" + xs.length; }\n",
+    "    static String vkind(Object... xs) { return \"obj\" + xs.length; }\n",
+    "    static String vtag(String tag, int... xs) { return tag + \":\" + xs.length + \":\" + Arrays.toString(xs); }\n",
+    "    static String vnull(Object... xs) { return xs == null ? \"nullarray\" : \"len\" + xs.length; }\n",
 );
 
 /// The types the probes construct: the `AutoCloseable` the resource probes open
@@ -1517,6 +1612,16 @@ const SUPPORT_CLASS: &str = concat!(
     "    String n;\n",
     "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
     "    public void close() { System.out.println(\"close \" + n); }\n",
+    "}\n",
+    // A variable-arity *constructor* and a variable-arity *instance* method —
+    // the two call sites besides a `static` that Java packs arguments at, and
+    // the reason a statics-only implementation would make the same declaration
+    // callable or not depending on where it sits.
+    "class Bag {\n",
+    "    int n;\n",
+    "    Bag(int... xs) { for (int v : xs) n += v; }\n",
+    "    int total() { return n; }\n",
+    "    int plus(int... xs) { int t = n; for (int v : xs) t += v; return t; }\n",
     "}\n",
     // Two *unrelated* classes declaring statics of the same name — `Qa` and `Qb`
     // both spell `f`, `g` and `h`. A qualified `Qb.f(1)` must reach `Qb`'s body
@@ -1593,6 +1698,8 @@ enum Mode {
     LoopKind,
     Narrow,
     ListOp,
+    Varargs,
+    ListView,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1641,6 +1748,8 @@ const CONCRETE: &[Mode] = &[
     Mode::LoopKind,
     Mode::Narrow,
     Mode::ListOp,
+    Mode::Varargs,
+    Mode::ListView,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1691,6 +1800,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::LoopKind => "loopkind",
         Mode::Narrow => "narrow",
         Mode::ListOp => "listop",
+        Mode::Varargs => "varargs",
+        Mode::ListView => "listview",
     }
 }
 
@@ -1753,6 +1864,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::LoopKind => g_loopkind(r),
         Mode::Narrow => g_narrow(r),
         Mode::ListOp => g_listop(r),
+        Mode::Varargs => g_varargs(r),
+        Mode::ListView => g_listview(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -2012,6 +2125,7 @@ fn main() {
     let base = args.seed.unwrap_or(0x5EED);
     let mut failures = 0usize;
     let mut probes_run = 0usize;
+    let mut skipped = 0usize;
 
     for k in 0..iters {
         let seed = if args.once {
@@ -2020,8 +2134,27 @@ fn main() {
             base.wrapping_add(k as u64)
         };
         let probes = gen_probes(seed, args.mode, args.probes);
+        let src = build_program(&probes);
+        let a = run_prog(&oracle, &src, args.timeout);
+        // A program the reference toolchain itself did not run is no evidence
+        // about javars. Comparing anyway would let a probe the JDK rejects be
+        // counted as agreement (both sides "fail"), which silently inflates a
+        // clean sweep — so it is skipped and reported under its own count.
+        if !a.ok || a.stdout.is_empty() {
+            skipped += 1;
+            eprintln!("seed {seed}: SKIPPED — reference `java` did not produce output");
+            // A skip is a claim about the *generator*, not about javars, so the
+            // program has to be inspectable — otherwise a mode that emits Java
+            // the JDK rejects would quietly shrink the verified count instead of
+            // being fixed.
+            if args.verbose {
+                eprintln!("{src}");
+            }
+            continue;
+        }
         probes_run += probes.len();
-        if !diverges(&probes, &ours, &oracle, args.timeout) {
+        let b = run_prog(&ours, &src, args.timeout);
+        if !differs(&a, &b) {
             if args.verbose {
                 eprintln!("seed {seed}: ok ({} probes)", probes.len());
             }
@@ -2041,7 +2174,7 @@ fn main() {
     }
 
     eprintln!(
-        "parity-fuzz: {} program(s), {probes_run} probe(s), {failures} divergence(s)",
+        "parity-fuzz: {} program(s) ({skipped} skipped), {probes_run} verified probe(s), {failures} divergence(s)",
         iters
     );
     if failures > 0 {

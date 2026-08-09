@@ -61,6 +61,9 @@ struct MethodSig {
     param_tys: Vec<String>,
     ret: NumType,
     ret_name: String,
+    /// True when the last parameter was declared `T...` — the overload is
+    /// eligible for Java's variable-arity resolution phase.
+    varargs: bool,
 }
 
 /// A resolved static-method call: the mangled target subroutine name and its
@@ -72,6 +75,21 @@ struct StaticResolved {
     /// The chosen overload's declared parameter types — the lambda target type
     /// for each argument.
     param_tys: Vec<String>,
+    /// `Some(k)` when the call was resolved in the variable-arity phase: the
+    /// arguments from index `k` on are packed into one array at the call site
+    /// (see [`Compiler::effective_args`]). `None` is a fixed-arity call, whose
+    /// arguments pass through untouched.
+    vararg_from: Option<usize>,
+}
+
+/// A resolved instance-method call: the chosen overload's declared parameter
+/// types (the virtual-dispatch key and the per-argument lambda target type),
+/// its return type, and the variable-arity packing point.
+struct InstanceResolved {
+    param_tys: Vec<String>,
+    ret_name: String,
+    ret: NumType,
+    vararg_from: Option<usize>,
 }
 
 /// Compile-time metadata for one user-defined class, resolved with inheritance
@@ -108,9 +126,53 @@ struct ClassInfo {
     /// method has no subroutine; it is only reached through virtual dispatch to a
     /// concrete implementor.
     methods: Vec<MethodMeta>,
-    /// Constructor parameter-type signatures this class declares (empty ⇒
-    /// implicit default ctor). Enables constructor overload resolution by type.
-    ctors: Vec<Vec<String>>,
+    /// Constructor signatures this class declares (empty ⇒ implicit default
+    /// ctor). Enables constructor overload resolution by type.
+    ctors: Vec<CtorSig>,
+}
+
+/// One declared constructor's compile-time signature.
+#[derive(Clone)]
+struct CtorSig {
+    param_tys: Vec<String>,
+    /// True when the last parameter was declared `T...` (see [`MethodSig`]).
+    varargs: bool,
+}
+
+/// True when a parameter list ends in a variable-arity parameter (`T... xs`).
+/// Java allows it only in last position, so only the last one is consulted.
+fn is_varargs(params: &[Param]) -> bool {
+    params.last().is_some_and(|p| p.varargs)
+}
+
+/// The `i`-th parameter type of a variable-arity signature *expanded* to as
+/// many positions as asked for: the fixed parameters as declared, then the
+/// trailing array's component type repeated. `(String, int[]…)` expands to
+/// `String, int, int, …`.
+fn expanded_param(ptys: &[String], i: usize) -> &str {
+    let last = ptys.len().saturating_sub(1);
+    let p = &ptys[i.min(last)];
+    if i >= last {
+        p.strip_suffix("[]").unwrap_or(p)
+    } else {
+        p
+    }
+}
+
+/// Why a fixed-arity resolution phase selected nothing.
+///
+/// The distinction decides whether Java's *third* (variable-arity) phase runs:
+/// it is reached only when the first two find nothing **applicable**. An
+/// ambiguity among applicable fixed-arity candidates is a compile error in
+/// Java, not a reason to widen the search — so it must not fall through, or
+/// `f(int,int)`/`f(long,long)` against `f(1,2)` could silently land on a
+/// `f(int...)` that Java never considers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoPick {
+    /// No candidate's parameters accept the arguments.
+    Inapplicable,
+    /// Several candidates are equally specific.
+    Ambiguous,
 }
 
 /// One dispatchable method's compile-time signature: its name, declared
@@ -125,6 +187,8 @@ struct MethodMeta {
     /// True for a bodyless interface/abstract method — it has no subroutine and
     /// is never itself a concrete virtual-dispatch target.
     is_abstract: bool,
+    /// True when the last parameter was declared `T...` (see [`MethodSig`]).
+    varargs: bool,
 }
 
 /// A field with its declared type and optional initializer, in the order it is
@@ -405,6 +469,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             param_tys: m.params.iter().map(|p| p.ty.clone()).collect(),
             ret: numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
             ret_name: m.ret.clone(),
+            varargs: is_varargs(&m.params),
         });
     }
     let classes = resolve_classes(prog)?;
@@ -593,6 +658,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                         defining: iface.clone(),
                         ret: m.ret.clone(),
                         is_abstract: m.is_abstract,
+                        varargs: is_varargs(&m.params),
                     },
                 );
             }
@@ -619,15 +685,19 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                         defining: anc_name.clone(),
                         ret: m.ret.clone(),
                         is_abstract: m.is_abstract,
+                        varargs: is_varargs(&m.params),
                     },
                 );
             }
         }
         let methods: Vec<MethodMeta> = methods.into_values().collect();
-        let ctors: Vec<Vec<String>> = cl
+        let ctors: Vec<CtorSig> = cl
             .ctors
             .iter()
-            .map(|c| c.params.iter().map(|p| p.ty.clone()).collect())
+            .map(|c| CtorSig {
+                param_tys: c.params.iter().map(|p| p.ty.clone()).collect(),
+                varargs: is_varargs(&c.params),
+            })
             .collect();
         let mut supertypes = Vec::new();
         if let Some(sup) = &cl.superclass {
@@ -1162,7 +1232,7 @@ impl Compiler {
                 let rc = self.expr_class(recv)?;
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
-                let (_, ret_name, _) = self.resolve_instance_call(&rc, method, &arg_tys)?;
+                let ret_name = self.resolve_instance_call(&rc, method, &arg_tys)?.ret_name;
                 self.classes.contains_key(&ret_name).then_some(ret_name)
             }
             _ => None,
@@ -1370,10 +1440,8 @@ impl Compiler {
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
                 if let Some(rc) = self.expr_class(recv) {
-                    if let Some((_, ret_name, _)) =
-                        self.resolve_instance_call(&rc, method, &arg_tys)
-                    {
-                        return Some(ret_name);
+                    if let Some(r) = self.resolve_instance_call(&rc, method, &arg_tys) {
+                        return Some(r.ret_name);
                     }
                 }
                 // A collection receiver's known return types.
@@ -1465,6 +1533,24 @@ impl Compiler {
         if to == "Object" && is_reference_type(from) {
             return Some(40);
         }
+        // Boxing — Java's *second* resolution phase. A primitive converts to its
+        // wrapper and then widens like any other reference, which is what makes
+        // `f(1)` reach an `f(Object)` (and `h(1, 2)` reach an `h(Object... xs)`)
+        // at all. Priced above every widening conversion so a phase-1 match
+        // always wins: `f(double)` still beats `f(Object)` for `f(1)`.
+        const BOX: u32 = 60;
+        if let Some(w) = wrapper_of(from) {
+            if w == to {
+                return Some(BOX);
+            }
+            if let Some(d) = self.subtype_distance(w, to) {
+                return Some(BOX + d);
+            }
+            let numeric = numeric_rank(from).is_some();
+            if to == "Object" || to == "Comparable" || (to == "Number" && numeric) {
+                return Some(BOX + 1);
+            }
+        }
         None
     }
 
@@ -1508,80 +1594,214 @@ impl Compiler {
     /// without contributing to specificity.
     fn pick_overload(
         &self,
-        cands: &[&[String]],
+        cands: &[(&[String], bool)],
         arg_tys: &[Option<String>],
-        who: &str,
-    ) -> Result<usize, String> {
-        if cands.len() == 1 {
+    ) -> Result<usize, NoPick> {
+        // javars does not type-check (see BUGS.md), so a lone *fixed-arity*
+        // candidate of the right arity is taken whether or not its parameters
+        // accept the arguments — a `javac` type error may still run. A lone
+        // *variable-arity* candidate is not the same question: whether its
+        // declared `T[]` accepts the argument is precisely what separates
+        // `sum(intArray)` (passed straight through) from `sum(1)` (packed), so
+        // there applicability has to be checked.
+        if matches!(cands, [(_, false)]) {
             return Ok(0);
         }
+        let scored = cands
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (ptys, _))| self.signature_cost(ptys, arg_tys).map(|c| (i, c)));
+        Self::most_specific(scored)
+    }
+
+    /// Java's three resolution phases over one candidate set, in order: the
+    /// fixed-arity ones first, and the variable-arity one **only** when they
+    /// find nothing applicable. Returns the winning candidate's index and, for
+    /// a variable-arity win, the argument index where call-site packing starts.
+    ///
+    /// This is the single entry point for all three kinds of user-declared
+    /// callable — `static` methods, instance methods, and constructors — so a
+    /// `T...` declaration means the same thing wherever it sits.
+    fn resolve_overload(
+        &self,
+        cands: &[(&[String], bool)],
+        arg_tys: &[Option<String>],
+    ) -> Option<(usize, Option<usize>)> {
+        let of_arity: Vec<usize> = (0..cands.len())
+            .filter(|&i| cands[i].0.len() == arg_tys.len())
+            .collect();
+        let fixed: Vec<(&[String], bool)> = of_arity.iter().map(|&i| cands[i]).collect();
+        match self.pick_overload(&fixed, arg_tys) {
+            Ok(i) => Some((of_arity[i], None)),
+            Err(NoPick::Ambiguous) => None,
+            Err(NoPick::Inapplicable) => {
+                let (i, from) = self.pick_varargs(cands, arg_tys)?;
+                Some((i, Some(from)))
+            }
+        }
+    }
+
+    /// The total conversion cost of passing `arg_tys` to a fixed-arity
+    /// parameter list, or `None` when some argument is not assignable. An
+    /// argument whose static type is unknown matches any parameter without
+    /// contributing to specificity.
+    fn signature_cost(&self, ptys: &[String], arg_tys: &[Option<String>]) -> Option<u32> {
+        let mut total = 0;
+        for (p, a) in ptys.iter().zip(arg_tys) {
+            if let Some(at) = a {
+                total += self.assign_cost(at, p)?;
+            }
+        }
+        Some(total)
+    }
+
+    /// The single cheapest candidate out of `(index, cost)` pairs — Java's
+    /// most-specific rule, approximated by conversion cost. A tie is
+    /// [`NoPick::Ambiguous`]; an empty set is [`NoPick::Inapplicable`].
+    fn most_specific(scored: impl Iterator<Item = (usize, u32)>) -> Result<usize, NoPick> {
         let mut best: Option<(usize, u32)> = None;
         let mut tie = false;
-        for (i, ptys) in cands.iter().enumerate() {
-            let mut total = 0u32;
-            let mut ok = true;
-            for (p, a) in ptys.iter().zip(arg_tys) {
-                if let Some(at) = a {
-                    match self.assign_cost(at, p) {
-                        Some(c) => total += c,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
+        for (i, cost) in scored {
             match best {
-                None => {
-                    best = Some((i, total));
+                Some((_, bc)) if cost > bc => {}
+                Some((_, bc)) if cost == bc => tie = true,
+                _ => {
+                    best = Some((i, cost));
                     tie = false;
-                }
-                Some((_, bc)) => {
-                    if total < bc {
-                        best = Some((i, total));
-                        tie = false;
-                    } else if total == bc {
-                        tie = true;
-                    }
                 }
             }
         }
         match best {
             Some((i, _)) if !tie => Ok(i),
-            Some(_) => Err(format!("javars: ambiguous overload for `{who}`")),
-            None => Err(format!("javars: no applicable overload for `{who}`")),
+            Some(_) => Err(NoPick::Ambiguous),
+            None => Err(NoPick::Inapplicable),
         }
     }
 
+    /// Java's **third** resolution phase (JLS 15.12.2.4), run only after both
+    /// fixed-arity phases report [`NoPick::Inapplicable`].
+    ///
+    /// A candidate declared `(P0 … Pk-1, T[]…)` is applicable to `n ≥ k`
+    /// arguments when each of the first `k` is assignable to its own parameter
+    /// and every remaining one is assignable to the *component* type `T`. The
+    /// winner's trailing arguments are packed into a `T[]` at the call site.
+    ///
+    /// Ordering matters and is not an implementation detail: because this phase
+    /// never runs while a fixed-arity candidate applies, `f(int,int)` beats
+    /// `f(int...)` for `f(1,2)`, and `sum(new int[]{1,2})` against
+    /// `sum(int... xs)` is a *fixed-arity* match on the declared `int[]` — so
+    /// the array passes straight through instead of being wrapped, which is
+    /// exactly what Java does (and why `f(null)` against `f(Object... xs)`
+    /// passes `null` as the whole array rather than an array holding `null`).
+    ///
+    /// Among applicable variable-arity candidates the cheaper conversion wins.
+    /// A tie is settled by JLS 15.12.2.5 specificity over the *expanded*
+    /// parameter lists ([`Compiler::at_least_as_specific`]) — which is what
+    /// picks `h(String...)` over `h(Object...)` for the zero-argument `h()`,
+    /// where both convert at no cost. Mutually-specific candidates are
+    /// genuinely ambiguous and select nothing, exactly as `javac` reports for
+    /// `g(int, int...)` against `g(int...)`.
+    ///
+    /// Returns the winning index and the argument index packing starts at.
+    fn pick_varargs(
+        &self,
+        cands: &[(&[String], bool)],
+        arg_tys: &[Option<String>],
+    ) -> Option<(usize, usize)> {
+        let n = arg_tys.len();
+        let applicable: Vec<(usize, u32)> = cands
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (ptys, varargs))| {
+                if !varargs || ptys.is_empty() || n + 1 < ptys.len() {
+                    return None;
+                }
+                let fixed = ptys.len() - 1;
+                let elem = ptys[fixed].strip_suffix("[]")?;
+                let mut total = self.signature_cost(&ptys[..fixed], &arg_tys[..fixed])?;
+                for a in arg_tys[fixed..].iter().flatten() {
+                    total += self.assign_cost(a, elem)?;
+                }
+                Some((i, total))
+            })
+            .collect();
+        let best = applicable.iter().map(|&(_, c)| c).min()?;
+        let tied: Vec<usize> = applicable
+            .iter()
+            .filter(|&&(_, c)| c == best)
+            .map(|&(i, _)| i)
+            .collect();
+        let mut winners = tied.iter().filter(|&&i| {
+            tied.iter()
+                .all(|&j| self.at_least_as_specific(cands[i].0, cands[j].0, n))
+        });
+        let idx = *winners.next()?;
+        winners
+            .next()
+            .is_none()
+            .then(|| (idx, cands[idx].0.len() - 1))
+    }
+
+    /// True when every expanded parameter of `a` is assignable to `b`'s — JLS
+    /// 15.12.2.5's "at least as specific", compared over
+    /// `max(n, arity(a), arity(b))` positions. Comparing at the *declared*
+    /// arity too is what separates `String...` from `Object...` when the call
+    /// passes no arguments at all.
+    fn at_least_as_specific(&self, a: &[String], b: &[String], n: usize) -> bool {
+        let k = n.max(a.len()).max(b.len());
+        (0..k).all(|i| {
+            self.assign_cost(expanded_param(a, i), expanded_param(b, i))
+                .is_some()
+        })
+    }
+
+    /// The argument list a call actually emits. `vararg_from` is `None` for a
+    /// fixed-arity call (the arguments pass through); for a variable-arity one
+    /// it is the index where packing starts, and everything from there becomes
+    /// a single array literal of the parameter's component type — the array the
+    /// callee's body sees as its `T[]` parameter.
+    fn effective_args(
+        args: &[Expr],
+        param_tys: &[String],
+        vararg_from: Option<usize>,
+    ) -> Vec<Expr> {
+        let Some(from) = vararg_from else {
+            return args.to_vec();
+        };
+        let elem_ty = param_tys
+            .last()
+            .and_then(|t| t.strip_suffix("[]"))
+            .map(str::to_string);
+        let mut out = args[..from].to_vec();
+        out.push(Expr::ArrayLit {
+            elems: args[from..].to_vec(),
+            elem_ty,
+        });
+        out
+    }
+
     /// Resolve an instance-method call on a static receiver class by argument
-    /// type: the chosen overload's parameter types, its return type name, and its
-    /// return numeric category. `None` when no method of that name+arity exists.
+    /// type. `None` when no method of that name resolves for these arguments.
     fn resolve_instance_call(
         &self,
         class: &str,
         method: &str,
         arg_tys: &[Option<String>],
-    ) -> Option<(Vec<String>, String, NumType)> {
+    ) -> Option<InstanceResolved> {
         let info = self.classes.get(class)?;
-        let cands: Vec<&MethodMeta> = info
-            .methods
+        let named: Vec<&MethodMeta> = info.methods.iter().filter(|m| m.name == method).collect();
+        let cands: Vec<(&[String], bool)> = named
             .iter()
-            .filter(|m| m.name == method && m.param_tys.len() == arg_tys.len())
+            .map(|m| (m.param_tys.as_slice(), m.varargs))
             .collect();
-        if cands.is_empty() {
-            return None;
-        }
-        let cand_tys: Vec<&[String]> = cands.iter().map(|m| m.param_tys.as_slice()).collect();
-        let idx = self.pick_overload(&cand_tys, arg_tys, method).ok()?;
-        let m = cands[idx];
-        Some((
-            m.param_tys.clone(),
-            m.ret.clone(),
-            numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
-        ))
+        let (i, vararg_from) = self.resolve_overload(&cands, arg_tys)?;
+        let m = named[i];
+        Some(InstanceResolved {
+            param_tys: m.param_tys.clone(),
+            ret_name: m.ret.clone(),
+            ret: numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
+            vararg_from,
+        })
     }
 
     /// Resolve the concrete implementation of an exact `(method, param_tys)`
@@ -1696,49 +1916,51 @@ impl Compiler {
         name: &str,
         arg_tys: &[Option<String>],
     ) -> Option<StaticResolved> {
-        let filtered: Vec<&&MethodSig> = cands
+        let sigs: Vec<(&[String], bool)> = cands
             .iter()
-            .filter(|s| s.param_tys.len() == arg_tys.len())
+            .map(|s| (s.param_tys.as_slice(), s.varargs))
             .collect();
-        if filtered.is_empty() {
-            return None;
-        }
-        let cand_tys: Vec<&[String]> = filtered.iter().map(|s| s.param_tys.as_slice()).collect();
-        let idx = self.pick_overload(&cand_tys, arg_tys, name).ok()?;
-        let s = filtered[idx];
+        let (i, vararg_from) = self.resolve_overload(&sigs, arg_tys)?;
+        let s = cands[i];
         Some(StaticResolved {
             mangled: mangle_static(&s.owner, name, &s.param_tys),
             ret: s.ret,
             ret_name: s.ret_name.clone(),
             param_tys: s.param_tys.clone(),
+            vararg_from,
         })
     }
 
     /// Resolve a constructor of `class` by argument type: the chosen ctor's
-    /// parameter-type list (for mangling the `<init>` subroutine). `None` when
-    /// no constructor of that arity is declared.
-    fn resolve_ctor(&self, class: &str, arg_tys: &[Option<String>]) -> Option<Vec<String>> {
+    /// parameter-type list (for mangling the `<init>` subroutine) and its
+    /// variable-arity packing point. `None` when no constructor resolves.
+    fn resolve_ctor(
+        &self,
+        class: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<(Vec<String>, Option<usize>)> {
         let info = self.classes.get(class)?;
-        let filtered: Vec<&Vec<String>> = info
+        let cands: Vec<(&[String], bool)> = info
             .ctors
             .iter()
-            .filter(|c| c.len() == arg_tys.len())
+            .map(|c| (c.param_tys.as_slice(), c.varargs))
             .collect();
-        if filtered.is_empty() {
-            return None;
-        }
-        let cand_tys: Vec<&[String]> = filtered.iter().map(|c| c.as_slice()).collect();
-        let idx = self.pick_overload(&cand_tys, arg_tys, "<init>").ok()?;
-        Some(filtered[idx].clone())
+        let (i, vararg_from) = self.resolve_overload(&cands, arg_tys)?;
+        Some((info.ctors[i].param_tys.clone(), vararg_from))
     }
 
     /// True when `class` declares or inherits any method named `method` with
     /// `argc` parameters (an existence check for dispatch decisions).
     fn has_instance_method(&self, class: &str, method: &str, argc: usize) -> bool {
         self.classes.get(class).is_some_and(|ci| {
-            ci.methods
-                .iter()
-                .any(|m| m.name == method && m.param_tys.len() == argc)
+            ci.methods.iter().any(|m| {
+                m.name == method
+                    && (m.param_tys.len() == argc
+                        // A variable-arity method accepts any count from its
+                        // fixed parameters up, so a bare `f(1, 2, 3)` inside
+                        // the class still routes to `this.f(int... xs)`.
+                        || (m.varargs && argc + 1 >= m.param_tys.len()))
+            })
         })
     }
 
@@ -1819,7 +2041,7 @@ impl Compiler {
         // Resolve which overload the static argument types select, then dispatch
         // that exact signature virtually on the receiver's runtime class.
         let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
-        let (param_tys, _, _) = self
+        let resolved = self
             .resolve_instance_call(rc, method, &arg_tys)
             .ok_or_else(|| {
                 format!(
@@ -1827,6 +2049,13 @@ impl Compiler {
                 args.len()
             )
             })?;
+        let param_tys = resolved.param_tys;
+        // A variable-arity call packs its trailing arguments into one array
+        // before anything is emitted, so every path below — the direct call,
+        // the virtual dispatch chain, and the argument temps — sees the same
+        // fixed-arity argument list the callee's parameters expect.
+        let packed = Self::effective_args(args, &param_tys, resolved.vararg_from);
+        let args: &[Expr] = &packed;
         let targets = self
             .virtual_targets(rc, method, &param_tys)
             .ok_or_else(|| {
@@ -2230,8 +2459,8 @@ impl Compiler {
                 if let Some(rc) = self.expr_class(recv) {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
-                    if let Some((_, _, ret)) = self.resolve_instance_call(&rc, method, &arg_tys) {
-                        return ret;
+                    if let Some(r) = self.resolve_instance_call(&rc, method, &arg_tys) {
+                        return r.ret;
                     }
                 }
                 // The `String` instance methods that return `int`.
@@ -2647,7 +2876,7 @@ impl Compiler {
             if method == "new" {
                 let arity = match ci.ctors.len() {
                     0 => 0,
-                    1 => ci.ctors[0].len(),
+                    1 => ci.ctors[0].param_tys.len(),
                     _ => {
                         return Err(format!(
                             "javars: `{name}::new` is ambiguous — {} constructors (line {line})",
@@ -3834,6 +4063,19 @@ impl Compiler {
         if self.is_char_expr(e) || self.is_float32_expr(e) {
             return self.emit_char_string(e);
         }
+        // A `List` operand's string conversion is its `toString()`, and for a
+        // `subList` view that call is what reports a backing list which moved
+        // underneath it. Routing a statically-known list through the collection
+        // dispatch (instead of the host's infallible rendering) is what lets
+        // the `ConcurrentModificationException` surface from `"x " + view`; it
+        // produces the identical text for every other list.
+        if self.expr_java_type(e).as_deref().and_then(collection_kind) == Some("list") {
+            self.expr(e)?;
+            let name_c = self.b.add_constant(Value::str("toString".to_string()));
+            self.b.emit(Op::LoadConst(name_c), 0);
+            self.emit_raising_builtin(crate::host::JCOLL_DISPATCH, 2, 0);
+            return Ok(());
+        }
         let Some(rc) = self.expr_class(e) else {
             return self.expr(e);
         };
@@ -4151,7 +4393,9 @@ impl Compiler {
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
                 if let Some(resolved) = self.resolve_static_on(&class, method, &arg_tys) {
-                    self.call_args_targeted(args, &resolved.param_tys)?;
+                    let args =
+                        Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
+                    self.call_args_targeted(&args, &resolved.param_tys)?;
                     let name_idx = self.b.add_name(&resolved.mangled);
                     self.b.emit(Op::Call(name_idx, args.len() as u8), line);
                     self.emit_exc_check(line);
@@ -4243,7 +4487,11 @@ impl Compiler {
         // catches a collection whose static type javars could not determine
         // (an erased `Map.get` result), so this is a diagnostics-and-clarity
         // shortcut rather than the only route.
-        if let Some(kind) = self.expr_java_type(recv).as_deref().and_then(collection_kind) {
+        if let Some(kind) = self
+            .expr_java_type(recv)
+            .as_deref()
+            .and_then(collection_kind)
+        {
             // `List` declares BOTH `remove(int)` and `remove(Object)`, and Java
             // picks between them from the argument's *static* type: an integral
             // primitive removes by index, anything else (a boxed `Integer`, a
@@ -4397,7 +4645,7 @@ impl Compiler {
             .get(ctor_class)
             .ok_or_else(|| format!("javars: unknown class `{ctor_class}` (line {line})"))?;
         let has_any_ctor = !ctor_info.ctors.is_empty();
-        let ctor_arities: Vec<usize> = ctor_info.ctors.iter().map(|c| c.len()).collect();
+        let ctor_arities: Vec<usize> = ctor_info.ctors.iter().map(|c| c.param_tys.len()).collect();
         let info = &self.classes[class];
         // Field-init plan (name, type, optional init expr), cloned so the
         // ChunkBuilder borrow does not alias `self.classes`.
@@ -4431,9 +4679,10 @@ impl Compiler {
         // with no declared ctor accepts only `new C()`.
         let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
         let ctor_sig = self.resolve_ctor(ctor_class, &arg_tys);
-        if let Some(param_tys) = ctor_sig {
+        if let Some((param_tys, vararg_from)) = ctor_sig {
+            let args = Self::effective_args(args, &param_tys, vararg_from);
             self.emit_get(&obj, line); // this
-            self.call_args_targeted(args, &param_tys)?;
+            self.call_args_targeted(&args, &param_tys)?;
             let mangled = mangle(ctor_class, "<init>", &param_tys);
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
@@ -4674,9 +4923,10 @@ impl Compiler {
                 {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
-                    if let Some(param_tys) = self.resolve_ctor(&sup, &arg_tys) {
+                    if let Some((param_tys, vararg_from)) = self.resolve_ctor(&sup, &arg_tys) {
+                        let args = Self::effective_args(args, &param_tys, vararg_from);
                         self.emit_this(line); // this
-                        self.call_args_targeted(args, &param_tys)?;
+                        self.call_args_targeted(&args, &param_tys)?;
                         let mangled = mangle(&sup, "<init>", &param_tys);
                         let idx = self.b.add_name(&mangled);
                         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
@@ -4701,7 +4951,8 @@ impl Compiler {
                     args.len()
                 )
             })?;
-            self.call_args_targeted(args, &resolved.param_tys)?;
+            let args = Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
+            self.call_args_targeted(&args, &resolved.param_tys)?;
             let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
             self.emit_exc_check(line);
@@ -5173,6 +5424,22 @@ fn rank_name(rank: u32) -> &'static str {
 
 /// True when `ty` is a reference type (a class, interface, array, or `String`)
 /// rather than a primitive or `void`.
+/// A primitive type's wrapper class, or `None` when `ty` is not a primitive.
+/// `void` has no boxing conversion, so it is deliberately absent.
+fn wrapper_of(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "int" => "Integer",
+        "long" => "Long",
+        "double" => "Double",
+        "float" => "Float",
+        "short" => "Short",
+        "byte" => "Byte",
+        "char" => "Character",
+        "boolean" => "Boolean",
+        _ => return None,
+    })
+}
+
 fn is_reference_type(ty: &str) -> bool {
     !matches!(
         ty,
@@ -5462,6 +5729,10 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         ("toString", 0) => "String",
         ("keySet", 0) => "Set",
         ("values", 0) => "List",
+        // A `subList` view is a `List`, so methods chain off it and a nested
+        // `subList` resolves through the collection path rather than falling
+        // through to the `String` methods.
+        ("subList", 2) if kind == "list" => "List",
         _ => return None,
     })
 }

@@ -280,7 +280,29 @@ enum HostObj {
         captures: Vec<Value>,
     },
     /// A `java.util.List` (`ArrayList`) — elements in list order.
-    List { items: Vec<Value>, fixed: Fixity },
+    List {
+        items: Vec<Value>,
+        fixed: Fixity,
+        /// Structural-modification counter, Java's `AbstractList.modCount`.
+        /// Every `add`/`remove`/`clear` and every `sort` bumps it; a `subList`
+        /// view snapshots it and refuses to operate once it has moved, which is
+        /// how Java reports a view whose backing list changed underneath it.
+        mods: u64,
+    },
+    /// A `List.subList(from, to)` **view**. It owns no elements: every read and
+    /// write goes to the window `[offset, offset + len)` of `parent`, which is
+    /// itself either a `List` or another view. That is what makes the aliasing
+    /// real in both directions — a write through the parent shows in the view
+    /// and a write through the view shows in the parent — rather than the copy
+    /// that would answer correctly right up until someone wrote to it.
+    SubList {
+        parent: u32,
+        offset: usize,
+        len: usize,
+        /// The backing list's `mods` when this view was created. A mismatch is
+        /// Java's `ConcurrentModificationException`.
+        exp_mods: u64,
+    },
     /// A `java.util.Map`. Entries are stored in *insertion* order whatever the
     /// implementation; [`Order`] decides what order iteration and `toString`
     /// present them in.
@@ -407,18 +429,30 @@ fn raise(vm: &mut VM, f: Fault) -> Value {
         return Value::Undef;
     }
     if !EXC_ENABLED.with(|e| e.get()) {
-        ffi_fault(
-            vm,
-            format!(
-                "Exception in thread \"main\" {}: {}",
-                crate::prelude::qualified_throwable(f.class).unwrap_or_else(|| f.class.to_string()),
-                f.msg
-            ),
-        );
+        let name =
+            crate::prelude::qualified_throwable(f.class).unwrap_or_else(|| f.class.to_string());
+        // Java's uncaught report names a messageless throwable with no trailing
+        // `": "`, exactly as its `toString()` does.
+        let detail = if f.msg.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", f.msg)
+        };
+        ffi_fault(vm, format!("Exception in thread \"main\" {name}{detail}"));
         return Value::Undef;
     }
     let mut fields = HashMap::new();
-    fields.insert("detailMessage".to_string(), Value::str(f.msg));
+    // A fault raised with no message is Java's no-argument constructor, whose
+    // `detailMessage` stays `null` — so `getMessage()` answers `null` and
+    // `toString()` prints the class name alone. Storing an empty *String*
+    // instead printed a bare trailing `": "` on every messageless throwable
+    // (`java.lang.UnsupportedOperationException: `).
+    let msg = if f.msg.is_empty() {
+        Value::Undef
+    } else {
+        Value::str(f.msg)
+    };
+    fields.insert("detailMessage".to_string(), msg);
     let id = heap_alloc(HostObj::Instance {
         class: f.class.to_string(),
         fields,
@@ -880,6 +914,7 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
     let obj = match kind {
         "ArrayList" | "LinkedList" | "List" => HostObj::List {
+            mods: 0,
             items: sequence_items(seed).unwrap_or_default(),
             fixed: Fixity::Mutable,
         },
@@ -934,6 +969,12 @@ fn sequence_items(v: &Value) -> Option<Vec<Value>> {
     let Value::Obj(id) = v else {
         return None;
     };
+    // A `subList` view holds no elements of its own — its window has to be read
+    // out of the backing list, and only after the view is checked against it,
+    // so a stale view raises rather than reporting the wrong slice.
+    if let Some(items) = sublist_items(*id as usize) {
+        return items.ok();
+    }
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(*id as usize) {
@@ -947,6 +988,20 @@ fn sequence_items(v: &Value) -> Option<Vec<Value>> {
             _ => None,
         }
     })
+}
+
+/// The elements a `subList` view currently presents, or the comodification
+/// fault if its backing list moved. `None` when the handle is not a view.
+fn sublist_items(id: usize) -> Option<Result<Vec<Value>, Fault>> {
+    if !is_sublist(id) {
+        return None;
+    }
+    Some(checked_window(id).and_then(|(root, offset, len)| {
+        HEAP.with(|h| match h.borrow().get(root) {
+            Some(HostObj::List { items, .. }) => Ok(items[offset..offset + len].to_vec()),
+            _ => Err(Fault::internal("javars: dangling subList backing")),
+        })
+    }))
 }
 
 /// The entries of a `Map` heap object, in insertion order.
@@ -969,7 +1024,12 @@ fn is_collection(v: &Value) -> bool {
     HEAP.with(|h| {
         matches!(
             h.borrow().get(*id as usize),
-            Some(HostObj::List { .. } | HostObj::Map { .. } | HostObj::Set { .. })
+            Some(
+                HostObj::List { .. }
+                    | HostObj::Map { .. }
+                    | HostObj::Set { .. }
+                    | HostObj::SubList { .. }
+            )
         )
     })
 }
@@ -1388,6 +1448,21 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         );
     };
     let id = *id as usize;
+    // Every method on a view checks it against its backing list first, exactly
+    // as Java's `checkForComodification` does. `sublist_method` repeats the
+    // check to get the window; this one covers the paths that bypass it
+    // (`toString`, `sort`, `forEach`).
+    if let Some(f) = stale_view(recv) {
+        return raise(vm, f);
+    }
+    // `subList` allocates a view over the receiver, so it needs the receiver's
+    // handle — which `list_method` (working on a plain `&mut Vec`) never sees.
+    if method == "subList" && args.len() == 2 {
+        return match make_sublist(id, args[0].to_int(), args[1].to_int()) {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     // The two VM-re-entering methods are handled before any borrow is taken.
     match (method, args.len()) {
         ("sort", 1) => {
@@ -1398,11 +1473,13 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 Ok(v) => v,
                 Err(f) => return raise(vm, f),
             };
-            HEAP.with(|h| {
-                if let Some(HostObj::List { items, .. }) = h.borrow_mut().get_mut(id) {
-                    *items = sorted;
-                }
-            });
+            // `ArrayList.sort` bumps `modCount` even though the length is
+            // unchanged, so an outstanding view is invalidated by it — verified
+            // against the reference JDK, which throws for a view read after
+            // `Collections.sort(parent)`.
+            if let Err(f) = write_sequence(id, sorted, true) {
+                return raise(vm, f);
+            }
             return Value::Undef;
         }
         ("forEach", 1) => {
@@ -1431,13 +1508,29 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
     let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
+    if is_sublist(id) {
+        return match sublist_method(id, method, args, &arg_seqs) {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     let result = HEAP.with(|h| {
         let mut heap = h.borrow_mut();
         let Some(obj) = heap.get_mut(id) else {
             return Err(Fault::internal("javars: dangling collection handle"));
         };
         match obj {
-            HostObj::List { items, fixed } => list_method(items, *fixed, method, args, &arg_seqs),
+            HostObj::List { items, fixed, mods } => {
+                let before = items.len();
+                let r = list_method(items, *fixed, method, args, &arg_seqs);
+                // Any length change is a structural modification, which is what
+                // Java's `modCount` counts (a `remove` that finds nothing does
+                // not bump it there either).
+                if items.len() != before {
+                    *mods += 1;
+                }
+                r
+            }
             HostObj::Map { entries, order } => map_method(entries, *order, method, args),
             HostObj::Set { items, .. } => set_method(items, method, args, &arg_seqs),
             _ => Err(Fault::internal(format!(
@@ -1459,6 +1552,229 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
 enum NewColl {
     Value(Value),
     Alloc(HostObj),
+}
+
+// ── `List.subList` views ────────────────────────────────────────────────────
+//
+// A view owns no elements. `resolve_window` walks the (possibly nested) parent
+// chain down to the backing `List`, giving an absolute window into it; every
+// operation reads that window out, runs the ordinary `list_method` on it, and
+// writes it back. A length change there is a structural modification of the
+// backing list, so it bumps the backing `mods` and is pushed up the ancestor
+// chain — matching Java's `SubList.updateSizeAndModCount`, which keeps the
+// enclosing views usable while a *sibling* view correctly goes stale.
+
+/// True when a handle is a `subList` view rather than a list of its own.
+fn is_sublist(id: usize) -> bool {
+    HEAP.with(|h| matches!(h.borrow().get(id), Some(HostObj::SubList { .. })))
+}
+
+/// The comodification fault a value would raise if it were rendered — `Some`
+/// only for a `subList` view whose backing list has been structurally modified
+/// since. Java reports it because rendering a view iterates it; javars's
+/// rendering is infallible, so the raising call sites consult this first.
+fn stale_view(v: &Value) -> Option<Fault> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    sublist_items(*id as usize)?.err()
+}
+
+/// A view resolved against its backing list: the backing `List`'s handle, the
+/// absolute offset of the window, and its length. `None` when `id` is not a
+/// view, or when the chain does not bottom out in a `List`.
+fn resolve_window(id: usize) -> Option<(usize, usize, usize)> {
+    HEAP.with(|h| {
+        let heap = h.borrow();
+        let Some(HostObj::SubList { len, .. }) = heap.get(id) else {
+            return None;
+        };
+        let len = *len;
+        let mut offset = 0;
+        let mut cur = id;
+        // The chain is built parent-first and can only ever be as deep as the
+        // heap is long, which bounds the walk even if a handle were corrupted.
+        for _ in 0..=heap.len() {
+            match heap.get(cur) {
+                Some(HostObj::SubList {
+                    parent, offset: o, ..
+                }) => {
+                    offset += o;
+                    cur = *parent as usize;
+                }
+                Some(HostObj::List { .. }) => return Some((cur, offset, len)),
+                _ => return None,
+            }
+        }
+        None
+    })
+}
+
+/// The backing list's structural-modification count, or `None` for a handle
+/// that is not a `List`.
+fn list_mods(id: usize) -> Option<u64> {
+    HEAP.with(|h| match h.borrow().get(id) {
+        Some(HostObj::List { mods, .. }) => Some(*mods),
+        _ => None,
+    })
+}
+
+/// Java's `ConcurrentModificationException`: the view's snapshot of the backing
+/// list's `modCount` no longer matches. Carries no detail message, exactly as
+/// the JDK throws it.
+fn comodification() -> Fault {
+    Fault::java("ConcurrentModificationException", String::new())
+}
+
+/// Check a view against its backing list and return its resolved window.
+fn checked_window(id: usize) -> Result<(usize, usize, usize), Fault> {
+    let (root, offset, len) =
+        resolve_window(id).ok_or_else(|| Fault::internal("javars: dangling subList view"))?;
+    let exp = HEAP.with(|h| match h.borrow().get(id) {
+        Some(HostObj::SubList { exp_mods, .. }) => Some(*exp_mods),
+        _ => None,
+    });
+    if exp != list_mods(root) {
+        return Err(comodification());
+    }
+    Ok((root, offset, len))
+}
+
+/// `list.subList(from, to)` on a list **or** on another view. The result is a
+/// view of the receiver, so a nested `subList` composes offsets rather than
+/// copying. Bounds are Java's, including its two distinct failures: a
+/// out-of-range endpoint is an `IndexOutOfBoundsException` naming the offending
+/// index, and a reversed range is an `IllegalArgumentException`.
+fn make_sublist(id: usize, from: i64, to: i64) -> Result<Value, Fault> {
+    let (root, size) = if is_sublist(id) {
+        let (root, _, len) = checked_window(id)?;
+        (root, len)
+    } else {
+        let len = HEAP
+            .with(|h| match h.borrow().get(id) {
+                Some(HostObj::List { items, .. }) => Some(items.len()),
+                _ => None,
+            })
+            .ok_or_else(|| Fault::internal("javars: `subList` needs a List receiver"))?;
+        (id, len)
+    };
+    if from < 0 {
+        return Err(Fault::java(
+            "IndexOutOfBoundsException",
+            format!("fromIndex = {from}"),
+        ));
+    }
+    if to > size as i64 {
+        return Err(Fault::java(
+            "IndexOutOfBoundsException",
+            format!("toIndex = {to}"),
+        ));
+    }
+    if from > to {
+        return Err(Fault::java(
+            "IllegalArgumentException",
+            format!("fromIndex({from}) > toIndex({to})"),
+        ));
+    }
+    let exp_mods = list_mods(root).unwrap_or_default();
+    Ok(Value::Obj(heap_alloc(HostObj::SubList {
+        parent: id as u32,
+        offset: from as usize,
+        len: (to - from) as usize,
+        exp_mods,
+    })))
+}
+
+/// Run an ordinary `List` method against a view's window of its backing list.
+///
+/// The window is lifted out, the shared [`list_method`] runs on it — so a view
+/// answers `get`/`set`/`add`/`remove`/`contains`/`indexOf`/`equals` exactly as
+/// a list does — and the result is spliced back, which is what makes a write
+/// through the view land in the backing list.
+fn sublist_method(
+    id: usize,
+    method: &str,
+    args: &[Value],
+    arg_seqs: &[Option<Vec<Value>>],
+) -> Result<Value, Fault> {
+    let (root, offset, len) = checked_window(id)?;
+    let (mut window, fixed) = HEAP
+        .with(|h| match h.borrow().get(root) {
+            Some(HostObj::List { items, fixed, .. }) => {
+                Some((items[offset..offset + len].to_vec(), *fixed))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| Fault::internal("javars: dangling subList backing"))?;
+    let out = list_method(&mut window, fixed, method, args, arg_seqs)?;
+    let delta = window.len() as isize - len as isize;
+    // The splice is unconditional: `set` rewrites an element without changing
+    // the length, and that write has to reach the backing list too.
+    HEAP.with(|h| {
+        if let Some(HostObj::List { items, mods, .. }) = h.borrow_mut().get_mut(root) {
+            items.splice(offset..offset + len, window);
+            if delta != 0 {
+                *mods += 1;
+            }
+        }
+    });
+    if delta != 0 {
+        let new_mods = list_mods(root).unwrap_or_default();
+        resize_ancestors(id, delta, new_mods);
+    }
+    Ok(match out {
+        NewColl::Value(v) => v,
+        NewColl::Alloc(obj) => Value::Obj(heap_alloc(obj)),
+    })
+}
+
+/// Push a view's length change up its own ancestor chain and re-snapshot each
+/// one's `modCount` — Java's `SubList.updateSizeAndModCount`. The views on the
+/// path stay usable; every other outstanding view of the same list does not,
+/// which is the behaviour that makes the stale one throw.
+fn resize_ancestors(id: usize, delta: isize, new_mods: u64) {
+    HEAP.with(|h| {
+        let mut heap = h.borrow_mut();
+        let mut cur = id;
+        for _ in 0..=heap.len() {
+            match heap.get_mut(cur) {
+                Some(HostObj::SubList {
+                    parent,
+                    len,
+                    exp_mods,
+                    ..
+                }) => {
+                    *len = len.saturating_add_signed(delta);
+                    *exp_mods = new_mods;
+                    cur = *parent as usize;
+                }
+                _ => return,
+            }
+        }
+    });
+}
+
+/// Replace a list's contents in place, optionally counting the write as a
+/// structural modification. Through a view the elements land in its window.
+fn write_sequence(id: usize, items: Vec<Value>, structural: bool) -> Result<(), Fault> {
+    let (root, offset, len) = if is_sublist(id) {
+        checked_window(id)?
+    } else {
+        (id, 0, usize::MAX)
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::List {
+            items: dst, mods, ..
+        }) = h.borrow_mut().get_mut(root)
+        {
+            let end = len.min(dst.len().saturating_sub(offset)) + offset;
+            dst.splice(offset..end, items);
+            if structural {
+                *mods += 1;
+            }
+        }
+    });
+    Ok(())
 }
 
 /// The presentation order of a `Map` handle.
@@ -1696,6 +2012,7 @@ fn map_method(
                 .map(|i| entries[i].1.clone())
                 .collect();
             NewColl::Alloc(HostObj::List {
+                mods: 0,
                 items: ordered,
                 fixed: Fixity::FixedSize,
             })
@@ -2120,7 +2437,11 @@ fn collection_static(
     args: &[Value],
 ) -> Option<Result<Value, Fault>> {
     let list = |items: Vec<Value>, fixed: Fixity| {
-        Ok(Value::Obj(heap_alloc(HostObj::List { items, fixed })))
+        Ok(Value::Obj(heap_alloc(HostObj::List {
+            items,
+            fixed,
+            mods: 0,
+        })))
     };
     Some(match (class, method) {
         // `Arrays.asList` is a fixed-size *view*: `set` works, `add` throws.
@@ -2140,19 +2461,14 @@ fn collection_static(
                 }
             };
             let cmp = args.get(1).cloned().unwrap_or(Value::Undef);
-            match sort_with(vm, items, &cmp) {
-                Ok(sorted) => {
-                    write_list(&args[0], sorted);
-                    Ok(Value::Undef)
-                }
-                Err(f) => Err(f),
-            }
+            sort_with(vm, items, &cmp)
+                .and_then(|sorted| write_list(&args[0], sorted))
+                .map(|()| Value::Undef)
         }
         ("Collections", "reverse") if args.len() == 1 => {
             let mut items = sequence_items(&args[0]).unwrap_or_default();
             items.reverse();
-            write_list(&args[0], items);
-            Ok(Value::Undef)
+            write_list(&args[0], items).map(|()| Value::Undef)
         }
         ("Collections", "max") | ("Collections", "min") if args.len() == 1 => {
             let items = sequence_items(&args[0]).unwrap_or_default();
@@ -2190,15 +2506,14 @@ fn varargs_items(args: &[Value]) -> Vec<Value> {
 
 /// Overwrite a `List` handle's elements in place, so a sort or reverse is
 /// visible through every reference to it — Java's semantics for these statics.
-fn write_list(target: &Value, items: Vec<Value>) {
+fn write_list(target: &Value, items: Vec<Value>) -> Result<(), Fault> {
     let Value::Obj(id) = target else {
-        return;
+        return Ok(());
     };
-    HEAP.with(|h| {
-        if let Some(HostObj::List { items: dst, .. }) = h.borrow_mut().get_mut(*id as usize) {
-            *dst = items;
-        }
-    });
+    // `Collections.sort`/`reverse` reorder in place; Java counts both as
+    // structural modifications, so an outstanding `subList` view of the target
+    // goes stale exactly as it does there.
+    write_sequence(*id as usize, items, true)
 }
 
 /// Evaluate a static stdlib method `Class.method(args)`.
@@ -3162,6 +3477,12 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
         vals.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     vals.reverse();
+    // Rendering a `subList` view iterates it, which is where Java reports a
+    // backing list that moved — so the check happens before anything is
+    // written, not after a wrong (empty) list has already reached the stream.
+    if let Some(f) = vals.iter().find_map(stale_view) {
+        return raise(vm, f);
+    }
     // Format once, then write to the selected stream. Boxing the lock keeps the
     // two branches on one write path.
     let text: String = vals.iter().map(java_str).collect();
@@ -3222,6 +3543,15 @@ fn obj_default_str(id: u32) -> String {
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
             Some(HostObj::List { items, .. }) => render_sequence(items),
+            // A view renders its window of the backing list. Rendering cannot
+            // raise, so a view whose backing list moved prints as though it
+            // were empty rather than reporting the comodification the next
+            // real method call does report.
+            Some(HostObj::SubList { .. }) => render_sequence(
+                &sublist_items(id as usize)
+                    .and_then(Result::ok)
+                    .unwrap_or_default(),
+            ),
             Some(HostObj::Set { items, order }) => render_set(items, *order),
             Some(HostObj::Map { entries, order }) => render_map(entries, *order),
             // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,

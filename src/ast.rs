@@ -183,6 +183,13 @@ pub struct Method {
 pub struct Param {
     pub ty: String,
     pub name: String,
+    /// True for the variable-arity parameter (`int... xs`). `ty` is already the
+    /// array type (`int[]`) — inside the body the parameter *is* that array —
+    /// so this flag only says the declaration also admits Java's third
+    /// (variable-arity) resolution phase, where a call passing loose trailing
+    /// arguments is packed into the array at the call site. Only the last
+    /// parameter may carry it.
+    pub varargs: bool,
 }
 
 /// A Java statement with its 1-based source line (threaded through the parser so

@@ -1203,60 +1203,70 @@ xs.set(0, 9);   // fine
         </article>
         <article class="doc-entry" id="doc-list-methods-7">
           <h3><a class="doc-anchor" href="#doc-list-methods-7">#</a> <code>remove</code></h3>
-          <pre><code class="lang-java">T remove(int index)</code></pre>
-          <p>Removes and returns the element at <code>index</code>. This is the by-index overload, which is the one Java selects for an integral argument; there is no <code>remove(Object)</code>, because javars cannot tell a boxed <code>Integer</code> from an <code>int</code>.</p>
-          <pre><code class="lang-java">xs.remove(0);</code></pre>
+          <pre><code class="lang-java">T remove(int index) | boolean remove(Object o)</code></pre>
+          <p>Both of Java's overloads, chosen at compile time from the argument's *static* type exactly as <code>javac</code> chooses them: an <code>int</code>/<code>short</code>/<code>byte</code>/<code>char</code> argument removes and returns the element at that index, and any reference argument — a boxed <code>Integer</code>, an <code>Integer.valueOf(x)</code>, a <code>String</code> — removes the first element equal to it and answers whether one was found. An argument javars cannot type statically keeps the by-index reading.</p>
+          <pre><code class="lang-java">xs.remove(0);                    // by index
+xs.remove(Integer.valueOf(20));  // by value</code></pre>
         </article>
         <article class="doc-entry" id="doc-list-methods-8">
-          <h3><a class="doc-anchor" href="#doc-list-methods-8">#</a> <code>clear</code></h3>
+          <h3><a class="doc-anchor" href="#doc-list-methods-8">#</a> <code>subList</code></h3>
+          <pre><code class="lang-java">List&lt;T&gt; subList(int fromIndex, int toIndex)</code></pre>
+          <p>A **view** of the half-open range, not a copy: it owns no elements, so writes cross in both directions — <code>list.set(i, v)</code> shows through the view and <code>view.set(i, v)</code> shows in the list — and <code>view.add</code>/<code>remove</code>/<code>clear</code> splice the backing list itself. A view of a view composes offsets down to the same list. Structurally modifying the backing list *behind* an outstanding view invalidates it, and the next operation on it (or rendering it) raises <code>ConcurrentModificationException</code>. <code>fromIndex &lt; 0</code> or <code>toIndex &gt; size()</code> is an <code>IndexOutOfBoundsException</code> naming the offending index; <code>fromIndex &gt; toIndex</code> is an <code>IllegalArgumentException</code>.</p>
+          <pre><code class="lang-java">List&lt;Integer&gt; l = new ArrayList&lt;&gt;(List.of(10, 20, 30, 40));
+List&lt;Integer&gt; v = l.subList(1, 3);
+v.set(0, 99);
+System.out.println(l);   // [10, 99, 30, 40]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-9">
+          <h3><a class="doc-anchor" href="#doc-list-methods-9">#</a> <code>clear</code></h3>
           <pre><code class="lang-java">void clear()</code></pre>
           <p>Removes every element. Structural, so it is refused on a fixed-size or immutable list.</p>
           <pre><code class="lang-java">xs.clear();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-9">
-          <h3><a class="doc-anchor" href="#doc-list-methods-9">#</a> <code>contains</code></h3>
+        <article class="doc-entry" id="doc-list-methods-10">
+          <h3><a class="doc-anchor" href="#doc-list-methods-10">#</a> <code>contains</code></h3>
           <pre><code class="lang-java">boolean contains(Object o)</code></pre>
           <p>True when some element equals <code>o</code> by value for strings, numbers, and booleans, or by handle identity for a heap object. A user <code>equals</code> override is not consulted.</p>
           <pre><code class="lang-java">System.out.println(xs.contains("a"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-10">
-          <h3><a class="doc-anchor" href="#doc-list-methods-10">#</a> <code>indexOf</code></h3>
+        <article class="doc-entry" id="doc-list-methods-11">
+          <h3><a class="doc-anchor" href="#doc-list-methods-11">#</a> <code>indexOf</code></h3>
           <pre><code class="lang-java">int indexOf(Object o)</code></pre>
           <p>The index of the first matching element, or <code>-1</code>.</p>
           <pre><code class="lang-java">System.out.println(xs.indexOf("a"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-11">
-          <h3><a class="doc-anchor" href="#doc-list-methods-11">#</a> <code>lastIndexOf</code></h3>
+        <article class="doc-entry" id="doc-list-methods-12">
+          <h3><a class="doc-anchor" href="#doc-list-methods-12">#</a> <code>lastIndexOf</code></h3>
           <pre><code class="lang-java">int lastIndexOf(Object o)</code></pre>
           <p>The index of the last matching element, or <code>-1</code>.</p>
           <pre><code class="lang-java">System.out.println(xs.lastIndexOf("a"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-12">
-          <h3><a class="doc-anchor" href="#doc-list-methods-12">#</a> <code>addAll</code></h3>
+        <article class="doc-entry" id="doc-list-methods-13">
+          <h3><a class="doc-anchor" href="#doc-list-methods-13">#</a> <code>addAll</code></h3>
           <pre><code class="lang-java">boolean addAll(Collection&lt;T&gt; other)</code></pre>
           <p>Appends every element of <code>other</code> in its presentation order and returns whether anything was added. The argument is snapshotted before the receiver's heap borrow is taken, so <code>xs.addAll(xs)</code> is well defined.</p>
           <pre><code class="lang-java">xs.addAll(ys);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-13">
-          <h3><a class="doc-anchor" href="#doc-list-methods-13">#</a> <code>equals</code></h3>
+        <article class="doc-entry" id="doc-list-methods-14">
+          <h3><a class="doc-anchor" href="#doc-list-methods-14">#</a> <code>equals</code></h3>
           <pre><code class="lang-java">boolean equals(Object other)</code></pre>
           <p>Element-wise equality against another sequence of the same length.</p>
           <pre><code class="lang-java">System.out.println(xs.equals(ys));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-14">
-          <h3><a class="doc-anchor" href="#doc-list-methods-14">#</a> <code>sort</code></h3>
+        <article class="doc-entry" id="doc-list-methods-15">
+          <h3><a class="doc-anchor" href="#doc-list-methods-15">#</a> <code>sort</code></h3>
           <pre><code class="lang-java">void sort(Comparator&lt;T&gt; cmp)</code></pre>
           <p>Sorts in place with a comparator lambda, or in natural order when given <code>null</code>. Handled before the heap borrow is taken, because the comparator body is user code that may allocate.</p>
           <pre><code class="lang-java">xs.sort((a, b) -&gt; a.length() - b.length());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-15">
-          <h3><a class="doc-anchor" href="#doc-list-methods-15">#</a> <code>forEach</code></h3>
+        <article class="doc-entry" id="doc-list-methods-16">
+          <h3><a class="doc-anchor" href="#doc-list-methods-16">#</a> <code>forEach</code></h3>
           <pre><code class="lang-java">void forEach(Consumer&lt;T&gt; action)</code></pre>
           <p>Invokes the action once per element, in order. Like <code>sort</code>, the elements are snapshotted first so the lambda body can safely allocate.</p>
           <pre><code class="lang-java">xs.forEach(x -&gt; System.out.println(x));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-16">
-          <h3><a class="doc-anchor" href="#doc-list-methods-16">#</a> <code>toString</code></h3>
+        <article class="doc-entry" id="doc-list-methods-17">
+          <h3><a class="doc-anchor" href="#doc-list-methods-17">#</a> <code>toString</code></h3>
           <pre><code class="lang-java">String toString()</code></pre>
           <p><code>AbstractCollection.toString</code> — <code>[a, b, c]</code>, each element rendered with Java's value-to-string rules. This is also what <code>System.out.println(list)</code> prints, without any explicit call.</p>
           <pre><code class="lang-java">System.out.println(xs);   // [a, b, c]</code></pre>
@@ -1503,6 +1513,15 @@ try { System.out.println(a[5]); } catch (ArrayIndexOutOfBoundsException e) { Sys
           <pre><code class="lang-java">class StringIndexOutOfBoundsException extends IndexOutOfBoundsException</code></pre>
           <p>Raised by <code>charAt</code> and both <code>substring</code> overloads. <code>charAt</code> carries <code>Index i out of bounds for length n</code>; <code>substring</code> carries <code>Range [b, e) out of bounds for length n</code>.</p>
           <pre><code class="lang-java">try { "hi".charAt(9); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-16">
+          <h3><a class="doc-anchor" href="#doc-throwables-16">#</a> <code>ConcurrentModificationException</code></h3>
+          <pre><code class="lang-java">class ConcurrentModificationException extends RuntimeException</code></pre>
+          <p>Raised by a <code>List.subList</code> view whose backing list was structurally modified behind it — an <code>add</code>, a <code>remove</code>, or a <code>Collections.sort</code> (which bumps Java's <code>modCount</code> even though the length is unchanged). It is the one modeled throwable outside <code>java.lang</code> besides <code>PatternSyntaxException</code>, and prints as <code>java.util.ConcurrentModificationException</code>.</p>
+          <pre><code class="lang-java">List&lt;Integer&gt; l = new ArrayList&lt;&gt;(List.of(1, 2, 3));
+List&lt;Integer&gt; v = l.subList(0, 2);
+l.add(4);
+// v.get(0);   // ConcurrentModificationException</code></pre>
         </article>
       </section>
 

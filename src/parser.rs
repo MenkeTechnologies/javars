@@ -547,6 +547,7 @@ fn record_members(
             params: vec![Param {
                 ty: "Object".to_string(),
                 name: other.to_string(),
+                varargs: false,
             }],
             ret: "boolean".to_string(),
             body: vec![
@@ -661,6 +662,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
             params: vec![Param {
                 ty: "Object".to_string(),
                 name: "other".to_string(),
+                varargs: false,
             }],
             ret: "boolean".to_string(),
             body: vec![Stmt::new(
@@ -926,16 +928,20 @@ impl Parser {
         }
         loop {
             let mut ty = self.type_name()?;
-            // A varargs parameter (`String... args`) is an array parameter; the
-            // three dots carry no further meaning here.
+            // A varargs parameter (`String... args`) *is* an array parameter —
+            // inside the body it is a `String[]`. The dots additionally admit
+            // Java's third resolution phase, so the flag rides along on the
+            // parameter for the compiler's call-site packing.
+            let mut varargs = false;
             if self.is(&Tok::Dot) && matches!(self.toks[self.pos + 1].kind, Tok::Dot) {
                 self.advance();
                 self.advance();
                 self.eat(&Tok::Dot)?;
                 ty.push_str("[]");
+                varargs = true;
             }
             let (name, ty) = self.declarator(&ty)?;
-            out.push(Param { ty, name });
+            out.push(Param { ty, name, varargs });
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {

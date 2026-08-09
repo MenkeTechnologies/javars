@@ -52,9 +52,10 @@ pub const THROWABLES: &[(&str, &str)] = &[
         "StringIndexOutOfBoundsException",
         "IndexOutOfBoundsException",
     ),
-    // The one modeled throwable that does not live in `java.lang` — see
+    // The modeled throwables that do not live in `java.lang` — see
     // [`qualified_throwable`].
     ("PatternSyntaxException", "IllegalArgumentException"),
+    ("ConcurrentModificationException", "RuntimeException"),
 ];
 
 /// True when `name` is one of the modeled JDK throwables.
@@ -64,15 +65,17 @@ pub fn is_throwable(name: &str) -> bool {
 
 /// The fully-qualified name of a modeled throwable, which is what
 /// `getClass().getName()`, `Throwable.toString()`, and the uncaught-exception
-/// report print. All but one live in `java.lang`; `PatternSyntaxException` is
-/// `java.util.regex`, and printing it under the wrong package would be a visible
-/// difference from Java for a program that ever prints a caught one.
+/// report print. Most live in `java.lang`; `PatternSyntaxException` is
+/// `java.util.regex` and `ConcurrentModificationException` is `java.util`, and
+/// printing either under the wrong package would be a visible difference from
+/// Java for a program that ever prints a caught one.
 pub fn qualified_throwable(name: &str) -> Option<String> {
     if !is_throwable(name) {
         return None;
     }
     Some(match name {
         "PatternSyntaxException" => format!("java.util.regex.{name}"),
+        "ConcurrentModificationException" => format!("java.util.{name}"),
         _ => format!("java.lang.{name}"),
     })
 }
@@ -161,8 +164,13 @@ fn prelude_source(declared: &[String]) -> String {
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ super(m); }}\n"));
         }
+        // The qualified name has to come from [`qualified_throwable`], not a
+        // hardcoded `java.lang.` — `PatternSyntaxException` is `java.util.regex`
+        // and `ConcurrentModificationException` is `java.util`, and a caught one
+        // printed under the wrong package is a silently wrong answer.
+        let qualified = qualified_throwable(name).unwrap_or_else(|| (*name).to_string());
         src.push_str(&format!(
-            "  String toString() {{ if (detailMessage == null) {{ return \"java.lang.{name}\"; }} return \"java.lang.{name}: \" + detailMessage; }}\n"
+            "  String toString() {{ if (detailMessage == null) {{ return \"{qualified}\"; }} return \"{qualified}: \" + detailMessage; }}\n"
         ));
         src.push_str("}\n");
     }
