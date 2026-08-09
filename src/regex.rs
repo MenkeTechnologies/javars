@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 /// A compiled Java pattern.
 /// A compiled pattern, or the `PatternSyntaxException` message its source
-/// produced. Shared out of [`CACHE`] by handle so a repeated call in a loop
+/// produced. Shared out of the module-level `CACHE` by handle so a repeated call in a loop
 /// neither recompiles nor reallocates.
 pub type Compiled = Rc<Result<Pattern, String>>;
 
@@ -156,7 +156,7 @@ impl Pattern {
     }
 
     /// `String.replaceAll` / `replaceFirst`. `replacement` is Java's replacement
-    /// grammar, expanded by [`expand`].
+    /// grammar, expanded by the private `expand` helper.
     pub fn replace(
         &self,
         text: &str,

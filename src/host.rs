@@ -242,7 +242,7 @@ pub const JF32: u16 = 737;
 pub const JF32_STR: u16 = 738;
 
 /// One arithmetic operation performed at 32-bit `float` width. Stack
-/// `[lhs, rhs, op]` (`op` on top, a [`F32Op`] discriminant); `argc == 3`.
+/// `[lhs, rhs, op]` (`op` on top, one of the [`f32_op`] constants); `argc == 3`.
 ///
 /// Rounding the `f64` result afterwards is *not* the same computation: a double
 /// rounding can land a ulp away from the single one Java performs.
