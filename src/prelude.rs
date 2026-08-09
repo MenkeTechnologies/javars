@@ -77,6 +77,21 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
     })
 }
 
+/// The fully-qualified name of a modeled JDK class, or `None` for a user class
+/// (whose simple name *is* its qualified one — a single-file program declares no
+/// package). This is what `getClass().getName()` prints and what Java's
+/// `Object.toString()` puts before the `@`.
+///
+/// `Object` is the root of the hierarchy rather than a modeled type: javars
+/// keeps it out of the class table on purpose (it is also the erasure of every
+/// type variable), so it is named here directly.
+pub fn qualified_class(name: &str) -> Option<String> {
+    if name == "Object" {
+        return Some("java.lang.Object".to_string());
+    }
+    qualified_throwable(name)
+}
+
 /// The modeled functional interfaces: `(name, declared single abstract method)`.
 ///
 /// Each is declared to javars as an ordinary `interface` with exactly one

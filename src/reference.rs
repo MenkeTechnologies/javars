@@ -256,9 +256,9 @@ pub const REFERENCE: &[Entry] = &[
     (
         "synchronized",
         "Contextual Keywords",
-        "synchronized <method>",
-        "Accepted as a method modifier and dropped. javars runs a program on one thread, so there is no monitor to acquire; a `synchronized (obj) { … }` *statement* is not parsed.",
-        "static synchronized void once() { System.out.println(\"once\"); }",
+        "synchronized <method> | synchronized (monitor) { … }",
+        "javars runs a program on one thread, so there is no monitor to acquire: as a method modifier it is dropped. As a *statement* the rest of the semantics still hold — the monitor expression is evaluated exactly once, and a `null` monitor throws `NullPointerException` before the body runs.",
+        "static synchronized void once() { System.out.println(\"once\"); }\nObject lock = new Object();\nsynchronized (lock) { System.out.println(\"critical\"); }",
     ),
     (
         "native",
@@ -415,6 +415,13 @@ pub const REFERENCE: &[Entry] = &[
         "An array literal. Elements are evaluated left to right and handed to the `JARRAY_LIT` builtin, which allocates one heap array. Nested braces build a rectangular multi-dimensional array.",
         "int[] a = {1, 2, 3};\nint[][] g = {{1, 2}, {3, 4}};",
     ),
+    (
+        "multi-declarator declaration",
+        "Types",
+        "T a [= e], b [= e], …;   |   T a[] = { … }, b;",
+        "One declaration statement declaring several variables — as a local, in a `for` init clause, or as a field. Declarators run left to right, so a later initializer may read an earlier name, and any may be left uninitialized. A C-style array suffix binds to its own *declarator*, so `int p[] = {1}, q;` is an `int[]` and an `int`; the suffix is accepted on locals, fields, and parameters. `var` is rejected here, as it is by `javac`.",
+        "int a = 1, b = a + 1, c;\nint p[] = {4, 5}, q = 6;\nfor (int i = 0, n = 3; i < n; i++) { System.out.println(i); }",
+    ),
     // ── Types: declaration-position type names with runtime meaning ──
     (
         "int",
@@ -455,8 +462,8 @@ pub const REFERENCE: &[Entry] = &[
         "float",
         "Types",
         "float name [= expr];",
-        "32-bit floating-point declaration in Java; in javars an alias for the single `f64` kind, so a `float` local carries double precision and prints with `Double.toString` rules.",
-        "float f = 1.5f;",
+        "Java's 32-bit floating-point type, kept at 32 bits rather than aliased to `double`: every operation rounds *once* at 32 bits (on the host, so it cannot round twice), and the value prints as the shortest decimal that round-trips at 32 bits. `Float.MIN_VALUE` prints `1.4E-45` — the two-digit widening Java's `toString` specification applies whenever the shortest form has a single digit.",
+        "float f = 1.5f;\nSystem.out.println(1.0f / 3.0f);   // 0.33333334",
     ),
     (
         "boolean",
@@ -483,15 +490,15 @@ pub const REFERENCE: &[Entry] = &[
         "var",
         "Types",
         "var name = expr;",
-        "Local variable with an inferred type (Java 10+). javars records the annotation for diagnostics only — the runtime is dynamically typed on the fusevm value model — so `var` behaves exactly as the explicit spelling would.",
-        "var s = \"inferred\";",
+        "Local variable with an inferred type (Java 10+). The inferred type is *recorded*, not just the value, so a `var` participates in `/`-truncation, the 32-bit `int` wrap, and class-typed dispatch exactly as the explicit spelling would. `var a = 1, b = 2;` is rejected, as it is by `javac`: each declarator would need its own inference.",
+        "var s = \"inferred\";\nvar i = 7; System.out.println(i / 2);   // 3, not 3.5",
     ),
     (
         "Object",
         "Types",
-        "Object name [= expr];",
-        "The universal reference type, and the erasure of every generic type parameter. Any reference is assignable to it (at a deliberately high overload-resolution cost, so a more specific overload always wins), and a `String` satisfies it.",
-        "Object o = \"anything\";",
+        "Object name [= expr];   |   new Object()",
+        "The universal reference type, and the erasure of every generic type parameter. Any reference is assignable to it (at a deliberately high overload-resolution cost, so a more specific overload always wins), and a `String` satisfies it. `new Object()` allocates the fieldless root instance — a distinct identity per allocation, usable as a lock, a sentinel, or a map key — and the methods a class inherits without overriding answer from `Object`: `equals` is reference identity, `getClass().getName()` is `java.lang.Object`, `toString()` is `java.lang.Object@<hash>`.",
+        "Object o = \"anything\";\nObject lock = new Object();\nSystem.out.println(lock.equals(lock));   // true",
     ),
     (
         "T[]",

@@ -15,8 +15,19 @@ at the bottom, and are summarized in the section right after this one.
   and `continue`, including the labeled forms (`outer: for (…) { break outer; }`)
   — a labeled `break` exits the named loop/`switch`, a labeled `continue` steps
   the named loop. A `for` header takes comma-separated init and update clauses
-  (`for (int i = 0, j = n; i < j; i++, j--)`), where the init's later declarators
-  reuse the first one's type.
+  (`for (int i = 0, j = n; i < j; i++, j--)`), the init's declarators sharing one
+  type on the rule in the next entry. `synchronized (m) { … }` is a statement too: javars
+  runs one thread, so the monitor is unobservable, but the expression is
+  evaluated exactly once and a `null` monitor throws before the body.
+- **Declarations with more than one declarator.** `int a = 1, b = 2;` in
+  statement position, in a `for` init clause, and as an instance or `static`
+  field. Declarators run left to right, so a later initializer may read an
+  earlier name (`int a = 1, b = a + 1;`), and any of them may be left
+  uninitialized (`int a, b = 2, c;`); `final` applies to the whole statement. The
+  C-style array suffix binds to its own *declarator*, which is what makes
+  `int p[] = {1}, q;` an `int[]` and an `int` rather than two arrays; it is
+  accepted on locals, fields, and parameters (`int add(int xs[], int n)`).
+  `var a = 1, b = 2;` is rejected, because Java forbids the compound form there.
 - **The enhanced `for`** (`for (String s : arr)`, `for (var v : arr)`) over an
   array or a collection — including a `T[][]` row (`for (int[] row : grid)`), an
   empty array, a `List`/`Set`/`keySet()`/`values()`, and labeled
@@ -102,8 +113,23 @@ at the bottom, and are summarized in the section right after this one.
   (closest to the value, ties to the even last digit — Rust's formatter breaks
   that tie the other way), and it is emitted wherever a statically-`float` value
   crosses into a String. `Float.parseFloat`/`valueOf`/`toString`/`compare`/
-  `isNaN`/`isInfinite` and the `Float.MAX_VALUE`/`MIN_VALUE`/`NaN`/infinity
-  constants answer at 32 bits too.
+  `isNaN`/`isInfinite` and the `Float.MAX_VALUE`/`MIN_VALUE`/`MIN_NORMAL`/`NaN`/
+  infinity constants answer at 32 bits too.
+- **`toString`'s two-digit widening at the subnormal floor.** `Double.toString`
+  and `Float.toString` are not "shortest decimal that round-trips". The
+  specification restricts the candidates to the minimal length only when that
+  length is at least 2; when the shortest form has a *single* digit the
+  candidates are the decimals of length 1 **or 2**, and the one nearest the value
+  wins (ties to even). Across the whole normal range the two rules coincide — a
+  normal's binary ulp is some sixteen decimal orders below the value, so the
+  nearest two-digit decimal is always the one-digit answer with a `0` appended,
+  which canonicalizes straight back. At the bottom of the exponent range the
+  binary ulp is the size of the value itself and they part: `Double.MIN_VALUE` is
+  4.9406…E-324, which `5.0E-324` does round-trip to but `4.9E-324` is nearer, and
+  the same for `Float.MIN_VALUE` (`1.4E-45`, not `1.0E-45`) and for every
+  subnormal whose shortest form is one digit. Deciding it needs the value's
+  *exact* decimal expansion, because `10^exp` is not itself representable down
+  there — the arithmetic `v / 10^(exp-1)` underflows to zero.
 - **`%e` and `%g` round HALF_UP.** Java's `Formatter` rounds through
   `BigDecimal.ROUND_HALF_UP`, so `%e` of 5592405.5 is `5.592406e+06` where
   half-to-even gives `5.592405e+06`. `%f` already did this; the scientific and
@@ -176,6 +202,18 @@ at the bottom, and are summarized in the section right after this one.
   instance methods, `this`, `new C(…)`, field access (`obj.f`, `obj.f = v`), and
   implicit-`this` field/method access. Multiple classes per file, including nested
   `static` classes. Instances are heap objects with reference/aliasing semantics.
+- **`java.lang.Object`.** `new Object()` allocates the fieldless root instance,
+  with a distinct identity per allocation — so it works as a lock, as a sentinel
+  compared with `==`, and as a `HashMap` key or `HashSet` element (two of them
+  occupy two slots). The methods a class inherits and does not override answer
+  from `Object`: `equals` is reference identity, `getClass().getName()` is
+  `java.lang.Object` (`getSimpleName()` is `Object`), and `toString()` is the
+  `java.lang.Object@<hash>` form. `Object` is deliberately not in the class table
+  — it is also the erasure of every type variable, so a receiver statically typed
+  `Object` has to keep dispatching on its runtime value — and a class that
+  declares its own `equals`/`toString` always wins over the inherited one.
+  `hashCode()` answers on an `Object` (see the `hashCode` entry below for why a
+  user class's is still an error).
 - **`static` fields and `static { }` blocks.** A `static` field is one cell per
   class, stored in a compiler-minted global (`#static#C#n`), seeded with its
   declared type's default before any user code runs and then initialized — field
@@ -424,9 +462,18 @@ known.
   interfaces javars supplies declare only their single abstract method, so
   calling a `default` one is a compile error. Lambdas and method references
   themselves are implemented (above).
-- **`hashCode()`**, including a `record`'s derived one. A record supplies its
-  accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
-  ("class `Pt` has no method `hashCode`") rather than a wrong number.
+- **`hashCode()` on a user class**, including a `record`'s derived one. A record
+  supplies its accessors, `toString`, and `equals`; calling `hashCode()` is a
+  compile error ("class `Pt` has no method `hashCode`") rather than a wrong
+  number. That is the point of the omission: a record's hash is derived from its
+  *components*, so falling back to an identity hash would answer a plausible
+  wrong number where the error is honest. `Object.hashCode()` itself *is*
+  supplied (on `new Object()`, and on any receiver javars types dynamically),
+  because there the specified answer is the identity hash and nothing else.
+- **Class literals** (`C.class`, `int.class`). `x.getClass()` works — it
+  evaluates to the runtime class name, over which `getName`/`getSimpleName`
+  answer — but there is no way to name a class without an instance, so
+  `synchronized (C.class)` and `C.class.getName()` are parse errors.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above, the
   `String` instance methods, and the `java.util` collections are the whole
@@ -522,14 +569,6 @@ known.
   failure, so `(String) anIntArray` succeeds where Java throws. A boxed
   `Character` is the one-character String javars models it as, so a failing cast
   from one names `java.lang.String` and `(String) aBoxedChar` succeeds.
-- **`Float.toString`/`Double.toString` of a subnormal can differ in the last
-  digit.** javars renders `Double.MIN_VALUE` as `5.0E-324` where Java prints
-  `4.9E-324`, and `Float.MIN_VALUE` as `1.0E-45` where Java prints `1.4E-45`.
-  Both are the same cause: at the very bottom of the exponent range the digit
-  Java selects is not the one the shortest-round-trip search settles on.
-  Normal-range values agree, subnormal ones above the floor agree, and the
-  `float` selection rule (closest, then even) is applied — this is the residue
-  under it.
 - **A `float` reaching `String.format` through a *non-literal* format string
   prints its `double` form under `%s`.** `String.format` is the one place a
   `float` argument splits by conversion — `%s` wants `Float.toString`, `%f` and
@@ -563,7 +602,15 @@ known.
   exception *class* is right, so `catch (NullPointerException e)` behaves
   identically; only `e.getMessage()`/`e.toString()` text differs. A method call
   on a null user-class receiver reports the first field access that fails inside
-  the callee rather than Java's `Cannot invoke "P.get()"`.
+  the callee rather than Java's `Cannot invoke "P.get()"`, and a `null`
+  `synchronized` monitor says `Cannot enter synchronized block because the
+  monitor is null` where Java names the expression it came from.
+- **The identity hash is javars's heap handle, not the JVM's.** It shows in
+  `Object.hashCode()` and in the `@<hash>` half of the default `toString()`.
+  Java's number is not reproducible either — it differs between runs of the same
+  program — so no deterministic program can print it, and the properties one
+  *can* rely on hold here: stable within a run, equal for equal references,
+  different for the objects a `HashMap`/`HashSet` has to keep apart.
 - **A throwing `close()` replaces the body's exception rather than being
   suppressed.** Java records it via `Throwable.addSuppressed`; javars has no
   suppression list, so the later exception wins.
@@ -577,6 +624,13 @@ known.
   re-enter the VM to run the element's Java-level `toString()`. This is the same
   limitation `Arrays.toString(objArray)` and `String.valueOf(obj)` already have
   (above); an `enum` constant is the exception, since its name is a real field.
+  The same boundary decides `toString()`/`equals()` called on a receiver javars
+  types only *dynamically*: `Pt p = new Pt(1, 2); p.toString()` dispatches to the
+  record's own version and is exact, while `Object o = new Pt(1, 2);
+  o.toString()` falls to `Object`'s (`Pt@2`, and `o.equals(…)` is identity),
+  because a builtin has no way to call back into the override. A receiver
+  declared with its class — which is how the overwhelming majority of Java is
+  written — is on the static path and unaffected.
 - **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
   spreads a *reference* array (`String[]` → a 3-element list) but not a
   primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element

@@ -1805,6 +1805,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     if is_collection(&recv) {
         return coll_method(vm, &recv, &method, &args);
     }
+    // A class instance whose own class declares no such method inherits
+    // `java.lang.Object`'s — including `new Object()` itself, which has no class
+    // body at all.
+    if let Some(v) = object_method(&recv, &method, &args) {
+        return v;
+    }
     // A method call on a `null` reference is Java's NPE, not an empty string.
     if matches!(recv, Value::Undef) {
         return raise(
@@ -1819,6 +1825,38 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     match string_method(&s, &method, &args) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
+    }
+}
+
+/// The three `java.lang.Object` methods that have an answer without a class
+/// body, for a class-instance receiver that declares no override:
+///
+///   * `equals(x)` is reference identity — the same heap handle.
+///   * `hashCode()` is the identity hash. Java's is a JVM value that is not
+///     reproducible across runs, so javars uses the heap handle: the properties
+///     a program can rely on (stable within a run, equal for equal references)
+///     hold, and the number itself is no more portable than Java's.
+///   * `toString()` is `getClass().getName() + "@" + Integer.toHexString(hash)`.
+///
+/// `None` for any other method and for any non-instance handle (an array, a
+/// collection, and a closure each have their own dispatch), so the caller falls
+/// through to the `String` methods exactly as before.
+fn object_method(recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let is_instance =
+        HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Instance { .. })));
+    if !is_instance {
+        return None;
+    }
+    match (method, args.len()) {
+        ("equals", 1) => Some(Value::bool(
+            matches!(args[0], Value::Obj(other) if other == *id),
+        )),
+        ("hashCode", 0) => Some(Value::Int(i64::from(*id))),
+        ("toString", 0) => Some(Value::str(obj_default_str(*id))),
+        _ => None,
     }
 }
 
@@ -1924,7 +1962,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // qualified name adds `java.lang.` for the modeled JDK types.
         ("getSimpleName", 0) => Ok(Value::str(s.to_string())),
         ("getName", 0) => Ok(Value::str(
-            crate::prelude::qualified_throwable(s).unwrap_or_else(|| s.to_string()),
+            crate::prelude::qualified_class(s).unwrap_or_else(|| s.to_string()),
         )),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
@@ -3142,8 +3180,10 @@ pub fn java_str(v: &Value) -> String {
 }
 
 /// Java's default `toString` for a heap object: `ClassName@<identity-hash>` for
-/// an instance, `[@<hash>` for an array. The hash is the handle (deterministic
-/// within a run) rather than a JVM identity hash.
+/// an instance, `[@<hash>` for an array. The class name is the qualified one
+/// `getClass().getName()` reports (`java.lang.Object`, not `Object`), and the
+/// hash is the handle (deterministic within a run) rather than a JVM identity
+/// hash.
 fn obj_default_str(id: u32) -> String {
     HEAP.with(|h| {
         let h = h.borrow();
@@ -3155,7 +3195,11 @@ fn obj_default_str(id: u32) -> String {
             // VM to call the Java-level `toString()`.
             Some(HostObj::Instance { class, fields }) => match fields.get(crate::ast::ENUM_NAME) {
                 Some(n) if !matches!(n, Value::Undef) => n.as_str_cow().into_owned(),
-                _ => format!("{class}@{id:x}"),
+                _ => {
+                    let name =
+                        crate::prelude::qualified_class(class).unwrap_or_else(|| class.to_string());
+                    format!("{name}@{id:x}")
+                }
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
             Some(HostObj::List { items, .. }) => render_sequence(items),
@@ -3174,7 +3218,87 @@ fn obj_default_str(id: u32) -> String {
 /// (`3.0`, not `3`) and keeps a decimal point; non-finite values print as
 /// `Infinity`/`-Infinity`/`NaN`.
 fn format_double(f: f64) -> String {
-    format_ieee(f, format!("{f}"), format!("{f:e}"))
+    // Rust's `{}`/`{:e}` are the shortest round-tripping decimal, which is what
+    // Java selects too — except when that decimal has a single digit, where
+    // Java widens the candidate set (see [`widen_exact`]).
+    let sci = format!("{f:e}");
+    if f.is_finite() && f != 0.0 && shortest_is_one_digit(&sci) {
+        if let Some((digits, exp)) = widen_exact(f) {
+            let sign = if f < 0.0 { "-" } else { "" };
+            return format_ieee(
+                f,
+                format!("{sign}{}", plain_form(&digits, exp)),
+                format!("{sign}{}", sci_form(&digits, exp)),
+            );
+        }
+    }
+    format_ieee(f, format!("{f}"), sci)
+}
+
+/// True when a Rust `{:e}` rendering has a single-digit mantissa (`1e-45`, not
+/// `1.4e-45`) — the gate on Java's **two-digit widening**, the one rule its
+/// `toString` specification applies that "shortest decimal that round-trips"
+/// does not.
+///
+/// `Double.toString`/`Float.toString` take `R` to be every decimal that rounds
+/// to the value and `p` to be the minimal length in `R`. For `p >= 2` the
+/// candidates `T` are the decimals of length exactly `p` — shortest-round-trip.
+/// **For `p < 2`, `T` is the decimals of length 1 _or 2_**, and the answer is
+/// the member of `T` nearest the value (ties to even). So a one-digit shortest
+/// form is not automatically the answer: a two-digit decimal that is closer
+/// beats it.
+///
+/// For every normal value the two rules agree, because a normal's binary ulp is
+/// some sixteen decimal orders below the value: the nearest two-digit decimal is
+/// always the one-digit answer with a `0` appended, which canonicalizes straight
+/// back (a decimal's length counts a mantissa not divisible by 10). Down at the
+/// subnormal floor the binary ulp is the same size as the value, and they part:
+/// `Double.MIN_VALUE` is 4.9406…E-324, which `5.0E-324` does round-trip to, but
+/// `4.9E-324` is nearer — so Java prints `4.9E-324`. The same holds for
+/// `Float.MIN_VALUE` (`1.4E-45`, not `1.0E-45`) and for every subnormal whose
+/// shortest form is one digit. [`widen_exact`] does the widening.
+fn shortest_is_one_digit(sci: &str) -> bool {
+    sci.split_once('e')
+        .is_some_and(|(mantissa, _)| mantissa.bytes().filter(u8::is_ascii_digit).count() == 1)
+}
+
+/// The two-digit widening itself (see [`shortest_is_one_digit`] for the rule).
+///
+/// Applied by rounding `|v|`'s **exact** decimal expansion to two significant
+/// digits, half to even — which is precisely "the nearest decimal of length 1 or
+/// 2, ties to even". The exact expansion is the only way to compare decimals
+/// down there: `10^exp` is not itself a representable `double` at the subnormal
+/// floor, so the arithmetic `v / 10^(exp-1)` underflows to zero. Nineteen
+/// significant digits (`{:.18e}`, which Rust renders exactly) decide any
+/// two-digit rounding.
+///
+/// Returns the widened `(digits, exp10)`, or `None` when the result canonicalizes
+/// back to one digit (a trailing `0`) — the no-change case. Callers gate this on
+/// [`shortest_is_one_digit`], because it is only the `p < 2` branch of the rule.
+fn widen_exact(v: f64) -> Option<(String, i32)> {
+    let exact = format!("{:.*e}", 18, v.abs());
+    let (mantissa, exp) = exact.split_once('e')?;
+    let exp: i32 = exp.parse().ok()?;
+    let d: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    let mut two = u32::from(d[0]) * 10 + u32::from(d[1]);
+    let beyond_half = d[2] > 5 || (d[2] == 5 && d[3..].iter().any(|&x| x != 0));
+    if beyond_half || (d[2] == 5 && two % 2 == 1) {
+        two += 1;
+    }
+    // A carry out of `99` is `100`, i.e. one digit more and one decade up.
+    let (two, exp) = if two == 100 {
+        (10, exp + 1)
+    } else {
+        (two, exp)
+    };
+    if two % 10 == 0 {
+        return None;
+    }
+    Some((two.to_string(), exp))
 }
 
 /// `Float.toString` — the same layout rules, but the shortest decimal is
@@ -3188,6 +3312,14 @@ fn format_float(f: f32) -> String {
     // The digit selection works on magnitude; the sign is put back on both
     // renderings so `format_ieee` only has to choose between them.
     let (digits, exp10) = java_shortest_f32(f);
+    // `Float.toString` carries the same two-digit widening as `Double`'s, over
+    // the `float`'s own rounding interval — which is what makes
+    // `Float.MIN_VALUE` print as `1.4E-45` rather than `1.0E-45`.
+    let (digits, exp10) = if digits.len() == 1 {
+        widen_exact(f64::from(f)).unwrap_or((digits, exp10))
+    } else {
+        (digits, exp10)
+    };
     let sign = if f < 0.0 { "-" } else { "" };
     format_ieee(
         f as f64,

@@ -803,7 +803,7 @@ impl Parser {
             self.pos = save;
             return Ok(None);
         }
-        let ty = self.type_name()?;
+        let base_ty = self.type_name()?;
         // A field is `type name` where name is not followed by `(` (that would be
         // a method the method-probe should have taken).
         let first_is_field = matches!(self.peek(), Tok::Ident(_))
@@ -814,18 +814,14 @@ impl Parser {
         }
         let mut out = Vec::new();
         loop {
-            let name = self.ident()?;
+            let (name, ty) = self.declarator(&base_ty)?;
             let init = if self.is(&Tok::Assign) {
                 self.advance();
                 Some(self.var_init()?)
             } else {
                 None
             };
-            out.push(FieldDecl {
-                ty: ty.clone(),
-                name,
-                init,
-            });
+            out.push(FieldDecl { ty, name, init });
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {
@@ -938,7 +934,7 @@ impl Parser {
                 self.eat(&Tok::Dot)?;
                 ty.push_str("[]");
             }
-            let name = self.ident()?;
+            let (name, ty) = self.declarator(&ty)?;
             out.push(Param { ty, name });
             if self.is(&Tok::Comma) {
                 self.advance();
@@ -976,6 +972,23 @@ impl Parser {
             ty = self.ident()?;
         }
         Ok(ty)
+    }
+
+    /// Parse one declarator — its name plus any C-style array suffix — and
+    /// return `(name, type)`. Java lets the brackets sit after the *name*
+    /// (`int a[]`) as well as after the type (`int[] a`), and the two spellings
+    /// declare the same thing; the difference only shows in a multi-declarator
+    /// statement, where a suffix binds to its own declarator alone, so
+    /// `int a[], b;` declares an `int[]` and an `int`.
+    fn declarator(&mut self, base_ty: &str) -> Result<(String, String), String> {
+        let name = self.ident()?;
+        let mut ty = base_ty.to_string();
+        while self.is(&Tok::LBracket) && matches!(self.toks[self.pos + 1].kind, Tok::RBracket) {
+            self.advance();
+            self.advance();
+            ty.push_str("[]");
+        }
+        Ok((name, ty))
     }
 
     /// Parse a declaration-position type: `void`, `int`, `String`, `int[]`, ….
@@ -1134,6 +1147,11 @@ impl Parser {
                     self.eat(&Tok::Semi)?;
                     return Ok(StmtKind::Throw(e));
                 }
+                // `synchronized (m) { … }` — a statement here, but also a method
+                // modifier, so the `(` is what tells the two apart.
+                "synchronized" if matches!(self.toks[self.pos + 1].kind, Tok::LParen) => {
+                    return self.synchronized_stmt()
+                }
                 _ => {}
             }
         }
@@ -1193,18 +1211,43 @@ impl Parser {
             if matches!(self.peek(), Tok::Ident(w) if w == "final") {
                 self.advance();
             }
-            let ty = self.type_name()?;
-            let name = self.ident()?;
-            let init = if self.is(&Tok::Assign) {
+            let base_ty = self.type_name()?;
+            // Every declarator of the statement, in source order: `int a = 1,
+            // b = 2;` is two, and `int a[], b;` gives them different types.
+            let mut decls = Vec::new();
+            loop {
+                let line = self.line();
+                let (name, ty) = self.declarator(&base_ty)?;
+                let init = if self.is(&Tok::Assign) {
+                    self.advance();
+                    Some(self.var_init()?)
+                } else {
+                    None
+                };
+                decls.push(Stmt::new(line, StmtKind::Local { ty, name, init }));
+                if !self.is(&Tok::Comma) {
+                    break;
+                }
                 self.advance();
-                Some(self.var_init()?)
-            } else {
-                None
-            };
+            }
+            // `var a = 1, b = 2;` is not Java: each `var` declarator would need
+            // its own inferred type, so the language forbids the compound form.
+            if base_ty == "var" && decls.len() > 1 {
+                return Err(format!(
+                    "javars: 'var' is not allowed in a compound declaration on line {}",
+                    self.line()
+                ));
+            }
             if expect_semi {
                 self.eat(&Tok::Semi)?;
             }
-            return Ok(StmtKind::Local { ty, name, init });
+            // A one-declarator statement stays the plain `Local` node, so the
+            // overwhelmingly common shape emits exactly the bytecode it did.
+            return Ok(if decls.len() == 1 {
+                decls.pop().expect("length checked").kind
+            } else {
+                StmtKind::Locals(decls)
+            });
         }
 
         // Bare-variable fast paths: `x <op>= e` and `x++`/`x--`. Handled before
@@ -1429,38 +1472,61 @@ impl Parser {
             return Ok(out);
         }
         let line = self.line();
-        let first = self.simple_statement(false)?;
-        let decl_ty = match &first {
-            StmtKind::Local { ty, .. } => Some(ty.clone()),
-            _ => None,
-        };
-        out.push(Stmt::new(line, first));
+        out.push(Stmt::new(line, self.simple_statement(false)?));
+        // A declaration clause has already swallowed its own comma-separated
+        // declarators (`for (int i = 0, n = 3; …)` is one `Locals` statement),
+        // so a comma left here separates statement *expressions*: `i++, j--`.
         while self.is(&Tok::Comma) {
             self.advance();
             let line = self.line();
-            match &decl_ty {
-                // A continued declarator: `j = n` or a bare `j`.
-                Some(ty) => {
-                    let name = self.ident()?;
-                    let init = if self.is(&Tok::Assign) {
-                        self.advance();
-                        Some(self.expression()?)
-                    } else {
-                        None
-                    };
-                    out.push(Stmt::new(
-                        line,
-                        StmtKind::Local {
-                            ty: ty.clone(),
-                            name,
-                            init,
-                        },
-                    ));
-                }
-                None => out.push(Stmt::new(line, self.simple_statement(false)?)),
-            }
+            out.push(Stmt::new(line, self.simple_statement(false)?));
         }
         Ok(out)
+    }
+
+    /// Parse `synchronized (monitor) { body }`.
+    ///
+    /// javars runs one thread, so holding the monitor is unobservable and the
+    /// lock itself is not modeled. What *is* observable is the rest of the
+    /// statement's semantics, and those are kept: the monitor expression is
+    /// evaluated exactly once (so `synchronized (next())` still calls `next`),
+    /// and a `null` monitor throws `NullPointerException` before the body runs.
+    /// Both fall out of desugaring to `if (m != null) { body } else { throw }` —
+    /// the same shape try-with-resources uses, so no new node reaches the
+    /// compiler.
+    ///
+    /// Java's own message names where the null came from
+    /// (`… because the return value of "C.give()" is null`), which is the
+    /// bytecode-slot provenance javars cannot reproduce; it keeps the operation
+    /// half, exactly as every other javars NPE message does.
+    fn synchronized_stmt(&mut self) -> Result<StmtKind, String> {
+        self.uses_exceptions = true;
+        let line = self.line();
+        self.advance(); // `synchronized`
+        self.eat(&Tok::LParen)?;
+        let monitor = self.expression()?;
+        self.eat(&Tok::RParen)?;
+        self.eat(&Tok::LBrace)?;
+        let body = self.block()?;
+        let npe = Stmt::new(
+            line,
+            StmtKind::Throw(Expr::NewObject {
+                class: "NullPointerException".to_string(),
+                args: vec![Expr::Str(
+                    "Cannot enter synchronized block because the monitor is null".to_string(),
+                )],
+                line,
+            }),
+        );
+        Ok(StmtKind::If {
+            cond: Expr::Binary {
+                op: BinOp::Ne,
+                lhs: Box::new(monitor),
+                rhs: Box::new(Expr::Var("null".to_string())),
+            },
+            then: body,
+            els: vec![npe],
+        })
     }
 
     /// Parse `try [(resources)] { .. } catch (Type name) { .. }* [finally { .. }]`.

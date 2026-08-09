@@ -1109,7 +1109,14 @@ impl Compiler {
                 let ty = self.classes.get(&rc)?.field_types.get(name)?;
                 self.classes.contains_key(ty).then(|| ty.to_string())
             }
-            Expr::NewObject { class, .. } => Some(class.clone()),
+            // Only a *user* class, on the rule every other arm here follows:
+            // `new ArrayList<>()` and `new Object()` are host values rather than
+            // class instances with a method table, so naming their type here
+            // would route `new ArrayList<>().size()` into user-class dispatch and
+            // reject it. (`Compiler::expr_java_type` still reports the type.)
+            Expr::NewObject { class, .. } => {
+                self.classes.contains_key(class).then(|| class.clone())
+            }
             // A cast states the class outright, which is how `((Animal) x)`
             // reaches `Animal`'s methods and how `println((Dog) a)` finds the
             // `toString` override.
@@ -2738,6 +2745,15 @@ impl Compiler {
         }
         let line = s.line;
         match &s.kind {
+            // `int a = 1, b = 2;` — one declaration statement, several
+            // declarators, lowered left to right so a later initializer sees the
+            // earlier names (Java's evaluation order).
+            StmtKind::Locals(decls) => {
+                for d in decls {
+                    self.stmt(d)?;
+                }
+                Ok(())
+            }
             StmtKind::Local { ty, name, init } => {
                 // Record the declared numeric type (for `/` truncation); `var`
                 // and untracked types are inferred from the initializer. The raw
@@ -4118,8 +4134,23 @@ impl Compiler {
         }
         // A user-class receiver: dispatch on the receiver's runtime class
         // (virtual dispatch), collapsing to a direct call when not overridden.
+        //
+        // `equals`/`toString` a class does not declare are the ones it inherits
+        // from `Object`, which has no Java-level body here — so they fall
+        // through to the host, where they are reference identity and
+        // `getClass().getName() + "@" + hex`. A class that declares either wins,
+        // which is what keeps a `record`'s and an `enum`'s own versions in play.
+        // `hashCode` is deliberately *not* in that set: a `record`'s is derived
+        // from its components, and answering an identity hash there would be a
+        // silently wrong number instead of the compile error it is today.
         if let Some(rc) = self.expr_class(recv) {
-            return self.dispatch_instance_method(recv, &rc, method, args, line);
+            let arg_tys: Vec<Option<String>> =
+                args.iter().map(|a| self.expr_java_type(a)).collect();
+            let inherited = matches!((method, args.len()), ("equals", 1) | ("toString", 0))
+                && self.resolve_instance_call(&rc, method, &arg_tys).is_none();
+            if !inherited {
+                return self.dispatch_instance_method(recv, &rc, method, args, line);
+            }
         }
         // A `java.util` collection receiver. The runtime path in `b_str_dispatch`
         // catches a collection whose static type javars could not determine
@@ -4202,6 +4233,23 @@ impl Compiler {
             let method_c = self.b.add_constant(Value::str("valueOf".to_string()));
             self.b.emit(Op::LoadConst(method_c), line);
             self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 3, line);
+            return Ok(());
+        }
+        // `new Object()` — the fieldless root instance programs use as a lock or
+        // a sentinel. `Object` is deliberately *not* in the class table (it is
+        // also the erasure of every type variable, and a receiver statically
+        // typed `Object` has to keep dispatching dynamically), so the allocation
+        // is emitted here directly: a `HostObj::Instance` with no fields and no
+        // constructor, which the heap already gives a distinct identity.
+        if !self.classes.contains_key(class) && class == "Object" {
+            if !args.is_empty() {
+                return Err(format!(
+                    "javars: `Object` has only a no-argument constructor (line {line})"
+                ));
+            }
+            let class_c = self.b.add_constant(Value::str("Object".to_string()));
+            self.b.emit(Op::LoadConst(class_c), line);
+            self.b.emit(Op::CallBuiltin(crate::host::JNEW, 1), line);
             return Ok(());
         }
         // `new ArrayList<>()` / `new HashMap<>(other)` — a `java.util`
@@ -4883,6 +4931,7 @@ impl Compiler {
 fn body_has_ffi(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::Local { init, .. } => init.as_ref().is_some_and(expr_has_ffi),
+        StmtKind::Locals(decls) => body_has_ffi(decls),
         StmtKind::Assign { value, .. } => expr_has_ffi(value),
         StmtKind::IndexAssign {
             array,
@@ -5360,6 +5409,10 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Float", "MAX_VALUE") => (Value::float(f32::MAX as f64), "float"),
         // `Float.MIN_VALUE` is the smallest positive *subnormal*, not `f32::MIN`.
         ("Float", "MIN_VALUE") => (Value::float(f32::from_bits(1) as f64), "float"),
+        // `MIN_NORMAL` is the smallest positive value with a full mantissa: the
+        // bottom of the *normal* range (1.1754944E-38), well above the subnormal
+        // floor `MIN_VALUE` names. Rust spells it `MIN_POSITIVE`.
+        ("Float", "MIN_NORMAL") => (Value::float(f32::MIN_POSITIVE as f64), "float"),
         ("Float", "POSITIVE_INFINITY") => (Value::float(f64::INFINITY), "float"),
         ("Float", "NEGATIVE_INFINITY") => (Value::float(f64::NEG_INFINITY), "float"),
         ("Float", "NaN") => (Value::float(f64::NAN), "float"),
@@ -5367,6 +5420,7 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         // The smallest positive *subnormal* double, 4.9E-324 — Java's
         // `Double.MIN_VALUE` is not `f64::MIN`.
         ("Double", "MIN_VALUE") => (Value::float(f64::from_bits(1)), "double"),
+        ("Double", "MIN_NORMAL") => (Value::float(f64::MIN_POSITIVE), "double"),
         ("Double", "POSITIVE_INFINITY") => (Value::float(f64::INFINITY), "double"),
         ("Double", "NEGATIVE_INFINITY") => (Value::float(f64::NEG_INFINITY), "double"),
         ("Double", "NaN") => (Value::float(f64::NAN), "double"),

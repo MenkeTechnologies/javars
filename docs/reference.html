@@ -250,9 +250,11 @@ for (final String s : names) { System.out.println(s); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-12">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-12">#</a> <code>synchronized</code></h3>
-          <pre><code class="lang-java">synchronized &lt;method&gt;</code></pre>
-          <p>Accepted as a method modifier and dropped. javars runs a program on one thread, so there is no monitor to acquire; a <code>synchronized (obj) { … }</code> *statement* is not parsed.</p>
-          <pre><code class="lang-java">static synchronized void once() { System.out.println("once"); }</code></pre>
+          <pre><code class="lang-java">synchronized &lt;method&gt; | synchronized (monitor) { … }</code></pre>
+          <p>javars runs a program on one thread, so there is no monitor to acquire: as a method modifier it is dropped. As a *statement* the rest of the semantics still hold — the monitor expression is evaluated exactly once, and a <code>null</code> monitor throws <code>NullPointerException</code> before the body runs.</p>
+          <pre><code class="lang-java">static synchronized void once() { System.out.println("once"); }
+Object lock = new Object();
+synchronized (lock) { System.out.println("critical"); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-13">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-13">#</a> <code>native</code></h3>
@@ -403,74 +405,86 @@ int[][] g = {{1, 2}, {3, 4}};</code></pre>
       <section class="tutorial-section" id="ch-types">
         <h2>Types</h2>
         <article class="doc-entry" id="doc-types-1">
-          <h3><a class="doc-anchor" href="#doc-types-1">#</a> <code>int</code></h3>
+          <h3><a class="doc-anchor" href="#doc-types-1">#</a> <code>multi-declarator declaration</code></h3>
+          <pre><code class="lang-java">T a [= e], b [= e], …;   |   T a[] = { … }, b;</code></pre>
+          <p>One declaration statement declaring several variables — as a local, in a <code>for</code> init clause, or as a field. Declarators run left to right, so a later initializer may read an earlier name, and any may be left uninitialized. A C-style array suffix binds to its own *declarator*, so <code>int p[] = {1}, q;</code> is an <code>int[]</code> and an <code>int</code>; the suffix is accepted on locals, fields, and parameters. <code>var</code> is rejected here, as it is by <code>javac</code>.</p>
+          <pre><code class="lang-java">int a = 1, b = a + 1, c;
+int p[] = {4, 5}, q = 6;
+for (int i = 0, n = 3; i &lt; n; i++) { System.out.println(i); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-2">
+          <h3><a class="doc-anchor" href="#doc-types-2">#</a> <code>int</code></h3>
           <pre><code class="lang-java">int name [= expr];</code></pre>
           <p>32-bit integer declaration. Arithmetic between two <code>int</code>-width operands wraps at 32 bits, matching <code>javac</code>; compound assignment and <code>++</code> narrow back to <code>int</code> on store.</p>
           <pre><code class="lang-java">int n = 42;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-2">
-          <h3><a class="doc-anchor" href="#doc-types-2">#</a> <code>long</code></h3>
+        <article class="doc-entry" id="doc-types-3">
+          <h3><a class="doc-anchor" href="#doc-types-3">#</a> <code>long</code></h3>
           <pre><code class="lang-java">long name [= expr];</code></pre>
           <p>64-bit integer declaration. A <code>long</code> operand suppresses the 32-bit wrap, so the arithmetic runs at fusevm's native <code>i64</code> width.</p>
           <pre><code class="lang-java">long big = 9000000000L;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-3">
-          <h3><a class="doc-anchor" href="#doc-types-3">#</a> <code>short</code></h3>
+        <article class="doc-entry" id="doc-types-4">
+          <h3><a class="doc-anchor" href="#doc-types-4">#</a> <code>short</code></h3>
           <pre><code class="lang-java">short name [= expr];</code></pre>
           <p>16-bit integer declaration. Java promotes <code>short</code> to <code>int</code> before any binary operation, so javars treats it as <code>int</code>-width for the wrap decision and never narrows the stored value to 16 bits.</p>
           <pre><code class="lang-java">short s = 7;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-4">
-          <h3><a class="doc-anchor" href="#doc-types-4">#</a> <code>byte</code></h3>
+        <article class="doc-entry" id="doc-types-5">
+          <h3><a class="doc-anchor" href="#doc-types-5">#</a> <code>byte</code></h3>
           <pre><code class="lang-java">byte name [= expr];</code></pre>
           <p>8-bit integer declaration. Like <code>short</code>, it promotes to <code>int</code> for arithmetic and is not narrowed on store.</p>
           <pre><code class="lang-java">byte b = 1;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-5">
-          <h3><a class="doc-anchor" href="#doc-types-5">#</a> <code>double</code></h3>
+        <article class="doc-entry" id="doc-types-6">
+          <h3><a class="doc-anchor" href="#doc-types-6">#</a> <code>double</code></h3>
           <pre><code class="lang-java">double name [= expr];</code></pre>
           <p>64-bit floating-point declaration — javars's only floating kind. Division follows IEEE-754 through the <code>JDIV</code> builtin, so a zero divisor yields a signed infinity or NaN instead of faulting.</p>
           <pre><code class="lang-java">double d = 3.0;
 System.out.println(d);   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-6">
-          <h3><a class="doc-anchor" href="#doc-types-6">#</a> <code>float</code></h3>
-          <pre><code class="lang-java">float name [= expr];</code></pre>
-          <p>32-bit floating-point declaration in Java; in javars an alias for the single <code>f64</code> kind, so a <code>float</code> local carries double precision and prints with <code>Double.toString</code> rules.</p>
-          <pre><code class="lang-java">float f = 1.5f;</code></pre>
-        </article>
         <article class="doc-entry" id="doc-types-7">
-          <h3><a class="doc-anchor" href="#doc-types-7">#</a> <code>boolean</code></h3>
+          <h3><a class="doc-anchor" href="#doc-types-7">#</a> <code>float</code></h3>
+          <pre><code class="lang-java">float name [= expr];</code></pre>
+          <p>Java's 32-bit floating-point type, kept at 32 bits rather than aliased to <code>double</code>: every operation rounds *once* at 32 bits (on the host, so it cannot round twice), and the value prints as the shortest decimal that round-trips at 32 bits. <code>Float.MIN_VALUE</code> prints <code>1.4E-45</code> — the two-digit widening Java's <code>toString</code> specification applies whenever the shortest form has a single digit.</p>
+          <pre><code class="lang-java">float f = 1.5f;
+System.out.println(1.0f / 3.0f);   // 0.33333334</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-8">
+          <h3><a class="doc-anchor" href="#doc-types-8">#</a> <code>boolean</code></h3>
           <pre><code class="lang-java">boolean name [= expr];</code></pre>
           <p>Boolean declaration. Prints as <code>true</code>/<code>false</code> through the Java-formatting print builtins rather than fusevm's shell-flavoured <code>1</code>/<code>0</code>.</p>
           <pre><code class="lang-java">boolean ok = true;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-8">
-          <h3><a class="doc-anchor" href="#doc-types-8">#</a> <code>char</code></h3>
+        <article class="doc-entry" id="doc-types-9">
+          <h3><a class="doc-anchor" href="#doc-types-9">#</a> <code>char</code></h3>
           <pre><code class="lang-java">char name [= expr];</code></pre>
           <p>Character declaration. A <code>char</code> value is a one-character string, so <code>+</code> concatenates rather than promoting to <code>int</code>, and <code>String</code> index arithmetic counts Unicode scalars rather than UTF-16 code units.</p>
           <pre><code class="lang-java">char c = 'A';</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-9">
-          <h3><a class="doc-anchor" href="#doc-types-9">#</a> <code>String</code></h3>
+        <article class="doc-entry" id="doc-types-10">
+          <h3><a class="doc-anchor" href="#doc-types-10">#</a> <code>String</code></h3>
           <pre><code class="lang-java">String name [= expr];</code></pre>
           <p>String declaration, and the receiver type that routes an instance call to the <code>java.lang.String</code> methods. <code>+</code> with a <code>String</code> operand concatenates through the host numeric hook using Java's value-to-string rules.</p>
           <pre><code class="lang-java">String s = "hi " + 1 + 2;   // "hi 12"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-types-10">
-          <h3><a class="doc-anchor" href="#doc-types-10">#</a> <code>var</code></h3>
-          <pre><code class="lang-java">var name = expr;</code></pre>
-          <p>Local variable with an inferred type (Java 10+). javars records the annotation for diagnostics only — the runtime is dynamically typed on the fusevm value model — so <code>var</code> behaves exactly as the explicit spelling would.</p>
-          <pre><code class="lang-java">var s = "inferred";</code></pre>
-        </article>
         <article class="doc-entry" id="doc-types-11">
-          <h3><a class="doc-anchor" href="#doc-types-11">#</a> <code>Object</code></h3>
-          <pre><code class="lang-java">Object name [= expr];</code></pre>
-          <p>The universal reference type, and the erasure of every generic type parameter. Any reference is assignable to it (at a deliberately high overload-resolution cost, so a more specific overload always wins), and a <code>String</code> satisfies it.</p>
-          <pre><code class="lang-java">Object o = "anything";</code></pre>
+          <h3><a class="doc-anchor" href="#doc-types-11">#</a> <code>var</code></h3>
+          <pre><code class="lang-java">var name = expr;</code></pre>
+          <p>Local variable with an inferred type (Java 10+). The inferred type is *recorded*, not just the value, so a <code>var</code> participates in <code>/</code>-truncation, the 32-bit <code>int</code> wrap, and class-typed dispatch exactly as the explicit spelling would. <code>var a = 1, b = 2;</code> is rejected, as it is by <code>javac</code>: each declarator would need its own inference.</p>
+          <pre><code class="lang-java">var s = "inferred";
+var i = 7; System.out.println(i / 2);   // 3, not 3.5</code></pre>
         </article>
         <article class="doc-entry" id="doc-types-12">
-          <h3><a class="doc-anchor" href="#doc-types-12">#</a> <code>T[]</code></h3>
+          <h3><a class="doc-anchor" href="#doc-types-12">#</a> <code>Object</code></h3>
+          <pre><code class="lang-java">Object name [= expr];   |   new Object()</code></pre>
+          <p>The universal reference type, and the erasure of every generic type parameter. Any reference is assignable to it (at a deliberately high overload-resolution cost, so a more specific overload always wins), and a <code>String</code> satisfies it. <code>new Object()</code> allocates the fieldless root instance — a distinct identity per allocation, usable as a lock, a sentinel, or a map key — and the methods a class inherits without overriding answer from <code>Object</code>: <code>equals</code> is reference identity, <code>getClass().getName()</code> is <code>java.lang.Object</code>, <code>toString()</code> is <code>java.lang.Object@&lt;hash&gt;</code>.</p>
+          <pre><code class="lang-java">Object o = "anything";
+Object lock = new Object();
+System.out.println(lock.equals(lock));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-types-13">
+          <h3><a class="doc-anchor" href="#doc-types-13">#</a> <code>T[]</code></h3>
           <pre><code class="lang-java">T[] name [= expr];   |   T name[];   |   T[][] name;</code></pre>
           <p>An array type. Arrays are host heap objects with reference (aliasing) assignment, a <code>.length</code> field, and a bounds check on every access that raises Java's <code>ArrayIndexOutOfBoundsException</code> with its exact detail message.</p>
           <pre><code class="lang-java">int[] a = new int[3];

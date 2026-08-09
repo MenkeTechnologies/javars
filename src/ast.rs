@@ -207,6 +207,13 @@ pub enum StmtKind {
         name: String,
         init: Option<Expr>,
     },
+    /// One declaration statement that declares more than one variable:
+    /// `int a = 1, b = 2;`. Each element is a [`StmtKind::Local`], in source
+    /// order, so every declarator keeps its own type (a C-style declarator
+    /// suffix binds to the *name*, so `int a[], b;` declares an `int[]` and an
+    /// `int`) and its own initializer. Java evaluates them left to right, and a
+    /// later declarator may read an earlier one (`int a = 1, b = a + 1;`).
+    Locals(Vec<Stmt>),
     /// An assignment to an existing variable: `x = expr;`, `x += expr;`.
     Assign {
         name: String,

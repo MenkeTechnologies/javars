@@ -23,23 +23,30 @@
 //! storage and initialization order (`static`), the members a `record` derives
 //! from its components (`record`), and the two-sided `char` boundary where an
 //! integral code point has to do arithmetic *and* render as a character
-//! (`char`). Pure random bytes only produce
+//! (`char`), the declaration statement that declares several variables at once
+//! and the C-style array suffix that binds to one of them (`decl`), and the
+//! identity `java.lang.Object` supplies to a lock, a sentinel, and a map key
+//! (`object`). Pure random bytes only produce
 //! mutual parse errors that agree on both sides and teach nothing.
 //!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
 //!   * No nondeterministic output (no `Random`, no `currentTimeMillis`, no
-//!     identity hashes, no unordered collections). Every probe's output is a pure
-//!     function of its source.
+//!     unordered collections). Every probe's output is a pure function of its
+//!     source. An identity hash is never *printed* — Java's differs between runs
+//!     of the same program — only the properties that do hold across runs
+//!     (`o.hashCode() == o.hashCode()`, the `java.lang.Object@` prefix).
 //!   * Documented `BUGS.md` simplifications are NOT generated, because they would
 //!     only reproduce known entries rather than find anything:
 //!       - `NullPointerException` detail messages (Java's helpful NPE names the
 //!         javac local slot, which javars cannot reproduce — the `fault` mode
 //!         raises every *other* runtime fault and prints its message),
 //!       - widening *value* conversion (`double d = 7;` printing `7` not `7.0`),
-//!       - `==` identity on non-string objects (including two boxed
-//!         `Character`s, which javars compares by value),
+//!       - `==` where javars compares by value and Java by reference: two
+//!         `String`s, and two boxed `Character`s (which javars models as
+//!         one-character `String`s). Reference `==` between *instances* is not
+//!         a simplification — it is exact, and the `object` mode asserts it,
 //!       - `int` arithmetic whose operand types are not statically known (the
 //!         `overflow` mode uses only statically `int`-typed operands, which is
 //!         exactly the subset javars wraps).
@@ -164,8 +171,17 @@ fn g_mixeddiv(r: &mut Rng) -> String {
 
 /// `Double.toString` notation — the decimal/scientific threshold.
 fn g_doublefmt(r: &mut Rng) -> String {
-    let d = pick(r, DBLS);
-    p((*d).to_string())
+    // Subnormals get their own share of the pool: the bottom of the exponent
+    // range is where "shortest decimal that round-trips" and Java's actual
+    // specification part company (its `p < 2` two-digit widening), and
+    // `Double.MIN_VALUE * k` is the only way to spell one — a literal that small
+    // is a `javac` error ("floating-point number too small").
+    match r.below(8) {
+        0 => p(format!("Double.MIN_VALUE * {}L", r.below(64) + 1)),
+        1 => p("Double.MIN_VALUE".to_string()),
+        2 => p("Double.MIN_NORMAL".to_string()),
+        _ => p((*pick(r, DBLS)).to_string()),
+    }
 }
 
 /// `+` string concatenation and its coercion rules.
@@ -1013,7 +1029,12 @@ fn g_float(r: &mut Rng) -> String {
     let c = pick(r, FLTS);
     let d = pick(r, DBLS);
     let i = pick(r, INTS);
-    match r.below(14) {
+    match r.below(17) {
+        // The `float` subnormal floor, where Java's two-digit widening decides
+        // the last digit (`Float.MIN_VALUE` is `1.4E-45`, not `1.0E-45`).
+        14 => p(format!("Float.MIN_VALUE * {}", r.below(64) + 1)),
+        15 => p("Float.MIN_VALUE".to_string()),
+        16 => p("Float.MIN_NORMAL".to_string()),
         0 => p(format!("{a} / {b}")),
         1 => p(format!("{a} + {b}")),
         2 => p(format!("{a} * {b}")),
@@ -1154,6 +1175,59 @@ fn g_regex(r: &mut Rng) -> String {
     }
 }
 
+/// Declaration statements with more than one declarator, and the C-style array
+/// suffix that binds to the *declarator* rather than the type — so
+/// `int a[], b;` declares an `int[]` and an `int`. Both spellings appear in
+/// locals, in `for` init clauses, and in the initializer that reads the
+/// declarator before it.
+fn g_decl(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    let b = pick(r, INTS);
+    let d = pick(r, DIVS);
+    let f = pick(r, DBLS);
+    let s = pick(r, STRS);
+    let c = pick(r, CHARS);
+    match r.below(14) {
+        0 => format!("{{ int x = {a}, y = {b}; System.out.println(x + \",\" + y + \",\" + (x + y)); }}"),
+        1 => format!("{{ int x = {a}, y = x + {b}, z = y * 2; System.out.println(x + \",\" + y + \",\" + z); }}"),
+        2 => format!("{{ int x, y = {b}, z; x = {a}; z = x + y; System.out.println(x + \",\" + y + \",\" + z); }}"),
+        3 => format!("{{ final int x = {a}, y = {b}; System.out.println(x / {d} + \",\" + y % {d}); }}"),
+        4 => format!("{{ int p[] = {{{a}, {b}}}, q = {d}; System.out.println(p.length + \",\" + p[1] + \",\" + q); }}"),
+        5 => format!("{{ int p[] = {{{a}}}, q[][] = {{{{{b}}}, {{{d}, 9}}}}; System.out.println(p[0] + \",\" + q[1][1] + \",\" + q.length); }}"),
+        6 => format!("{{ int[] u = {{{a}}}, v = {{{b}, {d}}}; System.out.println(u[0] + v.length); }}"),
+        7 => format!("{{ double x = {f}, y = x * 2; System.out.println(x + \",\" + y); }}"),
+        8 => format!("{{ String x = {s}, y = x + \"z\"; System.out.println(y + \",\" + y.length()); }}"),
+        9 => format!("{{ long m = {a}, n = {b}; System.out.println(m * n + \",\" + (m - n)); }}"),
+        10 => format!("{{ char c1 = '{c}', c2 = (char) (c1 + 1); System.out.println(\"\" + c1 + c2 + \",\" + (c1 + 0)); }}"),
+        11 => "{ boolean t = true, u = false; System.out.println(t + \",\" + u + \",\" + (t & u)); }".to_string(),
+        12 => format!("{{ int t = 0; for (int i = {a}, n = i + 3; i < n; i++) {{ t += i; }} System.out.println(t); }}"),
+        _ => format!("{{ int t = 0; for (int i = 0, j = 4; i < j; i++, j--) {{ t += i * {d} + j; }} System.out.println(t); }}"),
+    }
+}
+
+/// `new Object()` and the methods every class inherits from it. The identity
+/// hash itself is never printed — Java's is a JVM value that differs run to run
+/// — so the probes assert the properties a program can depend on: reference
+/// identity, the shape of the default `toString`, the class name, and the way an
+/// `Object` behaves as a key, an element, and a monitor.
+fn g_object(r: &mut Rng) -> String {
+    let a = pick(r, INTS);
+    match r.below(12) {
+        0 => "{ Object o = new Object(), p = new Object(); System.out.println((o == p) + \",\" + (o == o) + \",\" + o.equals(o) + \",\" + o.equals(p)); }".to_string(),
+        1 => "{ Object o = new Object(); System.out.println(o.getClass().getName() + \",\" + o.getClass().getSimpleName()); }".to_string(),
+        2 => "{ Object o = new Object(); System.out.println(o.toString().startsWith(\"java.lang.Object@\")); }".to_string(),
+        3 => "{ Object o = new Object(); System.out.println((o.hashCode() == o.hashCode()) + \",\" + (o.hashCode() == new Object().hashCode())); }".to_string(),
+        4 => "{ Object o = new Object(); System.out.println(String.valueOf(o).startsWith(\"java.lang.Object@\")); }".to_string(),
+        5 => "{ Object o = new Object(), p = new Object(); List<Object> l = new ArrayList<>(); l.add(o); l.add(p); System.out.println(l.size() + \",\" + l.indexOf(p) + \",\" + l.contains(o)); }".to_string(),
+        6 => "{ Object o = new Object(), p = new Object(); Set<Object> s = new HashSet<>(); s.add(o); s.add(o); s.add(p); System.out.println(s.size()); }".to_string(),
+        7 => "{ Object o = new Object(), p = new Object(); Map<Object, String> m = new HashMap<>(); m.put(o, \"A\"); m.put(p, \"B\"); System.out.println(m.get(o) + m.get(p) + m.size()); }".to_string(),
+        8 => format!("{{ Object lock = new Object(); int t = 0; synchronized (lock) {{ t += {a}; }} System.out.println(t); }}"),
+        9 => format!("{{ Bare b1 = new Bare({a}), b2 = new Bare({a}); System.out.println(b1.equals(b1) + \",\" + b1.equals(b2) + \",\" + b1.toString().startsWith(\"Bare@\")); }}"),
+        10 => format!("{{ Object[] xs = new Object[2]; xs[0] = new Object(); xs[1] = xs[0]; System.out.println((xs[0] == xs[1]) + \",\" + xs.length + \",\" + {a}); }}"),
+        _ => format!("{{ Object miss = new Object(); Map<String, Object> m = new HashMap<>(); m.put(\"k\", miss); System.out.println((m.get(\"k\") == miss) + \",\" + (m.getOrDefault(\"z\", miss) == miss) + \",\" + {a}); }}"),
+    }
+}
+
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
 const SUPPORT: &str = concat!(
@@ -1215,6 +1289,9 @@ const SUPPORT_CLASS: &str = concat!(
     // `java.util.function` types are, so these exercise the same path.
     // A hierarchy for the reference-cast probes: a base, two siblings, and an
     // interface only one of them implements, so a downcast can succeed or throw.
+    // A class that declares neither `equals` nor `toString`, so both come from
+    // `Object`: reference identity and `Bare@<hash>`.
+    "class Bare { int v; Bare(int v) { this.v = v; } }\n",
     "class Base { public String toString() { return \"B\"; } }\n",
     "class Left extends Base { public String toString() { return \"L\"; } }\n",
     "class Right extends Base implements Marker { public String toString() { return \"R\"; } }\n",
@@ -1272,6 +1349,8 @@ enum Mode {
     Char,
     Regex,
     Float,
+    Decl,
+    Object,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1314,6 +1393,8 @@ const CONCRETE: &[Mode] = &[
     Mode::Char,
     Mode::Regex,
     Mode::Float,
+    Mode::Decl,
+    Mode::Object,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1358,6 +1439,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Char => "char",
         Mode::Regex => "regex",
         Mode::Float => "float",
+        Mode::Decl => "decl",
+        Mode::Object => "object",
     }
 }
 
@@ -1414,6 +1497,8 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Char => g_char(r),
         Mode::Regex => g_regex(r),
         Mode::Float => g_float(r),
+        Mode::Decl => g_decl(r),
+        Mode::Object => g_object(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

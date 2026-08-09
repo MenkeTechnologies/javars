@@ -178,6 +178,21 @@ Implemented and checked against the reference `java`:
   (`i++`, `i--`). A `var` records the *type* it infers, so `var i = 7; i / 2`
   truncates and `var big = 100000; big * big` wraps — including the element type
   of a `var` enhanced-`for` over an array literal.
+- **Multi-declarator declarations** — `int a = 1, b = 2;` in statement position,
+  in a `for` init clause, and as a field. Declarators are evaluated left to
+  right, so a later one may read an earlier (`int a = 1, b = a + 1;`), and any of
+  them may be left uninitialized (`int a, b = 2, c;`). The C-style array suffix
+  binds to the *declarator* rather than the type, exactly as Java specifies, so
+  `int p[] = {1}, q;` declares an `int[]` and an `int` — the suffix is accepted
+  on locals, fields, and parameters (`static int add(int xs[], int n)`).
+- **`java.lang.Object`** — `new Object()` is the fieldless root instance, with a
+  distinct identity per allocation: it works as a lock, as a sentinel, and as a
+  map key or set element. The methods every class inherits and does not override
+  answer from `Object` — `equals` is reference identity, `getClass().getName()`
+  is `java.lang.Object`, and `toString()` is the `java.lang.Object@<hash>` form.
+  `synchronized (m) { … }` runs its body after evaluating the monitor once
+  (javars runs one thread, so the lock itself is unobservable) and throws
+  `NullPointerException` for a `null` monitor.
 - **Expressions** — integer (decimal, `0x`, `0b`, octal, `_`-separated) /
   floating / string / char / boolean literals; the binary operators `+ - * / %`,
   `== != < > <= >=`, `&& ||` (short-circuiting), the bitwise `& | ^` (Java's
@@ -196,7 +211,11 @@ Implemented and checked against the reference `java`:
   alias for `double`: it narrows at every operation (Java rounds *once* at 32
   bits, so the operation runs on the host rather than being computed in 64 bits
   and narrowed afterwards) and prints the shortest decimal that round-trips at 32
-  bits, so `1.0f / 3.0f` is `0.33333334`.
+  bits, so `1.0f / 3.0f` is `0.33333334`. Both `toString`s follow the
+  specification rather than a plain shortest-round-trip search, which differs at
+  the subnormal floor: the candidate set widens to two digits whenever the
+  shortest form has one, so `Double.MIN_VALUE` prints `4.9E-324` and
+  `Float.MIN_VALUE` prints `1.4E-45`.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
   `for (init; cond; update)` (with comma-separated init and update clauses), the
   enhanced `for (T x : arr)` (over an array or a collection), `break`,
@@ -363,7 +382,8 @@ Java source → lexer → parser (AST) → lower to fusevm bytecode → fusevm V
 
 ## [0x06] STATUS & ROADMAP
 
-This release: `main`, locals, arithmetic / comparison / logic, Java
+This release: `main`, locals (including multi-declarator statements and the
+C-style array suffix, `int a = 1, b[] = {2};`), arithmetic / comparison / logic, Java
 integer-vs-float division, the ternary `?:` operator, `if` / `while` /
 `do`-`while` / `for` / `switch` (with fall-through, on `int` and `String`) /
 `break` / `continue` (including labeled `break outer;` / `continue outer;`) /
@@ -391,8 +411,10 @@ types** with their derived accessors / `toString` / `equals`, **abstract
 classes**, **`enum` constants carrying state or bodies**, and **lambdas +
 method references** (heap closures capturing by value, dispatched through any
 single-abstract-method interface), and the **`java.util` collections**
-(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order), and
-**arrow `switch` expressions** with `yield` — all verified byte-for-byte against
+(`List`/`Map`/`Set` with Java's real `HashMap` bucket iteration order),
+**arrow `switch` expressions** with `yield`, and **`java.lang.Object`**
+(`new Object()` as a lock or sentinel, plus the `equals`/`hashCode`/`toString`/
+`getClass` every class inherits from it) — all verified byte-for-byte against
 OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
@@ -407,8 +429,9 @@ Next waves, in priority order:
    `Comparator.reversed`. The lambdas they take already work; what is missing is
    the library on top of them.
 2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
-   `Iterator`/`entrySet`, and wider stdlib coverage (more `Math`/`Integer`
-   statics, more `String` methods, `hashCode`).
+   class literals (`C.class`), `Iterator`/`entrySet`, and wider stdlib coverage
+   (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived
+   `hashCode`).
 3. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 

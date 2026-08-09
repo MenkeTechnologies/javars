@@ -2610,3 +2610,133 @@ fn float_notation_thresholds_and_statics() {
         "1.0E-4|1.0E8|1234567.0|1.2345678E7\n-8.5\n3.4028235E38|NaN|Infinity\n0.1|0.1|-1\n"
     );
 }
+
+#[test]
+fn one_declaration_statement_can_declare_several_variables() {
+    // `int a = 1, b = 2;` was a parse error, though the `for` init clause form
+    // already worked. Every shape is here: a later declarator reading an earlier
+    // one, a bare declarator with no initializer, `final`, the C-style array
+    // suffix that binds to the *declarator* (so `int p[] = …, q = 6` gives an
+    // `int[]` and an `int`), a two-dimensional one, both field kinds, an array
+    // parameter spelled `int xs[]`, and the `for` clauses. Verified against
+    // OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static int sa[] = {1, 2}, sb = 3;\
+         int fa[] = {9}, fb = 8;\
+         static int add(int xs[], int n) { int t = 0; for (int i = 0; i < n; i++) t += xs[i]; return t; }\
+         public static void main(String[] args) {\
+         int a = 1, b = a + 1, c = b * 2;\
+         System.out.println(a + \",\" + b + \",\" + c);\
+         int p[] = {4, 5}, q = 6, r[][] = {{7}, {8, 9}};\
+         System.out.println(p.length + \",\" + p[1] + \",\" + q + \",\" + r[1][1]);\
+         final String s = \"x\", t = s + \"y\";\
+         System.out.println(t + \",\" + t.length());\
+         int u, v = 2, w;\
+         u = 1; w = u + v;\
+         System.out.println(u + \",\" + v + \",\" + w);\
+         int total = 0;\
+         for (int i = 0, j = 4; i < j; i++, j--) total += i * 10 + j;\
+         System.out.println(total);\
+         System.out.println(sa[1] + \",\" + sb + \",\" + add(p, 2));\
+         Main o = new Main();\
+         System.out.println(o.fa[0] + \",\" + o.fb);\
+         double d1 = 1.5, d2 = d1 * 2;\
+         System.out.println(d1 + \",\" + d2);\
+         char c1 = 'a', c2 = (char) (c1 + 1);\
+         System.out.println(\"\" + c1 + c2 + \",\" + (c1 + 0));\
+         }}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1,2,4\n2,5,6,9\nxy,2\n1,2,3\n17\n2,3,9\n9,8\n1.5,3.0\nab,97\n"
+    );
+}
+
+#[test]
+fn var_is_rejected_in_a_compound_declaration() {
+    // `var a = 1, b = 2;` is not Java — each declarator would need its own
+    // inferred type — and javac rejects it. Accepting it would be javars running
+    // a program `javac` refuses.
+    let (out, ok) = run(&wrap("var a = 1, b = 2; System.out.println(a + b);"));
+    assert!(!ok);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn new_object_is_a_distinct_identity_with_objects_inherited_methods() {
+    // `new Object()` was `unknown class Object`. It is the fieldless root
+    // instance programs use as a lock or a sentinel, so what has to hold is
+    // identity: distinct handles, `equals` as reference equality, one map/set
+    // slot each, and the `java.lang.Object@…` default rendering. `Bare` declares
+    // neither `equals` nor `toString`, so both come from `Object` there too. The
+    // identity *hash* is never printed — Java's differs run to run — only its
+    // consistency. Verified against OpenJDK 26.
+    let (out, ok) = run(
+        "import java.util.*;\
+         class Bare { int v; Bare(int v) { this.v = v; } }\
+         public class Main { public static void main(String[] args) {\
+         Object o = new Object(), q = new Object();\
+         System.out.println((o == o) + \",\" + (o == q) + \",\" + o.equals(o) + \",\" + o.equals(q));\
+         System.out.println(o.getClass().getName() + \",\" + o.getClass().getSimpleName());\
+         System.out.println(o.toString().startsWith(\"java.lang.Object@\") + \",\" + (o.hashCode() == o.hashCode()));\
+         Set<Object> s = new HashSet<>();\
+         s.add(o); s.add(o); s.add(q);\
+         Map<Object, String> m = new HashMap<>();\
+         m.put(o, \"A\"); m.put(q, \"B\");\
+         System.out.println(s.size() + \",\" + m.get(o) + m.get(q) + \",\" + m.size());\
+         int t = 0;\
+         synchronized (o) { t += 5; }\
+         System.out.println(t);\
+         Bare b1 = new Bare(1), b2 = new Bare(1);\
+         System.out.println(b1.equals(b1) + \",\" + b1.equals(b2) + \",\" + b1.toString().startsWith(\"Bare@\"));\
+         System.out.println(new ArrayList<>().size() + \",\" + new HashSet<>(Arrays.asList(1, 1, 2)).size());\
+         }}",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,false,true,false\njava.lang.Object,Object\ntrue,true\n2,AB,2\n5\ntrue,false,true\n0,2\n"
+    );
+}
+
+#[test]
+fn a_null_monitor_throws_before_the_synchronized_body_runs() {
+    // javars runs one thread, so the monitor itself is unobservable — but the
+    // rest of the statement is not: the expression is evaluated exactly once,
+    // and a `null` monitor is a `NullPointerException` thrown *before* the body.
+    // Java's message names where the null came from, which is the bytecode-slot
+    // provenance javars documents as unreproducible; the class is exact.
+    let (out, ok) = run("public class Main {\
+         static Object give() { System.out.println(\"eval\"); return null; }\
+         public static void main(String[] args) {\
+         try { synchronized (give()) { System.out.println(\"never\"); } }\
+         catch (NullPointerException e) { System.out.println(\"NPE\"); }\
+         }}");
+    assert!(ok);
+    assert_eq!(out, "eval\nNPE\n");
+}
+
+#[test]
+fn a_subnormal_renders_with_javas_two_digit_widening() {
+    // `Double.toString`'s specification only restricts the candidates to the
+    // minimal length when that length is >= 2; for a one-digit shortest form the
+    // candidates are the decimals of length 1 *or 2*, and the nearest wins. That
+    // never shows in the normal range (a normal's binary ulp is sixteen decimal
+    // orders below it) but decides every subnormal at the floor:
+    // `Double.MIN_VALUE` is 4.9406…E-324, so `4.9E-324` beats the `5.0E-324` a
+    // pure shortest-round-trip search settles on. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Double.MIN_VALUE + \",\" + Float.MIN_VALUE);\
+         System.out.println((Double.MIN_VALUE * 2) + \",\" + (Double.MIN_VALUE * 10));\
+         System.out.println((Float.MIN_VALUE * 3) + \",\" + (Float.MIN_VALUE * 29));\
+         System.out.println(Double.MIN_NORMAL + \",\" + Float.MIN_NORMAL);\
+         System.out.println(1.0 + \",\" + 0.001 + \",\" + 0.1 + \",\" + 3.0e7 + \",\" + 100.0);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "4.9E-324,1.4E-45\n9.9E-324,4.9E-323\n4.2E-45,4.1E-44\n2.2250738585072014E-308,1.1754944E-38\n1.0,0.001,0.1,3.0E7,100.0\n"
+    );
+}
