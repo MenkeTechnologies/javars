@@ -2157,6 +2157,7 @@ impl Parser {
             | Tok::Int(_)
             | Tok::Long(_)
             | Tok::Float(_)
+            | Tok::Float32(_)
             | Tok::True
             | Tok::False
             | Tok::LParen
@@ -2248,6 +2249,10 @@ impl Parser {
             Tok::Float(f) => {
                 self.advance();
                 Ok(Expr::Float(f))
+            }
+            Tok::Float32(f) => {
+                self.advance();
+                Ok(Expr::Float32(f))
             }
             Tok::Str(s) => {
                 self.advance();

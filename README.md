@@ -192,7 +192,11 @@ Implemented and checked against the reference `java`:
   — and takes Java's string conversion back to a one-character String wherever
   one applies (`println`, `+` with a String, `String.valueOf`, a `String`-method
   argument). A compound assignment narrows back to its target's width, so
-  `byte b = 100; b += 100;` is -56.
+  `byte b = 100; b += 100;` is -56. `float` is Java's 32-bit type rather than an
+  alias for `double`: it narrows at every operation (Java rounds *once* at 32
+  bits, so the operation runs on the host rather than being computed in 64 bits
+  and narrowed afterwards) and prints the shortest decimal that round-trips at 32
+  bits, so `1.0f / 3.0f` is `0.33333334`.
 - **Control flow** — `if` / `else if` / `else`, `while`, the C-style
   `for (init; cond; update)` (with comma-separated init and update clauses), the
   enhanced `for (T x : arr)` (over an array or a collection), `break`,

@@ -849,7 +849,7 @@ impl Compiler {
         let target = numtype_of_ty(ty).unwrap_or(NumType::Other);
         let wrap = self.compound_wraps(Some(ty), value);
         self.emit_global_get(&global, line);
-        self.emit_compound(op, value, target, wrap, line)?;
+        self.emit_compound(op, value, target, Some(ty), wrap, line)?;
         self.emit_narrow_to(Some(ty), line);
         self.emit_global_set(&global, line);
         Ok(())
@@ -1187,6 +1187,7 @@ impl Compiler {
             Expr::Int(_) => Some("int".to_string()),
             Expr::Long(_) => Some("long".to_string()),
             Expr::Float(_) => Some("double".to_string()),
+            Expr::Float32(_) => Some("float".to_string()),
             Expr::Bool(_) => Some("boolean".to_string()),
             Expr::Str(_) => Some("String".to_string()),
             Expr::Char(_) => Some("char".to_string()),
@@ -1923,15 +1924,66 @@ impl Compiler {
         self.expr_java_type(e).as_deref() == Some("char[]")
     }
 
+    /// True when `e`'s static Java type is `float` (or `float[]`). fusevm has one
+    /// floating representation, so `float` is a `double` *kept* at 32-bit
+    /// precision — this is the flag that says where to narrow it and where to
+    /// print it as a `float` rather than as a `double`.
+    fn is_float32_expr(&self, e: &Expr) -> bool {
+        matches!(self.expr_java_type(e).as_deref(), Some("float" | "float[]"))
+    }
+
+    /// Emit one arithmetic operation at 32-bit `float` width, with both operands
+    /// already on the stack. Java rounds a `float` operation once, at 32 bits;
+    /// computing it in `f64` and rounding afterwards rounds twice and can land a
+    /// ulp away (`16777217.0f * 0.2f`), so the operation itself moves to the
+    /// host rather than the narrowing being appended to a native op.
+    fn emit_f32_arith(&mut self, op: BinOp, line: u32) {
+        let code = match op {
+            BinOp::Sub => crate::host::f32_op::SUB,
+            BinOp::Mul => crate::host::f32_op::MUL,
+            BinOp::Div => crate::host::f32_op::DIV,
+            BinOp::Mod => crate::host::f32_op::REM,
+            _ => crate::host::f32_op::ADD,
+        };
+        self.b.emit(Op::LoadInt(code), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JF32_ARITH, 3), line);
+    }
+
+    /// The Java type of `lhs <op> rhs` under binary numeric promotion, or `None`
+    /// when either operand's type is unknown. Only the promoted *width* matters
+    /// to the caller, so the operator itself does not enter into it.
+    fn arith_result_type(&self, lhs: &Expr, rhs: &Expr) -> Option<&'static str> {
+        let l = self.expr_java_type(lhs)?;
+        let r = self.expr_java_type(rhs)?;
+        Some(rank_name(numeric_rank(&l)?.max(numeric_rank(&r)?)))
+    }
+
     /// Evaluate `e` and, when its static type is `char` (or `char[]`), apply
     /// Java's string conversion — the code point becomes the one-character
     /// String. Every other expression is emitted unchanged, so this is safe to
     /// use anywhere a value flows into a String or an erased (`Object`)
     /// position.
     fn emit_char_string(&mut self, e: &Expr) -> Result<(), String> {
+        self.emit_converted_arg(e, true)
+    }
+
+    /// The same conversion, with the `float` half switchable.
+    ///
+    /// `String.format`'s numeric conversions (`%f`, `%e`, `%.9f`) must receive
+    /// the *number* — Java widens the `float` to a `double` for them, so
+    /// `%.9f` of `1.0f/3.0f` is `0.333333343`, which the shortest decimal
+    /// `0.33333334` cannot reproduce. Only its `%s`-family conversions want
+    /// `Float.toString`. A `char` has no such split: its one-character String
+    /// serves `%c` and `%s` alike.
+    fn emit_converted_arg(&mut self, e: &Expr, floats: bool) -> Result<(), String> {
         self.expr(e)?;
         if self.is_char_expr(e) || self.is_char_array_expr(e) {
             self.b.emit(Op::CallBuiltin(crate::host::JCHR_STR, 1), 0);
+        } else if floats && self.is_float32_expr(e) {
+            // A `float` and a `double` holding the same bits print differently,
+            // and only the static type says which this is.
+            self.b.emit(Op::CallBuiltin(crate::host::JF32_STR, 1), 0);
         }
         Ok(())
     }
@@ -2011,7 +2063,7 @@ impl Compiler {
     fn expr_type(&self, e: &Expr) -> NumType {
         match e {
             Expr::Int(_) | Expr::Long(_) => NumType::Int,
-            Expr::Float(_) => NumType::Float,
+            Expr::Float(_) | Expr::Float32(_) => NumType::Float,
             Expr::Str(_) | Expr::Bool(_) => NumType::Other,
             // `char` is integral, so `'a' / 2` truncates like any other `int`
             // division.
@@ -2743,8 +2795,8 @@ impl Compiler {
                     // `&=`/`|=`/`^=` on booleans.
                     _ => {
                         self.emit_get(name, line);
-                        self.emit_compound(*op, value, l, wrap, line)?;
                         let decl = self.var_decl_type(name).map(str::to_string);
+                        self.emit_compound(*op, value, l, decl.as_deref(), wrap, line)?;
                         self.emit_narrow_to(decl.as_deref(), line);
                     }
                 }
@@ -3639,6 +3691,13 @@ impl Compiler {
         let wrap = decl.as_deref() == Some("int");
         self.emit_get(name, 0);
         self.b.emit(Op::LoadInt(1), 0);
+        // `float f; f++;` is a 32-bit addition like every other `float`
+        // operation, not a 64-bit one narrowed afterwards.
+        if decl.as_deref() == Some("float") {
+            self.emit_f32_arith(if inc { BinOp::Add } else { BinOp::Sub }, 0);
+            self.emit_set(name, 0);
+            return Ok(());
+        }
         self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
         if wrap {
             self.emit_wrap32(0);
@@ -3682,7 +3741,7 @@ impl Compiler {
     /// that catches a `null`: Java's string conversion of a null reference is
     /// the text "null", not a call on nothing.
     fn emit_stringified(&mut self, e: &Expr) -> Result<(), String> {
-        if self.is_char_expr(e) {
+        if self.is_char_expr(e) || self.is_float32_expr(e) {
             return self.emit_char_string(e);
         }
         let Some(rc) = self.expr_class(e) else {
@@ -3760,6 +3819,12 @@ impl Compiler {
             }
             Expr::Float(f) => {
                 let c = self.b.add_constant(Value::float(*f));
+                self.b.emit(Op::LoadConst(c), 0);
+            }
+            // A `float` literal is stored already rounded to 32-bit precision,
+            // so `0.1f` is the `f64` nearest `0.1f32` from the start.
+            Expr::Float32(f) => {
+                let c = self.b.add_constant(Value::float(*f as f32 as f64));
                 self.b.emit(Op::LoadConst(c), 0);
             }
             Expr::Str(s) => {
@@ -4004,9 +4069,25 @@ impl Compiler {
                 // `char`'s one-character String; `Math.max(c, 5)` and the
                 // `Character` predicates take the code point unchanged.
                 let stringify = takes_char_as_string(class, method);
-                for a in args {
+                // `String.format` is the one static that treats its arguments
+                // differently from each other: the slots a `%s` consumes want
+                // `Float.toString`, the slots a `%f` consumes want the number.
+                let text_slots = (class == "String" && method == "format")
+                    .then(|| match args.first() {
+                        Some(Expr::Str(fmt)) => Some(text_conversion_slots(fmt)),
+                        // A non-literal format string cannot be scanned, so the
+                        // numeric conversions are kept exact and `%s` of a
+                        // `float` prints its `double` form (see BUGS.md).
+                        _ => Some(Vec::new()),
+                    })
+                    .flatten();
+                for (i, a) in args.iter().enumerate() {
+                    let floats = match &text_slots {
+                        Some(slots) => i > 0 && slots.contains(&(i - 1)),
+                        None => stringify,
+                    };
                     if stringify {
-                        self.emit_char_string(a)?;
+                        self.emit_converted_arg(a, floats)?;
                     } else {
                         self.expr(a)?;
                     }
@@ -4259,7 +4340,7 @@ impl Compiler {
             .map(|t| numtype_of_ty(t).unwrap_or(NumType::Other))
             .unwrap_or(NumType::Other);
         let wrap = self.compound_wraps(elem_ty.as_deref(), value);
-        self.emit_compound(op, value, elem_t, wrap, line)?;
+        self.emit_compound(op, value, elem_t, elem_ty.as_deref(), wrap, line)?;
         self.emit_narrow_to(elem_ty.as_deref(), line);
         let new_t = self.temp();
         self.emit_set(&new_t, line);
@@ -4311,7 +4392,7 @@ impl Compiler {
         // old field value
         self.emit_get(&obj_t, line);
         self.emit_field_get(name, line);
-        self.emit_compound(op, value, field_ty, wrap, line)?;
+        self.emit_compound(op, value, field_ty, field_ty_name.as_deref(), wrap, line)?;
         self.emit_narrow_to(field_ty_name.as_deref(), line);
         let new_t = self.temp();
         self.emit_set(&new_t, line);
@@ -4333,9 +4414,19 @@ impl Compiler {
         op: AssignOp,
         value: &Expr,
         target: NumType,
+        target_ty: Option<&str>,
         wrap32: bool,
         line: u32,
     ) -> Result<(), String> {
+        // `float f; f *= x;` is one 32-bit operation, not a 64-bit one narrowed
+        // afterwards — the same reason the binary path routes through the host.
+        if target_ty == Some("float") {
+            if let Some(bop) = compound_binop(op) {
+                self.expr(value)?;
+                self.emit_f32_arith(bop, line);
+                return Ok(());
+            }
+        }
         if matches!(op, AssignOp::Shl | AssignOp::Shr | AssignOp::Ushr) {
             // Same width rule as the binary shifts: the distance is masked to
             // the *target's* width, and `>>>` zero-fills at it. `wrap32` is
@@ -4533,6 +4624,18 @@ impl Compiler {
             BinOp::Shl | BinOp::Shr | BinOp::Ushr => return self.shift(op, lhs, rhs),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => return self.bitwise(op, lhs, rhs),
             _ => {}
+        }
+        // A `float`-typed arithmetic operation runs at 32-bit width throughout.
+        if matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+        ) && self.arith_result_type(lhs, rhs) == Some("float")
+            && !(op == BinOp::Add && self.is_string_concat(lhs, rhs))
+        {
+            self.expr(lhs)?;
+            self.expr(rhs)?;
+            self.emit_f32_arith(op, 0);
+            return Ok(());
         }
         // `/` truncation is decided from the operands' static types.
         if let BinOp::Div = op {
@@ -4864,6 +4967,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Int(_)
         | Expr::Long(_)
         | Expr::Float(_)
+        | Expr::Float32(_)
         | Expr::Str(_)
         | Expr::Char(_)
         | Expr::Bool(_)
@@ -4977,6 +5081,7 @@ fn is_static_class(name: &str) -> bool {
             | "Integer"
             | "Long"
             | "Double"
+            | "Float"
             | "Boolean"
             | "String"
             | "Character"
@@ -4985,6 +5090,19 @@ fn is_static_class(name: &str) -> bool {
             | "List"
             | "Set"
     )
+}
+
+/// The binary operator a compound assignment applies, or `None` for the ones
+/// whose lowering is not a plain binary op (the shifts, and `=` itself).
+fn compound_binop(op: AssignOp) -> Option<BinOp> {
+    Some(match op {
+        AssignOp::Add => BinOp::Add,
+        AssignOp::Sub => BinOp::Sub,
+        AssignOp::Mul => BinOp::Mul,
+        AssignOp::Div => BinOp::Div,
+        AssignOp::Mod => BinOp::Mod,
+        _ => return None,
+    })
 }
 
 /// True when a cast to `ty` is one javars can decide: a `java.lang` type its
@@ -5006,6 +5124,61 @@ fn is_checkable_jdk_type(ty: &str) -> bool {
             | "Number"
             | "CharSequence"
     )
+}
+
+/// The argument positions (0-based, counted after the format string) a format
+/// string consumes with a *text* conversion — `%s`, `%S`, `%h`, `%H`, `%b`,
+/// `%B`. Those are the ones a `float` reaches as `Float.toString`; every other
+/// conversion widens it to a `double` the way Java does.
+///
+/// Explicit argument indexes (`%2$s`) select a slot without advancing the
+/// implicit cursor, and `%%`/`%n` consume no argument at all.
+fn text_conversion_slots(fmt: &str) -> Vec<usize> {
+    let cs: Vec<char> = fmt.chars().collect();
+    let mut out = Vec::new();
+    let mut next = 0usize;
+    let mut i = 0usize;
+    while i < cs.len() {
+        if cs[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // `%<n>$` — an explicit, 1-based argument index.
+        let start = i;
+        while i < cs.len() && cs[i].is_ascii_digit() {
+            i += 1;
+        }
+        let explicit = if i < cs.len() && cs[i] == '$' && i > start {
+            let n: usize = cs[start..i].iter().collect::<String>().parse().unwrap_or(1);
+            i += 1;
+            Some(n.saturating_sub(1))
+        } else {
+            i = start;
+            None
+        };
+        // flags, width, `.precision`
+        while i < cs.len() && "-+ 0,(#".contains(cs[i]) {
+            i += 1;
+        }
+        while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
+            i += 1;
+        }
+        let Some(&conv) = cs.get(i) else { break };
+        i += 1;
+        if conv == '%' || conv == 'n' {
+            continue;
+        }
+        let slot = explicit.unwrap_or_else(|| {
+            let s = next;
+            next += 1;
+            s
+        });
+        if matches!(conv, 's' | 'S' | 'h' | 'H' | 'b' | 'B') {
+            out.push(slot);
+        }
+    }
+    out
 }
 
 /// True when a stdlib static renders a `char` argument as text, so the code
@@ -5035,6 +5208,10 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // wrap would be wrong.
         ("Long", "parseLong") | ("Math", "round") => "long",
         ("Math", "pow") | ("Math", "sqrt") | ("Math", "floor") | ("Math", "ceil") => "double",
+        ("Float", "parseFloat") | ("Float", "valueOf") => "float",
+        ("Float", "toString") => "String",
+        ("Float", "compare") => "int",
+        ("Float", "isNaN") | ("Float", "isInfinite") => "boolean",
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
         ("Boolean", "parseBoolean") => "boolean",
@@ -5180,6 +5357,12 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), "short"),
         ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), "byte"),
         ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), "byte"),
+        ("Float", "MAX_VALUE") => (Value::float(f32::MAX as f64), "float"),
+        // `Float.MIN_VALUE` is the smallest positive *subnormal*, not `f32::MIN`.
+        ("Float", "MIN_VALUE") => (Value::float(f32::from_bits(1) as f64), "float"),
+        ("Float", "POSITIVE_INFINITY") => (Value::float(f64::INFINITY), "float"),
+        ("Float", "NEGATIVE_INFINITY") => (Value::float(f64::NEG_INFINITY), "float"),
+        ("Float", "NaN") => (Value::float(f64::NAN), "float"),
         ("Double", "MAX_VALUE") => (Value::float(f64::MAX), "double"),
         // The smallest positive *subnormal* double, 4.9E-324 — Java's
         // `Double.MIN_VALUE` is not `f64::MIN`.

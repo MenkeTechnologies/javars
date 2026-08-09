@@ -86,6 +86,30 @@ at the bottom, and are summarized in the section right after this one.
   anchoring. A malformed pattern raises `java.util.regex.PatternSyntaxException`
   and a replacement naming an absent group raises `IndexOutOfBoundsException`,
   both catchable.
+- **32-bit `float`.** `float` is Java's 32-bit type, not an alias for `double`:
+  `1.0f / 3.0f` is `0.33333334`, `(float) 0.1` is not `0.1`, and `(double) 0.1f`
+  is `0.10000000149011612`. fusevm has one floating representation, so a `float`
+  is a `double` *kept* at 32-bit precision — the same per-site discipline the
+  32-bit `int` wrap uses, one width down. Java rounds a `float` operation **once**
+  at 32 bits, and computing it in 64 bits and narrowing afterwards rounds twice
+  and can land a ulp away (`16777217.0f * 0.2f` is 3355443.2 rounded once and
+  3355443.3 rounded twice), so a `float` operation runs on the host rather than as
+  a native op with a narrowing appended — the only Java arithmetic in javars that
+  does. Literals, locals, fields, parameters, returns, `float[]` elements,
+  compound assignment, and `++`/`--` all carry the width; mixing in a `double`
+  promotes the operation and mixing in an `int` does not. `Float.toString` is the
+  shortest decimal that round-trips at **32** bits, selected by Java's rule
+  (closest to the value, ties to the even last digit — Rust's formatter breaks
+  that tie the other way), and it is emitted wherever a statically-`float` value
+  crosses into a String. `Float.parseFloat`/`valueOf`/`toString`/`compare`/
+  `isNaN`/`isInfinite` and the `Float.MAX_VALUE`/`MIN_VALUE`/`NaN`/infinity
+  constants answer at 32 bits too.
+- **`%e` and `%g` round HALF_UP.** Java's `Formatter` rounds through
+  `BigDecimal.ROUND_HALF_UP`, so `%e` of 5592405.5 is `5.592406e+06` where
+  half-to-even gives `5.592405e+06`. `%f` already did this; the scientific and
+  general conversions now take their digits from the value's own decimal
+  expansion for the same reason — scaling by a power of ten first would round the
+  tie away before it could be seen.
 - **Fully-qualified type names.** `java.util.List<String> l`,
   `new java.util.ArrayList<>()`, `static java.lang.String greet(java.lang.String
   who)`, a qualified field type, `catch (java.util.regex.PatternSyntaxException
@@ -480,13 +504,22 @@ known.
   failure, so `(String) anIntArray` succeeds where Java throws. A boxed
   `Character` is the one-character String javars models it as, so a failing cast
   from one names `java.lang.String` and `(String) aBoxedChar` succeeds.
-- **`float` shares `double`'s width.** There is no 32-bit float representation,
-  so `(float) x` only makes an integral operand floating and `1.0f / 3.0f` prints
-  `0.3333333333333333` where Java prints `0.33333334`.
-- **`Double.toString` of a subnormal can differ in the last digit.** javars
-  renders `Double.MIN_VALUE` as `5.0E-324` where Java prints `4.9E-324`: Java's
-  shortest-round-trip algorithm and Rust's disagree at the very bottom of the
-  exponent range. Normal-range doubles agree.
+- **`Float.toString`/`Double.toString` of a subnormal can differ in the last
+  digit.** javars renders `Double.MIN_VALUE` as `5.0E-324` where Java prints
+  `4.9E-324`, and `Float.MIN_VALUE` as `1.0E-45` where Java prints `1.4E-45`.
+  Both are the same cause: at the very bottom of the exponent range the digit
+  Java selects is not the one the shortest-round-trip search settles on.
+  Normal-range values agree, subnormal ones above the floor agree, and the
+  `float` selection rule (closest, then even) is applied — this is the residue
+  under it.
+- **A `float` reaching `String.format` through a *non-literal* format string
+  prints its `double` form under `%s`.** `String.format` is the one place a
+  `float` argument splits by conversion — `%s` wants `Float.toString`, `%f` and
+  `%e` want the widened `double` — so the compiler scans the format string to
+  see which slots are text conversions. When the format is not a literal there is
+  nothing to scan, and the numeric conversions are kept exact at the cost of
+  `%s`. Every literal format string, which is what programs write, is exact on
+  both sides.
 - **Floating `/` routes through a builtin.** Statically-integral division keeps
   the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating or
   statically-unknown operand routes through `JDIV`, because Java floating

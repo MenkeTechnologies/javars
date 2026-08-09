@@ -243,15 +243,25 @@ fn g_math(r: &mut Rng) -> String {
 
 /// `String.format` — the `Formatter` subset javars implements.
 fn g_format(r: &mut Rng) -> String {
-    match r.below(5) {
+    let f = pick(r, FLTS);
+    match r.below(11) {
         0 => p(format!("String.format(\"%d\", {})", pick(r, INTS))),
         1 => p(format!("String.format(\"%s\", {})", pick(r, STRS))),
         2 => p(format!("String.format(\"%5d|\", {})", pick(r, INTS))),
         3 => p(format!("String.format(\"%-5d|\", {})", pick(r, INTS))),
-        _ => p(format!(
+        4 => p(format!(
             "String.format(\"%x\", Math.abs({}))",
             pick(r, INTS)
         )),
+        // A `float` argument splits by conversion: `%s` wants `Float.toString`,
+        // every numeric conversion wants the widened `double`. Both spellings
+        // have to be generated or the split is only half tested.
+        5 => p(format!("String.format(\"%s\", {f} / 3.0f)")),
+        6 => p(format!("String.format(\"%f\", {f} / 3.0f)")),
+        7 => p(format!("String.format(\"%.9f\", {f} / 3.0f)")),
+        8 => p(format!("String.format(\"%e|%s\", {f} / 3.0f, {f} / 3.0f)")),
+        9 => p(format!("String.format(\"%2$s|%1$.4f\", {f}, {f} / 7.0f)")),
+        _ => p(format!("String.format(\"%b %s %d%%\", true, {f}, 3)")),
     }
 }
 
@@ -973,6 +983,62 @@ fn g_char(r: &mut Rng) -> String {
     }
 }
 
+/// `float` operands, chosen so most are *not* exactly representable in 32 bits
+/// — that is where a `double` standing in for a `float` gives itself away.
+const FLTS: &[&str] = &[
+    "0.1f",
+    "0.2f",
+    "1.0f",
+    "3.0f",
+    "2.5f",
+    "-1.5f",
+    "1.1f",
+    "100.0f",
+    "1e3f",
+    "0.0f",
+    "7.0f",
+    "1e-4f",
+    "1e8f",
+    "16777217.0f",
+];
+
+/// `float` — a 32-bit type javars models as a `double` kept at 32-bit
+/// precision. Both halves have to hold: every operation rounds to `f32` (Java
+/// rounds per operation, so `a * b + c` rounds twice), and the value prints with
+/// `Float.toString`'s shortest-round-trip *at 32 bits* (`1.0f / 3.0f` is
+/// `0.33333334`, where the `double` answer is `0.3333333333333333`).
+fn g_float(r: &mut Rng) -> String {
+    let a = pick(r, FLTS);
+    let b = pick(r, FLTS);
+    let c = pick(r, FLTS);
+    let d = pick(r, DBLS);
+    let i = pick(r, INTS);
+    match r.below(14) {
+        0 => p(format!("{a} / {b}")),
+        1 => p(format!("{a} + {b}")),
+        2 => p(format!("{a} * {b}")),
+        3 => p(format!("{a} - {b}")),
+        4 => p(format!("{a} % {b}")),
+        // Rounding happens per operation, so the grouping changes the answer.
+        5 => p(format!("{a} * {b} + {c}")),
+        6 => p(format!("{a} * ({b} + {c})")),
+        // A `double` operand promotes the whole operation; an `int` does not.
+        7 => p(format!("{a} / {d}")),
+        8 => p(format!("{a} / {i}")),
+        9 => p(format!("(float) {d} + {a}")),
+        10 => p(format!("(double) {a}")),
+        // Accumulation, where 32-bit rounding compounds.
+        11 => format!(
+            "{{ float v = {a}; for (int k = 0; k < 8; k++) v += {b}; System.out.println(v); }}"
+        ),
+        12 => format!("{{ float v = {a}; v *= {b}; v /= {c}; System.out.println(v + \"|\" + (v < {a})); }}"),
+        // Rendering paths: concatenation, `String.valueOf`, an array.
+        _ => format!(
+            "{{ float[] fa = {{{a}, {b}}}; System.out.println(java.util.Arrays.toString(fa) + \"|\" + String.valueOf(fa[0] + fa[1]) + \"|\" + ({a} / {c})); }}"
+        ),
+    }
+}
+
 /// The `java.util.regex` patterns the `regex` mode draws from. Every one is a
 /// construct javars translates rather than refuses, and the pool deliberately
 /// mixes the places where Java's *defaults* differ from the engine's — ASCII
@@ -1205,6 +1271,7 @@ enum Mode {
     LabelFlow,
     Char,
     Regex,
+    Float,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1246,6 +1313,7 @@ const CONCRETE: &[Mode] = &[
     Mode::LabelFlow,
     Mode::Char,
     Mode::Regex,
+    Mode::Float,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1289,6 +1357,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::LabelFlow => "labelflow",
         Mode::Char => "char",
         Mode::Regex => "regex",
+        Mode::Float => "float",
     }
 }
 
@@ -1344,6 +1413,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::LabelFlow => g_labelflow(r),
         Mode::Char => g_char(r),
         Mode::Regex => g_regex(r),
+        Mode::Float => g_float(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

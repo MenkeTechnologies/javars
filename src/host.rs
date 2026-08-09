@@ -222,6 +222,45 @@ pub const JCHR_STR: u16 = 735;
 /// through unchecked rather than inventing a failure.
 pub const JCHECKCAST: u16 = 736;
 
+/// Round the top-of-stack value to 32-bit `float` precision. `argc == 1`.
+///
+/// fusevm has one floating representation (`f64`), so Java's `float` is modeled
+/// as a `double` that is *kept* at `f32` precision: the compiler emits this
+/// after every arithmetic operation whose static Java type is `float`, which is
+/// what makes `1.0f / 3.0f` the `f32` 0.33333334 rather than the `f64` answer.
+/// The same per-site narrowing the 32-bit `int` wrap uses, one width down.
+pub const JF32: u16 = 737;
+
+/// `Float.toString` of the top-of-stack value. `argc == 1`.
+///
+/// A `float` and a `double` holding the same bits print differently — Java's
+/// shortest-round-trip is computed against the *type's* precision, so `0.1f`
+/// prints `0.1` where the `double` with those bits prints
+/// `0.10000000149011612`. The value model cannot tell them apart, so the
+/// compiler emits this wherever a statically-`float` value crosses into a
+/// String. A `float[]` operand converts element-wise.
+pub const JF32_STR: u16 = 738;
+
+/// One arithmetic operation performed at 32-bit `float` width. Stack
+/// `[lhs, rhs, op]` (`op` on top, a [`F32Op`] discriminant); `argc == 3`.
+///
+/// Rounding the `f64` result afterwards is *not* the same computation: a double
+/// rounding can land a ulp away from the single one Java performs.
+/// `16777217.0f * 0.2f` is 3355443.2 in Java and 3355443.3 if the product is
+/// formed in `f64` first. So a `float` operation is done in `f32` throughout,
+/// which is why it costs a builtin rather than a native op — the only Java
+/// arithmetic in javars that does.
+pub const JF32_ARITH: u16 = 739;
+
+/// The [`JF32_ARITH`] operator codes, shared with the compiler.
+pub mod f32_op {
+    pub const ADD: i64 = 0;
+    pub const SUB: i64 = 1;
+    pub const MUL: i64 = 2;
+    pub const DIV: i64 = 3;
+    pub const REM: i64 = 4;
+}
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -476,6 +515,9 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JCAST, b_cast);
     vm.register_builtin(JCHR_STR, b_chr_str);
     vm.register_builtin(JCHECKCAST, b_checkcast);
+    vm.register_builtin(JF32, b_f32);
+    vm.register_builtin(JF32_STR, b_f32_str);
+    vm.register_builtin(JF32_ARITH, b_f32_arith);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -2223,7 +2265,29 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 )),
             }
         }
-        ("Double" | "Float", "toString", 1) => Ok(Value::str(format_double(args[0].to_float()))),
+        ("Double", "toString", 1) => Ok(Value::str(format_double(args[0].to_float()))),
+
+        // ── java.lang.Float ──
+        // Every one of these answers at 32-bit precision, which is the whole
+        // reason they are not aliases of the `Double` arm above.
+        ("Float", "toString", 1) => Ok(Value::str(format_float(args[0].to_float() as f32))),
+        ("Float", "parseFloat", 1) | ("Float", "valueOf", 1) => {
+            let s = args[0].as_str_cow();
+            match s.trim().parse::<f32>() {
+                Ok(f) => Ok(Value::float(f as f64)),
+                Err(_) => Err(Fault::java(
+                    "NumberFormatException",
+                    format!("For input string: \"{s}\""),
+                )),
+            }
+        }
+        ("Float", "compare", 2) => Ok(Value::Int(cmp_to_int(
+            (args[0].to_float() as f32)
+                .partial_cmp(&(args[1].to_float() as f32))
+                .unwrap_or(std::cmp::Ordering::Equal),
+        ))),
+        ("Float", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
+        ("Float", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
         ("Double", "compare", 2) => Ok(Value::Int(cmp_to_int(
             args[0]
                 .to_float()
@@ -2751,7 +2815,7 @@ fn format_conversion(
                 } else {
                     x.abs().log10().floor() as i32
                 };
-                format!("{:.*}", (p as i32 - 1 - exp).max(0) as usize, x)
+                signed(x, fixed_half_up(x, (p as i32 - 1 - exp).max(0) as usize))
             };
             // Both branches already carry a negative sign.
             let s = if x.is_sign_negative() {
@@ -2822,19 +2886,65 @@ fn sci_notation(x: f64, prec: usize) -> String {
     if x == 0.0 {
         return format!("{neg}{:.*}e+00", prec, 0.0);
     }
-    let mut exp = x.abs().log10().floor() as i32;
-    let mut mant = x.abs() / 10f64.powi(exp);
-    // Rounding the mantissa can carry it to 10.0, which belongs to the next
-    // exponent (`9.99e2` at one digit of precision is `1.0e3`).
-    if format!("{mant:.prec$}").starts_with("10") {
-        mant /= 10.0;
-        exp += 1;
-    }
+    // The mantissa is rounded HALF_UP like `%f`'s digits, not half-to-even:
+    // Java's `Formatter` rounds through `BigDecimal.ROUND_HALF_UP`, so
+    // `%e` of 5592405.5 is `5.592406e+06` where Rust's `{:.6e}` gives
+    // `5.592405e+06`. Rounding the mantissa *after* dividing by a power of ten
+    // would not see the exact tie at all, so the digits are taken from the
+    // value's own decimal expansion.
+    let (digits, exp) = sci_digits_half_up(x.abs(), prec);
+    let mantissa = if prec == 0 {
+        digits
+    } else {
+        format!("{}.{}", &digits[..1], &digits[1..])
+    };
     format!(
-        "{neg}{mant:.prec$}e{}{:02}",
+        "{neg}{mantissa}e{}{:02}",
         if exp < 0 { '-' } else { '+' },
         exp.abs()
     )
+}
+
+/// The first `prec + 1` significant digits of `x` (positive, finite, non-zero),
+/// rounded HALF_UP, with the decimal exponent they belong to.
+///
+/// Taken from the value's decimal expansion rather than from a scaled mantissa,
+/// because scaling by a power of ten is itself inexact and would round the tie
+/// away before it could be seen.
+fn sci_digits_half_up(x: f64, prec: usize) -> (String, i32) {
+    // Enough digits past the cut for the HALF_UP decision, the same margin
+    // `fixed_half_up` uses.
+    let expanded = format!("{:.*e}", prec + 30, x);
+    let (mantissa, exp) = expanded.split_once('e').unwrap_or((expanded.as_str(), "0"));
+    let mut exp: i32 = exp.parse().unwrap_or(0);
+    let all: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    let keep = prec + 1;
+    let mut digits: Vec<u8> = all.iter().copied().take(keep).collect();
+    digits.resize(keep, 0);
+    if all.get(keep).is_some_and(|d| *d >= 5) {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                // 999… carried out: the digits become 100… one exponent up.
+                digits.insert(0, 1);
+                digits.pop();
+                exp += 1;
+                break;
+            }
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0;
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    (digits.iter().map(|d| (d + b'0') as char).collect(), exp)
 }
 
 /// Insert Java's `,` grouping separators into the integer part of a rendered
@@ -3064,6 +3174,163 @@ fn obj_default_str(id: u32) -> String {
 /// (`3.0`, not `3`) and keeps a decimal point; non-finite values print as
 /// `Infinity`/`-Infinity`/`NaN`.
 fn format_double(f: f64) -> String {
+    format_ieee(f, format!("{f}"), format!("{f:e}"))
+}
+
+/// `Float.toString` — the same layout rules, but the shortest decimal is
+/// computed against **32-bit** precision. That is the whole difference between
+/// the two: the `f64` nearest `0.1f` prints as `0.10000000149011612` as a
+/// `double` and as `0.1` as a `float`, because only 32 bits have to round-trip.
+fn format_float(f: f32) -> String {
+    if !f.is_finite() || f == 0.0 {
+        return format_ieee(f as f64, String::new(), String::new());
+    }
+    // The digit selection works on magnitude; the sign is put back on both
+    // renderings so `format_ieee` only has to choose between them.
+    let (digits, exp10) = java_shortest_f32(f);
+    let sign = if f < 0.0 { "-" } else { "" };
+    format_ieee(
+        f as f64,
+        format!("{sign}{}", plain_form(&digits, exp10)),
+        format!("{sign}{}", sci_form(&digits, exp10)),
+    )
+}
+
+/// The digits and decimal exponent `Float.toString` selects for `v`, as
+/// (significant digits, exponent) where the value is `d.ddd × 10^exp`.
+///
+/// Java and Rust agree on the *length* — both emit the shortest decimal that
+/// round-trips — but not always on which one. Java's rule (`Double.toString`'s
+/// specification, which `Float`'s mirrors) picks the candidate closest to the
+/// value and, when two are equidistant, the one whose last digit is **even**.
+/// Rust's formatter breaks that final tie the other way, so `16777217.0f * 0.2f`
+/// (exactly 3355443.25) prints `3355443.3` there and `3355443.2` in Java.
+fn java_shortest_f32(v: f32) -> (String, i32) {
+    let sci = format!("{v:e}");
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let neg = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+
+    // The only other candidate of the same length is one decimal ulp away, on
+    // whichever side of the value Rust's answer is not.
+    let here = rebuild(&digits, exp, neg);
+    let delta = here - f64::from(v);
+    if delta == 0.0 {
+        return (digits, exp);
+    }
+    let toward = if (delta > 0.0) != neg { -1 } else { 1 };
+    let Some((other_digits, other_exp)) = step_last_digit(&digits, exp, toward) else {
+        return (digits, exp);
+    };
+    // A candidate that does not round-trip is not a candidate.
+    let other = rebuild(&other_digits, other_exp, neg);
+    if other as f32 != v {
+        return (digits, exp);
+    }
+    let (d_here, d_other) = (delta.abs(), (other - f64::from(v)).abs());
+    // Both distances sum to one decimal ulp, so "equidistant" is a comparison at
+    // that scale; f64 carries eight more digits than the nine at stake here.
+    let tie = (d_here - d_other).abs() <= (d_here + d_other) * 1e-9;
+    if tie {
+        let even = |d: &str| d.as_bytes().last().is_some_and(|b| (b - b'0') % 2 == 0);
+        return if even(&digits) {
+            (digits, exp)
+        } else {
+            (other_digits, other_exp)
+        };
+    }
+    if d_other < d_here {
+        (other_digits, other_exp)
+    } else {
+        (digits, exp)
+    }
+}
+
+/// The value of `d.ddd × 10^exp`, signed.
+fn rebuild(digits: &str, exp: i32, neg: bool) -> f64 {
+    let mut s = String::new();
+    if neg {
+        s.push('-');
+    }
+    s.push_str(&digits[..1]);
+    if digits.len() > 1 {
+        s.push('.');
+        s.push_str(&digits[1..]);
+    }
+    s.push('e');
+    s.push_str(&exp.to_string());
+    s.parse().unwrap_or(f64::NAN)
+}
+
+/// Add `step` (±1) to the last significant digit, carrying through. A carry out
+/// of the leading digit shortens the digit string and bumps the exponent, which
+/// keeps the candidate the same *length* as the one it came from.
+fn step_last_digit(digits: &str, exp: i32, step: i8) -> Option<(String, i32)> {
+    let mut d: Vec<u8> = digits.bytes().map(|b| b - b'0').collect();
+    let mut i = d.len();
+    if step > 0 {
+        loop {
+            if i == 0 {
+                // 999… + 1 → 100… one decimal place up.
+                let mut out = vec![1u8];
+                out.resize(d.len(), 0);
+                return Some((to_digits(&out), exp + 1));
+            }
+            i -= 1;
+            if d[i] < 9 {
+                d[i] += 1;
+                break;
+            }
+            d[i] = 0;
+        }
+    } else {
+        loop {
+            if i == 0 {
+                // 100… - 1 → 999… one decimal place down.
+                return Some((("9").repeat(d.len()), exp - 1));
+            }
+            i -= 1;
+            if d[i] > 0 {
+                d[i] -= 1;
+                break;
+            }
+            d[i] = 9;
+        }
+    }
+    Some((to_digits(&d), exp))
+}
+
+fn to_digits(d: &[u8]) -> String {
+    d.iter().map(|b| (b + b'0') as char).collect()
+}
+
+/// `d.ddd × 10^exp` written out in full, the form Java uses inside
+/// [1e-3, 1e7). Always carries at least one fractional digit.
+fn plain_form(digits: &str, exp: i32) -> String {
+    if exp < 0 {
+        return format!("0.{}{digits}", "0".repeat((-exp - 1) as usize));
+    }
+    let int_len = exp as usize + 1;
+    if digits.len() <= int_len {
+        format!("{digits}{}.0", "0".repeat(int_len - digits.len()))
+    } else {
+        format!("{}.{}", &digits[..int_len], &digits[int_len..])
+    }
+}
+
+/// `d.ddd × 10^exp` in the `1.5e3` shape [`format_ieee`] uppercases.
+fn sci_form(digits: &str, exp: i32) -> String {
+    if digits.len() > 1 {
+        format!("{}.{}e{exp}", &digits[..1], &digits[1..])
+    } else {
+        format!("{digits}e{exp}")
+    }
+}
+
+/// The shared layout of `Double.toString` / `Float.toString`, given the value
+/// and its shortest plain and scientific renderings at the right precision.
+fn format_ieee(f: f64, plain: String, sci: String) -> String {
     if f.is_nan() {
         return "NaN".to_string();
     }
@@ -3075,24 +3342,26 @@ fn format_double(f: f64) -> String {
         return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
     }
 
-    // `Double.toString` uses plain decimal only inside [1e-3, 1e7); outside that
-    // range it switches to "computerized scientific notation". Rust's `{}` never
+    // Java uses plain decimal only inside [1e-3, 1e7); outside that range it
+    // switches to "computerized scientific notation". Rust's `{}` never
     // switches, so the range test has to be explicit or large/small magnitudes
     // print as long digit strings (`25000000.0` where Java says `2.5E7`).
     let mag = f.abs();
     if (1e-3..1e7).contains(&mag) {
-        let s = format!("{f}");
         // Java always keeps a fractional digit: `1.0`, never `1`.
-        return if s.contains('.') { s } else { format!("{s}.0") };
+        return if plain.contains('.') {
+            plain
+        } else {
+            format!("{plain}.0")
+        };
     }
 
     // Scientific form. Rust renders `2.5e7` / `1e7`; Java wants `2.5E7` / `1.0E7`
     // — an uppercase exponent, no `+`, and a mantissa that always carries a
     // fractional digit.
-    let s = format!("{f:e}");
-    let (mantissa, exp) = match s.split_once('e') {
+    let (mantissa, exp) = match sci.split_once('e') {
         Some((m, e)) => (m, e),
-        None => return s,
+        None => return sci,
     };
     let mantissa = if mantissa.contains('.') {
         mantissa.to_string()
@@ -3197,9 +3466,11 @@ fn b_cast(vm: &mut VM, _argc: u8) -> Value {
         // A `char` is a 16-bit *unsigned* integral value, so `(char) -1` is
         // 65535 — the one narrowing cast that does not sign-extend.
         "char" => Value::Int(i64::from(cast_to_i64(&v) as u16)),
-        // `float` shares `double`'s representation here (see BUGS.md), so the
-        // cast only has to make an integral operand floating.
-        "float" | "double" => Value::float(as_f64(&v)),
+        // `(double)` only has to make an integral operand floating; `(float)`
+        // additionally rounds to 32-bit precision, which is a real value change
+        // (`(float) 0.1` is not `0.1`).
+        "double" => Value::float(as_f64(&v)),
+        "float" => Value::float(as_f64(&v) as f32 as f64),
         // `boolean` and every reference type keep their representation.
         _ => v,
     }
@@ -3228,6 +3499,55 @@ fn b_chr_str(vm: &mut VM, _argc: u8) -> Value {
 fn char_to_string(v: &Value) -> Value {
     match v {
         Value::Int(n) => Value::str(char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string()),
+        other => other.clone(),
+    }
+}
+
+/// [`JF32`] — round to 32-bit `float` precision.
+fn b_f32(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match &v {
+        Value::Float(f) => Value::float(*f as f32 as f64),
+        Value::Int(n) => Value::float(*n as f32 as f64),
+        _ => v,
+    }
+}
+
+/// [`JF32_ARITH`] — one arithmetic operation at 32-bit width.
+fn b_f32_arith(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let a = args.first().map(Value::to_float).unwrap_or(0.0) as f32;
+    let b = args.get(1).map(Value::to_float).unwrap_or(0.0) as f32;
+    let r = match args.get(2).map(Value::to_int).unwrap_or(f32_op::ADD) {
+        f32_op::SUB => a - b,
+        f32_op::MUL => a * b,
+        f32_op::DIV => a / b,
+        f32_op::REM => a % b,
+        _ => a + b,
+    };
+    Value::float(r as f64)
+}
+
+/// [`JF32_STR`] — `Float.toString`, or element-wise over a `float[]`.
+fn b_f32_str(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    match &v {
+        Value::Obj(_) => match array_items(&v) {
+            Some(items) => Value::Obj(heap_alloc(HostObj::Array(
+                items.iter().map(float_to_string).collect(),
+            ))),
+            None => v,
+        },
+        _ => float_to_string(&v),
+    }
+}
+
+/// One `float` rendered the way `Float.toString` does. A non-floating value
+/// passes through, so the builtin is safe on a statically-`float` expression
+/// whose value turned out to be `null`.
+fn float_to_string(v: &Value) -> Value {
+    match v {
+        Value::Float(f) => Value::str(format_float(*f as f32)),
         other => other.clone(),
     }
 }

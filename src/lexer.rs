@@ -24,6 +24,10 @@ pub enum Tok {
     /// to survive lexing rather than being dropped with the other ones.
     Long(i64),
     Float(f64),
+    /// An `f`/`F`-suffixed floating literal (`1.5f`). Java types it `float`,
+    /// which is a *32-bit* value — a distinct token because the width is what
+    /// makes `1.0f / 3.0f` print `0.33333334` rather than the `double` answer.
+    Float32(f64),
     Str(String),
     /// A `char` literal (`'a'`, `'\n'`). Java's `char` is a 16-bit *integral*
     /// type, so this is distinct from [`Tok::Str`]: `'a' + 1` is 98, not `"a1"`.
@@ -287,9 +291,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             // letters would also eat the `e` of an exponent.
             let num_end = i;
             let mut is_long = false;
+            let mut is_f32 = false;
             if i < bytes.len() && matches!(bytes[i], b'L' | b'l' | b'f' | b'F' | b'd' | b'D') {
                 match bytes[i] {
-                    b'f' | b'F' | b'd' | b'D' => is_float = true,
+                    b'f' | b'F' => {
+                        is_float = true;
+                        is_f32 = true;
+                    }
+                    b'd' | b'D' => is_float = true,
                     _ => is_long = true,
                 }
                 i += 1;
@@ -304,7 +313,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     .parse()
                     .map_err(|_| format!("javars: bad float literal `{text}` on line {line}"))?;
                 out.push(Token {
-                    kind: Tok::Float(v),
+                    kind: if is_f32 {
+                        Tok::Float32(v)
+                    } else {
+                        Tok::Float(v)
+                    },
                     line,
                 });
             } else {

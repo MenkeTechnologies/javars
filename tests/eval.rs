@@ -2476,3 +2476,137 @@ fn a_dotted_expression_statement_is_not_read_as_a_declaration() {
     assert!(ok);
     assert_eq!(out, "9\n4\ns\n");
 }
+
+#[test]
+fn float_is_a_32_bit_type_not_a_double() {
+    // fusevm has one floating representation, so Java's `float` is a `double`
+    // *kept* at 32-bit precision: the value narrows at every operation, and its
+    // string form is the shortest decimal that round-trips through `f32` — which
+    // is a different decimal from the one the same bits produce as a `double`.
+    // Mixing in a `double` promotes the whole operation; mixing in an `int` does
+    // not. Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(1.0f / 3.0f);\
+         System.out.println(0.1f + 0.2f);\
+         System.out.println((double) 0.1f);\
+         System.out.println(1.0f / 3.0);\
+         System.out.println(1.0f / 3);\
+         System.out.println((float) (1.0 / 3.0));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "0.33333334\n0.3\n0.10000000149011612\n0.3333333333333333\n0.33333334\n0.33333334\n"
+    );
+}
+
+#[test]
+fn float_arithmetic_rounds_once_per_operation() {
+    // Java rounds a `float` operation once, at 32 bits. Computing it in `f64`
+    // and narrowing afterwards rounds twice and lands a ulp away —
+    // `16777217.0f * 0.2f` is 3355443.2 rounded once and 3355443.3 rounded
+    // twice — which is why a `float` operation runs on the host rather than as a
+    // native op with a narrowing appended. Grouping is observable for the same
+    // reason. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(16777217.0f * 0.2f);\
+         System.out.println(16777217.0f / -7);\
+         float a = 1.1f;\
+         float b = 2.2f;\
+         float c = 3.3f;\
+         System.out.println(a * b + c);\
+         System.out.println(a * (b + c));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3355443.2\n-2396745.2\n5.7200003\n6.05\n");
+}
+
+#[test]
+fn float_mutation_and_arrays_stay_at_32_bits() {
+    // Compound assignment, `++`, and a `float[]` element all carry the same
+    // 32-bit width, so an accumulation drifts exactly the way Java's does and
+    // `Arrays.toString` prints the `float` decimals.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "float acc = 0.0f;\
+         for (int i = 0; i < 10; i++) acc += 0.1f;\
+         System.out.println(acc);\
+         float m = 1.0f;\
+         m *= 1.1f;\
+         m /= 3.0f;\
+         System.out.println(m);\
+         float inc = 1.5f;\
+         inc++;\
+         System.out.println(inc);\
+         float[] fa = {0.1f, 0.2f, 1.0f / 3.0f};\
+         System.out.println(java.util.Arrays.toString(fa));\
+         fa[0] += 0.05f;\
+         System.out.println(fa[0]);\
+         System.out.println(\"v=\" + (1.0f / 3.0f) + \"|\" + String.valueOf(0.1f));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1.0000001\n0.36666667\n2.5\n[0.1, 0.2, 0.33333334]\n0.15\nv=0.33333334|0.1\n"
+    );
+}
+
+#[test]
+fn a_float_reaches_format_as_text_or_as_a_number_by_conversion() {
+    // `String.format` is the one place a `float` argument splits: `%s` wants
+    // `Float.toString` (`0.33333334`), while every numeric conversion wants the
+    // `double` Java widens it to — `%.9f` is `0.333333343`, which the shortest
+    // decimal cannot reproduce. The format string is scanned for which slots are
+    // text conversions, explicit argument indexes included.
+    // Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "float f = 1.0f / 3.0f;\
+         System.out.println(String.format(\"%s\", f));\
+         System.out.println(String.format(\"%f\", f));\
+         System.out.println(String.format(\"%.9f\", f));\
+         System.out.println(String.format(\"%.9e\", f));\
+         System.out.println(String.format(\"%2$s|%1$.4f\", f, f / 7.0f));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "0.33333334\n0.333333\n0.333333343\n3.333333433e-01\n0.04761905|0.3333\n"
+    );
+}
+
+#[test]
+fn scientific_conversions_round_half_up_like_javas_formatter() {
+    // `%f` already rounded HALF_UP; `%e` and `%g` were still rounding
+    // half-to-even, so `%e` of 5592405.5 came out `5.592405e+06` where Java's
+    // `Formatter` (which rounds through `BigDecimal.ROUND_HALF_UP`) says
+    // `5.592406e+06`. The digits are taken from the value's own decimal
+    // expansion, because scaling by a power of ten would round the tie away
+    // before it could be seen. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(String.format(\"%e\", 5592405.5));\
+         System.out.println(String.format(\"%.1e\", 1.25));\
+         System.out.println(String.format(\"%.0e\", 2.5));\
+         System.out.println(String.format(\"%.2e\", 9.999));\
+         System.out.println(String.format(\"%.3g\", 1234.5));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "5.592406e+06\n1.3e+00\n3e+00\n1.00e+01\n1.23e+03\n");
+}
+
+#[test]
+fn float_notation_thresholds_and_statics() {
+    // `Float.toString` switches to scientific notation outside [1e-3, 1e7) just
+    // as `Double.toString` does, but at 32-bit precision — and the `Float`
+    // statics answer there too. Verified against OpenJDK 26.
+    let (out, ok) = run(&wrap(
+        "System.out.println(1.0e-4f + \"|\" + 1.0e8f + \"|\" + 1234567.0f + \"|\" + 12345678.0f);\
+         System.out.println(-1.5f - 7.0f);\
+         System.out.println(Float.MAX_VALUE + \"|\" + Float.NaN + \"|\" + Float.POSITIVE_INFINITY);\
+         System.out.println(Float.parseFloat(\"0.1\") + \"|\" + Float.toString(0.1f) + \"|\" + Float.compare(0.1f, 0.2f));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1.0E-4|1.0E8|1234567.0|1.2345678E7\n-8.5\n3.4028235E38|NaN|Infinity\n0.1|0.1|-1\n"
+    );
+}

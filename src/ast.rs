@@ -360,6 +360,11 @@ pub enum Expr {
     /// `long`, which keeps the operation out of the 32-bit `int` wrap.
     Long(i64),
     Float(f64),
+    /// An `f`-suffixed floating literal. Java types it `float`, a *32-bit*
+    /// value: every operation on one rounds to `f32`, and its string form is the
+    /// shortest decimal that round-trips through `f32` — `1.0f / 3.0f` is
+    /// `0.33333334`, not the `double` `0.3333333333333333`.
+    Float32(f64),
     Str(String),
     /// A `char` literal. Runs as its code point (an integer), because Java's
     /// `char` is an integral type that participates in numeric promotion; the
