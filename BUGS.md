@@ -400,12 +400,30 @@ known.
 
 ## Not implemented (parse or compile errors today)
 
-- **Streams** (`.stream()`, `map`/`filter`/`collect`), and the `default` methods
-  the JDK's functional interfaces carry (`Function.andThen`/`compose`,
-  `Predicate.negate`/`and`/`or`, `Comparator.reversed`/`comparing`). The
+- **Streams** — `Arrays.stream(a)`, `list.stream()`, `IntStream.range`,
+  `Stream.of`, the intermediate operations (`map`, `filter`, `sorted`,
+  `distinct`, `limit`), and the terminals (`collect`, `count`, `sum`, `reduce`,
+  `findFirst`, `anyMatch`). Naming any of them is a compile error, not a wrong
+  answer.
+
+  The obstacle is not the pipeline shape, it is *where a lambda can be called
+  from*: a host builtin cannot re-enter the VM (the same limit that keeps an
+  element's `toString()` from running inside a collection, below), so a stream
+  cannot be a host object that calls `map`'s function per element. It has to be
+  **fused at compile time** — the whole `source.op(f).op(g).terminal(h)` chain
+  lowered into one loop with the closure calls emitted inline — which is a
+  compiler pass rather than a library addition, and it drags in `Optional` for
+  the four terminals that return one (`findFirst`, `min`, `max`, `average`).
+  That substrate is not built, and half of it would be worse than none: a
+  pipeline that silently drops a stage is exactly the failure mode this file
+  exists to prevent.
+
+  The `default` methods the JDK's functional interfaces carry
+  (`Function.andThen`/`compose`, `Predicate.negate`/`and`/`or`,
+  `Comparator.reversed`/`comparing`) are absent for a smaller reason: the
   interfaces javars supplies declare only their single abstract method, so
-  calling a `default` one is a compile error, not a wrong answer. Lambdas and
-  method references themselves are implemented (above).
+  calling a `default` one is a compile error. Lambdas and method references
+  themselves are implemented (above).
 - **`hashCode()`**, including a `record`'s derived one. A record supplies its
   accessors, `toString`, and `equals`; calling `hashCode()` is a compile error
   ("class `Pt` has no method `hashCode`") rather than a wrong number.
