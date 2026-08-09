@@ -1581,6 +1581,175 @@ fn g_super(r: &mut Rng) -> String {
     }
 }
 
+/// `instanceof` — the runtime type test, asked of every shape javars's value
+/// model can name.
+///
+/// No probe in this generator wrote `instanceof` before this mode, so the whole
+/// form was unreachable and every clean sweep above was silent about it.
+///
+/// Every probe prints a *true* and a *false* answer drawn from one target
+/// family, so neither a blanket `true` nor a blanket `false` satisfies one.
+/// That shape is the point: the test a single-answer implementation passes is
+/// the one that only ever asks about a type the value is not, and asking both
+/// halves of the same question is what separates a real supertype walk from a
+/// constant.
+///
+/// Deliberately absent, because javars's value model cannot decide them and a
+/// probe would only re-report a documented BUGS.md simplification rather than
+/// find anything:
+///   * `new LinkedList<>()` — modeled as the same mutable list an `ArrayList`
+///     is, so no test can separate the two.
+///   * `Set.of(…)` — modeled as a hash-ordered `Set`, indistinguishable from
+///     `new HashSet<>()`, where Java's `ImmutableCollections.SetN` is not one.
+///   * a lambda against its functional interface — the closure records the body
+///     and its captures, not the interface it was assigned to.
+///   * `Long`/`Float`/`Character` — `int` and `long` are one `Value::Int`, a
+///     `double` and a `float` one `Value::Float`, and a boxed `char` is the
+///     one-character `String` javars models it as.
+fn g_instanceof(r: &mut Rng) -> String {
+    let i = pick(r, INTS);
+    let d = pick(r, DBLS);
+    let s = pick(r, STRS);
+    let b = pick(r, BOOLS);
+    match r.below(16) {
+        // Each boxed primitive against its own wrapper, the wrapper it is *not*,
+        // and the `java.lang` interfaces the JLS gives it.
+        0 => format!(
+            "{{ Object v = {i}; System.out.println((v instanceof Integer) + \",\" + (v instanceof Double) + \",\" + (v instanceof Boolean) + \",\" + (v instanceof Number) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof String) + \",\" + (v instanceof Object)); }}"
+        ),
+        1 => format!(
+            "{{ Object v = {d}; System.out.println((v instanceof Double) + \",\" + (v instanceof Integer) + \",\" + (v instanceof Number) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof CharSequence) + \",\" + (v instanceof Object)); }}"
+        ),
+        2 => format!(
+            "{{ Object v = {b}; System.out.println((v instanceof Boolean) + \",\" + (v instanceof Number) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof String) + \",\" + (v instanceof Object)); }}"
+        ),
+        3 => format!(
+            "{{ Object v = {s}; System.out.println((v instanceof String) + \",\" + (v instanceof CharSequence) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof Number) + \",\" + (v instanceof List) + \",\" + (v instanceof Object)); }}"
+        ),
+        // `instanceof Object` over every shape at once. Java answers it `true`
+        // for every non-null reference and `false` for `null`, so one blanket
+        // answer fails on the other end whichever way it is chosen.
+        4 => "{ Object[] vs = { 1, 2.5, true, \"s\", new int[]{1}, new ArrayList<Integer>(), new HashMap<String, Integer>(), new HashSet<Integer>(), new Left(), Color.RED, new Pt(1, 2), new IllegalStateException(\"e\"), null }; String out = \"\"; for (Object v : vs) out += (v instanceof Object) ? \"T\" : \"F\"; System.out.println(out); }".to_string(),
+        // A declared subclass chain plus an interface only one sibling carries.
+        5 => {
+            let v = pick(r, &["new Left()", "new Right()", "new Base()", "new Bare(1)"]);
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof Base) + \",\" + (v instanceof Left) + \",\" + (v instanceof Right) + \",\" + (v instanceof Marker) + \",\" + (v instanceof Bare) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // An enum constant is an instance of its own enum, of `java.lang.Enum`,
+        // and of `Comparable` — and never of a *different* enum in the program.
+        6 => {
+            let c = pick(r, &["Color.RED", "Color.BLUE", "Op.ADD", "Ops.TIMES"]);
+            format!(
+                "{{ Object v = {c}; System.out.println((v instanceof Color) + \",\" + (v instanceof Op) + \",\" + (v instanceof Enum) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // A record is an instance of `java.lang.Record`, and of no other record.
+        7 => {
+            let v = pick(r, &["new Pt(1, 2)", "new Tag(\"t\", 1.5)"]);
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof Pt) + \",\" + (v instanceof Tag) + \",\" + (v instanceof Record) + \",\" + (v instanceof Comparable) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // The throwable chain, asked as an expression rather than through
+        // `catch` — the same builtin decides both, and only `catch` was reachable.
+        8 => {
+            let v = pick(
+                r,
+                &[
+                    "new IllegalArgumentException(\"e\")",
+                    "new IllegalStateException(\"e\")",
+                    "new ArithmeticException(\"e\")",
+                    "new NumberFormatException(\"e\")",
+                ],
+            );
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof IllegalArgumentException) + \",\" + (v instanceof RuntimeException) + \",\" + (v instanceof Exception) + \",\" + (v instanceof Throwable) + \",\" + (v instanceof Error) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // A mutable list, against both the interfaces it implements and the
+        // collection kinds it is not.
+        9 => "{ Object v = new ArrayList<Integer>(); System.out.println((v instanceof List) + \",\" + (v instanceof Collection) + \",\" + (v instanceof Iterable) + \",\" + (v instanceof ArrayList) + \",\" + (v instanceof Map) + \",\" + (v instanceof Set) + \",\" + (v instanceof Object)); }".to_string(),
+        // The list *views*: `List.of` and `Arrays.asList` are `List`s that are
+        // not `ArrayList`s, which is the half a name-only answer gets wrong.
+        10 => {
+            let v = pick(
+                r,
+                &[
+                    "List.of(1, 2)",
+                    "Arrays.asList(1, 2)",
+                    "new ArrayList<Integer>(List.of(1, 2, 3)).subList(0, 2)",
+                ],
+            );
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof List) + \",\" + (v instanceof Collection) + \",\" + (v instanceof ArrayList) + \",\" + (v instanceof Set) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // The three map kinds. `LinkedHashMap` extends `HashMap` and `TreeMap`
+        // does not, so the pair only agrees with Java if the *declared* graph is
+        // walked rather than the name matched.
+        11 => {
+            let v = pick(
+                r,
+                &[
+                    "new HashMap<String, Integer>()",
+                    "new LinkedHashMap<String, Integer>()",
+                    "new TreeMap<String, Integer>()",
+                ],
+            );
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof Map) + \",\" + (v instanceof HashMap) + \",\" + (v instanceof LinkedHashMap) + \",\" + (v instanceof TreeMap) + \",\" + (v instanceof SortedMap) + \",\" + (v instanceof Collection) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // The three set kinds, the same way: `LinkedHashSet` extends `HashSet`,
+        // `TreeSet` does not, and neither is a `List`.
+        12 => {
+            let v = pick(
+                r,
+                &[
+                    "new HashSet<Integer>()",
+                    "new LinkedHashSet<Integer>()",
+                    "new TreeSet<Integer>()",
+                ],
+            );
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof Set) + \",\" + (v instanceof HashSet) + \",\" + (v instanceof LinkedHashSet) + \",\" + (v instanceof TreeSet) + \",\" + (v instanceof SortedSet) + \",\" + (v instanceof List) + \",\" + (v instanceof Object)); }}"
+            )
+        }
+        // An array is an `Object` and a `Cloneable`, and is not a collection —
+        // the element type it erases decides none of those.
+        13 => {
+            let v = pick(
+                r,
+                &[
+                    "new int[]{1, 2}",
+                    "new String[]{\"a\"}",
+                    "new Object[]{1, \"a\"}",
+                    "new Base[]{new Left()}",
+                ],
+            );
+            format!(
+                "{{ Object v = {v}; System.out.println((v instanceof Object) + \",\" + (v instanceof Cloneable) + \",\" + (v instanceof List) + \",\" + (v instanceof String) + \",\" + (v instanceof Base)); }}"
+            )
+        }
+        // `instanceof` driving control flow, where the answer picks a branch
+        // rather than being printed — and `null`, which is an instance of
+        // nothing at all, including `Object`.
+        14 => {
+            let v = pick(r, &["new Left()", "new Right()", "new Base()"]);
+            format!(
+                "{{ Object v = {v}; String out; if (v instanceof Left) {{ out = \"L\"; }} else if (v instanceof Right) {{ out = \"R\"; }} else if (v instanceof Base) {{ out = \"B\"; }} else {{ out = \"?\"; }} Object n = null; System.out.println(out + \",\" + (n instanceof Object) + \",\" + (n instanceof Base) + \",\" + (!(v instanceof Marker)) + \",\" + ((v instanceof Base) && !(v instanceof Bare))); }}"
+            )
+        }
+        // The test inside a loop over a mixed array, so one call site sees every
+        // shape in turn rather than a single value per program.
+        _ => format!(
+            "{{ Object[] vs = {{ {i}, {d}, {s}, {b}, new Left(), Color.GREEN, new Pt(1, 2), new ArrayList<Integer>(), new HashMap<String, Integer>(), new int[]{{1}} }}; String out = \"\"; for (Object v : vs) {{ out += (v instanceof Number) ? \"N\" : (v instanceof CharSequence) ? \"C\" : (v instanceof Base) ? \"B\" : (v instanceof Enum) ? \"E\" : (v instanceof Record) ? \"R\" : (v instanceof Collection) ? \"L\" : (v instanceof Map) ? \"M\" : (v instanceof Object) ? \"O\" : \"?\"; }} System.out.println(out); }}"
+        ),
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -1807,6 +1976,7 @@ enum Mode {
     Varargs,
     ListView,
     Super,
+    InstanceOf,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1858,6 +2028,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Varargs,
     Mode::ListView,
     Mode::Super,
+    Mode::InstanceOf,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1911,6 +2082,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Varargs => "varargs",
         Mode::ListView => "listview",
         Mode::Super => "super",
+        Mode::InstanceOf => "instanceof",
     }
 }
 
@@ -1976,6 +2148,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Varargs => g_varargs(r),
         Mode::ListView => g_listview(r),
         Mode::Super => g_super(r),
+        Mode::InstanceOf => g_instanceof(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
