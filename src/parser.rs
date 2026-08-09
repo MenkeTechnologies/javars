@@ -273,6 +273,7 @@ impl Parser {
             interfaces,
             is_interface,
             is_enum,
+            is_record,
             enum_constants,
             fields,
             static_fields,
@@ -392,6 +393,9 @@ impl Parser {
             interfaces: Vec::new(),
             is_interface: false,
             is_enum: false,
+            // The body of an enum constant is an anonymous subclass of the enum,
+            // never a record of its own.
+            is_record: false,
             enum_constants: Vec::new(),
             fields,
             static_fields,

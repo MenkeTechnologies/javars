@@ -411,7 +411,9 @@ host-owned object heap keyed by `Value::Obj`), a **class/object model** (instanc
 fields with initializers, constructors, instance methods dispatched over the
 frame ABI, `this`, `new`, field access `obj.f`, single inheritance with `extends`
 and `super(…)`, the non-virtual `super.method(args)`/`super.field` access an
-override uses to reach the version it overrides, `instanceof`, runtime-class
+override uses to reach the version it overrides, `instanceof` over every shape
+the value model names (user classes, boxed primitives, collections, arrays,
+`enum` as `Enum` and `record` as `Record`), runtime-class
 virtual dispatch for overrides, and
 `toString()` overrides honoured by `println`), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic

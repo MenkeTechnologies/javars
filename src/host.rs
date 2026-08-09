@@ -507,9 +507,86 @@ fn heap_alloc(obj: HostObj) -> u32 {
     })
 }
 
+/// The *direct* supertypes of the JDK types javars's value model names, spelled
+/// the way the JDK declares them so each line can be checked against one
+/// `extends`/`implements` clause rather than against a flattened closure.
+///
+/// This is the single definition of the JDK half of the supertype graph. The
+/// runtime type test (`instanceof`, and the `catch` matching that shares its
+/// builtin) needs it exact; the reference cast walks the same graph and then
+/// adds, separately and by name, the siblings it cannot prove wrong
+/// (see [`cast_allowed`]).
+///
+/// `java.lang.Object` is not an edge here. Every non-null reference is an
+/// `Object` whether or not its class appears in this table, so that is answered
+/// once at the top of [`is_instance_of`] instead of being reachable only from
+/// the classes that happen to be listed.
+fn jdk_supers(class: &str) -> &'static [&'static str] {
+    match class {
+        // java.lang
+        "String" => &["CharSequence", "Comparable", "Serializable"],
+        "Integer" | "Double" => &["Number", "Comparable"],
+        "Number" => &["Serializable"],
+        "Boolean" | "Character" => &["Comparable", "Serializable"],
+        "Enum" => &["Comparable", "Serializable"],
+        // The throwable chain itself comes from the prelude's declarations,
+        // which reach `Throwable` and stop; `Throwable implements Serializable`
+        // is the one edge above it.
+        "Throwable" => &["Serializable"],
+        // java.util — the collection interfaces. `List` gained
+        // `SequencedCollection` in Java 21 and `Set` did not, which is why they
+        // are not one arm.
+        "List" => &["Collection", "SequencedCollection"],
+        "Set" => &["Collection"],
+        "SequencedCollection" => &["Collection"],
+        "SequencedSet" => &["Set", "SequencedCollection"],
+        "Collection" => &["Iterable"],
+        "SortedSet" => &["SequencedSet"],
+        "NavigableSet" => &["SortedSet"],
+        "SequencedMap" => &["Map"],
+        "SortedMap" => &["SequencedMap"],
+        "NavigableMap" => &["SortedMap"],
+        "AbstractCollection" => &["Collection"],
+        "AbstractList" => &["AbstractCollection", "List"],
+        "AbstractSet" => &["AbstractCollection", "Set"],
+        "AbstractMap" => &["Map"],
+        // java.util — the concrete kinds javars models. `LinkedHashMap` and
+        // `LinkedHashSet` extend their hash counterparts; the tree kinds do not,
+        // which is the pair a name-matching answer gets wrong.
+        "ArrayList" => &["AbstractList", "RandomAccess", "Cloneable", "Serializable"],
+        "HashMap" => &["AbstractMap", "Cloneable", "Serializable"],
+        "LinkedHashMap" => &["HashMap", "SequencedMap"],
+        "TreeMap" => &["AbstractMap", "NavigableMap", "Cloneable", "Serializable"],
+        "HashSet" => &["AbstractSet", "Cloneable", "Serializable"],
+        "LinkedHashSet" => &["HashSet", "SequencedSet"],
+        "TreeSet" => &["AbstractSet", "NavigableSet", "Cloneable", "Serializable"],
+        // The internal names [`value_class`] gives the shapes Java spells with
+        // syntax, or with a class the JDK does not export, so no user type can
+        // collide with one. An array is `Cloneable` and `Serializable` and
+        // nothing else.
+        //
+        // The three list views are each a `List` that is not an `ArrayList`,
+        // and they do not agree with one another either: `List.of` answers
+        // `AbstractList` `false` where the other two answer `true`, and
+        // `subList` alone is not `Serializable`. One shared name would have to
+        // get two of the three wrong, and `Fixity` plus the `SubList` variant
+        // already tell them apart.
+        "[]" => &["Cloneable", "Serializable"],
+        "List$immutable" => &["AbstractCollection", "List", "RandomAccess", "Serializable"],
+        "List$fixed" => &["AbstractList", "RandomAccess", "Serializable"],
+        "List$sub" => &["AbstractList", "RandomAccess"],
+        _ => &[],
+    }
+}
+
 /// True when `class` is `target`, a (transitive) subclass of it, or a type that
 /// implements/extends the interface `target` — walking the supertype graph
 /// (superclass + interfaces).
+///
+/// The graph has two halves and both are walked at every node: the program's own
+/// declarations ([`SUPERS`], set before the run) and the JDK's ([`jdk_supers`]).
+/// A user class that `implements Comparable` needs the second half to reach
+/// `Serializable`, and a modeled `TreeMap` has no entry in the first at all.
 fn is_subclass_of(class: &str, target: &str) -> bool {
     if class == target {
         return true;
@@ -528,6 +605,7 @@ fn is_subclass_of(class: &str, target: &str) -> bool {
             if let Some(sups) = s.get(&cur) {
                 stack.extend(sups.iter().cloned());
             }
+            stack.extend(jdk_supers(&cur).iter().map(|t| t.to_string()));
         }
         false
     })
@@ -1384,22 +1462,73 @@ fn b_instanceof(vm: &mut VM, argc: u8) -> Value {
         .get(1)
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
-    match obj {
-        Value::Obj(id) => HEAP.with(|h| {
-            let h = h.borrow();
-            match h.get(id as usize) {
-                Some(HostObj::Instance { class, .. }) => {
-                    Value::bool(is_subclass_of(class, &target))
-                }
-                // A String value satisfies `instanceof String`.
-                _ => Value::bool(false),
-            }
-        }),
-        Value::Str(_) => {
-            Value::bool(target == "String" || target == "Object" || target == "CharSequence")
+    Value::bool(is_instance_of(&obj, &target))
+}
+
+/// The class a value answers `instanceof` as, for every shape javars's value
+/// model names one.
+///
+/// `None` means the class is genuinely not recorded rather than absent from this
+/// list: `null`, and a lambda, whose closure carries its body and its captures
+/// but not the functional interface it was assigned to.
+///
+/// The two names that are not legal Java identifiers — `[]` and `List$view` —
+/// exist so an array and a non-`ArrayList` list view can carry supertypes in
+/// [`jdk_supers`] without a user type ever being able to name them.
+fn value_class(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Str(_) => "String".to_string(),
+        Value::Int(_) => "Integer".to_string(),
+        Value::Float(_) => "Double".to_string(),
+        Value::Bool(_) => "Boolean".to_string(),
+        Value::Obj(id) => {
+            return HEAP.with(|h| {
+                Some(match h.borrow().get(*id as usize)? {
+                    HostObj::Instance { class, .. } => class.clone(),
+                    HostObj::Array(_) => "[]".to_string(),
+                    // `Arrays.asList` and `List.of` are `List`s that are not
+                    // `ArrayList`s, and a `subList` view is a third answer
+                    // again — see the note in [`jdk_supers`].
+                    HostObj::List { fixed, .. } => match fixed {
+                        Fixity::Mutable => "ArrayList".to_string(),
+                        Fixity::FixedSize => "List$fixed".to_string(),
+                        Fixity::Immutable => "List$immutable".to_string(),
+                    },
+                    HostObj::SubList { .. } => "List$sub".to_string(),
+                    HostObj::Map { order, .. } => match order {
+                        Order::Hash => "HashMap".to_string(),
+                        Order::Insertion => "LinkedHashMap".to_string(),
+                        Order::Sorted => "TreeMap".to_string(),
+                    },
+                    HostObj::Set { order, .. } => match order {
+                        Order::Hash => "HashSet".to_string(),
+                        Order::Insertion => "LinkedHashSet".to_string(),
+                        Order::Sorted => "TreeSet".to_string(),
+                    },
+                    HostObj::Closure { .. } => return None,
+                })
+            });
         }
-        _ => Value::bool(false),
-    }
+        _ => return None,
+    })
+}
+
+/// Java's `x instanceof T`: true when `x` is a non-null reference whose runtime
+/// class is `T`, a subclass of it, or a type implementing the interface `T`.
+///
+/// Two rules come before the graph walk, and both are the reason the previous
+/// implementation — which answered only for a `String` and a user-class instance
+/// and returned `false` for everything else — was wrong far more often than it
+/// looked. `null` is an instance of nothing, including `Object`; and every
+/// non-null reference *is* an `Object`, whatever javars models it as.
+fn is_instance_of(v: &Value, target: &str) -> bool {
+    let Some(class) = value_class(v) else {
+        // `null` is an instance of nothing. A lambda is at least an `Object`;
+        // its functional interface is not recorded, so that is as far as the
+        // answer goes.
+        return target == "Object" && matches!(v, Value::Obj(_));
+    };
+    target == "Object" || is_subclass_of(&class, target)
 }
 
 /// `__rust_compile("<base64>")` builtin: pop the base64-encoded `rust { ... }`
@@ -4340,22 +4469,24 @@ fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
     if target == "Object" || runtime == target {
         return true;
     }
+    // The exact supertype graph — the same one `instanceof` walks, so the two
+    // cannot drift into disagreeing about what a type extends.
+    if is_subclass_of(runtime, target) {
+        return true;
+    }
+    // On top of it, and only here, the sibling types the value model cannot
+    // tell apart: `int`/`long`/`short`/`byte` are one `Value::Int`, a `double`
+    // and a `float` one `Value::Float`, and a boxed `Character` is the
+    // one-character String javars models it as. A cast between any of these
+    // cannot be proven wrong, so it is allowed rather than invented as a
+    // failure. `instanceof` deliberately does NOT share this leniency: it has
+    // to answer a boolean, and Java's answer for `42 instanceof Long` is
+    // `false`.
     match runtime {
-        "String" => {
-            matches!(
-                target,
-                "CharSequence" | "Comparable" | "Serializable" // A boxed `Character` is the one-character String javars models it
-                                                               // as, so a cast back to `Character` has to be allowed.
-            ) || (target == "Character" && value.as_str_cow().chars().count() == 1)
-        }
-        "Integer" => matches!(
-            target,
-            "Long" | "Short" | "Byte" | "Character" | "Number" | "Comparable" | "Serializable"
-        ),
-        "Double" => matches!(target, "Float" | "Number" | "Comparable" | "Serializable"),
-        "Boolean" => matches!(target, "Comparable" | "Serializable"),
-        // A user class or interface: the declared supertype graph decides.
-        _ => is_subclass_of(runtime, target),
+        "Integer" => matches!(target, "Long" | "Short" | "Byte" | "Character"),
+        "Double" => target == "Float",
+        "String" => target == "Character" && value.as_str_cow().chars().count() == 1,
+        _ => false,
     }
 }
 

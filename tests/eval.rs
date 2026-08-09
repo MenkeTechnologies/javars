@@ -3324,3 +3324,193 @@ fn an_undeclared_name_is_a_compile_error_not_a_null() {
     assert!(ok);
     assert_eq!(out, "true\nnull\n");
 }
+
+// ── instanceof over every shape the value model names ───────────────────────
+//
+// `instanceof` answered `false` for everything that was not a `String` or a
+// user-class instance — including `x instanceof Object`, which Java answers
+// `true` for every non-null reference. No probe in `parity-fuzz` wrote the
+// operator at all, so nothing observed it. Every expectation below was captured
+// byte-for-byte from OpenJDK 26.0.2 (Temurin 26.0.2+10).
+
+#[test]
+fn instanceof_object_is_true_for_every_non_null_reference() {
+    // The single rule the old implementation broke everywhere: a boxed
+    // primitive, an array, a collection, a record, an enum constant and a
+    // lambda are all `Object`s, and `null` is not.
+    let (out, ok) = run("import java.util.*;\
+         public class T { interface Fn { int of(); }\
+         record R(int x) {} enum E { A }\
+         public static void main(String[] a) {\
+         Fn f = () -> 1;\
+         Object[] vs = { 1, 2.5, true, \"s\", new int[]{1}, new ArrayList<Integer>(),\
+         new HashMap<String, Integer>(), new HashSet<Integer>(), new R(1), E.A, f, null };\
+         String s = \"\"; for (Object v : vs) s += (v instanceof Object) ? \"T\" : \"F\";\
+         System.out.println(s); } }");
+    assert!(ok);
+    assert_eq!(out, "TTTTTTTTTTTF\n");
+}
+
+#[test]
+fn instanceof_separates_the_boxed_wrappers_and_their_interfaces() {
+    // Each wrapper is itself, is `Comparable`, and is `Number` only when it is
+    // one. A blanket answer cannot produce a row with both a `true` and a
+    // `false` in it.
+    let (out, ok) = run(&wrap(
+        "Object i = 42, d = 3.5, b = true, s = \"hi\";\
+         System.out.println((i instanceof Integer) + \",\" + (i instanceof Double) + \",\" + (i instanceof Number) + \",\" + (i instanceof Comparable) + \",\" + (i instanceof String));\
+         System.out.println((d instanceof Double) + \",\" + (d instanceof Integer) + \",\" + (d instanceof Number));\
+         System.out.println((b instanceof Boolean) + \",\" + (b instanceof Number) + \",\" + (b instanceof Comparable));\
+         System.out.println((s instanceof String) + \",\" + (s instanceof CharSequence) + \",\" + (s instanceof Number));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,false,true,true,false\ntrue,false,true\ntrue,false,true\ntrue,true,false\n"
+    );
+}
+
+#[test]
+fn instanceof_walks_the_jdk_collection_hierarchy() {
+    // `LinkedHashMap extends HashMap` and `TreeMap` does not; `LinkedHashSet
+    // extends HashSet` and `TreeSet` does not. Matching the modeled kind by
+    // name alone gets exactly those two pairs wrong.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class T { public static void main(String[] a) {\
+         Object al = new ArrayList<Integer>(), hm = new HashMap<String, Integer>(),\
+         lhm = new LinkedHashMap<String, Integer>(), tm = new TreeMap<String, Integer>(),\
+         hs = new HashSet<Integer>(), lhs = new LinkedHashSet<Integer>(), ts = new TreeSet<Integer>();\
+         System.out.println((al instanceof List) + \",\" + (al instanceof Collection) + \",\" + (al instanceof Iterable) + \",\" + (al instanceof ArrayList) + \",\" + (al instanceof Map) + \",\" + (al instanceof Set));\
+         System.out.println((hm instanceof Map) + \",\" + (hm instanceof HashMap) + \",\" + (hm instanceof LinkedHashMap) + \",\" + (hm instanceof TreeMap) + \",\" + (hm instanceof Collection));\
+         System.out.println((lhm instanceof LinkedHashMap) + \",\" + (lhm instanceof HashMap) + \",\" + (lhm instanceof TreeMap) + \",\" + (lhm instanceof SortedMap));\
+         System.out.println((tm instanceof TreeMap) + \",\" + (tm instanceof SortedMap) + \",\" + (tm instanceof NavigableMap) + \",\" + (tm instanceof HashMap));\
+         System.out.println((hs instanceof Set) + \",\" + (hs instanceof HashSet) + \",\" + (hs instanceof Collection) + \",\" + (hs instanceof List));\
+         System.out.println((lhs instanceof LinkedHashSet) + \",\" + (lhs instanceof HashSet) + \",\" + (lhs instanceof TreeSet));\
+         System.out.println((ts instanceof TreeSet) + \",\" + (ts instanceof SortedSet) + \",\" + (ts instanceof NavigableSet) + \",\" + (ts instanceof HashSet)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,true,true,true,false,false\n\
+         true,true,false,false,false\n\
+         true,true,false,false\n\
+         true,true,true,false\n\
+         true,true,true,false\n\
+         true,true,false\n\
+         true,true,true,false\n"
+    );
+}
+
+#[test]
+fn instanceof_tells_the_three_list_views_apart() {
+    // `List.of`, `Arrays.asList` and `subList` are each a `List` that is not an
+    // `ArrayList`, and they do not agree with each other either: only `List.of`
+    // answers `AbstractList` false, and only `subList` is not `Serializable`.
+    // One shared answer for "some list view" has to get two of the three wrong.
+    let (out, ok) = run(
+        "import java.util.*;\
+         import java.io.*;\
+         public class T { public static void main(String[] a) {\
+         Object lo = List.of(1, 2), aal = Arrays.asList(1, 2),\
+         sub = new ArrayList<Integer>(List.of(1, 2, 3)).subList(0, 2);\
+         System.out.println((lo instanceof List) + \",\" + (lo instanceof ArrayList) + \",\" + (lo instanceof AbstractList) + \",\" + (lo instanceof AbstractCollection) + \",\" + (lo instanceof Serializable));\
+         System.out.println((aal instanceof List) + \",\" + (aal instanceof ArrayList) + \",\" + (aal instanceof AbstractList) + \",\" + (aal instanceof Serializable));\
+         System.out.println((sub instanceof List) + \",\" + (sub instanceof ArrayList) + \",\" + (sub instanceof AbstractList) + \",\" + (sub instanceof Serializable)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,false,false,true,true\ntrue,false,true,true\ntrue,false,true,false\n"
+    );
+}
+
+#[test]
+fn instanceof_gives_an_enum_and_a_record_their_implicit_supertypes() {
+    // `javac` makes every enum a subclass of `java.lang.Enum` (so `Comparable`
+    // and `Serializable`) and every record a subclass of `java.lang.Record`
+    // (which is neither). Neither supertype is written in the source, so a graph
+    // built only from the declared `extends`/`implements` cannot see them.
+    let (out, ok) = run(
+        "import java.io.*;\
+         public class T { record Pt(int x, int y) {} record Tag(String t) {} enum C { RED, BLUE }\
+         public static void main(String[] a) {\
+         Object p = new Pt(1, 2), c = C.RED;\
+         System.out.println((c instanceof C) + \",\" + (c instanceof Enum) + \",\" + (c instanceof Comparable) + \",\" + (c instanceof Serializable));\
+         System.out.println((p instanceof Pt) + \",\" + (p instanceof Tag) + \",\" + (p instanceof Record) + \",\" + (p instanceof Comparable) + \",\" + (p instanceof Serializable)); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, "true,true,true,true\ntrue,false,true,false,false\n");
+}
+
+#[test]
+fn instanceof_answers_arrays_and_throwables() {
+    // An array is `Cloneable` and `Serializable` and no kind of collection,
+    // whatever its element type. A throwable reaches `Serializable` through
+    // `Throwable`, one edge above where the prelude's declarations stop.
+    let (out, ok) = run(
+        "import java.util.*;\
+         import java.io.*;\
+         public class T { public static void main(String[] a) {\
+         Object ia = new int[]{1, 2}, sa = new String[]{\"x\"};\
+         System.out.println((ia instanceof Object) + \",\" + (ia instanceof Cloneable) + \",\" + (ia instanceof Serializable) + \",\" + (ia instanceof List) + \",\" + (ia instanceof String));\
+         System.out.println((sa instanceof Cloneable) + \",\" + (sa instanceof Collection));\
+         Object e = new IllegalArgumentException(\"e\");\
+         System.out.println((e instanceof IllegalArgumentException) + \",\" + (e instanceof RuntimeException) + \",\" + (e instanceof Exception) + \",\" + (e instanceof Throwable) + \",\" + (e instanceof Serializable) + \",\" + (e instanceof Error)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,true,true,false,false\ntrue,false\ntrue,true,true,true,true,false\n"
+    );
+}
+
+#[test]
+fn instanceof_null_is_false_for_every_type_including_object() {
+    let (out, ok) = run(&wrap(
+        "Object n = null; String s = null;\
+         System.out.println((n instanceof Object) + \",\" + (n instanceof String) + \",\" + (s instanceof Object) + \",\" + (s instanceof CharSequence));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "false,false,false,false\n");
+}
+
+#[test]
+fn catch_matching_still_walks_the_same_graph_as_instanceof() {
+    // `catch` and the `instanceof` expression share one builtin, so widening
+    // the type test must not let a handler claim something it should not. A
+    // `RuntimeException` arm takes an `IllegalArgumentException` and leaves an
+    // `Error` alone.
+    let (out, ok) = run(&wrap(
+        "try { throw new IllegalArgumentException(\"x\"); }\
+         catch (IllegalStateException e) { System.out.println(\"ise\"); }\
+         catch (RuntimeException e) { System.out.println(\"rte\"); }\
+         try { throw new ArithmeticException(\"y\"); }\
+         catch (NumberFormatException e) { System.out.println(\"nfe\"); }\
+         catch (Exception e) { System.out.println(\"exc \" + e.getMessage()); }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "rte\nexc y\n");
+}
+
+#[test]
+fn a_reference_cast_still_walks_the_shared_supertype_graph() {
+    // `cast_allowed` now reads the same graph `instanceof` does instead of
+    // keeping its own copy of the wrapper supertypes, so the casts that
+    // succeeded and the messages that failed must be unchanged.
+    let (out, ok) = run(&wrap(
+        "Object i = 42, s = \"hi\";\
+         System.out.println((Number) i);\
+         System.out.println((Comparable) i);\
+         System.out.println((CharSequence) s);\
+         try { System.out.println((String) i); } catch (ClassCastException e) { System.out.println(e.getMessage()); }\
+         try { System.out.println((Integer) s); } catch (ClassCastException e) { System.out.println(e.getMessage()); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "42\n42\nhi\n\
+         class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')\n\
+         class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\n"
+    );
+}

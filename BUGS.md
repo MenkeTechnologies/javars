@@ -286,6 +286,26 @@ at the bottom, and are summarized in the section right after this one.
   the member, `super.toString`/`equals`/`hashCode` answer `java.lang.Object`'s.
   `super` outside an instance method, and a member no superclass has, are
   compile errors — `javac` rejects both too.
+- **`instanceof` over every shape the value model names.** The runtime type test
+  answers a boxed primitive (`Integer`/`Double`/`Boolean` plus `Number`,
+  `Comparable`, `Serializable`), a `String` (plus `CharSequence`), an array
+  (`Cloneable`, `Serializable`), each modeled collection against both its
+  concrete kind and the `java.util` interfaces above it — including the two
+  pairs a name match gets wrong, `LinkedHashMap extends HashMap` and
+  `LinkedHashSet extends HashSet` where the tree kinds do not — the three list
+  views (`List.of`, `Arrays.asList`, `subList`) that are `List`s but not
+  `ArrayList`s and disagree with each other on `AbstractList` and
+  `Serializable`, a user class or interface over its declared graph, and the two
+  supertypes `javac` supplies implicitly so the source never mentions them: an
+  `enum` is a `java.lang.Enum` (hence `Comparable`) and a `record` a
+  `java.lang.Record`. Every non-null reference is an `Object`, and `null` is an
+  instance of nothing, including `Object`.
+
+  The JDK half of that graph is a table of *direct* supertypes (`jdk_supers`),
+  walked by the same routine that walks the program's own declarations, and the
+  reference cast reads it too rather than keeping a second copy of the wrapper
+  supertypes. `catch` matching shares the builtin, so a handler claims exactly
+  what an `instanceof` of the same type would.
 - **Inheritance.** `extends`, `super(…)` constructor chaining, inherited fields
   and methods, method overriding, and `instanceof` (respecting the subclass
   chain). `toString()` overrides are honoured by `System.out.println(obj)`, by
@@ -711,6 +731,38 @@ known.
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
+- **What `instanceof` still cannot decide is what the value model does not
+  record.** The type test is exact for every shape javars names (see the
+  `instanceof` entry under "Implemented"); four answers are left, and each is a
+  *representation* the model shares rather than a missing branch:
+  * **A lambda answers `Object` and nothing else.** The closure carries its body
+    and its captures, not the functional interface it was assigned to, so
+    `((Object) aCalc) instanceof Calc` is `false` where Java says `true`.
+    Recording the interface means threading the assignment's target type into
+    closure creation, which is a change to how lambdas are lowered rather than
+    to the type test.
+  * **`Long`/`Short`/`Byte`/`Float`/`Character` cannot be separated from the
+    wrapper that shares their representation.** `int` and `long` are one
+    `Value::Int` and `double` and `float` one `Value::Float`, so `instanceof`
+    answers the common member: `42 instanceof Long` is `false` (Java agrees) but
+    so is `42L instanceof Long` (Java says `true`). This is the same erasure the
+    reference cast documents just below, decided the other way — a cast cannot
+    prove itself wrong and allows the sibling, while a type test has to answer a
+    boolean and answers for the member programs actually write.
+  * **`new LinkedList<>()` is modeled as the mutable list an `ArrayList` is**, so
+    it answers `instanceof ArrayList` `true` where Java says `false`. Every
+    interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
+    — is exact.
+  * **`Set.of(…)` is modeled as a hash-ordered `Set`**, indistinguishable from
+    `new HashSet<>()`, so it answers `instanceof HashSet` `true` where Java's
+    `ImmutableCollections.SetN` says `false`. `Set`/`Collection`/`Iterable` are
+    exact. (`Map.of` is not modeled at all — see "Not implemented".)
+
+  Two further limits are about reach rather than about the answer: pattern
+  binding (`x instanceof Point p`) does not parse, the right-hand side being a
+  bare type name; and the *reference cast* still declines to name a value whose
+  class it erases, so `(String) aList` passes where Java throws — `instanceof`
+  now names those values, the cast path deliberately still does not.
 - **A boxed `Character` is a one-character String.** The `char` *type* is a real
   16-bit integral value (see the "`char` arithmetic" entry under "Implemented"),
   but javars boxes no primitive, so a `char` entering an erased position — a

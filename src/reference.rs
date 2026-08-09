@@ -320,7 +320,7 @@ pub const REFERENCE: &[Entry] = &[
         "instanceof",
         "Contextual Keywords",
         "expr instanceof Type",
-        "Runtime type test through the `JINSTANCEOF` builtin. True when the value is a non-null instance whose class is `Type` or any transitive subclass or implemented interface; `null` is never an instance. A `String` value satisfies `String`, `CharSequence`, and `Object`. Pattern binding (`x instanceof Point p`) is not implemented.",
+        "Runtime type test through the `JINSTANCEOF` builtin, over every shape the value model names: a user class or interface walks the declared supertype graph, a boxed primitive answers its wrapper plus `Number`/`Comparable`/`Serializable`, a collection answers its concrete kind and the `java.util` interfaces above it, an array is `Cloneable` and `Serializable`, an `enum` is an `Enum` and a `record` a `Record`. Every non-null reference is an `Object`; `null` is an instance of nothing, including `Object`. A lambda answers only `Object` (the closure does not record its functional interface), and pattern binding (`x instanceof Point p`) is not implemented.",
         "if (shape instanceof Sq) { System.out.println(\"square\"); }",
     ),
     (

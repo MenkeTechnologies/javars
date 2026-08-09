@@ -38,6 +38,38 @@ pub fn parse(src: &str) -> Result<ast::Program, String> {
     Ok(prog)
 }
 
+/// The type → direct-supertypes map (superclass + interfaces) that drives
+/// runtime `instanceof`, `catch` matching, checked casts, and default
+/// `toString`.
+///
+/// Every entry point that runs a program builds this — the normal run and the
+/// DAP debugger — so it lives here rather than being spelled out at each, which
+/// is how the debugger came to walk a *different* graph from the interpreter.
+///
+/// Beyond what the source declares, this supplies the two supertypes `javac`
+/// gives a declaration implicitly and the text therefore never mentions:
+/// an `enum` extends `java.lang.Enum` (and so is `Comparable`), and a `record`
+/// extends `java.lang.Record`. `java.lang.Object` is deliberately NOT an edge
+/// here: every non-null reference is an `Object` whether or not its class is
+/// declared in this program, so that is answered once at the type test rather
+/// than by rooting the graph.
+pub(crate) fn supertype_map(prog: &ast::Program) -> std::collections::HashMap<String, Vec<String>> {
+    prog.classes
+        .iter()
+        .map(|c| {
+            let mut sups: Vec<String> = c.superclass.clone().into_iter().collect();
+            sups.extend(c.interfaces.iter().cloned());
+            if c.is_enum {
+                sups.push("Enum".to_string());
+            }
+            if c.is_record {
+                sups.push("Record".to_string());
+            }
+            (c.name.clone(), sups)
+        })
+        .collect()
+}
+
 /// Parse and lower Java `src` to a runnable fusevm chunk.
 pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
     let prog = parse(src)?;
@@ -93,17 +125,7 @@ pub fn run_str(src: &str) -> Result<Value, String> {
 /// parameter.
 pub fn run_str_args(src: &str, argv: &[String]) -> Result<Value, String> {
     let prog = parse(src)?;
-    // The type → direct-supertypes map (superclass + interfaces) drives runtime
-    // `instanceof`/`toString`.
-    let supers = prog
-        .classes
-        .iter()
-        .map(|c| {
-            let mut sups: Vec<String> = c.superclass.clone().into_iter().collect();
-            sups.extend(c.interfaces.iter().cloned());
-            (c.name.clone(), sups)
-        })
-        .collect();
+    let supers = supertype_map(&prog);
     let chunk = compiler::compile(&prog)?;
     run_chunk(chunk, supers, prog.uses_exceptions, argv)
 }

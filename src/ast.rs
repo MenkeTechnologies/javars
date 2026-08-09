@@ -88,6 +88,12 @@ pub struct Class {
     /// True when this declaration is an `enum`. Distinct from a non-empty
     /// [`Class::enum_constants`] because `enum Empty { }` is legal Java.
     pub is_enum: bool,
+    /// True when this declaration is a `record`. The parser lowers a record to
+    /// an ordinary class (fields, canonical constructor, accessors), so this is
+    /// the only thing left that says it was one — and `r instanceof Record` is
+    /// the observable that needs it, since Java makes every record a subclass of
+    /// `java.lang.Record`.
+    pub is_record: bool,
     /// The constants of an `enum`, in declaration order — the index is the
     /// value of `ordinal()`. Empty for a `class`/`interface`. An enum is
     /// otherwise an ordinary class: the parser gives it the `#name`/`#ordinal`
