@@ -9,10 +9,14 @@
 //!    (`true`→`1`, `3.0`→`3`). `System.out.print[ln]` instead lowers to a
 //!    registered builtin ([`JPRINTLN`]/[`JPRINT`]) that formats through
 //!    [`java_str`] — `true`/`false`, `3.0`, `null` — matching `java`.
-//! 2. **`+` overloading.** Java's `+` is string concatenation when either
-//!    operand is a `String`. fusevm runs *strict* once a numeric hook is
-//!    installed, delegating any operation with a non-numeric operand to
-//!    [`numeric_hook`], where `+` concatenates via the same [`java_str`].
+//! 2. **`+` overloading, and the arithmetic fusevm declines to answer.** Java's
+//!    `+` is string concatenation when either operand is a `String`. fusevm runs
+//!    *strict* once a numeric hook is installed, delegating to [`numeric_hook`]
+//!    both any operation with a non-numeric operand — where `+` concatenates via
+//!    the same [`java_str`] — and the numeric pairs it cannot answer exactly: an
+//!    `i64` overflow, and a mixed `Int`/`Float` pair whose integer is past 2^53.
+//!    The numeric pairs get Java's `long` wrapping and binary numeric promotion,
+//!    never a concatenation; see [`java_numeric`].
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::RefCell;
@@ -4233,28 +4237,124 @@ fn format_ieee(f: f64, plain: String, sci: String) -> String {
     format!("{mantissa}E{exp}")
 }
 
-/// Strict numeric hook: fusevm calls this only for an operation with a
-/// non-numeric operand. In slice 1 that is Java's `String` `+` overload plus
-/// value comparisons against strings; all-numeric arithmetic never reaches here
-/// (it stays on the native fast path and the JIT).
-pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
-    // Two integers only reach the hook when the operation overflowed `i64`.
-    // Java's `long` arithmetic is two's-complement and wraps silently, so
-    // `Long.MAX_VALUE + 1` is `Long.MIN_VALUE` — not a promotion to a wider
-    // representation.
+/// Whether `v` is one of Java's primitive numeric shapes on the fusevm value
+/// model: `byte`/`short`/`char`/`int`/`long` ride [`Value::Int`], `float` and
+/// `double` ride [`Value::Float`]. A `boolean`, a `String`, and every reference
+/// type answer `false`.
+///
+/// [`numeric_hook`] gates its arithmetic on this predicate rather than on an
+/// arm being written above the `String` ones. Java's `+` is overloaded, so a
+/// catch-all concatenating arm will answer an *arithmetic* pair the moment a
+/// numeric case is missing from the arms before it — and it answers with a
+/// number-shaped `String` rather than an error, which is why the failure is
+/// silent. Requiring both operands to be numbers up front makes the two paths
+/// disjoint by construction instead of by ordering.
+fn is_java_number(v: &Value) -> bool {
+    matches!(v, Value::Int(_) | Value::Float(_))
+}
+
+/// One binary operation on two Java primitive numbers — the pairs fusevm hands
+/// back rather than answering natively.
+///
+/// **Two `Value::Int`s are Java `long`s:** two's-complement and silently
+/// wrapping, never a promotion to a wider representation. fusevm delegates such
+/// a pair when the native operation overflows `i64` (`Long.MAX_VALUE + 1` is
+/// `Long.MIN_VALUE`) or when `checked_rem` overflows, which is the single pair
+/// `Long.MIN_VALUE % -1L` — Java answers `0`.
+///
+/// **A mixed `Int`/`Float` pair is Java's binary numeric promotion** (JLS
+/// 5.6.2: if either operand is of type `double`, the other is converted to
+/// `double`). fusevm delegates such a pair once the integer is past 2^53,
+/// because converting it *rounds* and only the host knows whether the rounding
+/// is a defect. **For Java it is not a defect: the language mandates the
+/// conversion, so the rounded `double` is the correct answer and is returned
+/// here deliberately.** Measured against `java` 26.0.2 with
+/// `L = 3^34 = 16677181699666569L` and `R = 1.6677181699666568E16` (its
+/// `double` image, a neighbouring value): `L == R` is `true` and `L + 2.0` is
+/// `1.667718169966657E16`. The same pair in Ruby answers `false` — that
+/// divergence is precisely why the decision belongs to the frontend and not to
+/// the VM.
+///
+/// A zero divisor is Java's `ArithmeticException`; fusevm answers integral
+/// `%` by zero natively so it does not currently arrive here, but the hook is
+/// public and must not depend on that.
+fn java_numeric(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     if let (Value::Int(x), Value::Int(y)) = (a, b) {
-        let wrapped = match op {
-            NumOp::Add => Some(x.wrapping_add(*y)),
-            NumOp::Sub => Some(x.wrapping_sub(*y)),
-            NumOp::Mul => Some(x.wrapping_mul(*y)),
-            _ => None,
+        let (x, y) = (*x, *y);
+        return match op {
+            NumOp::Add => Ok(Value::Int(x.wrapping_add(y))),
+            NumOp::Sub => Ok(Value::Int(x.wrapping_sub(y))),
+            NumOp::Mul => Ok(Value::Int(x.wrapping_mul(y))),
+            NumOp::Div | NumOp::Mod if y == 0 => {
+                Err("java.lang.ArithmeticException: / by zero".to_string())
+            }
+            // Both truncate toward zero, and both wrap on the one overflowing
+            // pair: `Long.MIN_VALUE / -1L` is `Long.MIN_VALUE`, `% -1L` is `0`.
+            NumOp::Div => Ok(Value::Int(x.wrapping_div(y))),
+            NumOp::Mod => Ok(Value::Int(x.wrapping_rem(y))),
+            NumOp::Eq => Ok(Value::bool(x == y)),
+            NumOp::Ne => Ok(Value::bool(x != y)),
+            NumOp::Lt => Ok(Value::bool(x < y)),
+            NumOp::Gt => Ok(Value::bool(x > y)),
+            NumOp::Le => Ok(Value::bool(x <= y)),
+            NumOp::Ge => Ok(Value::bool(x >= y)),
+            NumOp::Neg => Ok(Value::Int(x.wrapping_neg())),
+            NumOp::Pow => Err(NO_POW.to_string()),
         };
-        if let Some(v) = wrapped {
-            return Ok(Value::Int(v));
-        }
     }
-    if let (NumOp::Neg, Value::Int(x)) = (op, a) {
-        return Ok(Value::Int(x.wrapping_neg()));
+    // Promoted to `double`. Rust's `f64` operators are IEEE-754 with the same
+    // NaN and infinity rules Java specifies, and its `%` is the truncated
+    // remainder that takes the dividend's sign, like Java's — `7L % -2.5` is
+    // `2.0` in both.
+    let (x, y) = (as_f64(a), as_f64(b));
+    match op {
+        NumOp::Add => Ok(Value::float(x + y)),
+        NumOp::Sub => Ok(Value::float(x - y)),
+        NumOp::Mul => Ok(Value::float(x * y)),
+        NumOp::Div => Ok(Value::float(x / y)),
+        NumOp::Mod => Ok(Value::float(x % y)),
+        NumOp::Eq => Ok(Value::bool(x == y)),
+        NumOp::Ne => Ok(Value::bool(x != y)),
+        NumOp::Lt => Ok(Value::bool(x < y)),
+        NumOp::Gt => Ok(Value::bool(x > y)),
+        NumOp::Le => Ok(Value::bool(x <= y)),
+        NumOp::Ge => Ok(Value::bool(x >= y)),
+        NumOp::Neg => Ok(Value::float(-x)),
+        NumOp::Pow => Err(NO_POW.to_string()),
+    }
+}
+
+/// Java has no exponentiation operator, so [`NumOp::Pow`] is never emitted;
+/// `Math.pow` is a builtin call instead.
+const NO_POW: &str = "javars: Java has no `**` operator";
+
+/// Strict numeric hook: fusevm delegates here whenever it cannot answer an
+/// operation itself under the strict policy. Three cases arrive:
+///
+/// 1. **A non-numeric operand** — Java's `String` `+` overload, and value
+///    comparisons against a string. This is the case slice 1 was written for.
+/// 2. **An all-integer operation fusevm could not complete in `i64`** — an
+///    overflowing `Add`/`Sub`/`Mul`/`Neg`, or `Long.MIN_VALUE % -1L`.
+/// 3. **A mixed `Int`/`Float` pair whose integer is past 2^53** — converting it
+///    to `f64` would round, so fusevm hands over the operands instead of an
+///    answer computed on a neighbouring value.
+///
+/// Case 3 is newer than this hook. The comment that stood here asserted that
+/// "all-numeric arithmetic never reaches here (it stays on the native fast path
+/// and the JIT)"; that was true when written and fusevm's strict-exactness fix
+/// falsified it. Under the old text every mixed pair fell through to the
+/// `String` arms below — `Add` returned a concatenation, the comparisons
+/// answered by lexicographic string order, and the rest returned a type error.
+/// [`java_numeric`] now answers all three cases and is reached on operand
+/// shape, so no numeric pair can fall into a `String` arm again.
+pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    // `Neg` is unary — fusevm passes `Undef` as the second operand, so it can
+    // never satisfy the two-number gate below and is answered first.
+    if op == NumOp::Neg && is_java_number(a) {
+        return java_numeric(op, a, &Value::Int(0));
+    }
+    if is_java_number(a) && is_java_number(b) {
+        return java_numeric(op, a, b);
     }
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
