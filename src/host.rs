@@ -1976,7 +1976,7 @@ fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Valu
             let mid = (lo + width).min(n);
             let hi = (lo + 2 * width).min(n);
             let (mut i, mut j) = (lo, mid);
-            for slot in lo..hi {
+            for slot in &mut buf[lo..hi] {
                 // Take from the left run unless the right one compares strictly
                 // smaller — the tie going left is what makes the merge stable.
                 let take_left = if i >= mid {
@@ -1987,10 +1987,10 @@ fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Valu
                     invoke_closure(vm, cmp, &[items[j].clone(), items[i].clone()]).to_int() >= 0
                 };
                 if take_left {
-                    buf[slot] = items[i].clone();
+                    *slot = items[i].clone();
                     i += 1;
                 } else {
-                    buf[slot] = items[j].clone();
+                    *slot = items[j].clone();
                     j += 1;
                 }
             }
