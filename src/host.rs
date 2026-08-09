@@ -1568,12 +1568,26 @@ fn list_method(
             std::mem::replace(&mut items[i], args[1].clone())
         }
         // `List.remove(int)` removes by index — the overload Java picks for an
-        // integral argument. There is no `remove(Object)` here, because javars
-        // cannot tell a boxed `Integer` from an `int`.
+        // integral argument. The `remove(Object)` overload arrives under the
+        // distinct name `removeObject`, chosen by the compiler from the
+        // argument's static type (the same question Java answers statically),
+        // because a boxed `Integer` and an `int` are one value here.
         ("remove", 1) => {
             structural()?;
             let i = bounds(args[0].to_int(), items.len())?;
             items.remove(i)
+        }
+        // `List.remove(Object)` — removes the first element equal to the
+        // argument and answers whether one was found.
+        ("removeObject", 1) => {
+            structural()?;
+            match items.iter().position(|x| value_eq(x, &args[0])) {
+                Some(i) => {
+                    items.remove(i);
+                    Value::bool(true)
+                }
+                None => Value::bool(false),
+            }
         }
         ("clear", 0) => {
             structural()?;
@@ -2382,10 +2396,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             java_format(&fmt, &args[1..])
         }
 
-        // `String.join(sep, a, b, …)` and `String.join(sep, array)`.
+        // `String.join(sep, a, b, …)`, `String.join(sep, array)`, and
+        // `String.join(sep, iterable)` — Java's second overload takes an
+        // `Iterable<CharSequence>`, so a `List`/`Set` argument joins its
+        // *elements*. Matching only arrays here rendered the collection's own
+        // `toString` as one part (`String.join("-", List.of("a","b"))` gave
+        // `[a, b]` instead of `a-b`).
         ("String", "join", n) if n >= 2 => {
             let sep = args[0].as_str_cow().into_owned();
-            let parts: Vec<String> = match (array_items(&args[1]), n) {
+            let parts: Vec<String> = match (sequence_items(&args[1]), n) {
                 (Some(items), 2) => items.iter().map(java_str).collect(),
                 _ => args[1..].iter().map(java_str).collect(),
             };

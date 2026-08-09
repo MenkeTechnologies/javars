@@ -262,6 +262,25 @@ at the bottom, and are summarized in the section right after this one.
   widening < reference upcast; ambiguity is an error). Applies to `static`
   methods, instance methods (with virtual dispatch keyed on the statically-chosen
   signature), and constructors.
+- **`static` methods resolve against the class they are called on.** A qualified
+  `C.m(args)` is looked up in `C`'s own declarations first and then up its
+  superclass chain, so a subclass's `static` *hides* the one it inherits
+  (`Derived.kind()` and `Base.kind()` are different methods) and a same-named
+  `static` on an *unrelated* class is never reachable. An unqualified `m(args)`
+  prefers the enclosing class's chain and falls back to the program-wide pool,
+  which is what lets a nested class call a sibling's helper. Subroutine names
+  carry the declaring class too, so two classes may declare the same signature
+  without colliding.
+- **`List.remove` picks its overload from the argument's static type**, the way
+  Java does: an `int`/`short`/`byte`/`char` argument is an *index*
+  (`l.remove(1)` drops the second element), and any reference argument — a
+  boxed `Integer`, an explicit `Integer.valueOf(x)`, a `String` — is a *value*,
+  removing the first element equal to it and answering whether one was found.
+  An argument javars cannot type statically keeps the by-index reading.
+- **`String.join(sep, iterable)`.** Java's second `join` overload takes an
+  `Iterable<CharSequence>`, so a `List` or `Set` argument joins its *elements*
+  (`String.join("-", List.of("a", "b"))` is `a-b`); the varargs and array forms
+  are the same method.
 - **Generics (type-erased).** `class Box<T>`, `class Pair<K, V>`, `<T> T id(T x)`,
   bounded `<T extends Number>` / `<T extends Comparable<T>>`, the diamond
   `new Box<>()`, and library type arguments (`List<String>`, `Map<K, V>`) all
@@ -503,6 +522,24 @@ known.
   Java but not in the engine), and a named error beats a silently different
   answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
   four `String` methods are the whole surface.
+- **Varargs in a user-declared method.** `static int sum(int... xs)` *parses* —
+  the parameter becomes an ordinary `int[]` — but the three dots carry no
+  further meaning, so the method has a fixed arity of one and only a call
+  passing an actual array matches it. `sum()`, `sum(1)` and `sum(1, 2, 3)` are
+  all "no `sum` overload matches N argument(s)" compile errors. Closing it is
+  not a library addition: Java resolves a variable-arity call in a third phase
+  that only runs after both fixed-arity phases fail, and the packing of the
+  trailing arguments into an array has to happen at every call site — for
+  `static` methods, instance methods, and constructors alike. A partial version
+  (statics only) would make the same declaration callable or not depending on
+  where it sits, which is worse than one honest error. `main(String... args)` is
+  unaffected: it is the entry point and takes the real argument array.
+- **`List.subList(from, to)`**, and the other view methods (`Map.entrySet`,
+  `List.listIterator`). A view aliases its backing collection in Java —
+  mutating one shows through the other — and javars's collections are heap
+  objects with no aliasing model, so a copy would answer correctly right up
+  until someone wrote through it. An unsupported-method error is the honest
+  answer until views exist.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded

@@ -19,9 +19,12 @@ pub struct Program {
     /// one. Bound to the real program arguments by the compiler's prologue;
     /// `None` for the (legal) `main()` that declares no parameter.
     pub main_param: Option<String>,
-    /// User-defined `static` methods declared in any class (a flat pool — javars
-    /// resolves a bare `name(...)` call to one of these by name). `main` is
-    /// excluded (it is the entry [`Program::main`]).
+    /// User-defined `static` methods declared in any class, in one pool keyed by
+    /// name. Each entry carries its declaring class in [`Method::owner`], which
+    /// is what a *qualified* `C.m(...)` call resolves against (`C`'s own
+    /// declarations, then its superclass chain); an *unqualified* `m(...)`
+    /// prefers the enclosing class's chain and falls back to the whole pool.
+    /// `main` is excluded (it is the entry [`Program::main`]).
     pub methods: Vec<Method>,
     /// Every user-defined class in the compilation unit (top-level siblings and
     /// nested `static` classes, flattened into one namespace). The entry class
@@ -154,10 +157,11 @@ pub struct Ctor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Method {
     pub name: String,
-    /// The class that declares this method. For a `static` method it is the
+    /// The class that declares this method. For a `static` method it is both the
     /// class whose `static` fields an unqualified name inside the body resolves
-    /// against (javars hoists statics into one flat pool, so the owner has to
-    /// travel with the method).
+    /// against, and the scope a qualified `C.m(...)` call must match — statics
+    /// share one by-name pool, so the owner has to travel with the method or two
+    /// classes spelling the same method name become indistinguishable.
     pub owner: String,
     /// Formal parameters in declaration order (bound to slots `0..n`).
     pub params: Vec<Param>,

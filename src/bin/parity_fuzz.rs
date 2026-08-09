@@ -29,6 +29,23 @@
 //! (`object`). Pure random bytes only produce
 //! mutual parse errors that agree on both sides and teach nothing.
 //!
+//! Four modes exist specifically because a *shape* the rest of the generator
+//! could not emit hid a wrong answer behind an otherwise clean sweep:
+//!   * `staticref` — a **qualified** `C.m(…)` where a second, unrelated class
+//!     also declares `m`. With one static name per program, a resolver that
+//!     ignores the receiver is indistinguishable from a correct one; with two,
+//!     it runs the wrong body.
+//!   * `loopkind` — `continue`/`break` in a `while` and a `do`/`while`, labelled
+//!     and unlabelled, nested, through a `switch`, and through a `finally`.
+//!     `continue` lowers differently in each of Java's three loops; the older
+//!     probes emitted only the `for` one.
+//!   * `narrow` — `byte` and `short`, the two integral widths no probe declared,
+//!     and the implicit narrowing cast Java inserts into their compound
+//!     assignments.
+//!   * `listop` — the methods whose *meaning* depends on an argument's static
+//!     type, above all `List.remove`, which is an index for an `int` and a value
+//!     for an `Integer`. A mode that only *builds* collections cannot see it.
+//!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
@@ -1230,6 +1247,202 @@ fn g_object(r: &mut Rng) -> String {
 
 /// Helper declarations the `finally`/`resource` probes call. Emitted into every
 /// generated program (they are inert when unused).
+/// A **qualified** static call, `C.m(args)`, where more than one class in the
+/// program declares `m`.
+///
+/// Java resolves a qualified static in the receiver class's own declarations
+/// first and then up its superclass chain; it never reaches an unrelated class.
+/// The pre-existing modes could not observe that rule, because every probe they
+/// emitted lived in a program whose static names were unique — with one name per
+/// method a by-name-only resolver is indistinguishable from a correct one. These
+/// probes put a same-named static in a *second* class and then ask which body
+/// ran, which is the only shape that separates the two.
+fn g_staticref(r: &mut Rng) -> String {
+    let n = pick(r, &["0", "1", "2", "7", "-3"]);
+    let s = pick(r, &["\"x\"", "\"\"", "\"ab\""]);
+    match r.below(10) {
+        // Same name, same signature, different class: the receiver alone decides.
+        0 => p(format!("Qa.f({n})")),
+        1 => p(format!("Qb.f({n})")),
+        2 => p(format!("Qa.f({n}) + \",\" + Qb.f({n})")),
+        // Same name, *different* parameter types: a resolver that scores
+        // signatures across the whole program picks the closer one and crosses
+        // classes; Java scores only inside the named class.
+        3 => p(format!("Qa.g({s})")),
+        4 => p(format!("Qb.g({s})")),
+        5 => p(format!("Qa.g({s}) + Qb.g({s})")),
+        // Zero-arg statics whose signatures are identical in every way but owner.
+        6 => p("Qa.h() + Qb.h()".to_string()),
+        // A subclass hides an inherited static; the name it does not redeclare
+        // still resolves up the chain.
+        7 => p("Qbase.kind() + \"/\" + Qderiv.kind()".to_string()),
+        8 => p("Qderiv.only() + Qbase.only()".to_string()),
+        // The chosen body's result feeding an expression, so a wrong target is
+        // visible as a wrong number rather than only as a wrong label.
+        _ => format!(
+            "{{ int q = Qb.f({n}) * 2 + Qa.f({n}); System.out.println(q + Qbase.kind()); }}"
+        ),
+    }
+}
+
+/// `while` and `do`/`while` with `continue` and `break`.
+///
+/// `continue` lowers differently in each of Java's three loops — a `for` runs its
+/// update clause first, a `while` jumps straight back to the condition, and a
+/// `do`/`while` jumps *forward* to the trailing condition — so they are three
+/// separate code paths in the compiler. Every loop probe that existed emitted a
+/// `for` (the sole `while` was a `while (true)` with a `break`), which left two
+/// of the three lowerings and the whole `do`/`while` statement ungenerated. A
+/// sibling frontend shipped a `continue` that compiled to a jump-to-zero — an
+/// infinite loop — under exactly this blind spot.
+fn g_loopkind(r: &mut Rng) -> String {
+    let n = 3 + r.below(4);
+    let skip = r.below(3);
+    match r.below(12) {
+        // `continue` in a `while`: the condition is re-tested, nothing is stepped.
+        0 => format!(
+            "{{ int i = 0, acc = 0; while (i < {n}) {{ i++; if (i == {skip}) continue; acc += i; }} System.out.println(acc); }}"
+        ),
+        // `continue` in a `do`/`while`: jumps to the *trailing* condition.
+        1 => format!(
+            "{{ int i = 0, acc = 0; do {{ i++; if (i == {skip}) continue; acc += i; }} while (i < {n}); System.out.println(acc); }}"
+        ),
+        // `break` out of a `do`/`while`.
+        2 => format!(
+            "{{ int i = 0, acc = 0; do {{ i++; if (i == {skip}) break; acc += i; }} while (i < {n}); System.out.println(acc); }}"
+        ),
+        // The body of a `do`/`while` always runs once, however false the test.
+        3 => "{ int k = 0; do { k++; } while (false); System.out.println(k); }".to_string(),
+        // A labelled `continue` stepping an outer `while` from an inner one.
+        4 => format!(
+            "{{ int i = 0; String o = \"\"; L: while (i < {n}) {{ i++; int j = 0; while (j < 3) {{ j++; if (j == 2) continue L; o += i + \"\" + j + \" \"; }} }} System.out.println(o); }}"
+        ),
+        // A labelled `continue` on a `do`/`while`.
+        5 => format!(
+            "{{ int i = 0; String o = \"\"; D: do {{ i++; if (i % 2 == 0) continue D; o += i; }} while (i < {n}); System.out.println(o); }}"
+        ),
+        // A labelled `break` out of a `do`/`while` nest.
+        6 => format!(
+            "{{ int t = 0; U: do {{ int j = 0; while (j < {n}) {{ j++; if (j == 2) break U; t += j; }} }} while (t < 100); System.out.println(t); }}"
+        ),
+        // `continue` inside a `switch` inside a loop — the `switch` owns `break`
+        // but not `continue`, so the jump has to pass through it.
+        7 => format!(
+            "{{ int acc = 0; for (int i = 0; i < {n}; i++) {{ switch (i) {{ case 1: continue; case 2: acc += 100; break; default: acc += i; }} }} System.out.println(acc); }}"
+        ),
+        8 => format!(
+            "{{ int i = 0, acc = 0; while (i < {n}) {{ i++; switch (i) {{ case 2: continue; default: acc += i; }} }} System.out.println(acc); }}"
+        ),
+        // `continue` in a `while` whose body carries a `finally` — the cleanup
+        // has to run on the way out of the iteration.
+        9 => format!(
+            "{{ int i = 0, acc = 0; while (i < {n}) {{ i++; try {{ if (i == {skip}) continue; acc += i; }} finally {{ System.out.print(\"f\" + i); }} }} System.out.println(\" \" + acc); }}"
+        ),
+        10 => format!(
+            "{{ int i = 0, acc = 0; do {{ i++; try {{ if (i == {skip}) continue; acc += i; }} finally {{ System.out.print(\"g\" + i); }} }} while (i < {n}); System.out.println(\" \" + acc); }}"
+        ),
+        // Two unlabelled `continue`s nested two deep: each steps its own loop.
+        _ => format!(
+            "{{ String o = \"\"; int i = 0; while (i < {n}) {{ i++; if (i == 1) continue; int j = 0; while (j < 3) {{ j++; if (j == 2) continue; o += i + \"\" + j; }} }} System.out.println(o); }}"
+        ),
+    }
+}
+
+/// `byte` and `short` — the two integral widths narrower than `int`.
+///
+/// Every fusevm number is a 64-bit value with no width tag, so each of Java's
+/// widths is a per-site narrowing the compiler has to emit. The `overflow` mode
+/// covers `int` and the `char` mode covers the unsigned 16-bit one, but no probe
+/// declared a `byte` or a `short` at all — and their signed 8/16-bit wraps are
+/// separate emit sites. Compound assignment is the sharp edge: Java inserts an
+/// *implicit* narrowing cast into `b += 100`, so it wraps where the equivalent
+/// `b = b + 100` would not even compile.
+fn g_narrow(r: &mut Rng) -> String {
+    let k = pick(r, &["1", "2", "100", "127", "-128", "1000", "10000"]);
+    match r.below(11) {
+        // Compound assignment carries an implicit narrowing cast.
+        0 => format!("{{ byte b = 100; b += {k}; System.out.println(b); }}"),
+        1 => format!("{{ short s = 30000; s += {k}; System.out.println(s); }}"),
+        2 => format!("{{ byte b = 100; b *= {k}; System.out.println(b); }}"),
+        3 => format!("{{ short s = 1000; s *= {k}; System.out.println(s); }}"),
+        // `++`/`--` at the width's boundary.
+        4 => "{ byte b = 127; b++; System.out.println(b); }".to_string(),
+        5 => "{ short s = 32767; s++; System.out.println(s); }".to_string(),
+        6 => "{ byte b = -128; b--; System.out.println(b); }".to_string(),
+        // An explicit cast past the width.
+        7 => format!("System.out.println((byte) ({k} * 3) + \",\" + (short) ({k} * 700));"),
+        // A `byte` promotes to `int` in arithmetic, so the *expression* does not
+        // wrap even though the variable would.
+        8 => format!("{{ byte b = 100; int w = b * 3 + {k}; System.out.println(w); }}"),
+        // The sign-extension idiom, and the shifts a signed narrow type feeds.
+        9 => "{ byte b = -1; System.out.println((b & 0xFF) + \",\" + (b >> 1) + \",\" + (b >>> 24)); }"
+            .to_string(),
+        // An array element is a storage site of the same width.
+        _ => format!(
+            "{{ byte[] ba = {{100}}; short[] sa = {{30000}}; ba[0] += {k}; sa[0] += {k}; System.out.println(ba[0] + \",\" + sa[0]); }}"
+        ),
+    }
+}
+
+/// Operations *on* a constructed collection, rather than its construction.
+///
+/// The `collection` mode builds lists and maps and prints them; what it does not
+/// do is apply the methods whose meaning depends on the argument's static type.
+/// `List` declares both `remove(int)` and `remove(Object)` and Java chooses
+/// between them at compile time, so the same call text removes an *index* or a
+/// *value* depending on how the argument was declared — a difference no
+/// construction probe can see. Every probe here has a deterministic order
+/// (`ArrayList`, `TreeMap`, `TreeSet`), never a `HashMap` iteration.
+fn g_listop(r: &mut Rng) -> String {
+    let i = r.below(3);
+    let v = pick(r, &["10", "20", "30", "99"]);
+    let s = pick(r, &["\"a\"", "\"b\"", "\"z\""]);
+    match r.below(12) {
+        // `remove(int)` — an `int`-typed argument is an index.
+        0 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(10, 20, 30)); l.remove({i}); System.out.println(l); }}"
+        ),
+        1 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(10, 20, 30)); int ix = {i}; l.remove(ix); System.out.println(l); }}"
+        ),
+        // `remove(Object)` — a boxed or reference argument is a *value*, and the
+        // call answers whether one was found.
+        2 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(10, 20, 30)); boolean hit = l.remove(Integer.valueOf({v})); System.out.println(hit + \" \" + l); }}"
+        ),
+        3 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(10, 20, 30)); Integer k = {v}; System.out.println(l.remove(k) + \" \" + l); }}"
+        ),
+        4 => format!(
+            "{{ List<String> l = new ArrayList<>(Arrays.asList(\"a\", \"b\", \"c\")); System.out.println(l.remove({s}) + \" \" + l); }}"
+        ),
+        // `String.join` over an *Iterable*, Java's second overload — the one that
+        // joins elements rather than rendering the collection.
+        5 => format!(
+            "{{ List<String> l = new ArrayList<>(Arrays.asList(\"a\", \"b\", \"c\")); l.remove({s}); System.out.println(String.join(\"-\", l)); }}"
+        ),
+        6 => "{ Set<String> st = new TreeSet<>(Arrays.asList(\"q\", \"p\", \"q\")); System.out.println(String.join(\",\", st)); }"
+            .to_string(),
+        // Ordering, searching and in-place mutation of a built list.
+        7 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(30, 10, 20)); Collections.sort(l); l.set({i}, 5); System.out.println(l + \" \" + l.indexOf(5)); }}"
+        ),
+        8 => "{ List<Integer> l = new ArrayList<>(Arrays.asList(3, 1, 2)); Collections.reverse(l); System.out.println(l + \" \" + Collections.max(l) + Collections.min(l)); }"
+            .to_string(),
+        9 => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(1, 2)); l.add({i}, 9); System.out.println(l + \" \" + l.contains(9) + l.lastIndexOf(9)); }}"
+        ),
+        // A `TreeMap` keeps key order, so iterating it is deterministic.
+        10 => format!(
+            "{{ Map<String, Integer> m = new TreeMap<>(); m.put(\"b\", 2); m.put(\"a\", 1); m.remove({s}); int t = 0; for (String k : m.keySet()) t += m.get(k); System.out.println(m + \" \" + t); }}"
+        ),
+        // Removing while the value is absent must leave the list untouched.
+        _ => format!(
+            "{{ List<Integer> l = new ArrayList<>(Arrays.asList(10, 20)); System.out.println(l.remove(Integer.valueOf({v})) + \" \" + l.size() + \" \" + l); }}"
+        ),
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -1305,6 +1518,31 @@ const SUPPORT_CLASS: &str = concat!(
     "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
     "    public void close() { System.out.println(\"close \" + n); }\n",
     "}\n",
+    // Two *unrelated* classes declaring statics of the same name — `Qa` and `Qb`
+    // both spell `f`, `g` and `h`. A qualified `Qb.f(1)` must reach `Qb`'s body
+    // and nothing else, which is only observable when a same-named static exists
+    // somewhere else in the compilation unit. `g`'s two overloads differ in
+    // parameter type, so a by-name-only resolver picks the *signature* that fits
+    // best and silently crosses classes.
+    "class Qa {\n",
+    "    static int f(int x) { return x + 1; }\n",
+    "    static String g(String s) { return \"a:\" + s; }\n",
+    "    static int h() { return 1; }\n",
+    "}\n",
+    "class Qb {\n",
+    "    static int f(int x) { return x + 100; }\n",
+    "    static String g(Object o) { return \"b:\" + o; }\n",
+    "    static int h() { return 2; }\n",
+    "}\n",
+    // A chain, so a subclass's static *hides* the one it inherits while the
+    // names it does not redeclare still resolve up the chain.
+    "class Qbase {\n",
+    "    static String kind() { return \"base\"; }\n",
+    "    static int only() { return 7; }\n",
+    "}\n",
+    "class Qderiv extends Qbase {\n",
+    "    static String kind() { return \"deriv\"; }\n",
+    "}\n",
 );
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1351,6 +1589,10 @@ enum Mode {
     Float,
     Decl,
     Object,
+    StaticRef,
+    LoopKind,
+    Narrow,
+    ListOp,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -1395,6 +1637,10 @@ const CONCRETE: &[Mode] = &[
     Mode::Float,
     Mode::Decl,
     Mode::Object,
+    Mode::StaticRef,
+    Mode::LoopKind,
+    Mode::Narrow,
+    Mode::ListOp,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -1441,6 +1687,10 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Float => "float",
         Mode::Decl => "decl",
         Mode::Object => "object",
+        Mode::StaticRef => "staticref",
+        Mode::LoopKind => "loopkind",
+        Mode::Narrow => "narrow",
+        Mode::ListOp => "listop",
     }
 }
 
@@ -1499,6 +1749,10 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Float => g_float(r),
         Mode::Decl => g_decl(r),
         Mode::Object => g_object(r),
+        Mode::StaticRef => g_staticref(r),
+        Mode::LoopKind => g_loopkind(r),
+        Mode::Narrow => g_narrow(r),
+        Mode::ListOp => g_listop(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

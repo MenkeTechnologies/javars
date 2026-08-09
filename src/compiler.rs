@@ -53,6 +53,11 @@ fn numtype_of_ty(ty: &str) -> Option<NumType> {
 /// of its return type (so a call participates in division typing). The raw
 /// return-type name is kept for static typing of a call result.
 struct MethodSig {
+    /// The class that declares this overload. Two classes may declare a static
+    /// of the same name and signature, so the owner is part of both the
+    /// resolution key (a qualified `C.m()` may only reach `C`'s chain) and the
+    /// mangled subroutine name (or the two bodies would collide).
+    owner: String,
     param_tys: Vec<String>,
     ret: NumType,
     ret_name: String,
@@ -396,6 +401,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     let mut methods: HashMap<String, Vec<MethodSig>> = HashMap::new();
     for m in &prog.methods {
         methods.entry(m.name.clone()).or_default().push(MethodSig {
+            owner: m.owner.clone(),
             param_tys: m.params.iter().map(|p| p.ty.clone()).collect(),
             ret: numtype_of_ty(&m.ret).unwrap_or(NumType::Other),
             ret_name: m.ret.clone(),
@@ -1147,10 +1153,10 @@ impl Compiler {
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return self.classes.contains_key(&t).then_some(t);
                 }
-                if self.user_class_ref(recv).is_some() {
+                if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
-                    let ret = self.resolve_static_call(method, &arg_tys)?.ret_name;
+                    let ret = self.resolve_static_on(&class, method, &arg_tys)?.ret_name;
                     return self.classes.contains_key(&ret).then_some(ret);
                 }
                 let rc = self.expr_class(recv)?;
@@ -1321,13 +1327,13 @@ impl Compiler {
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return Some(t);
                 }
-                // `T.helper(x)` — a user class's `static` method, which lives in
-                // the same flat pool a bare `helper(x)` resolves through.
-                if self.user_class_ref(recv).is_some() {
+                // `T.helper(x)` — the named class's `static` method, resolved in
+                // that class's own inheritance chain.
+                if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
                     return self
-                        .resolve_static_call(method, &arg_tys)
+                        .resolve_static_on(&class, method, &arg_tys)
                         .map(|s| s.ret_name);
                 }
                 // A bare stdlib class receiver (`Integer.parseInt`) is a static
@@ -1618,13 +1624,79 @@ impl Compiler {
     /// Resolve a top-level user `static` method call by argument type: the
     /// mangled target subroutine and its return type. `None` when no method of
     /// that name+arity exists (an unresolved reference or arity mismatch).
+    /// The superclass chain of `class`, most-derived first — the order Java
+    /// searches for a `static` member, a subclass's declaration *hiding* the
+    /// one it inherits.
+    fn static_lookup_chain(&self, class: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut cur = Some(class.to_string());
+        // The class graph is acyclic, but a malformed `extends` cycle would spin
+        // here, so the walk is bounded by the number of declared classes.
+        while let Some(c) = cur {
+            if chain.contains(&c) || chain.len() > self.classes.len() {
+                break;
+            }
+            cur = self
+                .classes
+                .get(&c)
+                .and_then(|ci| ci.superclass.clone())
+                .filter(|s| s != &c);
+            chain.push(c);
+        }
+        chain
+    }
+
+    /// Resolve `class.name(args)` — a **qualified** static call. Java looks the
+    /// name up in `class`'s own declarations first and only then in the classes
+    /// it inherits from; it never reaches an unrelated class. Restricting the
+    /// candidate set to that chain is what keeps `Q.f(1)` out of `P.f(int)`
+    /// when both `P` and `Q` declare an `f` — with one flat by-name pool the
+    /// nearest *signature* won regardless of receiver, which silently ran the
+    /// wrong method body.
+    fn resolve_static_on(
+        &self,
+        class: &str,
+        name: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<StaticResolved> {
+        let overloads = self.methods.get(name)?;
+        // Each class in the chain is a separate resolution scope: the most
+        // derived one that declares the name at all wins, hiding the rest.
+        self.static_lookup_chain(class).into_iter().find_map(|c| {
+            let scoped: Vec<&MethodSig> = overloads.iter().filter(|s| s.owner == c).collect();
+            (!scoped.is_empty())
+                .then(|| self.pick_from(&scoped, name, arg_tys))
+                .flatten()
+        })
+    }
+
+    /// Resolve an **unqualified** `name(args)` call. The enclosing class's own
+    /// chain is searched first (Java's rule); the whole pool is the fallback,
+    /// which is what lets a nested class call a sibling's or the entry class's
+    /// static the way javars has always allowed.
     fn resolve_static_call(
         &self,
         name: &str,
         arg_tys: &[Option<String>],
     ) -> Option<StaticResolved> {
+        if let Some(cur) = self.current_class.as_deref() {
+            if let Some(r) = self.resolve_static_on(cur, name, arg_tys) {
+                return Some(r);
+            }
+        }
         let overloads = self.methods.get(name)?;
-        let filtered: Vec<&MethodSig> = overloads
+        let all: Vec<&MethodSig> = overloads.iter().collect();
+        self.pick_from(&all, name, arg_tys)
+    }
+
+    /// Choose the best-matching overload out of an already-scoped candidate set.
+    fn pick_from(
+        &self,
+        cands: &[&MethodSig],
+        name: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<StaticResolved> {
+        let filtered: Vec<&&MethodSig> = cands
             .iter()
             .filter(|s| s.param_tys.len() == arg_tys.len())
             .collect();
@@ -1635,7 +1707,7 @@ impl Compiler {
         let idx = self.pick_overload(&cand_tys, arg_tys, name).ok()?;
         let s = filtered[idx];
         Some(StaticResolved {
-            mangled: mangle_static(name, &s.param_tys),
+            mangled: mangle_static(&s.owner, name, &s.param_tys),
             ret: s.ret,
             ret_name: s.ret_name.clone(),
             param_tys: s.param_tys.clone(),
@@ -2138,12 +2210,12 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
-                // `T.helper(x)` — the static pool's declared return type.
-                if self.user_class_ref(recv).is_some() {
+                // `T.helper(x)` — the named class's declared return type.
+                if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
                     return self
-                        .resolve_static_call(method, &arg_tys)
+                        .resolve_static_on(&class, method, &arg_tys)
                         .map(|s| s.ret)
                         .unwrap_or(NumType::Other);
                 }
@@ -2223,7 +2295,9 @@ impl Compiler {
     fn compile_method(&mut self, m: &Method) -> Result<(), String> {
         let entry = self.b.current_pos();
         let param_tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
-        let name_idx = self.b.add_name(&mangle_static(&m.name, &param_tys));
+        let name_idx = self
+            .b
+            .add_name(&mangle_static(&m.owner, &m.name, &param_tys));
         self.b.add_sub_entry(name_idx, entry);
 
         let mut scope = MethodScope::new();
@@ -4069,11 +4143,24 @@ impl Compiler {
             }
         }
         // `T.helper(x)` on a user class is a call to that class's `static`
-        // method — javars hoists every static into one flat pool, so it is the
-        // same target a bare `helper(x)` inside `T` resolves to.
+        // method. It resolves in `T`'s own inheritance chain — NOT through the
+        // flat by-name pool a bare `helper(x)` falls back to — so a same-named
+        // static on an unrelated class can never be selected.
         if let Some(class) = self.user_class_ref(recv) {
             if self.methods.contains_key(method) {
-                return self.call(method, args, line);
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                if let Some(resolved) = self.resolve_static_on(&class, method, &arg_tys) {
+                    self.call_args_targeted(args, &resolved.param_tys)?;
+                    let name_idx = self.b.add_name(&resolved.mangled);
+                    self.b.emit(Op::Call(name_idx, args.len() as u8), line);
+                    self.emit_exc_check(line);
+                    return Ok(());
+                }
+                return Err(format!(
+                    "javars: class `{class}` has no static method `{method}` taking {} argument(s) (line {line})",
+                    args.len()
+                ));
             }
             return Err(format!(
                 "javars: class `{class}` has no static method `{method}` (line {line})"
@@ -4156,12 +4243,29 @@ impl Compiler {
         // catches a collection whose static type javars could not determine
         // (an erased `Map.get` result), so this is a diagnostics-and-clarity
         // shortcut rather than the only route.
-        if self
-            .expr_java_type(recv)
-            .as_deref()
-            .and_then(collection_kind)
-            .is_some()
-        {
+        if let Some(kind) = self.expr_java_type(recv).as_deref().and_then(collection_kind) {
+            // `List` declares BOTH `remove(int)` and `remove(Object)`, and Java
+            // picks between them from the argument's *static* type: an integral
+            // primitive removes by index, anything else (a boxed `Integer`, a
+            // `String`, an `Object`) removes the first equal element. Selecting
+            // by index unconditionally silently removed the wrong element
+            // (`l.remove(Integer.valueOf(20))` on `[10,20,30]` gave `[10,20]`
+            // instead of `[10,30]`) or threw a bogus `IndexOutOfBoundsException`
+            // when the value exceeded the size. The choice is a compile-time one
+            // because it is a static-type question, so it is made here and the
+            // by-value overload reaches the host under its own name.
+            // An argument whose static type javars could not infer keeps the
+            // by-index reading it has always had, so only a *known* reference
+            // type switches overload. A boxed `Character` is a reference type in
+            // Java and selects `remove(Object)` there too.
+            let by_value = kind == "list"
+                && method == "remove"
+                && args.len() == 1
+                && (is_boxing_call(&args[0])
+                    || self
+                        .expr_java_type(&args[0])
+                        .is_some_and(|t| !matches!(t.as_str(), "int" | "short" | "byte" | "char")));
+            let method = if by_value { "removeObject" } else { method };
             self.expr(recv)?;
             // A collection element is a *boxed* `Character`, which javars models
             // as the one-character String — so it prints and compares like Java's.
@@ -5037,8 +5141,8 @@ fn mangle(class: &str, member: &str, param_tys: &[String]) -> String {
 /// The mangled subroutine name for a top-level user `static` method, including
 /// its parameter types so overloads get distinct subroutines. Prefixed with `#`
 /// so it never collides with an instance mangle or a user identifier.
-fn mangle_static(name: &str, param_tys: &[String]) -> String {
-    format!("#s#{name}#{}", param_tys.join(","))
+fn mangle_static(owner: &str, name: &str, param_tys: &[String]) -> String {
+    format!("#s#{owner}#{name}#{}", param_tys.join(","))
 }
 
 /// The numeric widening rank of a primitive type (`byte` < `short`/`char` <
@@ -5294,6 +5398,30 @@ fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
 /// The `java.util` collection types javars models, mapped to the collection
 /// *shape* the host allocates. A user class of the same name wins (the compiler
 /// checks `self.classes` first), so declaring your own `List` is still legal.
+/// True when `e` is an explicit *boxing* call — `Integer.valueOf(x)` and the
+/// other wrapper factories. Its static Java type in Java is the wrapper class,
+/// but javars types it as the primitive it wraps (so `Integer.valueOf(7) / 2`
+/// still truncates), which leaves the reference-ness invisible to
+/// `expr_java_type`. The one place that distinction changes an *answer* is
+/// `List.remove`, where the wrapper picks `remove(Object)` and the primitive
+/// picks `remove(int)`, so it is recognised syntactically here.
+fn is_boxing_call(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::MethodCall { recv, method, args, .. }
+            if method == "valueOf"
+                && args.len() == 1
+                && matches!(
+                    recv.as_ref(),
+                    Expr::Var(c) if matches!(
+                        c.as_str(),
+                        "Integer" | "Long" | "Short" | "Byte" | "Character"
+                            | "Double" | "Float" | "Boolean"
+                    )
+                )
+    )
+}
+
 fn collection_kind(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "ArrayList" | "LinkedList" => "list",
@@ -5329,6 +5457,8 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         ("isEmpty", 0) | ("contains", 1) | ("containsKey", 1) | ("containsValue", 1) => "boolean",
         ("add", 1) | ("addAll", 1) | ("equals", 1) => "boolean",
         ("remove", 1) if kind == "set" => "boolean",
+        // The compiler-selected `List.remove(Object)` overload.
+        ("removeObject", 1) => "boolean",
         ("toString", 0) => "String",
         ("keySet", 0) => "Set",
         ("values", 0) => "List",
