@@ -339,6 +339,7 @@ impl Parser {
             };
             constants.push(EnumConstant {
                 name: c,
+                line,
                 args,
                 body_class,
             });
@@ -436,6 +437,7 @@ fn record_members(
             ty: c.ty.clone(),
             name: c.name.clone(),
             init: None,
+            line,
         });
     }
     // The canonical constructor assigns each component to its field. A compact
@@ -619,11 +621,13 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         ty: "String".to_string(),
         name: ENUM_NAME.to_string(),
         init: None,
+        line,
     });
     fields.push(FieldDecl {
         ty: "int".to_string(),
         name: ENUM_ORDINAL.to_string(),
         init: None,
+        line,
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
         name: method.to_string(),
@@ -855,6 +859,9 @@ impl Parser {
         }
         let mut out = Vec::new();
         loop {
+            // Each declarator in `int a = 1, b = 2;` reports its own line, so a
+            // duplicate is pointed at where it was written.
+            let line = self.line();
             let (name, ty) = self.declarator(&base_ty)?;
             let init = if self.is(&Tok::Assign) {
                 self.advance();
@@ -862,7 +869,12 @@ impl Parser {
             } else {
                 None
             };
-            out.push(FieldDecl { ty, name, init });
+            out.push(FieldDecl {
+                ty,
+                name,
+                init,
+                line,
+            });
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {

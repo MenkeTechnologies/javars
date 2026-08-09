@@ -90,6 +90,10 @@ to per-constant state (`EARTH(5.97e24)`) and per-constant bodies — run too, an
 `main`'s `args` carries the real program arguments. An unsupported construct is
 a parse or compile error rather than a silent mis-run: there is no construct
 javars accepts and then runs with the wrong meaning (see [`BUGS.md`](BUGS.md)).
+A program `javac` itself rejects is rejected here too where javars can see it —
+an undeclared name, and a class, field, method, constructor, `enum` constant, or
+parameter declared twice, each reported at the duplicate in `javac`'s own
+wording rather than resolved silently to one of the two.
 
 ---
 

@@ -122,6 +122,8 @@ pub struct Class {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumConstant {
     pub name: String,
+    /// 1-based source line the constant sits on (diagnostics).
+    pub line: u32,
     /// The constructor arguments the constant supplies (`EARTH(5.97e24)`), run
     /// against the enum's own constructor when its singleton is built.
     pub args: Vec<Expr>,
@@ -147,6 +149,11 @@ pub struct FieldDecl {
     /// Field initializer expression, run (with default values first) before the
     /// constructor body — Java's instance-initialization order.
     pub init: Option<Expr>,
+    /// 1-based source line the declaration sits on, so a duplicate can be
+    /// reported where it was written rather than at the head of its class. A
+    /// parser-synthesized field (a record component, an `enum`'s `#name`) has
+    /// its declaration's line.
+    pub line: u32,
 }
 
 /// A constructor: `ClassName(<params>) { <body> }`.

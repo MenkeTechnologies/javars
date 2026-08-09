@@ -6307,3 +6307,155 @@ fn compound_op(op: AssignOp) -> Op {
         AssignOp::Assign => unreachable!("plain assign never lowers through compound_op"),
     }
 }
+
+// ── duplicate declarations ──────────────────────────────────────────────────
+//
+// Every table below is keyed by a *name*, and every one of them was
+// last-write-wins or first-write-wins before this check existed: the class
+// table (`resolve_classes`' `out.insert`), the supertype map
+// (`crate::supertype_map`'s `collect`), a class's field list, the static-method
+// pool, and fusevm's `sub_entries` (whose lookup returns the first match — see
+// its own note that the builder does not prevent duplicates). A compilation
+// unit that declares one name twice therefore ran, silently, against whichever
+// declaration the table happened to keep:
+//
+//   class Pt { int v() { return 1; } }
+//   class Pt { int v() { return 2; } }   // javars printed 1
+//   class C { int x = 1; int x = 2; }    // javars printed 2
+//
+// `javac` rejects all of them, so no working Java program is affected; what the
+// silence cost was a *wrong answer* for a program `javac` never would have let
+// run. The two that did fail failed misleadingly — a duplicate `static` method
+// was reported as "no `f` overload matches 1 argument(s)" at the call site, and
+// a duplicate constructor as "no constructor taking 1 argument(s) (declared
+// arities: [1, 1])", both naming the caller rather than the duplicate.
+//
+// Java's own wording is reproduced, because it is what a reader will search
+// for. Local variables are deliberately NOT checked here: Java forbids
+// redeclaring a local anywhere inside an enclosing local's block but allows two
+// sibling blocks to reuse a name, and javars's `MethodScope` is flat per method
+// (sibling blocks share one slot), so the check needs block-scope tracking that
+// does not exist yet. See BUGS.md.
+
+/// The parameter-type list Java prints inside a member's diagnostic:
+/// `f(int, String)`.
+fn signature(name: &str, param_tys: &[String]) -> String {
+    format!("{name}({})", param_tys.join(", "))
+}
+
+/// Reject a compilation unit that declares any name twice, with `javac`'s
+/// diagnostic.
+///
+/// Runs on the *parsed* unit, before [`crate::prelude::inject`] adds the
+/// modeled JDK types — a prelude type is skipped when the user declares one of
+/// the same name, so checking afterwards would be checking javars's own tables
+/// rather than the program's. (Those tables have their own guard:
+/// `tests/registry_names.rs`.)
+pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
+    let mut seen_class: HashMap<&str, u32> = HashMap::new();
+    for cl in &prog.classes {
+        if seen_class.insert(&cl.name, cl.line).is_some() {
+            return Err(format!(
+                "javars: duplicate class: `{}` (line {})",
+                cl.name, cl.line
+            ));
+        }
+    }
+    for cl in &prog.classes {
+        let what = if cl.is_enum {
+            "enum"
+        } else if cl.is_interface {
+            "interface"
+        } else {
+            "class"
+        };
+        // Instance and `static` fields share one namespace in Java, and so do
+        // an enum's constants — `enum C { RED }` with a field `RED` collides.
+        let mut seen: HashMap<&str, ()> = HashMap::new();
+        let fields = cl.fields.iter().chain(&cl.static_fields);
+        for f in fields {
+            // The parser synthesizes an enum's `#name`/`#ordinal` and a
+            // record's component fields; `#` is not a legal Java identifier
+            // char, and a record component is already checked as a
+            // constructor parameter, so neither can collide with user text.
+            if f.name.starts_with('#') {
+                continue;
+            }
+            if seen.insert(&f.name, ()).is_some() {
+                return Err(format!(
+                    "javars: variable `{}` is already defined in {what} `{}` (line {})",
+                    f.name, cl.name, f.line
+                ));
+            }
+        }
+        for c in &cl.enum_constants {
+            if seen.insert(&c.name, ()).is_some() {
+                return Err(format!(
+                    "javars: variable `{}` is already defined in {what} `{}` (line {})",
+                    c.name, cl.name, c.line
+                ));
+            }
+        }
+        // A class's instance methods and its `static` methods share one
+        // namespace: `int m()` and `static int m()` in one class is
+        // "method m() is already defined" in Java too.
+        let statics = prog.methods.iter().filter(|m| m.owner == cl.name);
+        let mut seen: HashMap<(String, Vec<String>), ()> = HashMap::new();
+        for m in cl.methods.iter().chain(statics) {
+            let tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
+            if seen.insert((m.name.clone(), tys.clone()), ()).is_some() {
+                return Err(format!(
+                    "javars: method `{}` is already defined in {what} `{}` (line {})",
+                    signature(&m.name, &tys),
+                    cl.name,
+                    m.line
+                ));
+            }
+            check_duplicate_params(&m.params, &m.name, m.line)?;
+        }
+        let mut seen: HashMap<Vec<String>, ()> = HashMap::new();
+        for c in &cl.ctors {
+            let tys: Vec<String> = c.params.iter().map(|p| p.ty.clone()).collect();
+            if seen.insert(tys.clone(), ()).is_some() {
+                return Err(format!(
+                    "javars: constructor `{}` is already defined in {what} `{}` (line {})",
+                    signature(&cl.name, &tys),
+                    cl.name,
+                    c.line
+                ));
+            }
+            check_duplicate_params(&c.params, &cl.name, c.line)?;
+        }
+    }
+    // `static` methods whose owner declares no class node of its own still
+    // share the by-name pool, so they are checked as a whole too — a duplicate
+    // there is the one that used to surface as a bogus "no overload matches".
+    let mut seen: HashMap<(&str, &str, Vec<String>), ()> = HashMap::new();
+    for m in &prog.methods {
+        let tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
+        if seen.insert((&m.owner, &m.name, tys.clone()), ()).is_some() {
+            return Err(format!(
+                "javars: method `{}` is already defined in class `{}` (line {})",
+                signature(&m.name, &tys),
+                m.owner,
+                m.line
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject `f(int a, int a)`, which `javac` reports as a variable redeclaration
+/// rather than as a signature problem.
+fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<(), String> {
+    let mut seen: HashMap<&str, ()> = HashMap::new();
+    for p in params {
+        if seen.insert(&p.name, ()).is_some() {
+            return Err(format!(
+                "javars: variable `{}` is already defined in method `{owner}` (line {line})",
+                p.name
+            ));
+        }
+    }
+    Ok(())
+}

@@ -572,6 +572,42 @@ Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
 known.
 
+### A duplicate declaration is rejected, with one exception
+
+A compilation unit that declares the same name twice is not a program `javac`
+would run, but javars *did* run it — against whichever declaration the table it
+landed in happened to keep. Every one of those tables is keyed by name, and
+they do not agree on which duplicate wins: the class table
+(`resolve_classes`' `out.insert`) and a class's field list keep the **last**,
+while fusevm's `sub_entries` lookup returns the **first**. So
+
+    class Pt { int v() { return 1; } }
+    class Pt { int v() { return 2; } }   // javars printed 1
+    class C  { int x = 1; int x = 2; }   // javars printed 2
+
+each answered silently, and the two forms that *did* fail failed at the caller:
+a duplicate `static` method as "no `f` overload matches 1 argument(s)" and a
+duplicate constructor as "no constructor taking 1 argument(s) (declared arities:
+`[1, 1]`)" — that repeated `1` being the duplicate itself, reported as though
+the call were at fault.
+
+`Compiler::check_duplicate_declarations` now rejects all of them at the
+declaration, in `javac`'s own wording: a duplicate class, field, instance or
+`static` method (keyed by name **and** parameter types, so real overloading is
+untouched), constructor, `enum` constant, or parameter name.
+
+The exception is a **duplicate local variable**, which still runs and keeps the
+last assignment:
+
+    int x = 1;
+    int x = 2;   // javac: "variable x is already defined in method main(String[])"
+
+Java's rule is scoped, not flat — two sibling blocks may each declare `x`, but a
+nested block may not redeclare an enclosing local — and javars's `MethodScope`
+is one flat set per method, with sibling blocks deliberately sharing a slot.
+Detecting this needs block-scope tracking that does not exist yet; a flat check
+would reject the sibling-block form that Java accepts, which is the worse error.
+
 ## Not implemented (parse or compile errors today)
 
 - **Streams** — `Arrays.stream(a)`, `list.stream()`, `IntStream.range`,
@@ -587,17 +623,39 @@ known.
   "String.range()"`, because an unmodeled class name was just an undeclared
   variable reading `null`.
 
-  The obstacle is not the pipeline shape, it is *where a lambda can be called
-  from*: a host builtin cannot re-enter the VM (the same limit that keeps an
-  element's `toString()` from running inside a collection, below), so a stream
-  cannot be a host object that calls `map`'s function per element. It has to be
-  **fused at compile time** — the whole `source.op(f).op(g).terminal(h)` chain
-  lowered into one loop with the closure calls emitted inline — which is a
-  compiler pass rather than a library addition, and it drags in `Optional` for
-  the four terminals that return one (`findFirst`, `min`, `max`, `average`).
-  That substrate is not built, and half of it would be worse than none: a
-  pipeline that silently drops a stage is exactly the failure mode this file
-  exists to prevent.
+  This entry used to say the obstacle was *where a lambda can be called from* —
+  that "a host builtin cannot re-enter the VM", so a stream could not be a host
+  object calling `map`'s function per element, and the pipeline would have to be
+  fused at compile time. **That was wrong**, and it is worth being precise about
+  why, because the same sentence appears elsewhere in this file for a case where
+  it *is* true.
+
+  fusevm has two host-callback shapes and only one of them is VM-less:
+
+  | callback | type | gets a `VM`? |
+  | --- | --- | --- |
+  | registered builtin | `BuiltinHandler = fn(&mut VM, u8) -> Value` | **yes** |
+  | numeric hook | `NumericHook = Arc<dyn Fn(NumOp, &Value, &Value) -> …>` | no |
+  | sited numeric hook | `SitedNumericHook`, whose `NumericCall` carries `op`/`a`/`b`/`chunk`/`ip` | no |
+
+  A builtin holds `&mut VM`, and javars already re-enters through it:
+  `host::run_sub` pushes a frame and calls `vm.run()`, `host::invoke_closure`
+  wraps that, and `coll_method`'s `forEach` and `sort` arms call a user lambda
+  once per element — including a lambda that calls a user `static` method,
+  assigns a `static` field, allocates its own collection, and re-enters a
+  collection builtin from inside, all matching `java`. So a stream *can* be a
+  host object: `stream()` allocates one, each intermediate pushes an op onto it,
+  and the terminal drives the elements through the chain with `invoke_closure`,
+  exactly as `forEach` already does. Compile-time fusion is one way to build
+  this, not the only way.
+
+  What is genuinely not built is the surface: the sources, the intermediate ops
+  with Java's laziness (a `peek` before a `limit` must see only the elements the
+  `limit` demands, and `sorted` is a full barrier), the terminals, and
+  `Optional`/`OptionalInt`/`OptionalDouble` for the four terminals that return
+  one. Half of that would be worse than none — a pipeline that silently drops a
+  stage is exactly the failure mode this file exists to prevent — so it stays a
+  compile error until it is whole.
 
   The `default` and `static` members the JDK's functional interfaces carry are
   all implemented, `Comparator.comparing`/`naturalOrder`/`reverseOrder`
@@ -840,10 +898,9 @@ known.
   something a deterministic program does, so this only shows up if you ask for it.
 - **An element's `toString()` override is not called inside a collection.**
   Printing a `List<Pt>` of records gives `[Pt@2]` where Java gives
-  `[Pt[x=1, y=2]]`, because rendering happens in a host builtin that cannot
-  re-enter the VM to run the element's Java-level `toString()`. This is the same
-  limitation `Arrays.toString(objArray)` and `String.valueOf(obj)` already have
-  (above); an `enum` constant is the exception, since its name is a real field.
+  `[Pt[x=1, y=2]]`. This is the same limitation `Arrays.toString(objArray)` and
+  `String.valueOf(obj)` already have (above); an `enum` constant is the
+  exception, since its name is a real field.
   The same boundary decides `toString()`/`equals()` called on a receiver javars
   types only *dynamically*: `Pt p = new Pt(1, 2); p.toString()` dispatches to the
   record's own version and is exact, while `Object o = new Pt(1, 2);
@@ -857,10 +914,29 @@ known.
   every concrete user class declaring that name and arity, with the `String`
   method as the last arm (`Compiler::emit_erased_call`). So
   `list.get(0).compareTo(x)` and `Comparator.comparing(P::n)`'s key extractor
-  reach the class's own body. What remains on the host side is *rendering* —
-  `toString()` reached through `java_str` from a collection, an array, or `+`
-  concatenation — because `fusevm`'s numeric hook is a plain `fn` with no `VM`
-  to re-enter.
+  reach the class's own body. What remains on the host side is *rendering*:
+  `toString()` reached through `java_str`.
+
+  **Why the whole of it stays, when a builtin can re-enter the VM.** Every
+  rendering path but one is a registered builtin holding `&mut VM`
+  (`BuiltinHandler = fn(&mut VM, u8) -> Value`), so each *could* call the
+  override — `println(list)` is `print_args`, `list.toString()` is
+  `coll_method`, `String.valueOf(obj)` and `Arrays.toString(arr)` are the static
+  dispatch builtin, `String.format("%s", …)` is `b_format`. The exception is
+  `"" + list`. The compiler lowers string concatenation to `Op::Add`, and a
+  non-numeric operand lands in `host::numeric_hook`, which fusevm types as
+  `NumericHook = Arc<dyn Fn(NumOp, &Value, &Value) -> Result<Value, String>>` —
+  three values and no VM. (Its sited sibling adds only `chunk` and `ip`.)
+
+  Fixing only the builtin side would make `System.out.println(list)` print
+  `[Pt[x=1, y=2]]` while `System.out.println("" + list)` printed `[Pt@2]`, in the
+  same program, for the same list. One consistent wrong rendering is a
+  documented model; two different renderings of one value is a trap. So the
+  whole of it waits on the one change that would close both: lowering
+  concatenation with a reference-typed operand to a *builtin* rather than
+  `Op::Add`, which puts every path on the side that has a VM. That costs
+  `Op::Add`'s JIT-friendliness on the concatenations it applies to, which is why
+  it is a deliberate decision and not a cleanup.
 
   `compareTo` additionally has to answer a *number*, and the boxed types do not
   agree on which: `Integer`/`Long`/`Double`/`Float` answer the sign,

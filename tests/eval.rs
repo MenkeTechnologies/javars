@@ -3514,3 +3514,137 @@ fn a_reference_cast_still_walks_the_shared_supertype_graph() {
          class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')\n"
     );
 }
+
+// ── duplicate declarations ──────────────────────────────────────────────────
+//
+// Every one of these is a `javac` error, and every one of them used to run.
+// The expected text is `javac`'s own wording (verified against
+// OpenJDK 21) with javars's `javars: ` prefix, backticks, and `(line N)`.
+
+/// Assert that `src` is rejected with a message containing `want`, and that
+/// nothing was printed — a rejected unit must not run any of its `main`.
+fn rejected(src: &str, want: &str) {
+    let (out, err, ok) = run_streams(src);
+    assert!(!ok, "expected a rejection, got stdout {out:?}");
+    assert_eq!(out, "", "a rejected unit must not run");
+    assert!(err.contains(want), "stderr was {err:?}, wanted {want:?}");
+}
+
+#[test]
+fn a_class_declared_twice_is_rejected_rather_than_silently_resolved() {
+    // The class table (`resolve_classes`' `out.insert`) and the supertype map
+    // both keep one of the two, so this printed `1` — the first `Pt`'s body —
+    // with the second declaration silently discarded.
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         System.out.println(new Pt().v()); } }\
+         class Pt { int v() { return 1; } }\
+         class Pt { int v() { return 2; } }",
+        "javars: duplicate class: `Pt`",
+    );
+}
+
+#[test]
+fn a_field_declared_twice_is_rejected_rather_than_silently_resolved() {
+    // A class's field list is name-keyed, and the *last* one won here: this
+    // printed `2`.
+    rejected(
+        "public class Main { int x = 1; int x = 2;\
+         public static void main(String[] a) { System.out.println(new Main().x); } }",
+        "javars: variable `x` is already defined in class `Main`",
+    );
+}
+
+#[test]
+fn an_instance_method_declared_twice_is_rejected() {
+    // fusevm's `sub_entries` lookup returns the *first* match, so this printed
+    // `1` and the second body was unreachable code that still compiled.
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         System.out.println(new R().m()); } }\
+         class R { int m() { return 1; } int m() { return 2; } }",
+        "javars: method `m()` is already defined in class `R`",
+    );
+}
+
+#[test]
+fn a_static_method_declared_twice_is_rejected_at_the_declaration() {
+    // This one did fail — but at the *call site*, as "no `f` overload matches
+    // 1 argument(s)", because overload resolution found two equally good
+    // candidates. The duplicate is what is wrong, so that is what is named.
+    rejected(
+        "public class Main { static int f(int a) { return 1; }\
+         static int f(int a) { return 2; }\
+         public static void main(String[] a) { System.out.println(f(0)); } }",
+        "javars: method `f(int)` is already defined in class `Main`",
+    );
+}
+
+#[test]
+fn a_constructor_declared_twice_is_rejected_at_the_declaration() {
+    // Also previously reported at the call site, and with a tell-tale message:
+    // "no constructor taking 1 argument(s) (declared arities: [1, 1])" — the
+    // repeated `1` in that list *is* the duplicate, reported as though the
+    // caller were at fault.
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         System.out.println(new Q(1).v); } }\
+         class Q { int v; Q(int a) { v = 1; } Q(int a) { v = 2; } }",
+        "javars: constructor `Q(int)` is already defined in class `Q`",
+    );
+}
+
+#[test]
+fn a_repeated_parameter_name_is_rejected() {
+    // `f(int a, int a)` bound both parameters to one slot, so the *first*
+    // argument won and this printed `1` where `javac` refuses the declaration.
+    rejected(
+        "public class Main { static int f(int a, int a) { return a; }\
+         public static void main(String[] x) { System.out.println(f(1, 2)); } }",
+        "javars: variable `a` is already defined in method `f`",
+    );
+}
+
+#[test]
+fn a_repeated_enum_constant_is_rejected() {
+    rejected(
+        "public class Main { enum C { RED, RED }\
+         public static void main(String[] a) { System.out.println(C.RED); } }",
+        "javars: variable `RED` is already defined in enum `C`",
+    );
+}
+
+#[test]
+fn an_overload_that_differs_only_in_parameter_type_is_still_accepted() {
+    // The duplicate check keys on (name, parameter types), so real overloading
+    // — which is the reason the key is not just the name — is untouched. So is
+    // the same member name in two different classes, and a subclass's
+    // override of an inherited method.
+    let (out, ok) = run("public class Main {\
+         static String f(int a) { return \"int\"; }\
+         static String f(String a) { return \"String\"; }\
+         static String f(int a, int b) { return \"two\"; }\
+         public static void main(String[] a) {\
+         System.out.println(f(1) + f(\"x\") + f(1, 2));\
+         System.out.println(new A().m() + new B().m());\
+         B b = new B(); System.out.println(b.n()); } }\
+         class A { int m() { return 1; } int n() { return 10; } }\
+         class B extends A { int m() { return 2; } int n() { return 20; } }");
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "intStringtwo\n3\n20\n");
+}
+
+#[test]
+fn two_sibling_blocks_may_still_reuse_a_local_name() {
+    // Java allows this (the two `x`s are in disjoint scopes) and forbids only a
+    // redeclaration inside an *enclosing* local's block. javars's method scope
+    // is flat, so the two share a slot — which is why the duplicate check
+    // stops at declarations and leaves locals alone.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         { int x = 1; System.out.println(x); }\
+         { int x = 2; System.out.println(x); }\
+         for (int i = 0; i < 2; i++) { System.out.println(i); }\
+         for (int i = 5; i < 6; i++) { System.out.println(i); } } }");
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "1\n2\n0\n1\n5\n");
+}

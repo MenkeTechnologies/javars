@@ -769,9 +769,10 @@ fn b_exc_abort(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// Render a throwable the way `Throwable.toString()` does, from the heap object
-/// directly. The Java-level `toString()` override cannot be called from here (a
-/// builtin cannot re-enter the VM), and this path only serves the uncaught
-/// report, so it reproduces the same text: the class name — qualified with
+/// directly. The Java-level `toString()` override is not called from here — it
+/// is the same rendering boundary `java_str` keeps (BUGS.md), and this path
+/// only serves the uncaught report — so it reproduces the same text: the class
+/// name — qualified with
 /// `java.lang.` for the modeled JDK throwables, bare for a user class — plus
 /// `": " + detailMessage` when a message was supplied.
 fn throwable_str(v: &Value) -> String {
@@ -3916,8 +3917,11 @@ fn obj_default_str(id: u32) -> String {
             // An enum constant carries its name in a synthesized field, and
             // `Enum.toString()` returns exactly that. Reading it here is what
             // makes `String.valueOf(color)` and `Arrays.toString(values())`
-            // print `RED` rather than `Color@1` — a builtin cannot re-enter the
-            // VM to call the Java-level `toString()`.
+            // print `RED` rather than `Color@1` without calling the Java-level
+            // `toString()`. Rendering does not call an override at all — not
+            // because it could not (this runs under a builtin, which holds
+            // `&mut VM`), but because `"" + obj` renders from the numeric hook,
+            // which does not, and the two must not disagree. See BUGS.md.
             Some(HostObj::Instance { class, fields }) => match fields.get(crate::ast::ENUM_NAME) {
                 Some(n) if !matches!(n, Value::Undef) => n.as_str_cow().into_owned(),
                 _ => {

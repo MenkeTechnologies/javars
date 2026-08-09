@@ -31,6 +31,12 @@ use fusevm::{VMResult, Value, VM};
 pub fn parse(src: &str) -> Result<ast::Program, String> {
     let src = rust_ffi::desugar(src);
     let mut prog = parser::parse(&src)?;
+    // A name declared twice is a `javac` error, and every table javars would
+    // have put it in keeps exactly one of the two — so the program used to run
+    // against whichever declaration won. Checked before the prelude is injected,
+    // so it sees the user's declarations only (see
+    // [`compiler::check_duplicate_declarations`]).
+    compiler::check_duplicate_declarations(&prog)?;
     // A program that throws or catches also declares, implicitly, the
     // `java.lang` throwable classes it names — there is no JDK to import them
     // from. No-op for every other program (see [`prelude::inject`]).
