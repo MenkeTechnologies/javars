@@ -916,12 +916,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   plausible number; field hiding is also the one inheritance shape Java itself
   discourages, which is why the rest of the model is unaffected. `super.method()`
   — the far more common qualified access — is exact (see "Implemented").
-- **An unqualified name that is another class's `static` field is unbound**
-  rather than a compile error. `javac` rejects reading `v` from outside the
-  class declaring `static int v`; javars resolves an unqualified static only
-  against the enclosing class and its ancestors, and an unresolved name reads as
-  `null` (the same behaviour as an uninitialized local, below). `C.v` is the
-  spelling that works, and it is the only one valid Java uses.
+- **An unqualified name that is another class's `static` field is rejected, as
+  `javac` rejects it.** javars resolves an unqualified static only against the
+  enclosing class and its ancestors, so reading `v` from outside the class
+  declaring `static int v` reaches no declaration — and the undeclared-name
+  check makes that ``javars: cannot find symbol: `v` `` rather than a `null`
+  read. Measured against `openjdk 21.0.12`: `javac` answers
+  `error: cannot find symbol / symbol: variable v` and both exit non-zero.
+  `C.v` is the spelling that works, and it is the only one valid Java uses.
+  (This entry said the opposite until the undeclared-name check landed; it is
+  kept, corrected, because "unbound" was the documented behaviour long enough
+  to be worth contradicting explicitly. An *uninitialized local* is still
+  unbound — see below — so the two are no longer the same case.)
 - **A widening conversion needs a statically known *source* type.** The
   conversion itself is performed (see "Widening primitive conversion" under
   "Implemented"), but it is emitted only when the value's own type is
@@ -1115,7 +1121,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   is a native `Shl 32; Shr 32` pair rather than a builtin, so hot integer loops
   keep their JIT trace.
 - **Uninitialized locals are unbound** rather than rejected; reading one before
-  assignment yields `null` instead of a compile error.
+  assignment yields `null` instead of a compile error. Measured: `int n;
+  System.out.println(n);` prints `null` and exits 0 here, where `javac` answers
+  `error: variable n might not have been initialized`. Definite-assignment
+  analysis is what would be needed, and javars has none.
 - **`NullPointerException` detail messages drop the provenance clause.** Java's
   "helpful NPE" names the *bytecode local slot* of the null reference — `Cannot
   read field "x" because "<local4>" is null` — which javars cannot reproduce: it
