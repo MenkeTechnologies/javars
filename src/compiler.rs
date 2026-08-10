@@ -1521,6 +1521,12 @@ impl Compiler {
                     }
                     return None;
                 }
+                // A boxed primitive's own methods. `charValue()` in particular
+                // must report `char`, or the code point it answers would print
+                // as a number.
+                if let Some(t) = boxed_call_java_type(method, args.len()) {
+                    return Some(t.to_string());
+                }
                 // A `String` receiver's known return types.
                 match (method.as_str(), args.len()) {
                     ("length", 0)
@@ -6161,6 +6167,30 @@ fn takes_char_as_string(class: &str, method: &str) -> bool {
         "Arrays" => matches!(method, "toString" | "deepToString" | "asList"),
         _ => false,
     }
+}
+
+/// The declared Java return type of a boxed primitive's own instance method —
+/// `Number`'s six converters, `Boolean.booleanValue`, `Character.charValue`,
+/// and `Object.hashCode`.
+///
+/// Consulted only after a user class's own methods have been resolved, so a
+/// user `intValue()` still wins. Feeds the 32-bit `int` wrap decision and, for
+/// `charValue()`, the choice to render a code point as a character.
+fn boxed_call_java_type(method: &str, argc: usize) -> Option<&'static str> {
+    if argc != 0 {
+        return None;
+    }
+    Some(match method {
+        "intValue" | "hashCode" => "int",
+        "longValue" => "long",
+        "shortValue" => "short",
+        "byteValue" => "byte",
+        "doubleValue" => "double",
+        "floatValue" => "float",
+        "booleanValue" => "boolean",
+        "charValue" => "char",
+        _ => return None,
+    })
 }
 
 /// The declared Java return type of a known stdlib static call, or `None` when

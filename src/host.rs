@@ -2976,6 +2976,13 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             ),
         );
     }
+    // A boxed number's own methods, *before* the receiver is stringified. They
+    // are not `String` methods, so falling through to that table did not fail —
+    // it answered from the receiver's text: `Integer.valueOf(300).hashCode()`
+    // was 50547, the hash of `"300"`, where Java's is 300.
+    if let Some(v) = boxed_method(&recv, &method, args.len()) {
+        return v;
+    }
     let s = recv.as_str_cow().into_owned();
     // `"%s".formatted(x)` renders `x`, so it needs the VM `string_method` has
     // not got. Every other `String` method reads text only.
@@ -3033,6 +3040,60 @@ fn object_method(recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
         ("toString", 0) => Some(Value::str(obj_default_str(*id))),
         _ => None,
     }
+}
+
+/// The methods a boxed primitive answers itself, for a receiver javars models
+/// as a bare value rather than as a heap instance.
+///
+/// `Number`'s six converters plus `Boolean.booleanValue`, `Character.charValue`
+/// and `Object.hashCode`. Without this the receiver was rendered to text and
+/// the call went to the `String` table, which has no `intValue` (an error) but
+/// *does* have `hashCode` — so a boxed number's hash was the hash of its
+/// digits. `Integer.valueOf(300).hashCode()` answered 50547 against Java's 300.
+///
+/// The converters are the JLS narrowing conversions and need no per-box arity:
+/// `intValue()` truncates to 32 bits, which is identity for an `Integer` and
+/// the wrap Java performs for a `Long` (`Long.valueOf(4294967296L).intValue()`
+/// is 0). A floating receiver saturates rather than wraps, which is what Java's
+/// `(int) aDouble` does and what Rust's `as` already gives.
+fn boxed_method(recv: &Value, method: &str, argc: usize) -> Option<Value> {
+    if argc != 0 || matches!(recv, Value::Obj(_) | Value::Undef) {
+        return None;
+    }
+    // `Number.intValue()` is `(int) value`, and the two receiver kinds narrow
+    // differently: a `double` *saturates* at the `int` bounds (Java's
+    // floating-to-integral conversion), while a `long` *wraps*. Going through
+    // `long` first would saturate at the wrong width and then wrap —
+    // `Double.valueOf(1e30).intValue()` came out -1 instead of
+    // `Integer.MAX_VALUE`. `shortValue`/`byteValue` are `(short) intValue()`
+    // and `(byte) intValue()`, so both derive from this one.
+    let int_value = match recv {
+        Value::Float(f) => *f as i32,
+        other => other.to_int() as i32,
+    };
+    let long_value = match recv {
+        Value::Float(f) => *f as i64,
+        other => other.to_int(),
+    };
+    Some(match method {
+        // `String.hashCode` is a different function and the `String` table
+        // already answers it; a one-character `String` is javars's `char`, and
+        // `Character.hashCode` is the code point, which is the same number.
+        "hashCode" if !matches!(recv, Value::Str(_)) => Value::Int(java_hash(recv)?.into()),
+        "intValue" => Value::Int(int_value.into()),
+        "shortValue" => Value::Int((int_value as i16).into()),
+        "byteValue" => Value::Int((int_value as i8).into()),
+        "longValue" => Value::Int(long_value),
+        "doubleValue" => Value::float(recv.to_float()),
+        "floatValue" => Value::float(recv.to_float() as f32 as f64),
+        "booleanValue" if matches!(recv, Value::Bool(_)) => recv.clone(),
+        // A `char` is carried as its code point (or as the one-character
+        // `String` a rendered one becomes), so unboxing it is identity — the
+        // compiler types the call `char`, which is what makes it print as a
+        // character rather than as a number.
+        "charValue" => recv.clone(),
+        _ => return None,
+    })
 }
 
 /// `String.compareTo` / `compareToIgnoreCase`: the difference of the first
@@ -3620,6 +3681,23 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             Ok(Value::Int(args[0].to_int().wrapping_add(args[1].to_int())))
         }
         ("Integer" | "Long", "signum", 1) => Ok(Value::Int(args[0].to_int().signum())),
+        // `Xxx.hashCode(x)` is the static spelling of the boxed instance
+        // method, and each box folds a different width: `Integer` is the value,
+        // `Long` folds its halves, `Double` folds `doubleToLongBits`, and
+        // `Float` is `floatToIntBits` *unfolded* — so `Float.hashCode(1.5f)` is
+        // 1069547520 where `Double.hashCode(1.5)` is 1073217536.
+        ("Integer" | "Long" | "Double" | "Boolean" | "Character", "hashCode", 1) => {
+            let v = match class {
+                "Double" => Value::float(args[0].to_float()),
+                "Boolean" => Value::bool(matches!(args[0], Value::Bool(true))),
+                "Character" => Value::Int(i64::from(char_arg(&args[0]) as u32)),
+                _ => Value::Int(args[0].to_int()),
+            };
+            Ok(Value::Int(java_hash(&v).unwrap_or(0).into()))
+        }
+        ("Float", "hashCode", 1) => Ok(Value::Int(
+            ((args[0].to_float() as f32).to_bits() as i32).into(),
+        )),
         ("Long", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
         ("Long", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, false),

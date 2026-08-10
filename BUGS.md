@@ -186,7 +186,10 @@ at the bottom, and are summarized in the section right after this one.
   `toOctalString`/`compare`/`max`/`min`/`sum`/`signum` and the `Long`
   equivalents; `Double.parseDouble`/`valueOf`/`toString`/`compare`/`isNaN`/
   `isInfinite`; `Boolean.parseBoolean`/`toString`/`compare`; the `Character`
-  predicates and case conversions; `String.valueOf`/`join`/`format`; and
+  predicates and case conversions; `Integer`/`Long`/`Double`/`Float`/`Boolean`/
+  `Character`'s `hashCode(x)`, each folding at its own width (so
+  `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers);
+  `String.valueOf`/`join`/`format`; and
   `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
   `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
   %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, the `-`/`0`/`+`/`,`/`(`
@@ -228,6 +231,18 @@ at the bottom, and are summarized in the section right after this one.
   `U+001C`–`U+001F`. Neither is Rust's `char::is_whitespace`.
   Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
   one unit per astral character (which Java counts as two UTF-16 units).
+- **A boxed primitive's own methods.** `Number`'s six converters
+  (`intValue`/`longValue`/`shortValue`/`byteValue`/`doubleValue`/`floatValue`),
+  `Boolean.booleanValue`, `Character.charValue` and `Object.hashCode` answer on
+  a boxed receiver. They are checked *before* the `String` table, which is what
+  a boxed receiver used to reach after being rendered to text — that table has
+  no `intValue`, but it does have `hashCode`, so `Integer.valueOf(300)
+  .hashCode()` answered 50547 (the hash of `"300"`) instead of 300. The
+  converters narrow the way Java's casts do, and the two receiver kinds differ:
+  a `double` saturates at the `int` bounds (`Double.valueOf(1e30).intValue()` is
+  `Integer.MAX_VALUE`) where a `long` wraps
+  (`Long.valueOf(4294967296L).intValue()` is 0). A user class declaring a method
+  of the same name still wins, because its own resolution runs first.
 - **Reference arrays.** `new T[n]` (default-valued), `{…}` literals (and
   `new T[]{…}`), get/set indexing (`a[i]`, `a[i] = v`, compound `a[i] += v`,
   `a[i]++`), and `a.length`. Arrays are heap objects (`Value::Obj` handles into a

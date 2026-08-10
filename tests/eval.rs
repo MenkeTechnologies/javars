@@ -4241,3 +4241,54 @@ fn a_diagnostic_naming_a_type_uses_the_jdks_own_spelling() {
          java.lang.IllegalArgumentException: No group with name {nope}\n"
     );
 }
+
+#[test]
+fn a_boxed_primitive_answers_its_own_methods_not_its_texts() {
+    // A boxed receiver was rendered to text and the call went to the `String`
+    // table. That table has no `intValue` (an error, at least visible) but it
+    // *does* have `hashCode` — so a boxed number's hash was the hash of its
+    // digits: `Integer.valueOf(300).hashCode()` answered 50547 against Java's
+    // 300. The converters narrow the way Java's casts do, and the two receiver
+    // kinds differ: a `double` saturates at the `int` bounds where a `long`
+    // wraps, so `intValue()` cannot be routed through `long` for both.
+    let (out, ok) = run(&wrap(
+        "Integer i = 300; Long l = 4294967296L; Double d = 1e30; Boolean b = true; Character c = 'z';\
+         System.out.println(i.hashCode() + \",\" + l.hashCode() + \",\" + b.hashCode() + \",\" + c.hashCode());\
+         System.out.println(d.intValue() + \",\" + d.longValue() + \",\" + l.intValue());\
+         System.out.println(i.shortValue() + \",\" + i.byteValue() + \",\" + i.doubleValue());\
+         char ch = c.charValue();\
+         System.out.println(ch + \",\" + b.booleanValue() + \",\" + Double.valueOf(-3.9).intValue());",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "300,1,1231,122\n\
+         2147483647,9223372036854775807,0\n\
+         300,44,300.0\n\
+         z,true,-3\n"
+    );
+}
+
+#[test]
+fn the_hash_code_statics_fold_each_box_at_its_own_width() {
+    // `Xxx.hashCode(x)` is a different function per box: `Integer` is the
+    // value, `Long` folds its halves, `Double` folds `doubleToLongBits`, and
+    // `Float` is `floatToIntBits` left unfolded — so `Float.hashCode(1.5f)` and
+    // `Double.hashCode(1.5)` are different numbers. `Double.hashCode` also
+    // separates the zeroes and gives NaN one answer, matching the `equals` it
+    // has to agree with.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Integer.hashCode(7) + \",\" + Long.hashCode(7L) + \",\" + Long.hashCode(4294967296L));\
+         System.out.println(Boolean.hashCode(true) + \",\" + Boolean.hashCode(false) + \",\" + Character.hashCode('a'));\
+         System.out.println(Double.hashCode(5.5) + \",\" + Double.hashCode(0.0) + \",\" + Double.hashCode(-0.0) + \",\" + Double.hashCode(Double.NaN));\
+         System.out.println(Float.hashCode(1.5f) + \",\" + Integer.hashCode(-1));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "7,7,1\n\
+         1231,1237,97\n\
+         1075183616,0,-2147483648,2146959360\n\
+         1069547520,-1\n"
+    );
+}
