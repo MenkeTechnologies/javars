@@ -2633,6 +2633,17 @@ impl Compiler {
                 if name == "length" {
                     return NumType::Int;
                 }
+                // `Long.MAX_VALUE` / `Integer.MIN_VALUE` / `Math.PI` — a
+                // wrapper's `static final`. [`Compiler::expr_java_type`] already
+                // reads this table; without the same arm here the constant's
+                // category is `Other`, which sends `Long.MAX_VALUE / 2` down the
+                // *floating* division path and answers 4.611686018427388E18.
+                // The `int`-width constants hid the gap: their division is
+                // followed by [`Compiler::emit_wrap32`], which truncated the
+                // float back to the right integer by accident.
+                if let Some((_, ty)) = self.wrapper_constant_ref(e) {
+                    return numtype_of_ty(ty).unwrap_or(NumType::Other);
+                }
                 if let Some((_, ty)) = self.static_field_ref(e) {
                     return numtype_of_ty(&ty).unwrap_or(NumType::Other);
                 }
@@ -3717,6 +3728,18 @@ impl Compiler {
             let mut jf = None;
             let last = arm.types.len().saturating_sub(1);
             for (i, ty) in arm.types.iter().enumerate() {
+                // A catch type javars does not know matched nothing, silently:
+                // the arm compiled, `JINSTANCEOF` answered `false` for every
+                // throwable, and the handler was dead code. So
+                // `catch (StackOverflowError e)` and `catch (IOException e)`
+                // both *compiled* and then never fired, which reads as "javars
+                // handles this" at the exact place a program says what it
+                // handles. `javac` rejects an unresolvable catch type outright
+                // ("cannot find symbol"), and so does javars now — the same
+                // diagnostic `new Unknown()` already produced.
+                if !self.classes.contains_key(ty) {
+                    return Err(format!("javars: unknown class `{ty}` (line {line})"));
+                }
                 self.emit_get(&exc_t, line);
                 let c = self.b.add_constant(Value::str(ty.clone()));
                 self.b.emit(Op::LoadConst(c), line);
@@ -4795,14 +4818,22 @@ impl Compiler {
                     args.len() as u8 + 2,
                     line,
                 );
-                // `Math.abs(int)` is the one `Math` overload that overflows:
-                // `Math.abs(Integer.MIN_VALUE)` is `Integer.MIN_VALUE`, because
-                // negating it does not fit an `int`. The host has no argument
-                // width to work from, so the narrowing is emitted here.
-                if class == "Math"
-                    && method == "abs"
-                    && args.len() == 1
-                    && Self::is_int_width(self.expr_java_type(&args[0]).as_deref())
+                // The `Math` overloads that overflow at `int` width:
+                // `Math.abs(Integer.MIN_VALUE)` is `Integer.MIN_VALUE` because
+                // negating it does not fit an `int`, and
+                // `Math.floorDiv(Integer.MIN_VALUE, -1)` is the same value for
+                // the same reason (it answered 2147483648, the `long` the host
+                // computed). The host has no argument width to work from, so the
+                // narrowing is emitted here — and only when *every* argument is
+                // `int`-width, since the `long` overloads must keep 64 bits.
+                let int_overflowing = matches!(
+                    (class.as_str(), method, args.len()),
+                    ("Math", "abs", 1) | ("Math", "floorDiv", 2) | ("Math", "floorMod", 2)
+                );
+                if int_overflowing
+                    && args
+                        .iter()
+                        .all(|a| Self::is_int_width(self.expr_java_type(a).as_deref()))
                 {
                     self.emit_wrap32(line);
                 }
@@ -5413,7 +5444,10 @@ impl Compiler {
         } else if op == AssignOp::Div {
             let r = self.expr_type(value);
             self.expr(value)?;
-            self.emit_div(target, r, value, line);
+            // `wrap32` is exactly "the target is a declared `int` and the
+            // operand is `int`-width", which is the condition under which the
+            // native float division is exact; a `long /=` must not take it.
+            self.emit_div(target, r, value, wrap32, line);
         } else {
             // `s += x` on a String target is concatenation, so the operand takes
             // Java's string conversion; a numeric target makes it arithmetic,
@@ -5620,7 +5654,7 @@ impl Compiler {
             let wrap = self.operands_are_int(lhs, rhs);
             self.expr(lhs)?;
             self.expr(rhs)?;
-            self.emit_div(l, r, rhs, 0);
+            self.emit_div(l, r, rhs, wrap, 0);
             // `Integer.MIN_VALUE / -1` is the one division that overflows.
             if wrap {
                 self.emit_wrap32(0);
@@ -5811,16 +5845,26 @@ impl Compiler {
     /// with a trailing `Op::TruncInt`.
     /// Lower `/`.
     ///
-    /// Statically-integral division keeps the native op pair so the JIT can
-    /// trace it. Anything else — a floating operand, or an operand whose type is
-    /// not statically known — routes through the `JDIV` builtin, because Java
+    /// `int`-width integral division keeps the native op pair so the JIT can
+    /// trace it. Integral division at 64-bit width routes through the `JIDIV`
+    /// builtin, because fusevm's `Op::Div` computes in `f64`: that is exact for
+    /// two `int` operands but not for a `long`, where an operand above 2^53 does
+    /// not survive the round trip and `Long.MIN_VALUE / -1` saturates instead of
+    /// wrapping (see [`crate::host::JIDIV`]).
+    ///
+    /// Anything else — a floating operand, or an operand whose type is not
+    /// statically known — routes through the `JDIV` builtin, because Java
     /// floating division is IEEE-754: `x / 0.0` is a signed infinity and
     /// `0.0 / 0.0` is NaN, where the native op yields `Undef`.
-    fn emit_div(&mut self, l: NumType, r: NumType, divisor: &Expr, line: u32) {
+    fn emit_div(&mut self, l: NumType, r: NumType, divisor: &Expr, int_width: bool, line: u32) {
         if l == NumType::Int && r == NumType::Int {
             self.emit_zero_divisor_check(divisor, line);
-            self.b.emit(Op::Div, line);
-            self.b.emit(Op::TruncInt, line);
+            if int_width {
+                self.b.emit(Op::Div, line);
+                self.b.emit(Op::TruncInt, line);
+            } else {
+                self.b.emit(Op::CallBuiltin(crate::host::JIDIV, 2), line);
+            }
         } else {
             self.b.emit(Op::CallBuiltin(crate::host::JDIV, 2), line);
         }
@@ -6405,6 +6449,13 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Short", "MIN_VALUE") => (Value::Int(i16::MIN as i64), "short"),
         ("Byte", "MAX_VALUE") => (Value::Int(i8::MAX as i64), "byte"),
         ("Byte", "MIN_VALUE") => (Value::Int(i8::MIN as i64), "byte"),
+        // `char` is unsigned, so its bounds are not a signed type's: Java's
+        // `Character.MIN_VALUE` is `' '` and `MAX_VALUE` is `'￿'`
+        // (65535), and both are typed `char` — so `Character.MAX_VALUE / 2` is
+        // the `int` 32767 while `println(Character.MAX_VALUE)` prints the
+        // character, which the `char` type name is what selects.
+        ("Character", "MAX_VALUE") => (Value::Int(u16::MAX as i64), "char"),
+        ("Character", "MIN_VALUE") => (Value::Int(0), "char"),
         ("Float", "MAX_VALUE") => (Value::float(f32::MAX as f64), "float"),
         // `Float.MIN_VALUE` is the smallest positive *subnormal*, not `f32::MIN`.
         ("Float", "MIN_VALUE") => (Value::float(f32::from_bits(1) as f64), "float"),

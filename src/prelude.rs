@@ -59,6 +59,16 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("NoSuchElementException", "RuntimeException"),
     ("IllegalFormatException", "IllegalArgumentException"),
     ("IllegalFormatConversionException", "IllegalFormatException"),
+    // The rest of `java.util`'s format family. Each is a *catchable*
+    // `IllegalFormatException` in Java, and javars reported all four as internal
+    // `javars:` errors that abort the run — two of them only after a `panic!` or
+    // a hang first. Superclasses read off `getSuperclass()` on openjdk 21.0.12,
+    // not assumed from the names: all four sit directly under
+    // `IllegalFormatException`, siblings of `IllegalFormatConversionException`.
+    ("IllegalFormatWidthException", "IllegalFormatException"),
+    ("IllegalFormatPrecisionException", "IllegalFormatException"),
+    ("MissingFormatArgumentException", "IllegalFormatException"),
+    ("UnknownFormatConversionException", "IllegalFormatException"),
 ];
 
 /// True when `name` is one of the modeled JDK throwables.
@@ -81,7 +91,11 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
         "ConcurrentModificationException"
         | "NoSuchElementException"
         | "IllegalFormatException"
-        | "IllegalFormatConversionException" => format!("java.util.{name}"),
+        | "IllegalFormatConversionException"
+        | "IllegalFormatWidthException"
+        | "IllegalFormatPrecisionException"
+        | "MissingFormatArgumentException"
+        | "UnknownFormatConversionException" => format!("java.util.{name}"),
         _ => format!("java.lang.{name}"),
     })
 }
@@ -216,10 +230,19 @@ pub fn is_functional(name: &str) -> bool {
 
 /// The Java source of the prelude classes the program does not already declare.
 ///
-/// `Throwable` holds the message and the accessors; every subclass adds only its
-/// two constructors and a `toString()` that names itself, because Java's
-/// `Throwable.toString()` prints the *runtime* class name and javars resolves
-/// that by virtual dispatch on the override rather than by a runtime class query.
+/// `Throwable` holds the message, the accessors, and the single `toString()` the
+/// whole tree inherits; every subclass adds only its two constructors.
+///
+/// That one `toString()` asks `this.getClass().getName()` for the name, which is
+/// what Java's own `Throwable.toString()` does. The earlier shape gave *each*
+/// prelude class its own override with the qualified name written into the
+/// string literal, so the name came from the class the compiler resolved the
+/// override on rather than from the object. That is indistinguishable for a
+/// prelude class thrown directly, and wrong for every user-defined one:
+/// `class MyEx extends RuntimeException` inherited `RuntimeException`'s
+/// override and rendered `java.lang.RuntimeException: b` where Java prints
+/// `T$MyEx: b`. Subclassing an exception is the ordinary way to define one, so
+/// that was the common case, not the corner.
 fn prelude_source(declared: &[String]) -> String {
     let mut src =
         String::from("public class __JavaLang { public static void main(String[] a) { } }\n");
@@ -241,18 +264,21 @@ fn prelude_source(declared: &[String]) -> String {
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ detailMessage = m; }}\n"));
             src.push_str("  String getMessage() { return detailMessage; }\n");
+            // `getLocalizedMessage()` is `Throwable`'s own one-liner
+            // (`return getMessage();`), overridable but never overridden here.
+            src.push_str("  String getLocalizedMessage() { return getMessage(); }\n");
+            // The name comes from the *object*, not from the class this method
+            // was resolved on — `getName()` already answers `java.lang.Foo` for
+            // a modeled throwable (including the two that are not in
+            // `java.lang`) and `T$MyEx` for a user-defined one.
+            src.push_str(
+                "  String toString() { String n = this.getClass().getName(); \
+                 if (detailMessage == null) { return n; } return n + \": \" + detailMessage; }\n",
+            );
         } else {
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ super(m); }}\n"));
         }
-        // The qualified name has to come from [`qualified_throwable`], not a
-        // hardcoded `java.lang.` — `PatternSyntaxException` is `java.util.regex`
-        // and `ConcurrentModificationException` is `java.util`, and a caught one
-        // printed under the wrong package is a silently wrong answer.
-        let qualified = qualified_throwable(name).unwrap_or_else(|| (*name).to_string());
-        src.push_str(&format!(
-            "  String toString() {{ if (detailMessage == null) {{ return \"{qualified}\"; }} return \"{qualified}: \" + detailMessage; }}\n"
-        ));
         src.push_str("}\n");
     }
     src

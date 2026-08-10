@@ -2062,67 +2062,73 @@ xs.forEach(show);</code></pre>
           <p>Java's floating-point division. fusevm's native <code>Div</code> yields <code>Undef</code> for a zero divisor because its shell/awk flavour has no infinities; only the floating path routes here, so statically-integral division keeps the native op and stays JIT-traceable.</p>
         </article>
         <article class="doc-entry" id="doc-runtime-builtins-21">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-21">#</a> <code>JTHROW</code></h3>
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-21">#</a> <code>JIDIV</code></h3>
+          <pre><code class="lang-java">id 745 · stack [a, b] -&gt; long</code></pre>
+          <p>Java's 64-bit integral division. fusevm's native <code>Div</code> computes in <code>f64</code>, which is exact for two <code>int</code> operands but not for a <code>long</code>: above 2^53 the operand does not survive the round trip, and <code>Long.MIN_VALUE / -1</code> saturates where Java wraps. <code>int</code>-width division keeps the native op pair and stays JIT-traceable; only a <code>long</code> routes here. A zero divisor is rejected by the compiler's inline check before the call.</p>
+          <pre><code class="lang-java">long q = Long.MAX_VALUE / 2;   // 4611686018427387903, not 4611686018427387904</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-runtime-builtins-22">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-22">#</a> <code>JTHROW</code></h3>
           <pre><code class="lang-java">id 720 · stack [throwable] -&gt; null</code></pre>
           <p><code>throw e</code> — parks the value as the host's pending exception. The compiler emits the jump to the handler, or the frame exit, immediately after.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-22">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-22">#</a> <code>JEXC_PENDING</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-23">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-23">#</a> <code>JEXC_PENDING</code></h3>
           <pre><code class="lang-java">id 721 · stack [] -&gt; boolean</code></pre>
           <p>Is an exception in flight? Emitted after every call in a program that uses exceptions — that per-call-site check is how the unwind is modeled, since fusevm has no unwind opcode.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-23">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-23">#</a> <code>JEXC_TAKE</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-24">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-24">#</a> <code>JEXC_TAKE</code></h3>
           <pre><code class="lang-java">id 722 · stack [] -&gt; throwable</code></pre>
           <p>Claims the pending exception, clearing it. Emitted at the top of a handler.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-24">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-24">#</a> <code>JEXC_DEPTH</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-25">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-25">#</a> <code>JEXC_DEPTH</code></h3>
           <pre><code class="lang-java">id 723 · stack [] -&gt; int</code></pre>
           <p>The current value-stack depth, recorded on entry to a <code>try</code>.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-25">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-25">#</a> <code>JEXC_CUT</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-26">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-26">#</a> <code>JEXC_CUT</code></h3>
           <pre><code class="lang-java">id 724 · stack [depth] -&gt; null</code></pre>
           <p>Truncates the value stack back to a recorded depth, discarding the operands of the expression the throw abandoned. Without it those operands would pile up once per throw, forever, inside a loop.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-26">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-26">#</a> <code>JEXC_ABORT</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-27">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-27">#</a> <code>JEXC_ABORT</code></h3>
           <pre><code class="lang-java">id 725 · stack [] -&gt; null</code></pre>
           <p>Reports an exception that reached the top of <code>main</code> in Java's own <code>Exception in thread "main" &lt;class&gt;: &lt;message&gt;</code> form and halts, so the process exits non-zero the way <code>java</code> does.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-27">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-27">#</a> <code>JFAULT</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-28">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-28">#</a> <code>JFAULT</code></h3>
           <pre><code class="lang-java">id 726 · stack [className, message] -&gt; null</code></pre>
           <p>Raises a fault the compiler detected inline — integral division by zero, and an enum <code>valueOf</code> with no matching constant — through the same path a host-detected fault takes, so the throwable is catchable.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-28">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-28">#</a> <code>JARGV</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-29">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-29">#</a> <code>JARGV</code></h3>
           <pre><code class="lang-java">id 727 · stack [] -&gt; array</code></pre>
           <p><code>main</code>'s <code>String[] args</code>, as a fresh array of the program arguments the CLI collected. Called once by the prologue, so the array the program sees is its own.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-29">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-29">#</a> <code>JMAKE_CLOSURE</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-30">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-30">#</a> <code>JMAKE_CLOSURE</code></h3>
           <pre><code class="lang-java">id 728 · stack [caps…, nameIdx, params, ncap] -&gt; closure</code></pre>
           <p>Builds a lambda closure, snapshotting the enclosing locals by value. A javars local lives in a call-frame slot that does not outlive the frame, so a by-value snapshot is the only model that also gives the enhanced <code>for</code> its per-iteration capture.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-30">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-30">#</a> <code>JCLOSURE_CALL</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-31">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-31">#</a> <code>JCLOSURE_CALL</code></h3>
           <pre><code class="lang-java">id 729 · stack [closure, args…] -&gt; result</code></pre>
           <p>Invokes a closure in its own fusevm call frame through a nested run. A mismatched arity is padded with <code>null</code> or truncated rather than corrupting the frame, and an exception already in flight suppresses the call so a unwinding frame cannot re-run side effects.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-31">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-31">#</a> <code>JCOLL_NEW</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-32">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-32">#</a> <code>JCOLL_NEW</code></h3>
           <pre><code class="lang-java">id 730 · stack [kindName, seed] -&gt; collection</code></pre>
           <p>Allocates a modeled <code>java.util</code> collection, optionally seeded by a copy constructor's argument. Collections live on the same heap slab as arrays and instances, so aliasing, <code>==</code> identity, and passing one to a method all behave like Java references with no extra machinery.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-32">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-32">#</a> <code>JCOLL_DISPATCH</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-33">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-33">#</a> <code>JCOLL_DISPATCH</code></h3>
           <pre><code class="lang-java">id 731 · stack [recv, args…, method] -&gt; result</code></pre>
           <p>An instance method on a collection receiver. Methods that run user code (<code>sort</code> with a comparator, <code>forEach</code>) snapshot the elements and re-enter the VM with no heap borrow held, because a lambda body can allocate.</p>
         </article>
-        <article class="doc-entry" id="doc-runtime-builtins-33">
-          <h3><a class="doc-anchor" href="#doc-runtime-builtins-33">#</a> <code>JITER_ARRAY</code></h3>
+        <article class="doc-entry" id="doc-runtime-builtins-34">
+          <h3><a class="doc-anchor" href="#doc-runtime-builtins-34">#</a> <code>JITER_ARRAY</code></h3>
           <pre><code class="lang-java">id 732 · stack [iterable] -&gt; array</code></pre>
           <p>The elements of an enhanced-<code>for</code> iterable, as an array. An array receiver is handed back unchanged so an array loop keeps aliasing; a collection is snapshotted. Emitted only when the compiler could not prove the iterable is already an array.</p>
         </article>

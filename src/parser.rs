@@ -192,6 +192,17 @@ impl Parser {
             self.advance();
             loop {
                 let sup = self.type_name()?;
+                // `class MyEx extends RuntimeException { … }` needs the modeled
+                // throwable hierarchy just as much as a `throw` does — the
+                // superclass is where `detailMessage`, `getMessage()` and
+                // `toString()` come from. Without this, the prelude was skipped
+                // for a program that only *subclasses* an exception, the
+                // `extends` dangled, and `e.getMessage()` was "class `MyEx` has
+                // no method `getMessage`" while `println(e)` rendered the
+                // `Object` default `T$MyEx@1` instead of `T$MyEx: b`.
+                if crate::prelude::is_throwable(&sup) {
+                    self.uses_exceptions = true;
+                }
                 if is_interface {
                     interfaces.push(sup);
                 } else {

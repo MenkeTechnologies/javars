@@ -2235,6 +2235,13 @@ pub const REFERENCE: &[Entry] = &[
         "",
     ),
     (
+        "JIDIV",
+        "Runtime Builtins",
+        "id 745 · stack [a, b] -> long",
+        "Java's 64-bit integral division. fusevm's native `Div` computes in `f64`, which is exact for two `int` operands but not for a `long`: above 2^53 the operand does not survive the round trip, and `Long.MIN_VALUE / -1` saturates where Java wraps. `int`-width division keeps the native op pair and stays JIT-traceable; only a `long` routes here. A zero divisor is rejected by the compiler's inline check before the call.",
+        "long q = Long.MAX_VALUE / 2;   // 4611686018427387903, not 4611686018427387904",
+    ),
+    (
         "JTHROW",
         "Runtime Builtins",
         "id 720 · stack [throwable] -> null",

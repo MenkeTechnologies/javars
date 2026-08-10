@@ -175,8 +175,14 @@ fn utf8_string_literal_survives() {
 
 #[test]
 fn missing_main_is_an_error() {
-    let (_out, ok) = run("public class NoMain { int x; }");
-    assert!(!ok, "a class with no main should fail to run");
+    // The diagnostic is asserted, not only the exit status: every way a program
+    // can fail is non-zero, so `!ok` alone passes when javars rejects the unit
+    // for some unrelated reason — a parse error in the class body would satisfy
+    // it just as well as the missing entry point this test is named for.
+    rejected(
+        "public class NoMain { int x; }",
+        "javars: no class declares `public static void main(String[] args)`",
+    );
 }
 
 // ── integer vs. floating division (Java binary numeric promotion) ──
@@ -262,9 +268,11 @@ fn method_call_result_feeds_arithmetic() {
 
 #[test]
 fn wrong_argument_count_is_a_compile_error() {
-    let (_out, ok) = run("public class E { static int f(int a) { return a; } \
-         public static void main(String[] args) { System.out.println(f(1, 2)); } }");
-    assert!(!ok, "calling a method with the wrong arity must fail");
+    rejected(
+        "public class E { static int f(int a) { return a; } \
+         public static void main(String[] args) { System.out.println(f(1, 2)); } }",
+        "javars: no `f` overload matches 2 argument(s)",
+    );
 }
 
 // ── String instance methods (postfix `.` dispatch) ──
@@ -309,10 +317,14 @@ fn chained_string_calls() {
 
 #[test]
 fn string_index_out_of_range_is_an_error() {
-    let (_out, ok) = run(&wrap("System.out.println(\"hi\".charAt(9));"));
-    assert!(
-        !ok,
-        "an out-of-range charAt must surface an error, not a wrong value"
+    // Asserting the throwable's class and detail message, not just a non-zero
+    // exit: the point is that the failure is Java's
+    // `StringIndexOutOfBoundsException` reaching the top of `main`, and a
+    // compile error or a panic would satisfy a bare `!ok` identically.
+    rejected(
+        &wrap("System.out.println(\"hi\".charAt(9));"),
+        "Exception in thread \"main\" java.lang.StringIndexOutOfBoundsException: \
+         Index 9 out of bounds for length 2",
     );
 }
 
@@ -464,10 +476,10 @@ fn integer_parse_value_and_to_string_with_radix() {
 
 #[test]
 fn integer_parse_int_rejects_non_numeric() {
-    let (_out, ok) = run(&wrap("System.out.println(Integer.parseInt(\"notnum\"));"));
-    assert!(
-        !ok,
-        "parseInt of a non-numeric string must fault, not return a wrong value"
+    rejected(
+        &wrap("System.out.println(Integer.parseInt(\"notnum\"));"),
+        "Exception in thread \"main\" java.lang.NumberFormatException: \
+         For input string: \"notnum\"",
     );
 }
 
@@ -492,10 +504,12 @@ fn system_err_writes_to_stderr_not_stdout() {
 
 #[test]
 fn unknown_static_method_is_an_error() {
-    let (_out, ok) = run(&wrap("System.out.println(Math.tan(1.0));"));
-    assert!(
-        !ok,
-        "an unregistered static method must error rather than run"
+    // `Math.tan` is deliberately unregistered (its last digit does not match
+    // StrictMath), so the diagnostic must name it — a rejection that merely
+    // failed to parse the call would pass a bare status check.
+    rejected(
+        &wrap("System.out.println(Math.tan(1.0));"),
+        "javars: unsupported static method `Math.tan` with 1 argument(s)",
     );
 }
 
@@ -555,11 +569,11 @@ fn string_array_elements_are_reference_typed() {
 
 #[test]
 fn array_index_out_of_bounds_is_an_error() {
-    let (_out, ok) = run("public class Main { public static void main(String[] a) {\
-         int[] x = new int[2]; System.out.println(x[5]); } }");
-    assert!(
-        !ok,
-        "an out-of-range array read must fault, not return junk"
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         int[] x = new int[2]; System.out.println(x[5]); } }",
+        "Exception in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: \
+         Index 5 out of bounds for length 2",
     );
 }
 
@@ -782,9 +796,11 @@ fn interface_extends_interface_default_override() {
 
 #[test]
 fn instantiating_an_interface_is_an_error() {
-    let (_out, ok) = run("public class Main { interface I { void m(); }\
-         public static void main(String[] a) { I x = new I(); } }");
-    assert!(!ok, "an interface must not be instantiable");
+    rejected(
+        "public class Main { interface I { void m(); }\
+         public static void main(String[] a) { I x = new I(); } }",
+        "javars: `I` is an interface and cannot be instantiated",
+    );
 }
 
 // ── Method overloading by parameter type ─────────────────────────────────────
@@ -1145,9 +1161,11 @@ fn enum_constants_are_singletons_with_name_and_ordinal() {
 fn an_enum_constant_with_arguments_is_rejected() {
     // javars has no per-constant state, so running `EARTH(5.97)` as a bare
     // `EARTH` would silently drop the mass. The program is refused instead.
-    let (_, ok) = run("enum Planet { EARTH(5.97), MARS(0.64); double mass; }\
-         public class Main { public static void main(String[] a) { System.out.println(Planet.EARTH); } }");
-    assert!(!ok);
+    rejected(
+        "enum Planet { EARTH(5.97), MARS(0.64); double mass; }\
+         public class Main { public static void main(String[] a) { System.out.println(Planet.EARTH); } }",
+        "javars: class `Planet` has no constructor taking 1 argument(s)",
+    );
 }
 
 #[test]
@@ -1547,14 +1565,16 @@ fn an_ambiguous_method_reference_is_a_compile_error() {
     // A method reference's arity comes from the referenced member, because
     // javars does not target-type. An overloaded name therefore has no single
     // arity and is rejected, rather than one overload being guessed.
-    let (_, ok) = run("import java.util.function.*;\
+    rejected(
+        "import java.util.function.*;\
          public class Main {\
          static int f(int a) { return a; }\
          static int f(int a, int b) { return a + b; }\
          public static void main(String[] x) {\
          Function<Integer, Integer> g = Main::f;\
-         System.out.println(g.apply(1)); } }");
-    assert!(!ok);
+         System.out.println(g.apply(1)); } }",
+        "javars: class `Main` has no member `f` a method reference can name",
+    );
 }
 
 #[test]
@@ -4337,4 +4357,350 @@ fn the_array_copies_reject_a_bad_range_instead_of_clamping_it() {
     ));
     assert!(ok);
     assert_eq!(out, "2 > 1\nnas -1\naioobe\n[2, 3, 0, 0]\n[]\n");
+}
+
+// ── Round 7: panic-vs-throwable, and the throwable's class rather than its text
+
+#[test]
+fn integral_division_is_exact_at_64_bits() {
+    // `long / long` lowered to fusevm's `Op::Div` (an `f64` divide) plus
+    // `Op::TruncInt`. That is exact for two `int` operands but not for a
+    // `long`: the operand itself stops round-tripping above 2^53, so `x / 1`
+    // did not answer `x`, and `Long.MAX_VALUE / 2` rounded *up* past the true
+    // quotient. Every expectation here is a `parity_expected.txt` record
+    // captured from openjdk 21.0.12; they are repeated as a unit test because
+    // the corpus replays whole programs and this pins the operator.
+    let (out, ok) = run(&wrap(
+        "long a = 9007199254740993L; System.out.println(a / 1);\
+         long b = Long.MAX_VALUE; System.out.println(b / 2);\
+         System.out.println(b / 3);\
+         long c = 123456789012345678L; System.out.println(c / 7);\
+         long d = 1000000007L * 1000000009L; System.out.println(d / 1000000007L);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "9007199254740993\n4611686018427387903\n3074457345618258602\n\
+         17636684144620811\n1000000009\n"
+    );
+}
+
+#[test]
+fn long_min_value_divided_by_minus_one_wraps_rather_than_saturating() {
+    // JLS 15.17.2 names this case: the quotient overflows and the result is the
+    // dividend. As an `f64` divide the quotient is 2^63, and `Op::TruncInt`
+    // *saturates* — so this answered `Long.MAX_VALUE`, off by one and the wrong
+    // sign. The `int` counterpart never had the defect: its trailing
+    // `emit_wrap32` folded the overflow back.
+    let (out, ok) = run(&wrap(
+        "long x = Long.MIN_VALUE; long y = -1; System.out.println(x / y);\
+         int i = Integer.MIN_VALUE; int j = -1; System.out.println(i / j);\
+         long z = Long.MIN_VALUE; z /= -1; System.out.println(z);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "-9223372036854775808\n-2147483648\n-9223372036854775808\n"
+    );
+}
+
+#[test]
+fn a_wrapper_constant_divides_at_its_own_declared_width() {
+    // `expr_java_type` read the wrapper-constant table but `expr_type` did not,
+    // so `Long.MAX_VALUE`'s numeric category was `Other` and the division took
+    // the *floating* path, printing 4.611686018427388E18. The `int`-width
+    // constants hid it: their `emit_wrap32` truncated the float back to the
+    // right integer, so only the 64-bit ones were visibly wrong.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Long.MAX_VALUE / 2);\
+         System.out.println(Long.MIN_VALUE / 2);\
+         System.out.println(Integer.MAX_VALUE / 2);\
+         System.out.println(Short.MAX_VALUE / 2);\
+         System.out.println(Character.MAX_VALUE / 2);\
+         System.out.println((int) Character.MIN_VALUE);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "4611686018427387903\n-4611686018427387904\n1073741823\n16383\n32767\n0\n"
+    );
+}
+
+#[test]
+fn a_user_defined_throwable_reports_its_own_class_not_its_superclass() {
+    // Two defects met here. The exception prelude was injected only for a
+    // program that wrote `throw`/`try`/`new <throwable>`, so a program that
+    // merely *subclassed* one got no `Throwable` at all: the `extends` dangled
+    // and `e.getMessage()` was "class `MyEx` has no method `getMessage`". And
+    // each prelude class carried its own `toString()` with the qualified name
+    // written into a string literal, so once the prelude was there, a user
+    // subclass inherited `RuntimeException`'s and rendered
+    // `java.lang.RuntimeException: b`. Java names the runtime class.
+    let (out, ok) = run("public class Main {\
+         static class MyEx extends RuntimeException { MyEx(String m) { super(m); } }\
+         static class Bare extends RuntimeException { }\
+         public static void main(String[] a) {\
+         MyEx e = new MyEx(\"b\");\
+         System.out.println(e);\
+         System.out.println(e.toString());\
+         System.out.println(e.getMessage());\
+         System.out.println(e.getLocalizedMessage());\
+         System.out.println(new Bare());\
+         RuntimeException widened = e;\
+         System.out.println(widened.toString()); } }");
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "Main$MyEx: b\nMain$MyEx: b\nb\nb\nMain$Bare\nMain$MyEx: b\n"
+    );
+}
+
+#[test]
+fn an_uncaught_user_throwable_reports_its_binary_name() {
+    // The uncaught report renders from the heap object rather than through the
+    // Java-level `toString()`, and it asked `qualified_throwable`, which answers
+    // `None` for a user class — so the report printed the *simple* name `MyEx`
+    // where Java prints the binary name `Main$MyEx`. A corpus record cannot pin
+    // this: the capture script only keeps programs that exit 0.
+    let (out, err, ok) = run_streams(
+        "public class Main {\
+         static class MyEx extends RuntimeException { MyEx(String m) { super(m); } }\
+         public static void main(String[] a) { throw new MyEx(\"boom\"); } }",
+    );
+    assert!(!ok, "an uncaught throwable must exit non-zero");
+    assert_eq!(out, "", "nothing runs after the throw");
+    assert!(
+        err.contains("Exception in thread \"main\" Main$MyEx: boom"),
+        "stderr was {err:?}"
+    );
+}
+
+#[test]
+fn a_catch_type_javars_does_not_model_is_rejected_rather_than_never_matching() {
+    // An unmodeled catch type compiled: `JINSTANCEOF` answered `false` for every
+    // throwable, so the arm was dead code and the program ran as if the handler
+    // were live. That is the one place a program states what it handles, so a
+    // silently-dead arm is worse than a rejection — and `javac` rejects an
+    // unresolvable one too. `new`/`throw` already enforced this; `catch` did
+    // not.
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         try { System.out.println(\"hi\"); }\
+         catch (TotallyBogusException e) { System.out.println(\"no\"); } } }",
+        "javars: unknown class `TotallyBogusException`",
+    );
+    // A real JDK throwable javars does not model reaches the same rejection —
+    // `catch (StackOverflowError e)` used to compile and could never fire,
+    // because javars raises no `StackOverflowError` (BUGS.md).
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         try { System.out.println(\"hi\"); }\
+         catch (StackOverflowError e) { System.out.println(\"no\"); } } }",
+        "javars: unknown class `StackOverflowError`",
+    );
+    // A multi-catch is checked alternative by alternative, so a good first
+    // alternative does not launder a bad second one.
+    rejected(
+        "public class Main { public static void main(String[] a) {\
+         try { System.out.println(\"hi\"); }\
+         catch (IllegalStateException | NoSuchThingException e) { System.out.println(\"no\"); } } }",
+        "javars: unknown class `NoSuchThingException`",
+    );
+    // The modeled ones still compile and still catch.
+    let (out, ok) = run(&wrap(
+        "try { throw new IllegalStateException(\"s\"); }\
+         catch (RuntimeException e) { System.out.println(\"caught \" + e); }",
+    ));
+    assert!(ok);
+    assert_eq!(out, "caught java.lang.IllegalStateException: s\n");
+}
+
+#[test]
+fn parsing_a_null_string_faults_with_javas_class_not_just_javas_wording() {
+    // The integral parsers coerced `null` to `""` and reported
+    // `For input string: ""` — the message a genuinely empty string gets, so the
+    // two inputs were indistinguishable. The floating parsers were wrong in the
+    // *class*: javars raised `NumberFormatException` where the JDK dereferences
+    // the argument in `FloatingDecimal.readJavaFormatString` and raises
+    // `NullPointerException`, which a `catch (NumberFormatException e)` does not
+    // catch. `Integer.valueOf(null)` did not fault at all — it read `null` as
+    // the `int` overload and answered 0. Measured on openjdk 21.0.12.
+    let (out, ok) = run(&wrap(
+        "String n = null;\
+         try { Integer.parseInt(n); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { Integer.parseInt(n, 16); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { Long.parseLong(n); } catch (Throwable t) { System.out.println(t.getClass().getName()); }\
+         try { Integer.valueOf(n); } catch (Throwable t) { System.out.println(t.getClass().getName()); }\
+         try { Long.valueOf(n); } catch (Throwable t) { System.out.println(t.getClass().getName()); }\
+         try { Double.parseDouble(n); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { Float.parseFloat(n); } catch (Throwable t) { System.out.println(t.getClass().getName()); }\
+         System.out.println(Integer.parseInt(\"7\"));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "java.lang.NumberFormatException: Cannot parse null string\n\
+         java.lang.NumberFormatException: Cannot parse null string\n\
+         java.lang.NumberFormatException\n\
+         java.lang.NumberFormatException\n\
+         java.lang.NumberFormatException\n\
+         java.lang.NullPointerException: Cannot invoke \"String.trim()\" because \"in\" is null\n\
+         java.lang.NullPointerException\n\
+         7\n"
+    );
+}
+
+#[test]
+fn a_null_parse_is_caught_by_the_handler_java_sends_it_to() {
+    // The shape check the message audit cannot make: which arm runs. A
+    // `NumberFormatException` handler must NOT see the floating parsers' null,
+    // and an empty string must still reach the handler it always did.
+    let (out, ok) = run(&wrap(
+        "try { Double.parseDouble(null); System.out.println(\"no throw\"); }\
+         catch (NumberFormatException e) { System.out.println(\"WRONG: NFE arm\"); }\
+         catch (NullPointerException e) { System.out.println(\"NPE arm\"); }\
+         try { Integer.parseInt(null); }\
+         catch (NullPointerException e) { System.out.println(\"WRONG: NPE arm\"); }\
+         catch (NumberFormatException e) { System.out.println(\"NFE arm\"); }\
+         try { Double.parseDouble(\"\"); }\
+         catch (NumberFormatException e) { System.out.println(\"empty: \" + e.getMessage()); }",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "NPE arm\nNFE arm\nempty: empty String\n");
+}
+
+#[test]
+fn the_integral_math_overloads_wrap_instead_of_panicking() {
+    // `Math.abs(Long.MIN_VALUE)` called Rust's `i64::abs`, which panics on
+    // `i64::MIN` — the process aborted with "attempt to negate with overflow"
+    // where Java answers `Long.MIN_VALUE` (its javadoc names the case). The
+    // `floorDiv`/`floorMod` pair had three more of the same: the `%`, the
+    // `q - 1`, and the `q * b` all overflowed on the same operands. A panic is a
+    // parity divergence even when the happy path matches, because no `catch` can
+    // see it.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Math.abs(Long.MIN_VALUE));\
+         System.out.println(Math.abs(Integer.MIN_VALUE));\
+         System.out.println(Math.abs(-5L));\
+         System.out.println(Math.floorDiv(Long.MIN_VALUE, -1L));\
+         System.out.println(Math.floorMod(Long.MIN_VALUE, -1L));\
+         System.out.println(Math.floorDiv(Integer.MIN_VALUE, -1));\
+         System.out.println(Math.floorMod(Integer.MIN_VALUE, -1));\
+         System.out.println(Math.floorDiv(-7, 2));\
+         System.out.println(Math.floorMod(-7, 2));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "-9223372036854775808\n-2147483648\n5\n-9223372036854775808\n0\n\
+         -2147483648\n0\n-4\n1\n"
+    );
+}
+
+#[test]
+fn a_bad_format_specifier_is_a_catchable_illegal_format_exception() {
+    // Four `String.format` failures were internal `javars:` errors that end the
+    // run, where Java raises a catchable `IllegalFormatException`. Two were
+    // worse than uncatchable: `%.99999999999f` reached
+    // `format!("{:.*}", prec + 30, x)` and panicked, and `%99999999999d` reached
+    // the padder and hung. Java parses width and precision as `int` and rejects
+    // a digit string that does not fit, with the overflowed value as the
+    // message. Classes and messages measured on openjdk 21.0.12.
+    let (out, ok) = run(&wrap(
+        "try { String.format(\"%99999999999d\", 1); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { String.format(\"%2147483648d\", 1); } catch (Throwable t) { System.out.println(t.getClass().getName()); }\
+         try { String.format(\"%.99999999999f\", 1.0); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { String.format(\"%,10.2f\"); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { String.format(\"%z\", 1); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         System.out.println(String.format(\"%5.2f|%,d|%-6s|\", 3.14159, 1234567, \"ab\"));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "java.util.IllegalFormatWidthException: -2147483648\n\
+         java.util.IllegalFormatWidthException\n\
+         java.util.IllegalFormatPrecisionException: -2147483648\n\
+         java.util.MissingFormatArgumentException: Format specifier '%,10.2f'\n\
+         java.util.UnknownFormatConversionException: Conversion = 'z'\n\
+         \u{20}3.14|1,234,567|ab    |\n"
+    );
+}
+
+#[test]
+fn a_format_failure_reaches_the_handler_its_java_supertype_names() {
+    // The shape, not the text: all four are `IllegalFormatException`, which is an
+    // `IllegalArgumentException` (read off `getSuperclass()` on openjdk 21.0.12).
+    // As internal javars errors none of them could be caught at all, so no
+    // handler shape was observable.
+    let (out, ok) = run(&wrap(
+        "try { String.format(\"%z\", 1); } catch (IllegalArgumentException e) { System.out.println(\"IAE arm\"); }\
+         try { String.format(\"%d\"); } catch (java.util.IllegalFormatException e) { System.out.println(\"IFE arm\"); }\
+         try { String.format(\"%.99999999999f\", 1.0); } catch (RuntimeException e) { System.out.println(\"RTE arm\"); }\
+         try { String.format(\"%99999999999d\", 1); } catch (java.util.IllegalFormatConversionException e) { System.out.println(\"WRONG sibling arm\"); } catch (java.util.IllegalFormatException e) { System.out.println(\"width arm\"); }",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "IAE arm\nIFE arm\nRTE arm\nwidth arm\n");
+}
+
+#[test]
+fn a_string_method_given_null_throws_instead_of_coercing_it_to_empty() {
+    // Ten `String` methods dereference their argument, so Java fails before
+    // computing anything. javars coerced `null` to `""` and answered:
+    // `"abc".compareTo(null)` was 3, `startsWith(null)` was true,
+    // `split(null)` returned the whole string. A wrong answer where Java throws
+    // is worse than either, because nothing marks it. `equals` and
+    // `equalsIgnoreCase` are specified to answer `false` rather than throw, and
+    // a null *element* of `String.join` renders as "null" — all three stay.
+    let (out, ok) = run(&wrap(
+        "String n = null;\
+         try { \"abc\".compareTo(n); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         try { \"abc\".contains(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".startsWith(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".endsWith(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".indexOf(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".concat(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".split(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".replace(n, \"x\"); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { \"abc\".compareToIgnoreCase(n); } catch (Throwable t) { System.out.println(t.getClass().getSimpleName()); }\
+         try { String.join(n, \"a\", \"b\"); } catch (Throwable t) { System.out.println(t.getClass().getName() + \": \" + t.getMessage()); }\
+         System.out.println(\"abc\".equals(n));\
+         System.out.println(\"abc\".equalsIgnoreCase(n));\
+         System.out.println(String.join(\",\", \"a\", null));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "java.lang.NullPointerException: Cannot read field \"value\" because \"anotherString\" is null\n\
+         NullPointerException\nNullPointerException\nNullPointerException\nNullPointerException\n\
+         NullPointerException\nNullPointerException\nNullPointerException\nNullPointerException\n\
+         java.lang.NullPointerException: Cannot invoke \"java.lang.CharSequence.toString()\" because \"delimiter\" is null\n\
+         false\nfalse\na,null\n"
+    );
+}
+
+#[test]
+fn a_boxed_compare_to_null_names_the_boxs_own_parameter() {
+    // `compareTo` runs through its own builtin rather than the `String` method
+    // table, so it needed its own null-argument guard — and each box names a
+    // different parameter in the message, measured one by one on openjdk 21.0.12
+    // rather than sharing one wording.
+    let (out, ok) = run(&wrap(
+        "Integer i = 1; Double d = 1.0; Character c = 'a'; Boolean b = true; Long g = 1L;\
+         try { i.compareTo(null); } catch (Throwable t) { System.out.println(t.getMessage()); }\
+         try { d.compareTo(null); } catch (Throwable t) { System.out.println(t.getMessage()); }\
+         try { c.compareTo(null); } catch (Throwable t) { System.out.println(t.getMessage()); }\
+         try { b.compareTo(null); } catch (Throwable t) { System.out.println(t.getMessage()); }\
+         try { g.compareTo(null); } catch (Throwable t) { System.out.println(t.getMessage()); }\
+         System.out.println(i.compareTo(2));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "Cannot read field \"value\" because \"anotherInteger\" is null\n\
+         Cannot read field \"value\" because \"anotherDouble\" is null\n\
+         Cannot read field \"value\" because \"anotherCharacter\" is null\n\
+         Cannot read field \"value\" because \"b\" is null\n\
+         Cannot read field \"value\" because \"anotherLong\" is null\n\
+         -1\n"
+    );
 }

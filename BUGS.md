@@ -201,7 +201,19 @@ at the bottom, and are summarized in the section right after this one.
   formatting the `int`; a `null` argument prints as `null` under every
   conversion but `%b`. The value model cannot tell an `Integer` from a `Long`
   from a `char`, so the compiler sends each argument's static Java type along
-  with the values.
+  with the values. The other four ways a specifier can be wrong raise Java's own
+  classes too, all of them `java.util.IllegalFormatException` subclasses and so
+  catchable as `IllegalArgumentException`: too few arguments is
+  `MissingFormatArgumentException: Format specifier '%,10.2f'` (the specifier
+  verbatim), an undefined conversion is `UnknownFormatConversionException:
+  Conversion = 'z'`, and a width or precision too large for an `int` is
+  `IllegalFormatWidthException` / `IllegalFormatPrecisionException` with Java's
+  own `-2147483648` message. Those four were internal `javars:` errors that ended
+  the run; two of them were worse than uncatchable, because javars parsed width
+  and precision into a `usize` — `%.99999999999f` reached
+  `format!("{:.*}", prec + 30, x)` and *panicked* ("Formatting argument out of
+  range"), and `%99999999999d` reached the padder and hung. Measured against
+  `openjdk 21.0.12`; five records in the frozen corpus.
   `System.out.printf` (and the `System.err` form) is that same formatter with no
   trailing newline. Malformed numeric input faults like `NumberFormatException`;
   an unregistered static method is an error. `System.err.print[ln]` writes to
@@ -457,7 +469,23 @@ at the bottom, and are summarized in the section right after this one.
   `NegativeArraySizeException`, and the `IndexOutOfBounds` pair is supplied as an
   implicit prelude (`src/prelude.rs`), so `catch (Exception e)` matches a thrown
   `NumberFormatException`, `e.getMessage()` works, and `System.out.println(e)`
-  prints `java.lang.Foo: message`. A user class may `extend` any of them. An
+  prints `java.lang.Foo: message`. A user class may `extend` any of them, and a
+  user subclass reports *its own* runtime class everywhere Java does:
+  `class MyEx extends RuntimeException` nested in `T` renders `T$MyEx: b` from
+  `toString()`, from `"" + e`, from `println(e)`, and from the uncaught report.
+  Two separate defects used to break exactly that case. The prelude was injected
+  only for a program that wrote `throw`/`try`/`new <throwable>`, so a program
+  that merely *subclassed* one got no `Throwable` at all — the `extends` dangled
+  silently and `e.getMessage()` was "class `MyEx` has no method `getMessage`".
+  And each prelude class carried its own `toString()` with the qualified name
+  written into a string literal, so once the prelude was present a user subclass
+  inherited `RuntimeException`'s and rendered `java.lang.RuntimeException: b`.
+  There is now one `toString()`, on `Throwable`, reading
+  `this.getClass().getName()` the way Java's own does; the uncaught report asks
+  `qualified_or_binary` rather than `qualified_throwable`, which had answered
+  `None` for a user class and printed the simple name `MyEx`.
+  `getLocalizedMessage()` is supplied alongside `getMessage()`. Four records in
+  the frozen corpus. An
   exception no handler claims reports Java's `Exception in thread "main" …` line
   on stderr and exits non-zero — the same exit status (1) Java uses, with the
   line prefixed `javars: ` and no `at T.main(T.java:1)` frame after it, because
@@ -475,7 +503,28 @@ at the bottom, and are summarized in the section right after this one.
   size (`NegativeArraySizeException: -1`), `String.charAt`/`substring` out of
   range (`StringIndexOutOfBoundsException: Range [2, 9) out of bounds for length
   3`), and `String.repeat` with a negative count (`IllegalArgumentException:
-  count is negative: -1`). A fault raised inside a called method unwinds to the
+  count is negative: -1`). A `null` *argument* faults where Java faults, rather
+  than being coerced to the empty string and answered: the ten `String` methods
+  that dereference their argument (`compareTo`, `compareToIgnoreCase`,
+  `contains`, `indexOf`, `startsWith`, `endsWith`, `concat`, `split`, `replace`,
+  and `String.join`'s delimiter) raise `NullPointerException` with the JDK's own
+  wording, while `equals` and `equalsIgnoreCase` still answer `false` and a null
+  `String.join` *element* still renders `null`, because those are specified not
+  to throw. `"abc".compareTo(null)` used to answer 3, `startsWith(null)` `true`,
+  and `split(null)` the whole string — a wrong answer where Java throws, with
+  nothing marking it. `x.compareTo(null)` on a box names the box's own parameter
+  (`anotherInteger`, `anotherDouble`, `anotherCharacter`, `anotherLong`, `b`),
+  measured one type at a time rather than sharing one wording. The integral
+  parsers separate a null from an empty string — `Integer.parseInt(null)`,
+  `Long.parseLong(null)` and `Integer.valueOf(null)` are `NumberFormatException:
+  Cannot parse null string`, not `For input string: ""` — and the *floating*
+  parsers differ in class, not merely in text: `Double.parseDouble(null)` and
+  `Float.parseFloat(null)` are a `NullPointerException`, because
+  `FloatingDecimal.readJavaFormatString` has no null check and the dereference is
+  what fails. A `catch (NumberFormatException e)` therefore does not catch them,
+  and javars used to send them there. `Integer.valueOf(null)` did not fault at
+  all: it read `null` as the `int` overload and answered 0. All measured against
+  `openjdk 21.0.12`. A fault raised inside a called method unwinds to the
   caller's handler like a `throw`; one no handler claims still prints Java's
   uncaught line and exits non-zero. The `/ 0` check is emitted inline (`Dup`,
   compare, branch) and is skipped entirely for a literal non-zero divisor, so
@@ -769,6 +818,59 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
+- **`StackOverflowError` and `OutOfMemoryError` are never raised**, and a
+  program that would provoke either does not fail — it runs until the OS stops
+  it. javars's call frames are heap-allocated `Vec` entries, not native stack
+  frames, so there is no stack to overflow: `static int f(int n) { return f(n+1); }`
+  returned nothing after 20s under `gtimeout` (rc=124) where a JVM throws in
+  milliseconds, and a *bounded* recursion of depth 100000 that the JDK refuses
+  (`Exception in thread "main" java.lang.StackOverflowError`) javars completes
+  and prints `100000`. `new int[Integer.MAX_VALUE]` and
+  `Arrays.copyOfRange(new int[]{1}, 0, Integer.MAX_VALUE)` likewise hang where
+  the JDK answers `OutOfMemoryError: Requested array size exceeds VM limit`.
+  Both are `Error`s, not `Exception`s, but both are catchable and both are
+  therefore observable. Raising them needs a depth counter checked at every call
+  — a `CallBuiltin` in the prologue of every method, which aborts JIT trace
+  recording and taxes every non-recursive call to serve a case a correct program
+  never reaches. Doing it only for methods in a call-graph cycle would confine
+  the cost, and is the shape a fix should take; it is not built. Because neither
+  class is modeled, `catch (StackOverflowError e)` is now a compile error (see
+  the catch-type entry below) rather than an arm that compiles and can never
+  fire.
+- **`ArrayStoreException` is never raised.** A reference array carries no
+  element type at runtime, so storing the wrong type through a widened reference
+  succeeds silently: `Object[] o = new String[2]; o[0] = Integer.valueOf(3);`
+  stores and continues, where the JDK throws `ArrayStoreException:
+  java.lang.Integer`. Measured on `openjdk 21.0.12`. The array's element type
+  would have to be recorded on the host object and checked on every store.
+- **`Throwable.getCause()`, `getSuppressed()`, `initCause`, `addSuppressed`,
+  `printStackTrace()`, and `getStackTrace()`** — and with them the two-argument
+  `(String, Throwable)` constructor every modeled throwable lacks, so
+  `new RuntimeException("wrap", cause)` is ``javars: class `RuntimeException` has
+  no constructor taking 2 argument(s) (declared arities: [0, 1])``. Cause
+  chaining and suppression are a *structural* part of a Java throwable, not
+  decoration: try-with-resources suppression and `e.getCause()` unwrapping are
+  ordinary idioms. javars keeps no call-site table (see the uncaught-report entry
+  above), so a stack trace has nothing to print, but the cause and suppressed
+  lists have no such obstacle and are simply not built. `getLocalizedMessage()`
+  *is* supplied, being `getMessage()` verbatim.
+- **`StringBuilder`** — ``javars: unknown class `StringBuilder` ``. Every method
+  on it is therefore unreachable, including the four bounds failures the JDK
+  raises (`setLength(-1)`, `deleteCharAt(9)`, `insert(9, …)`, `charAt(-1)` are
+  each a `StringIndexOutOfBoundsException`). Concatenation with `+` covers the
+  common case; the mutable builder does not exist.
+- **An unmodeled `catch` type is a compile error.** javars models the throwable
+  subset in `src/prelude.rs`; a `catch` naming anything else — a name that does
+  not exist (`catch (TotallyBogusException e)`), or a real JDK throwable outside
+  the subset (`catch (StackOverflowError e)`, `catch (java.io.IOException e)`) —
+  is ``javars: unknown class `X` (line N)``. `javac` rejects the first and
+  accepts the other two, so this is stricter than Java for a name the JDK
+  defines. It is deliberate, and it replaces something worse: the arm used to
+  *compile*, `JINSTANCEOF` answered `false` for every throwable, and the handler
+  was dead code — so the one place a program states what it handles silently
+  handled nothing. `new` and `throw` already enforced the same rule; only `catch`
+  did not. Each alternative of a multi-catch is checked separately, so a good
+  first alternative does not launder a bad second one.
 - **Streams** — `Arrays.stream(a)`, `list.stream()`, `IntStream.range`,
   `Stream.of`, the intermediate operations (`map`, `filter`, `sorted`,
   `distinct`, `limit`), and the terminals (`collect`, `count`, `sum`, `reduce`,
@@ -1280,6 +1382,7 @@ The three are `tests/parity.rs` (replays the frozen corpus, no JDK needed),
 | `parity.rs` + capture | **empty output** | A record is written only when stdout is non-empty, and the replay asserts a frozen string, so "prints nothing" cannot be frozen as the expected answer. |
 | `parity.rs` + capture | **a non-zero exit** | Rejected at capture time. An uncaught exception's exit status is therefore never frozen. |
 | `parity.rs` + capture | **trailing blank lines** | `$(...)` strips them and the script puts exactly one back, so the number of trailing newlines is pinned to 1 for every record. |
+| `parity.rs` + capture | **a multi-line program** | The two halves decode the record's *program* field differently. `capture-parity.sh` expands `\n` to a newline before writing `T.java` (`perl -pe 's/\\n/\n/g'`), while `parity.rs` `run` writes `src` verbatim — so a program containing `\n` compiles under the capture and reaches `javac` as a literal backslash-n under the replay. The script will happily emit such a record, and it then fails the replay it was captured for. No record has ever contained one (checked: 0 of the 323 that predate round 7), so the convention is single-line programs, and every round-7 addition was rewritten onto one line rather than relying on it. Making the two agree means changing the capture script, which is measurement infrastructure and out of scope for the round that found it; it is noted here rather than patched alongside the work it measures. |
 | `parity.rs` | **the JDK's source-launcher rule** | It replays through `javars T.java`, which is `javac` + `java T` (see the entry above), while the capture script's second entry point is the JDK's real `java T.java`. Four records predate the check that the two agree; they declare an `enum` first, so a real JDK runs the enum and prints nothing where the record says otherwise. The gate rejects any new record of that shape. |
 | fuzzer | **a mutual timeout** | A program both sides hang on yields `ok=false` and empty stdout on both, which `differs` reads as agreement. |
 | fuzzer | **generator-visible axes only** | A divergence has to be *generated* to be found. The pool is one `public class T` with a fixed set of support classes; anything not in a generator is not tested, and the honest way to find those is this table rather than a clean sweep. Two were found this way: no probe rendered a user `toString()` through a collection (closed by the `render` mode), and no probe put a heap element in a collection at all — every element was an `Integer` or a `String`, which javars compares structurally, so the whole `equals` axis was invisible (closed by the `equals` mode). |

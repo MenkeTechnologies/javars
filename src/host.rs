@@ -108,6 +108,24 @@ pub const JARRAY_NEW_MULTI: u16 = 718;
 /// floating path routes through here.
 pub const JDIV: u16 = 719;
 
+/// Builtin id for Java's 64-bit integral division (`long / long`).
+///
+/// fusevm's native `Op::Div` computes in `f64` and javars truncates the result
+/// with `Op::TruncInt`. For two `int`-width operands that is exact — both fit a
+/// `f64` mantissa, and the quotient's distance to the nearest integer is at
+/// least `1/|b| >= 2^-31` while the rounding error is at most `|a| * 2^-53 <=
+/// 2^-22 * 2^-31`, so the rounding can never cross an integer boundary — and
+/// the compiler keeps the native pair there so the JIT can trace it.
+///
+/// A `long` operand breaks both halves of that argument. Above 2^53 the operand
+/// itself no longer survives the round trip, so `9007199254740993L / 1`
+/// answered 9007199254740992, and `Long.MAX_VALUE / 2` answered
+/// 4611686018427387904 for a true quotient of 4611686018427387903. Separately,
+/// `Long.MIN_VALUE / -1` overflows to 2^63 as a float and `TruncInt` *saturates*
+/// to `i64::MAX`, where Java wraps back to `Long.MIN_VALUE`. So 64-bit integral
+/// division routes here instead and divides in `i64`.
+pub const JIDIV: u16 = 745;
+
 // ── Exception builtins (`throw` / `try` / `catch` / `finally`) ──
 // fusevm has no unwind opcode, so javars models the in-flight exception as a
 // host-side pending value plus a compiler-emitted check after every `Op::Call`.
@@ -762,6 +780,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JINSTANCEOF, b_instanceof);
     vm.register_builtin(JCLASSOF, b_classof);
     vm.register_builtin(JDIV, b_div);
+    vm.register_builtin(JIDIV, b_idiv);
     vm.register_builtin(JUSHR, b_ushr);
     vm.register_builtin(JCAST, b_cast);
     vm.register_builtin(JCHR_STR, b_chr_str);
@@ -891,8 +910,15 @@ fn throwable_str(v: &Value) -> String {
         let h = h.borrow();
         match h.get(*id as usize) {
             Some(HostObj::Instance { class, fields }) => {
-                let name =
-                    crate::prelude::qualified_throwable(class).unwrap_or_else(|| class.clone());
+                // [`qualified_or_binary`], not `qualified_throwable`: the latter
+                // answers `None` for a user-defined throwable and left the
+                // report printing the *simple* name, so an uncaught
+                // `class MyEx extends RuntimeException` nested in `T` read
+                // `Exception in thread "main" MyEx: boom` where Java prints the
+                // binary name `T$MyEx: boom`. The modeled throwables are
+                // unaffected — `qualified_or_binary` consults the same table
+                // first.
+                let name = qualified_or_binary(class);
                 match fields.get("detailMessage") {
                     Some(m) if !matches!(m, Value::Undef) => format!("{name}: {}", java_str(m)),
                     _ => name,
@@ -3151,6 +3177,36 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
             ),
         );
     }
+    // A null *argument* is an NPE too, and javars compared against the coerced
+    // empty string instead: `"abc".compareTo(null)` answered 3. Every box
+    // dereferences the argument to read its `value`, and names its own
+    // parameter while doing so — measured on openjdk 21.0.12, one per type
+    // rather than one shared wording, because the parameter names differ.
+    if matches!(b, Value::Undef) {
+        let param = match tag.as_str() {
+            "Integer" | "int" => "anotherInteger",
+            "Long" | "long" => "anotherLong",
+            "Double" | "double" | "Float" | "float" => "anotherDouble",
+            "Character" | "char" => "anotherCharacter",
+            "Boolean" | "boolean" => "b",
+            "String" | "CharSequence" => "anotherString",
+            // The compiler could not name the receiver's type; the runtime value
+            // decides, the same way the comparison below does.
+            _ => match &a {
+                Value::Str(_) => "anotherString",
+                Value::Float(_) => "anotherDouble",
+                Value::Bool(_) => "b",
+                _ => "anotherInteger",
+            },
+        };
+        return raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                format!("Cannot read field \"value\" because \"{param}\" is null"),
+            ),
+        );
+    }
     // A class instance here means no user class declares a one-argument
     // `compareTo`, so there is no body to run — `javac` would have rejected the
     // call. Say so rather than comparing the object's default `toString`.
@@ -3203,6 +3259,7 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
 /// message; an unknown method is a javars internal error.
 fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
     let char_len = || s.chars().count() as i64;
+    null_string_argument(method, args)?;
     match (method, args.len()) {
         ("length", 0) => Ok(Value::Int(char_len())),
         ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
@@ -3438,7 +3495,11 @@ fn rendering_static(vm: &mut VM, class: &str, method: &str, args: &[Value]) -> O
             Some(items) => items.iter().map(|v| java_str_vm(vm, v)).collect::<String>(),
             None => java_str_vm(vm, &args[0]),
         }),
-        ("String", "join", n) if n >= 2 => {
+        // A null delimiter falls through to [`static_method`], which raises the
+        // `NullPointerException` Java does. Answering here would join on the
+        // coerced empty string instead. (A null *element* is fine — Java renders
+        // it "null" — so only the separator is checked.)
+        ("String", "join", n) if n >= 2 && !matches!(args[0], Value::Undef) => {
             let sep = args[0].as_str_cow().into_owned();
             let parts: Vec<String> = match (sequence_items(&args[1]), n) {
                 (Some(items), 2) => items.iter().map(|v| java_str_vm(vm, v)).collect(),
@@ -3594,8 +3655,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
     let both_int = |a: &Value, b: &Value| matches!(a, Value::Int(_)) && matches!(b, Value::Int(_));
     match (class, method, args.len()) {
         // ── java.lang.Math ──
+        // `wrapping_abs`, not `abs`: Rust's `abs` panics on `i64::MIN`, so
+        // `Math.abs(Long.MIN_VALUE)` aborted the process where Java answers
+        // `Long.MIN_VALUE` — "if the argument is equal to the value of
+        // Long.MIN_VALUE, the most negative representable long value, the result
+        // is that same value, which is negative" (Math.abs javadoc). The `int`
+        // overload's identical case is narrowed by the compiler's trailing
+        // `emit_wrap32`; this is the 64-bit one, which had no guard at all.
         ("Math", "abs", 1) => Ok(match &args[0] {
-            Value::Int(n) => Value::Int(n.abs()),
+            Value::Int(n) => Value::Int(n.wrapping_abs()),
             other => Value::float(other.to_float().abs()),
         }),
         ("Math", "max", 2) => Ok(if both_int(&args[0], &args[1]) {
@@ -3621,7 +3689,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Math", "floorDiv", 2) => floor_div(args[0].to_int(), args[1].to_int()).map(Value::Int),
         ("Math", "floorMod", 2) => {
             let (a, b) = (args[0].to_int(), args[1].to_int());
-            floor_div(a, b).map(|q| Value::Int(a - q * b))
+            // Wrapping for the same reason `floor_div` wraps: with
+            // `Long.MIN_VALUE` and -1 the quotient is `Long.MIN_VALUE` and
+            // `q * b` overflows, which panicked and aborted. Java answers 0.
+            floor_div(a, b).map(|q| Value::Int(a.wrapping_sub(q.wrapping_mul(b))))
         }
         ("Math", "signum", 1) => Ok(Value::float(match args[0].to_float() {
             f if f > 0.0 => 1.0,
@@ -3640,6 +3711,12 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Math", "toDegrees", 1) => Ok(Value::float(args[0].to_float().to_degrees())),
 
         // ── java.lang.Integer / Long ──
+        // A null argument is rejected before the text is looked at; without the
+        // guard it coerced to `""` and reported `For input string: ""`, which is
+        // the message a genuinely empty string gets. See [`null_number_fault`].
+        ("Integer", "parseInt", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
+        ("Integer", "parseInt", 2) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
+        ("Long", "parseLong", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
         ("Integer", "parseInt", 1) => parse_int_radix(&args[0].as_str_cow(), 10, true),
         ("Integer", "parseInt", 2) => {
             let radix = args[1].to_int();
@@ -3647,8 +3724,11 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         }
         ("Long", "parseLong", 1) => parse_int_radix(&args[0].as_str_cow(), 10, false),
         // `Integer.valueOf(String)` parses; `Integer.valueOf(int)` is identity.
+        // `null` is neither: it is the `String` overload, and it faults. Left to
+        // the `other` arm it read as the `int` overload and answered 0.
         ("Integer", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, true),
+            Value::Undef => Err(null_number_fault()),
             other => Ok(Value::Int(other.to_int())),
         },
         // `Integer.toString(int)` / `Integer.toString(int, radix)`.
@@ -3701,10 +3781,21 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Long", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
         ("Long", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, false),
+            Value::Undef => Err(null_number_fault()),
             other => Ok(Value::Int(other.to_int())),
         },
 
         // ── java.lang.Double ──
+        // The floating parsers answer a null with a `NullPointerException`, not
+        // with the integral parsers' `NumberFormatException` — see
+        // [`null_float_parse_fault`]. javars reported `NumberFormatException:
+        // empty String` for both, which is the wrong *class*, so a
+        // `catch (NumberFormatException e)` caught what Java does not.
+        ("Double" | "Float", "parseDouble" | "parseFloat" | "valueOf", 1)
+            if matches!(args[0], Value::Undef) =>
+        {
+            Err(null_float_parse_fault())
+        }
         ("Double", "parseDouble", 1) | ("Double", "valueOf", 1) => {
             let s = args[0].as_str_cow();
             parse_java_double(&s)
@@ -3789,6 +3880,12 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // *elements*. Matching only arrays here rendered the collection's own
         // `toString` as one part (`String.join("-", List.of("a","b"))` gave
         // `[a, b]` instead of `a-b`).
+        // `String.join` dereferences the delimiter before it looks at anything
+        // else, so a null one is an NPE rather than a join on "".
+        ("String", "join", n) if n >= 2 && matches!(args[0], Value::Undef) => Err(Fault::java(
+            "NullPointerException",
+            "Cannot invoke \"java.lang.CharSequence.toString()\" because \"delimiter\" is null",
+        )),
         ("String", "join", n) if n >= 2 => {
             let sep = args[0].as_str_cow().into_owned();
             let parts: Vec<String> = match (sequence_items(&args[1]), n) {
@@ -3973,7 +4070,17 @@ fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
     }
     let q = a.wrapping_div(b);
     // One correction step when the signs differ and the division was inexact.
-    Ok(if a % b != 0 && (a ^ b) < 0 { q - 1 } else { q })
+    //
+    // Every arithmetic step here wraps, because `Long.MIN_VALUE / -1` reaches
+    // all three. The divide already used `wrapping_div`; plain `%` panicked
+    // ("attempt to calculate the remainder with overflow") and aborted the
+    // process, and `q - 1` would have been the next panic. Java's answer is
+    // `Long.MIN_VALUE`: the remainder is 0, so no correction applies.
+    Ok(if a.wrapping_rem(b) != 0 && (a ^ b) < 0 {
+        q.wrapping_sub(1)
+    } else {
+        q
+    })
 }
 
 /// Java's `Character.isWhitespace(int)`.
@@ -4058,6 +4165,36 @@ fn parse_java_double(text: &str) -> Option<f64> {
 /// what is left of nothing — so `Double.parseDouble("")` and
 /// `Double.parseDouble("   ")` both report that, where `Integer.parseInt("")`
 /// reports `For input string: ""`. Measured on `openjdk 21.0.12`.
+/// The failure `Integer.parseInt(null)` / `Long.parseLong(null)` /
+/// `Integer.valueOf((String) null)` raises.
+///
+/// `Integer.parseInt` checks its argument for null *before* it looks at any
+/// character, so the message is not the `For input string: ""` an empty string
+/// gets — a null and an empty string are distinguishable outcomes. Measured on
+/// `openjdk 21.0.12`.
+fn null_number_fault() -> Fault {
+    Fault::java("NumberFormatException", "Cannot parse null string")
+}
+
+/// The failure `Double.parseDouble(null)` / `Float.parseFloat(null)` raises —
+/// which is a *different class* from the integral parsers' answer above.
+///
+/// `FloatingDecimal.readJavaFormatString` has no null check at all: it calls
+/// `in.trim()` on its argument and the dereference is what fails, so a null
+/// reaches the caller as a `NullPointerException`, not as the
+/// `NumberFormatException` every other parse failure raises. A program that
+/// writes `catch (NumberFormatException e)` around `Double.parseDouble` does not
+/// catch this one, so answering with the integral parsers' class would let code
+/// through a handler Java sends it past. The quoted name `in` is
+/// `readJavaFormatString`'s own parameter, not a bytecode slot javars would have
+/// to invent. Measured on `openjdk 21.0.12`.
+fn null_float_parse_fault() -> Fault {
+    Fault::java(
+        "NullPointerException",
+        "Cannot invoke \"String.trim()\" because \"in\" is null",
+    )
+}
+
 fn float_format_message(text: &str) -> String {
     if text.trim_matches(|c: char| c <= ' ').is_empty() {
         "empty String".to_string()
@@ -4388,12 +4525,18 @@ fn java_format(
             out.push(c);
             continue;
         }
+        // The specifier's own source text, accumulated as it is consumed.
+        // `MissingFormatArgumentException`'s message is the specifier verbatim
+        // — `Format specifier '%,10.2f'` — so it cannot be rebuilt from the
+        // parsed flags without re-deriving the original spelling and ordering.
+        let mut spec = String::from("%");
         // An explicit argument index, `%2$s`. It is digits followed by `$`, so
         // it can only be told from a width by scanning past the digits first.
         let mut lead = String::new();
         while let Some(&d) = chars.peek() {
             if d.is_ascii_digit() {
                 lead.push(d);
+                spec.push(d);
                 chars.next();
             } else {
                 break;
@@ -4402,6 +4545,7 @@ fn java_format(
         let mut explicit_index: Option<usize> = None;
         if chars.peek() == Some(&'$') {
             chars.next();
+            spec.push('$');
             // Java indexes arguments from 1.
             explicit_index = lead.parse::<usize>().ok().map(|n| n.saturating_sub(1));
             lead.clear();
@@ -4428,6 +4572,7 @@ fn java_format(
                 ' ' | '#' => {}
                 _ => break,
             }
+            spec.push(f);
             chars.next();
         }
         // width
@@ -4435,6 +4580,7 @@ fn java_format(
         while let Some(&d) = chars.peek() {
             if d.is_ascii_digit() {
                 width.push(d);
+                spec.push(d);
                 chars.next();
             } else {
                 break;
@@ -4444,21 +4590,37 @@ fn java_format(
         let mut prec: Option<usize> = None;
         if chars.peek() == Some(&'.') {
             chars.next();
+            spec.push('.');
             let mut p = String::new();
             while let Some(&d) = chars.peek() {
                 if d.is_ascii_digit() {
                     p.push(d);
+                    spec.push(d);
                     chars.next();
                 } else {
                     break;
                 }
             }
-            prec = Some(p.parse().unwrap_or(0));
+            // Java's width and precision are `int`. A digit string that does not
+            // fit one is rejected outright, and the detail message is the
+            // overflowed value — literally `-2147483648` for every such input,
+            // measured on openjdk 21.0.12. javars parsed into `usize` instead:
+            // `%.99999999999f` reached `format!("{:.*}", prec + 30, x)` and
+            // *panicked* ("Formatting argument out of range"), and
+            // `%99999999999d` reached `pad` and hung building the padding. Both
+            // are catchable `IllegalFormatException`s in Java.
+            prec = Some(int_format_field(&p, "IllegalFormatPrecisionException")?);
         }
-        let conv = chars
-            .next()
-            .ok_or_else(|| Fault::internal("javars: String.format: dangling `%`"))?;
-        let width_n: Option<usize> = width.parse().ok();
+        let conv = chars.next().ok_or_else(|| {
+            // Java's own class for a `%` with nothing after it.
+            Fault::java("UnknownFormatConversionException", "Conversion = '%'")
+        })?;
+        spec.push(conv);
+        let width_n: Option<usize> = if width.is_empty() {
+            None
+        } else {
+            Some(int_format_field(&width, "IllegalFormatWidthException")?)
+        };
         match conv {
             '%' => out.push('%'),
             'n' => out.push('\n'),
@@ -4466,8 +4628,14 @@ fn java_format(
                 // An explicit `%n$` index does not advance the implicit cursor,
                 // which is what lets `%2$s %1$s` repeat and reorder arguments.
                 let idx = explicit_index.unwrap_or(argi);
+                // Java's `MissingFormatArgumentException`, naming the specifier
+                // that had no argument — not an internal javars error, which
+                // aborted the run where Java lets the program catch it.
                 let arg = args.get(idx).ok_or_else(|| {
-                    Fault::internal("javars: String.format: not enough arguments")
+                    Fault::java(
+                        "MissingFormatArgumentException",
+                        format!("Format specifier '{spec}'"),
+                    )
                 })?;
                 if explicit_index.is_none() {
                     argi += 1;
@@ -4723,9 +4891,69 @@ fn format_conversion(
             };
             Ok((if conv == 'H' { s.to_uppercase() } else { s }, false))
         }
-        other => Err(Fault::internal(format!(
-            "javars: String.format: unsupported conversion `%{other}`"
-        ))),
+        // Java's own class and wording for a conversion character it does not
+        // define. javars reported an internal error, which the program could not
+        // catch even though `catch (IllegalArgumentException e)` catches it in
+        // Java (`UnknownFormatConversionException` is an `IllegalFormatException`
+        // is an `IllegalArgumentException` — read off `getSuperclass()` on
+        // openjdk 21.0.12).
+        other => Err(Fault::java(
+            "UnknownFormatConversionException",
+            format!("Conversion = '{other}'"),
+        )),
+    }
+}
+
+/// The `NullPointerException` a `String` method raises when its first argument
+/// is `null`, or `Ok(())` when this method tolerates one.
+///
+/// Every one of these dereferences its argument, so Java fails before it can
+/// compute anything. javars coerced `null` to `""` instead and answered:
+/// `"abc".compareTo(null)` was 3, `"abc".startsWith(null)` was `true`,
+/// `"abc".split(null)` returned the whole string. A wrong answer where Java
+/// throws is worse than either, because nothing marks it.
+///
+/// `equals` and `equalsIgnoreCase` are deliberately absent: they are specified
+/// to answer `false` for a null argument rather than throw, and both already do.
+///
+/// The messages name the JDK's own parameter (`anotherString`, `prefix`,
+/// `regex`) and the member it dereferenced, which is fixed text per method
+/// rather than the bytecode-slot provenance javars cannot reproduce. Each is
+/// quoted from a run on openjdk 21.0.12.
+fn null_string_argument(method: &str, args: &[Value]) -> Result<(), Fault> {
+    if !matches!(args.first(), Some(Value::Undef)) {
+        return Ok(());
+    }
+    let detail = match method {
+        "compareTo" => "Cannot read field \"value\" because \"anotherString\" is null",
+        "compareToIgnoreCase" => "Cannot read field \"value\" because \"s2\" is null",
+        "contains" => "Cannot invoke \"java.lang.CharSequence.toString()\" because \"s\" is null",
+        "replace" => {
+            "Cannot invoke \"java.lang.CharSequence.toString()\" because \"target\" is null"
+        }
+        "indexOf" | "lastIndexOf" => "Cannot invoke \"String.coder()\" because \"str\" is null",
+        "startsWith" => "Cannot invoke \"String.length()\" because \"prefix\" is null",
+        "endsWith" => "Cannot invoke \"String.length()\" because \"suffix\" is null",
+        "concat" => "Cannot invoke \"String.isEmpty()\" because \"str\" is null",
+        "split" | "matches" | "replaceAll" | "replaceFirst" => {
+            "Cannot invoke \"String.length()\" because \"regex\" is null"
+        }
+        _ => return Ok(()),
+    };
+    Err(Fault::java("NullPointerException", detail))
+}
+
+/// Parse a format specifier's width or precision the way Java does: as an `int`.
+///
+/// A digit string too long for an `int` is not a large width, it is an error —
+/// and Java's detail message for it is the overflowed value, which is
+/// `-2147483648` for every such input (measured on openjdk 21.0.12). `class` is
+/// which of the two exceptions to raise, since the digits are parsed the same
+/// way for both.
+fn int_format_field(digits: &str, class: &'static str) -> Result<usize, Fault> {
+    match digits.parse::<i32>() {
+        Ok(n) if n >= 0 => Ok(n as usize),
+        _ => Err(Fault::java(class, i32::MIN.to_string())),
     }
 }
 
@@ -5759,6 +5987,24 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.stack.pop().unwrap_or(Value::Undef);
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     Value::float(as_f64(&a) / as_f64(&b))
+}
+
+/// Java's 64-bit integral `/`, divided in `i64` rather than in `f64`. See
+/// [`JIDIV`] for why the native float pair cannot serve a `long`.
+///
+/// `wrapping_div`, not `/`: Rust's `/` panics on `i64::MIN / -1`, and that
+/// overflow check runs in release too. Java defines the case — JLS 15.17.2, "if
+/// the dividend is the negative integer of largest possible magnitude for its
+/// type, and the divisor is -1, then integer overflow occurs and the result is
+/// equal to the dividend" — so the answer is `i64::MIN`, which is exactly what
+/// `wrapping_div` gives. A zero divisor cannot reach here: the compiler emits
+/// [`Compiler::emit_zero_divisor_check`] ahead of the call, which raises
+/// `ArithmeticException` first. Guarding it anyway keeps a panic out of the
+/// builtin regardless of how it is reached.
+fn b_idiv(vm: &mut VM, _argc: u8) -> Value {
+    let b = as_i64(&vm.stack.pop().unwrap_or(Value::Undef));
+    let a = as_i64(&vm.stack.pop().unwrap_or(Value::Undef));
+    Value::Int(if b == 0 { 0 } else { a.wrapping_div(b) })
 }
 
 /// `>>>` — zero-fill right shift at `width` bits (32 for `int`, 64 for `long`).

@@ -259,9 +259,13 @@ Implemented and checked against the reference `java`:
 - **Exceptions** — `throw`, `try` / `catch` / `finally`, try-with-resources,
   multiple `catch` arms matched by class, and the modeled `java.lang` throwable
   hierarchy (`RuntimeException`, `IllegalArgumentException`,
-  `NumberFormatException`, …) supplied as an implicit prelude. A throw unwinds
-  real fusevm call frames into the caller's handler; an uncaught one reports and
-  exits non-zero. A `return`/`break`/`continue` leaving a guarded block runs the
+  `NumberFormatException`, …) supplied as an implicit prelude. A user class may
+  extend any of them and reports its own runtime class wherever Java does —
+  `toString()`, `"" + e`, `println(e)`, and the uncaught report all render a
+  nested `class MyEx extends RuntimeException` as `T$MyEx: message`. A throw
+  unwinds real fusevm call frames into the caller's handler; an uncaught one
+  reports and exits non-zero. A `catch` naming a throwable javars does not model
+  is a compile error rather than an arm that can never match. A `return`/`break`/`continue` leaving a guarded block runs the
   `finally` on its way out, and so does an exception raised inside a `catch` arm.
 - **`enum` types** — constants as singletons with reference identity,
   `name()`/`ordinal()`/`toString()`/`equals`, `values()`/`valueOf`, unqualified
@@ -274,12 +278,22 @@ Implemented and checked against the reference `java`:
   than aborts: an out-of-range array index, a null receiver, `Integer.parseInt`
   on junk, integral `/ 0` and `% 0`, a negative array size, and the `String`
   index/argument faults all raise the throwable Java raises, with Java's detail
-  message, catchable by any supertype.
+  message, catchable by any supertype. A `null` argument faults where Java faults
+  rather than being coerced to `""`, and it faults with Java's *class*:
+  `Integer.parseInt(null)` is a `NumberFormatException` while
+  `Double.parseDouble(null)` is a `NullPointerException`, exactly as the JDK
+  splits them. The `String.format` failures — missing argument, unknown
+  conversion, and a width or precision too large for an `int` — are catchable
+  `java.util.IllegalFormatException`s too.
 - **`int` width** — Java's 32-bit `int` wrapping, for operations whose operand
   types are statically `int`; `long` stays 64-bit.
 - **Division** — Java's binary numeric promotion: `int / int` truncates toward
   zero (`7 / 2` → `3`, `-7 / 2` → `-3`), and a `double` operand keeps the
   fractional result (`7.0 / 2` → `3.5`), decided from the operands' static types.
+  `int`-width division stays on fusevm's native op pair, where computing in
+  `f64` is provably exact; a `long` divides in `i64` through a builtin instead,
+  so `Long.MAX_VALUE / 2` is `4611686018427387903` and `Long.MIN_VALUE / -1`
+  wraps to `Long.MIN_VALUE` as JLS 15.17.2 specifies.
 - **Static methods** — `static <ret> name(<params>) { … }` compiled to fusevm's
   `Op::Call` frame ABI: parameters and locals in call-frame slots, so recursion,
   mutual recursion, and forward references work; `void` and value returns; arity

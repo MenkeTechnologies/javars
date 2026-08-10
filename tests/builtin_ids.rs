@@ -175,10 +175,28 @@ fn every_builtin_is_registered_exactly_once() {
     // Every declared ID must have a handler. An unregistered one is a call site
     // that dispatches into nothing.
     let declared: Vec<String> = declared_ids().into_iter().map(|(n, _, _)| n).collect();
-    let missing: Vec<&String> = declared
+    let builtins: Vec<&String> = declared
         .iter()
         .filter(|n| n.starts_with('J') || *n == "DBG_LINE")
-        .filter(|n| !counts.contains_key(*n))
+        .collect();
+    // A floor on the names that survive the `J`-prefix filter, not just on the
+    // constants the scan found. The `declared_ids` floor above counts *every*
+    // `pub const … : u16`, so it is satisfied whether or not any of them reach
+    // the `missing` check — and `missing` is a filter over what is left, so it
+    // reports "every builtin is registered" just as confidently when the
+    // prefix matched nothing. Renaming the builtins off the `J` prefix, or
+    // scanning a table that no longer uses it, would empty this silently.
+    assert!(
+        builtins.len() >= 44,
+        "expected the `J`-prefixed builtin constants to be found, got {} of {} \
+         declared — the check below is a filter over this list, so an empty one \
+         reports no missing registrations",
+        builtins.len(),
+        declared.len()
+    );
+    let missing: Vec<&&String> = builtins
+        .iter()
+        .filter(|n| !counts.contains_key(**n))
         .collect();
     assert!(
         missing.is_empty(),
