@@ -496,8 +496,9 @@ at the bottom, and are summarized in the section right after this one.
   are heap objects like arrays and instances, so passing one to a method and
   mutating it is visible to the caller. The enhanced `for` iterates them (the
   compiler routes a non-array iterable through a snapshot builtin, so an array
-  loop still emits exactly the ops it did before), `keySet()`/`values()` are
-  views in the map's own order, and `sort`/`forEach` take a lambda.
+  loop still emits exactly the ops it did before), `keySet()`/`values()` produce
+  the map's keys and values in the map's own order (as *copies*, not views — see
+  "Runs wrong rather than being rejected"), and `sort`/`forEach` take a lambda.
   **`HashMap`/`HashSet` iterate in Java's real bucket order**, not insertion
   order: Java indexes a power-of-two table with `(capacity - 1) & (h ^ (h >>> 16))`,
   appends within a bucket, and preserves relative order across a resize, so the
@@ -567,8 +568,8 @@ and each is a deliberate, bounded model rather than a bug found and left.
 
 Some of those simplifications do print a different answer for a program `javac`
 accepts, and it is worth naming which. The first two are missing *conversions*
-javars's untyped runtime never performs, not wrong arithmetic; the third is a
-storage-model difference:
+javars's untyped runtime never performs, not wrong arithmetic; the last two are
+storage-model differences:
 
 - `s.get() / 2` on a `Supplier<Integer>` prints `3.5`, not `3` (the erased
   interface returns `Object`, so javars cannot type the result as `int`).
@@ -578,6 +579,20 @@ storage-model difference:
   cell rather than two, so the parent's own methods and a parent-typed reference
   read the subclass's value. See "Field *hiding* collapses to one cell" below
   for the reproducer and the exact divergence.
+- **`keySet()`/`values()` are copies, not views.** Java's are backed by the map,
+  so `m.keySet().remove(k)` removes the entry; javars builds a fresh set or list
+  in the map's order, so the removal is lost:
+
+  ```java
+  Map<String, String> m = new HashMap<>();
+  m.put("k", "v"); m.put("j", "w");
+  m.keySet().remove("k");
+  System.out.println(m.size());   // Java: 1     javars: 2
+  ```
+
+  `List.subList` *is* a real aliasing view (above); these two are not, which is
+  also why a cast of one names the set or list javars modeled it as rather than
+  `HashMap$KeySet`.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -844,6 +859,17 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   rather than its kind — `ImmutableCollections$List12` at one or two elements
   and `$ListN` otherwise, `Arrays$ArrayList`, and a `subList` named for the root
   list it is a window onto.
+
+  Two message shapes it does not reach. An **array** is declined outright rather
+  than named: its element type is erased, so neither `[I` nor
+  `[Ljava.lang.String;` is available, and `(String) anIntArray` passes where Java
+  throws. A **`keySet()`/`values()` result** is a plain set or list here rather
+  than a distinct view class, so the cast *throws* where Java throws but names
+  what javars modeled it as — `java.util.LinkedHashSet` where Java says
+  `java.util.HashMap$KeySet`, `java.util.Arrays$ArrayList` where Java says
+  `java.util.HashMap$Values`. The control flow is right and only the class in the
+  message is wrong; naming it exactly needs the view to be a shape of its own,
+  which is the same change that would make it alias.
 - **A boxed `Character` is a one-character String.** The `char` *type* is a real
   16-bit integral value (see the "`char` arithmetic" entry under "Implemented"),
   but javars boxes no primitive, so a `char` entering an erased position — a
