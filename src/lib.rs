@@ -76,6 +76,14 @@ pub(crate) fn supertype_map(prog: &ast::Program) -> std::collections::HashMap<St
         .collect()
 }
 
+/// Every user class's simple name → Java's binary name (`Outer$Nested`).
+pub(crate) fn binary_name_map(prog: &ast::Program) -> std::collections::HashMap<String, String> {
+    prog.classes
+        .iter()
+        .map(|c| (c.name.clone(), c.binary.clone()))
+        .collect()
+}
+
 /// Parse and lower Java `src` to a runnable fusevm chunk.
 pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
     let prog = parse(src)?;
@@ -91,12 +99,14 @@ pub fn compile(src: &str) -> Result<fusevm::Chunk, String> {
 fn run_chunk(
     chunk: fusevm::Chunk,
     supers: std::collections::HashMap<String, Vec<String>>,
+    binaries: std::collections::HashMap<String, String>,
     exceptions: bool,
     argv: &[String],
 ) -> Result<Value, String> {
     // A fresh object heap per run — no handle leaks across programs.
     host::heap_reset();
     host::set_supertypes(supers);
+    host::set_binary_names(binaries);
     host::set_exceptions_enabled(exceptions);
     host::set_argv(argv.to_vec());
     let mut vm = VM::new(chunk);
@@ -132,8 +142,9 @@ pub fn run_str(src: &str) -> Result<Value, String> {
 pub fn run_str_args(src: &str, argv: &[String]) -> Result<Value, String> {
     let prog = parse(src)?;
     let supers = supertype_map(&prog);
+    let binaries = binary_name_map(&prog);
     let chunk = compiler::compile(&prog)?;
-    run_chunk(chunk, supers, prog.uses_exceptions, argv)
+    run_chunk(chunk, supers, binaries, prog.uses_exceptions, argv)
 }
 
 /// Read and run a `.java` file.

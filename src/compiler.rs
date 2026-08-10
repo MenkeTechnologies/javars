@@ -358,6 +358,11 @@ struct Compiler {
     /// runtime FFI dispatch instead of a compile error — so non-FFI programs keep
     /// their exact "unresolved reference" compile-time diagnostic.
     has_ffi: bool,
+    /// True when any user class supplies a `toString()` body. Only then does a
+    /// concatenation operand the compiler could not type route through the
+    /// VM-holding rendering builtin instead of fusevm's `Op::Add` — see
+    /// [`Compiler::emit_host_stringified`].
+    has_user_tostring: bool,
     /// Declared numeric types of `main`'s locals (the global/`main` scope,
     /// keyed by name). Method locals live in [`Compiler::scope`] instead.
     global_types: HashMap<String, NumType>,
@@ -489,6 +494,15 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         });
     }
     let classes = resolve_classes(prog)?;
+    // One whole-program question, asked once: does any class supply a
+    // `toString()` body? It gates the concatenation rerouting in
+    // [`Compiler::emit_host_stringified`], so a program with none emits exactly
+    // the bytecode it did before that path existed.
+    let has_user_tostring = classes.values().any(|ci| {
+        ci.methods
+            .iter()
+            .any(|m| m.name == "toString" && m.param_tys.is_empty() && !m.is_abstract)
+    });
     let mut c = Compiler {
         b: ChunkBuilder::new(),
         scopes: Vec::new(),
@@ -497,6 +511,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         exit_ops: Vec::new(),
         debug,
         has_ffi,
+        has_user_tostring,
         global_types: HashMap::new(),
         scope: None,
         methods,
@@ -4213,13 +4228,80 @@ impl Compiler {
             return Ok(());
         }
         let Some(rc) = self.expr_class(e) else {
-            return self.expr(e);
+            return self.emit_host_stringified(e);
         };
         let overriders = self.to_string_overriders(&rc);
         if overriders.is_empty() {
-            return self.expr(e);
+            return self.emit_host_stringified(e);
         }
         self.emit_virtual_to_string(e, &overriders)
+    }
+
+    /// The fall-through of [`Compiler::emit_stringified`]: an operand whose
+    /// static type does not name a user class — an `Object`, a `Map`, an erased
+    /// `get()` — so the compiler cannot build a dispatch chain for it.
+    ///
+    /// When the program declares a `toString()` anywhere, the value goes through
+    /// the [`JSTRINGIFY`](crate::host::JSTRINGIFY) builtin, which holds a `&mut
+    /// VM` and can therefore run the override the runtime class resolves, at
+    /// every depth of a nested collection. Left to fusevm's `Op::Add` instead,
+    /// the operand would be stringified by the numeric hook — three values and
+    /// no VM — so `"" + o` would print `Pt@1` while `println(o)`, which is a
+    /// builtin, printed `Pt<1>`. One rendering that is wrong is a documented
+    /// model; two renderings of one object in one program is a trap.
+    ///
+    /// A program with no override emits exactly the bytecode it always did: the
+    /// `Op::Add` lowering is the JIT-visible one, and this must not cost
+    /// anything when there is nothing to dispatch to.
+    fn emit_host_stringified(&mut self, e: &Expr) -> Result<(), String> {
+        self.expr(e)?;
+        if self.has_user_tostring && !self.renders_without_a_class(e) {
+            self.emit_raising_builtin(crate::host::JSTRINGIFY, 1, 0);
+        }
+        Ok(())
+    }
+
+    /// Whether `e` is statically known to be something no `toString()` override
+    /// can answer for — a literal, or a value whose declared type is a primitive,
+    /// a wrapper, or `String`. javars models every one of those as a scalar
+    /// `Value`, never a heap handle, so routing it through the rendering builtin
+    /// would only add a call to every `"x " + i` in a program that happens to
+    /// declare one override somewhere.
+    fn renders_without_a_class(&self, e: &Expr) -> bool {
+        if matches!(
+            e,
+            Expr::Int(_)
+                | Expr::Long(_)
+                | Expr::Float(_)
+                | Expr::Float32(_)
+                | Expr::Str(_)
+                | Expr::Char(_)
+                | Expr::Bool(_)
+        ) {
+            return true;
+        }
+        matches!(
+            self.expr_java_type(e).as_deref(),
+            Some(
+                "int"
+                    | "long"
+                    | "short"
+                    | "byte"
+                    | "char"
+                    | "boolean"
+                    | "double"
+                    | "float"
+                    | "Integer"
+                    | "Long"
+                    | "Short"
+                    | "Byte"
+                    | "Character"
+                    | "Boolean"
+                    | "Double"
+                    | "Float"
+                    | "String"
+            )
+        )
     }
 
     /// Every concrete subtype of `rc` that resolves a no-arg `toString`, as

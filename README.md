@@ -176,6 +176,20 @@ Implemented and checked against the reference `java`:
   `Pt[x=1, y=2]` form, and a component-wise `equals`. A compact constructor
   validates before the fields are assigned; a member the body declares itself
   wins over the derived one.
+- **`toString()` overrides, wherever a value renders** — `println(obj)`,
+  `"x " + obj`, `obj.toString()`, `String.valueOf(obj)`,
+  `Arrays.toString`/`deepToString`, `String.join`, `String.format("%s", obj)` /
+  `"%s".formatted(obj)`, and every element of a `List`/`Set`/`Map` at any depth,
+  whatever the receiver's *static* type — an `Object`, an erased `get()`, a map
+  value. A subclass that declares none inherits its ancestor's body. The
+  override is real code: it may print (its output comes first, before the
+  `println` it was rendering for) and it may throw (the throwable propagates,
+  and no half-built text reaches the stream). A program that declares no
+  override compiles to byte-identical bytecode.
+- **Nested type names** — `getClass().getName()`, the default `Class@hash`
+  rendering, and a `ClassCastException`'s head all spell Java's binary name for
+  a nested declaration (`Outer$Nested`, `A$B$C` when doubly nested);
+  `getSimpleName()` stays the simple one.
 - **Abstract classes** — `abstract class Shape { abstract double area(); … }`,
   with `super(…)` chaining and concrete methods that call the abstract one
   (resolved to the subclass's override at runtime).
@@ -423,7 +437,7 @@ the value model names (user classes, boxed primitives, collections, arrays,
 `enum` as `Enum` and `record` as `Record`) with the checked reference cast
 reading that same answer, runtime-class
 virtual dispatch for overrides, and
-`toString()` overrides honoured by `println`), **interfaces** (abstract +
+`toString()` overrides honoured wherever a value renders), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic
 dispatch through an interface type), **method overloading by parameter type**
 (most-specific resolution for methods and constructors, plus Java's third —
@@ -454,9 +468,14 @@ Next waves, in priority order:
    `collect`/`reduce`/`findFirst` terminals. The lambdas they take already work,
    as do the functional interfaces' `default` composition methods and statics
    (`Function.andThen`, `Predicate.negate`, `Comparator.reversed`/
-   `naturalOrder`/`comparing`); what is missing is the compile-time pipeline
-   fusion a stream needs, because a host builtin cannot re-enter the VM to call
-   a stage's closure per element.
+   `naturalOrder`/`comparing`). What is missing is the surface itself — the
+   sources, the intermediate operations with Java's laziness, the terminals, and
+   `Optional`. A host builtin holds `&mut VM` and can re-enter it (that is how
+   `forEach`, `sort` with a comparator, and a user `toString()` already run user
+   code), so a stream can be a host object driving each stage's closure per
+   element; compile-time pipeline fusion is one way to build it, not a
+   prerequisite. See [`BUGS.md`](BUGS.md) for which callback shapes can re-enter
+   and which cannot.
 2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
    class literals (`C.class`), `Iterator`/`entrySet`, and wider stdlib coverage
    (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived

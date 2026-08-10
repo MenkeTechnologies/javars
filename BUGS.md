@@ -317,10 +317,51 @@ at the bottom, and are summarized in the section right after this one.
   what an `instanceof` of the same type would.
 - **Inheritance.** `extends`, `super(…)` constructor chaining, inherited fields
   and methods, method overriding, and `instanceof` (respecting the subclass
-  chain). `toString()` overrides are honoured by `System.out.println(obj)`, by
-  string concatenation (`"x = " + obj`, `s += obj`), and by an explicit
-  `obj.toString()`. `String.valueOf(obj)` and `Arrays.toString(objArray)` still
-  render the default `Class@hash` form.
+  chain). `toString()` overrides are honoured wherever a value renders, whatever
+  the receiver's static type: `System.out.println(obj)`, string concatenation
+  (`"x = " + obj`, `s += obj`), an explicit `obj.toString()`,
+  `String.valueOf(obj)`, `Arrays.toString`/`deepToString`, `String.join`,
+  `String.format("%s", obj)` / `"%s".formatted(obj)`, and every element of a
+  `List`/`Set`/`Map` at any depth. A subclass that declares none inherits its
+  ancestor's body; a class whose chain declares none renders the default
+  `Class@hash` form.
+
+  **How concatenation reaches it, when the numeric hook cannot.** fusevm has two
+  host-callback shapes and only one of them carries a VM:
+
+  | callback | type | gets a `VM`? |
+  | --- | --- | --- |
+  | registered builtin | `BuiltinHandler = fn(&mut VM, u8) -> Value` | **yes** |
+  | numeric hook | `NumericHook = Arc<dyn Fn(NumOp, &Value, &Value) -> …>` | no |
+  | sited numeric hook | `SitedNumericHook`, whose `NumericCall` adds `chunk`/`ip` | no |
+
+  Every rendering surface but one is a builtin, so each can re-enter and run the
+  override: `println` is `print_args`, `list.toString()` is `coll_method`,
+  `String.valueOf`/`Arrays.toString`/`String.join` are the static dispatch
+  builtin, `String.format`/`formatted` are `b_format`. The exception was `"" +
+  obj`, which the compiler lowered to `Op::Add`, whose non-numeric operand lands
+  in `host::numeric_hook` — three values and no VM. Fixing only the builtin side
+  would have made `println(list)` and `println("" + list)` print the same list
+  two different ways in one program, so the fix is not to make the hook re-enter
+  (it cannot) but to keep concatenation away from it: an operand whose static
+  type does not name a user class goes through the `JSTRINGIFY` builtin
+  (`Compiler::emit_host_stringified`) instead of `Op::Add`, and the host resolves
+  the override by looking `Class#toString#` up in `chunk.sub_entries` and calling
+  `run_sub`, walking supertypes for a subclass that declares none.
+
+  Both halves are gated on the program declaring an override at all — the
+  compiler's on a whole-program scan, the host's on a chunk-name scan — and the
+  compiler additionally skips any operand it has typed as a primitive, a wrapper
+  or a `String`, none of which can be a heap handle. A program with no override
+  emits byte-identical bytecode: `--disasm` of a 200k-iteration concatenation
+  loop is unchanged, and so is its user time (1.01/1.01/1.04 s before,
+  1.05/1.00/1.03 s after). With an override declared but only primitives
+  concatenated, the bytecode is unchanged too (1.00/1.01/1.00 s).
+
+  Running the override is running user code, with the consequences that implies:
+  it may print (rendering happens before stdout is locked, so its output comes
+  first), and it may throw (the throwable propagates out of the surface that was
+  rendering, and the half-built text is discarded rather than written).
 - **Interfaces.** `interface I { void m(); }` with abstract and `default`
   methods, `class C implements I, J`, `interface B extends A`, dispatch through
   an interface-typed variable or parameter (virtual on the runtime class),
@@ -880,15 +921,71 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   caches the ASCII range, so `Character.valueOf('a') == Character.valueOf('a')`
   is true), javars compares the strings by value — the same String-`==` model
   above.
+- **`java Foo.java` is `javac Foo.java && java Foo`, not the JDK's source-file
+  mode.** The two entry points select a different class to run. JDK 21's
+  source-file launcher runs the FIRST top-level class in the file; `java -cp . T`
+  runs the one named on the command line. javars runs the class that declares
+  `main`, wherever it sits — which matches the second, so a file whose first
+  declaration is not the main class runs here and is refused by the reference:
+
+  ```
+  $ cat T4.java
+  enum Color { RED, GREEN }
+  public class T4 { public static void main(String[] a) { System.out.println("T4 ran " + Color.RED); } }
+
+  $ java T4.java                        # openjdk 21.0.12
+  error: can't find main(String[]) method in class: Color
+  $ javac T4.java && java -cp . T4
+  T4 ran RED
+  $ java T4.java                        # javars
+  T4 ran RED
+  ```
+
+  The divergence is in the permissive direction — javars accepts a file the
+  reference refuses, never the reverse — and no observable answer differs for a
+  file the reference accepts. It matters mostly to the harness: `tests/parity.rs`
+  replays the frozen corpus through `java T.java`, while
+  `scripts/capture-parity.sh` captured it through `javac` + `java -cp . T`, so
+  the script now requires a new record to produce the same output under BOTH
+  before it is written. Four records predating that check declare an `enum`
+  first.
+- **`String.format` uses the root locale, always.** javars has no locale model:
+  `%,d` groups with `,` and `%,.2f` separates with `.` whatever
+  `Locale.getDefault()` is. The reference agrees on this machine (`en_US`) and
+  disagrees under another — `java -Duser.language=de -Duser.country=DE` renders
+  `String.format("%,d", 1234567)` as `1.234.567` where javars keeps
+  `1,234,567`. javars accepts no `-D` option, so a program cannot ask for the
+  other behaviour; the gap is only reachable by changing the machine's locale.
+- **An array's `getClass().getName()` is empty.** Java answers with the JVM
+  descriptor — `[I` for an `int[]`, `[Ljava.lang.String;` for a `String[]` — and
+  javars answers the empty string, because array element types are erased at
+  runtime (the same erasure that makes `(String) anIntArray` pass, above). A
+  class-instance handle, an enum, a record and a modeled JDK type all report
+  correctly, nested types included (`Outer$Nested`).
 - **A `ClassCastException` message drops the module-and-loader clause for a user
   class, and a cast javars cannot decide passes through.** Reference casts *are*
   checked (see "Checked reference casts" under "Implemented"), with two bounded
-  gaps. Java appends `(X and Y are in unnamed module of loader
-  com.sun.tools.javac.launcher.MemoryClassLoader @<identity hash>)` to a
-  user-class message, which javars has no counterpart for, so it ends after
-  `class X cannot be cast to class Y`; between two `java.lang` types the whole
-  message is exact. And a value whose class javars erases — an array (element
-  type gone), a collection, a lambda — passes any cast rather than inventing a
+  gaps. Java appends a parenthetical naming each class's module and loader, and
+  for a user class that clause is not even a property of the program — it is a
+  property of how the JVM was *launched*. Measured on `openjdk 21.0.12`, one
+  source file, one cast:
+
+  ```
+  java CC.java          … (CC$A is in unnamed module of loader
+                            com.sun.tools.javac.launcher.Main$MemoryClassLoader @5e25a92e; …)
+  javac CC.java && java -cp . CC
+                        … (CC$A is in unnamed module of loader 'app'; …)
+  ```
+
+  An identity hash that changes per run, and a loader name that changes per
+  entry point. javars has a counterpart for neither, so the message ends after
+  `class X cannot be cast to class Y`; between two `java.lang` types, where the
+  clause is the fixed `are in module java.base of loader 'bootstrap'`, the whole
+  message is exact. The head is exact in every case, nested classes included —
+  `class CC$A cannot be cast to class java.lang.String`.
+
+  The second gap: a value whose class javars erases — an array (element type
+  gone), a collection, a lambda — passes any cast rather than inventing a
   failure, so `(String) anIntArray` succeeds where Java throws. A boxed
   `Character` is the one-character String javars models it as, so a failing cast
   from one names `java.lang.String` and `(String) aBoxedChar` succeeds.
@@ -945,63 +1042,22 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
   something a deterministic program does, so this only shows up if you ask for it.
-- **An element's `toString()` override is not called inside a collection.**
-  Printing a `List<Pt>` of records gives `[Pt@2]` where Java gives
-  `[Pt[x=1, y=2]]`. This is the same limitation `Arrays.toString(objArray)` and
-  `String.valueOf(obj)` already have (above); an `enum` constant is the
-  exception, since its name is a real field.
-  The same boundary decides `toString()`/`equals()` called on a receiver javars
-  types only *dynamically*: `Pt p = new Pt(1, 2); p.toString()` dispatches to the
-  record's own version and is exact, while `Object o = new Pt(1, 2);
-  o.toString()` falls to `Object`'s (`Pt@2`, and `o.equals(…)` is identity),
-  because a builtin has no way to call back into the override. A receiver
-  declared with its class — which is how the overwhelming majority of Java is
-  written — is on the static path and unaffected.
-
-  A *method call* on such a receiver no longer takes that fall, though: the
-  compiler emits a dispatch chain keyed on the receiver's runtime class over
-  every concrete user class declaring that name and arity, with the `String`
-  method as the last arm (`Compiler::emit_erased_call`). So
-  `list.get(0).compareTo(x)` and `Comparator.comparing(P::n)`'s key extractor
-  reach the class's own body. What remains on the host side is *rendering*:
-  `toString()` reached through `java_str`.
-
-  **Why the whole of it stays, when a builtin can re-enter the VM.** Every
-  rendering path but one is a registered builtin holding `&mut VM`
-  (`BuiltinHandler = fn(&mut VM, u8) -> Value`), so each *could* call the
-  override — `println(list)` is `print_args`, `list.toString()` is
-  `coll_method`, `String.valueOf(obj)` and `Arrays.toString(arr)` are the static
-  dispatch builtin, `String.format("%s", …)` is `b_format`. The exception is
-  `"" + list`. The compiler lowers string concatenation to `Op::Add`, and a
-  non-numeric operand lands in `host::numeric_hook`, which fusevm types as
-  `NumericHook = Arc<dyn Fn(NumOp, &Value, &Value) -> Result<Value, String>>` —
-  three values and no VM. (Its sited sibling adds only `chunk` and `ip`.)
-
-  Fixing only the builtin side would make `System.out.println(list)` print
-  `[Pt[x=1, y=2]]` while `System.out.println("" + list)` printed `[Pt@2]`, in the
-  same program, for the same list. One consistent wrong rendering is a
-  documented model; two different renderings of one value is a trap. So both
-  stay until one change closes both.
-
-  That change is **not** to make the hook re-enter — it cannot — but to keep
-  concatenation away from it. `Compiler::binary` already routes a `+` it has
-  typed as string concatenation through `emit_stringified` on each operand
-  (which is why `"" + p` on a `Pt`-typed local already prints the override); the
-  operands that fall through to `java_str` are the ones whose static type does
-  not name a user class — a `List<Pt>`, an `Object`, an erased `get()`. Emitting
-  a rendering *builtin* for those, instead of leaving the value to `Op::Add`,
-  puts every surface on the side that has a VM, and the hook stops being on the
-  concatenation path at all. The builtin then resolves the override the way the
-  compiler's own dispatch does, by looking the mangled `Class#toString#` up in
-  `chunk.sub_entries` and calling `run_sub`.
-
-  Two things that has to demonstrate before it lands. First, depth: a `List` of
-  `List` of `Pt` must render its overrides all the way down, and a `toString()`
-  that itself throws must surface the throwable rather than a half-built string.
-  Second, cost: `Op::Add` is the JIT-friendly lowering, so the rerouting must be
-  gated on a user `toString` actually being declared, and a benchmark of
-  concatenation-heavy code with no override declared must be unchanged — the
-  gate provably off when unused, not merely cheap.
+- **A collection's membership test does not call a user `equals()`.** Java's
+  `contains`/`indexOf`/`remove(Object)`, `Set` de-duplication, and
+  `Map.get`/`containsKey` all compare with the element's own `equals`; javars
+  compares with its value model, which is reference identity for a heap handle.
+  So for a class declaring `equals`, `list.contains(new C(1))` is `false` where
+  Java says `true`, `indexOf` is `-1` where Java says `0`, two equal elements
+  make a `HashSet` of size 2 rather than 1, and `map.get(new C(1))` is `null`.
+  A *direct* call is exact — `p.equals(q)` and `((Object) p).equals(q)` both
+  reach the class's own body, because the compiler emits a dispatch chain keyed
+  on the receiver's runtime class (`Compiler::emit_erased_call`) — so the gap is
+  specifically the comparison the collection performs internally, in the host,
+  where the element is a bare handle with no call site to hang the dispatch on.
+  A `record` is NOT an exception, though its `equals` is derived: it is a heap
+  instance like any other, so `list.contains(new R(1))` is `false` and a
+  `HashSet` holding two equal records has size 2. Only the values javars models
+  as scalars — boxed primitives and `String`s — compare structurally here.
 
   `compareTo` additionally has to answer a *number*, and the boxed types do not
   agree on which: `Integer`/`Long`/`Double`/`Float` answer the sign,

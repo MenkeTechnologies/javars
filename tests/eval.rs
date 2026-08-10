@@ -3870,3 +3870,103 @@ fn overloads_get_distinct_subroutines_rather_than_colliding_by_name() {
         "g0|g1 5|g2 11|gS s|gD 1.5\nh0|h1 5|h2 11|hS s\nD0|g1 5|g2 11\n"
     );
 }
+
+// ── A user `toString()` reached through a receiver the compiler cannot type ──
+
+#[test]
+fn a_user_tostring_answers_at_every_surface_that_renders_a_value() {
+    // The compiler resolves an override statically whenever the operand's
+    // declared type names the class, so every receiver here deliberately loses
+    // that type — an `Object`, a list element, a map value — which is the only
+    // way to reach the host's runtime lookup.
+    //
+    // The point is not that any one surface is right; it is that they AGREE.
+    // Before this, `println(list)` and `"" + list` rendered the same object two
+    // different ways in one program, because concatenation lowers to fusevm's
+    // `Op::Add` (whose numeric hook holds no VM and so could not call the
+    // override) while `println` is a builtin (which does). Verified
+    // byte-for-byte against `openjdk 21.0.12`.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class Main {\
+         static class Pt { int x; Pt(int x) { this.x = x; } public String toString() { return \"Pt<\" + x + \">\"; } }\
+         public static void main(String[] a) {\
+         Pt p = new Pt(1);\
+         Object o = p;\
+         List<Pt> l = new ArrayList<>(); l.add(p);\
+         Map<String, Pt> m = new LinkedHashMap<>(); m.put(\"k\", p);\
+         Set<Pt> s = new LinkedHashSet<>(); s.add(p);\
+         List<List<Pt>> ll = new ArrayList<>(); ll.add(l);\
+         Object[] arr = { p };\
+         System.out.println(o + \"|\" + \"\" + o + \"|\" + String.valueOf(o) + \"|\" + String.format(\"%s\", o) + \"|\" + o.toString());\
+         System.out.println(l + \"|\" + \"\" + l + \"|\" + l.toString() + \"|\" + l.get(0).toString());\
+         System.out.println(m + \"|\" + \"\" + m + \"|\" + s + \"|\" + \"\" + s);\
+         System.out.println(ll + \"|\" + \"\" + ll);\
+         System.out.println(Arrays.toString(arr) + \"|\" + Arrays.deepToString(new Object[][] { arr }));\
+         System.out.println(String.format(\"%S|%.2s\", o, o) + \"|\" + \"%s\".formatted(o)); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "Pt<1>|Pt<1>|Pt<1>|Pt<1>|Pt<1>\n\
+         [Pt<1>]|[Pt<1>]|[Pt<1>]|Pt<1>\n\
+         {k=Pt<1>}|{k=Pt<1>}|[Pt<1>]|[Pt<1>]\n\
+         [[Pt<1>]]|[[Pt<1>]]\n\
+         [Pt<1>]|[[Pt<1>]]\n\
+         PT<1>|Pt|Pt<1>\n"
+    );
+}
+
+#[test]
+fn rendering_runs_the_override_as_real_code_and_names_the_nesting() {
+    // Rendering now runs user bytecode, which brings the three consequences a
+    // pure formatter never had, and each is asserted here rather than assumed:
+    //
+    //   * inheritance — `Sub` declares none, so the supertype chain has to be
+    //     walked to `Base`'s body; a lookup keyed on the runtime class alone
+    //     would render `Sub@<hash>`.
+    //   * an override that PRINTS emits before the `println` it was rendering
+    //     for, because rendering happens before stdout is locked.
+    //   * an override that THROWS propagates out of the surface that called it —
+    //     concatenation, `println`, and `String.valueOf` alike — instead of the
+    //     half-built string reaching the stream.
+    //
+    // `Bare` is the negative case: no override anywhere in its chain, so the
+    // default form still answers, and Java spells a nested class's binary name
+    // `Main2$Bare` (which javars reported as bare `Bare` before this). Verified
+    // byte-for-byte against `openjdk 21.0.12`.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class Main2 {\
+         static class Base { public String toString() { return \"B\"; } }\
+         static class Sub extends Base { }\
+         static class Own extends Base { public String toString() { return \"O\"; } }\
+         static class Bare { int v; Bare(int v) { this.v = v; } }\
+         static class Boom { public String toString() { throw new IllegalStateException(\"nope\"); } }\
+         static class Chatty { public String toString() { System.out.println(\"side\"); return \"C\"; } }\
+         public static void main(String[] a) {\
+         System.out.println(List.of(new Sub(), new Own(), new Base()));\
+         Object c = new Chatty();\
+         System.out.println(\"pre\" + c + \"post\");\
+         Object b = new Boom();\
+         try { System.out.println(\"x\" + b); } catch (IllegalStateException e) { System.out.println(\"c1:\" + e.getMessage()); }\
+         try { System.out.println(b); } catch (IllegalStateException e) { System.out.println(\"c2:\" + e.getMessage()); }\
+         try { System.out.println(String.valueOf(b)); } catch (IllegalStateException e) { System.out.println(\"c3:\" + e.getMessage()); }\
+         Object bare = new Bare(1);\
+         System.out.println((\"\" + bare).equals(String.valueOf(bare)));\
+         System.out.println(bare.getClass().getName() + \"|\" + bare.getClass().getSimpleName() + \"|\" + bare.toString().startsWith(\"Main2$Bare@\"));\
+         Object n = null;\
+         System.out.println(\"n:\" + n + \"|\" + String.valueOf(n) + \"|\" + String.format(\"%s\", n)); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "[B, O, B]\n\
+         side\n\
+         preCpost\n\
+         c1:nope\nc2:nope\nc3:nope\n\
+         true\n\
+         Main2$Bare|Bare|true\n\
+         n:null|null|null\n"
+    );
+}

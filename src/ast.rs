@@ -74,6 +74,12 @@ pub fn static_global(class: &str, field: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Class {
     pub name: String,
+    /// Java's *binary* name for this type: `Outer$Nested` for a nested
+    /// declaration, the simple name for a top-level one. javars flattens nesting
+    /// into one namespace, so `name` is the simple name everything resolves by;
+    /// this is what `getClass().getName()` and the default `toString()` report,
+    /// which are the two places Java shows the nesting.
+    pub binary: String,
     /// The direct superclass name (`class C extends B`), if any. For an
     /// `interface` this is always `None` (extended interfaces go in
     /// [`Class::interfaces`]).

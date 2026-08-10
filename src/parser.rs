@@ -117,7 +117,7 @@ impl Parser {
         let mut classes = Vec::new();
         // Top-level type declarations, in sequence.
         while !self.is(&Tok::Eof) {
-            self.parse_class(&mut entry, &mut methods, &mut classes)?;
+            self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
         }
         match entry {
             Some(entry) => Ok(Program {
@@ -142,6 +142,7 @@ impl Parser {
     /// the same three sinks (flattened namespace).
     fn parse_class(
         &mut self,
+        enclosing: Option<&str>,
         entry: &mut Option<Entry>,
         methods: &mut Vec<Method>,
         classes: &mut Vec<Class>,
@@ -165,6 +166,12 @@ impl Parser {
             self.eat(&Tok::Class)?;
         }
         let name = self.ident()?;
+        // Java's binary name nests with `$`; the enclosing declaration passes
+        // down its own binary name, so a doubly-nested type is `A$B$C`.
+        let binary = match enclosing {
+            Some(outer) => format!("{outer}${name}"),
+            None => name.clone(),
+        };
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
         // `<K, V>` — erased (parsed and discarded).
         self.skip_generics();
@@ -232,7 +239,7 @@ impl Parser {
                     ..found
                 });
             } else if self.at_nested_class() {
-                self.parse_class(entry, methods, classes)?;
+                self.parse_class(Some(&binary), entry, methods, classes)?;
             } else if let Some(c) = self.try_compact_ctor(&name, is_record, &components)? {
                 ctors.push(c);
             } else if let Some(c) = self.try_ctor(&name)? {
@@ -269,6 +276,7 @@ impl Parser {
         }
         classes.push(Class {
             name,
+            binary,
             superclass,
             interfaces,
             is_interface,
@@ -389,6 +397,10 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok(Class {
+            // An enum constant body is a synthetic subclass javars mints; Java
+            // names its own `Outer$Enum$1`, which is a counter this frontend does
+            // not model, so the synthetic name stands in.
+            binary: name.clone(),
             name,
             superclass: Some(enum_name.to_string()),
             interfaces: Vec::new(),

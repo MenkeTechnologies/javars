@@ -1955,6 +1955,77 @@ fn g_instanceof(r: &mut Rng) -> String {
     }
 }
 
+/// `toString()` overrides reached through a receiver the compiler cannot type.
+///
+/// The compiler resolves an override statically whenever the operand's declared
+/// type names the class, so every probe here deliberately loses that type — the
+/// value goes into an `Object`, into a collection, or into a `Map` — which is
+/// the only way to reach the host's runtime lookup. Each surface is asked twice
+/// over, once by concatenation and once by a rendering call, because those are
+/// two different code paths (fusevm's `Op::Add` versus a builtin) and the
+/// failure this mode exists to catch is them disagreeing for the same object.
+///
+/// `Bare` is in the pool as the negative case: it declares no override, so a
+/// lookup that answered *some* body for every class would print `B`/`L`/`R`
+/// where Java prints `Bare@<hash>` — and the probes keep that one to the
+/// `endsWith`/`startsWith` shape, since the hash is not reproducible.
+fn g_render(r: &mut Rng) -> String {
+    let v = pick(
+        r,
+        &[
+            "new Base()",
+            "new Left()",
+            "new Right()",
+            "new SupC()",
+            "new Pt(1, 2)",
+            "new Tag(\"t\", 1.5)",
+            "Color.RED",
+            "Ops.TIMES",
+        ],
+    );
+    match r.below(10) {
+        // An `Object`-typed local: concatenation, `println`, `String.valueOf`,
+        // `%s`, and an explicit `toString()` must all answer the same text.
+        0 => format!(
+            "{{ Object o = {v}; System.out.println(\"\" + o); System.out.println(o); System.out.println(String.valueOf(o)); System.out.println(String.format(\"%s\", o)); System.out.println(o.toString()); }}"
+        ),
+        // An element of a list, which renders through the collection's own
+        // `toString` — the element's static type is erased by `get`.
+        1 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add({v}); System.out.println(l); System.out.println(\"\" + l); System.out.println(l.toString()); System.out.println(l.get(0).toString()); }}"
+        ),
+        // Depth: a list inside a list, and a list inside a map value.
+        2 => format!(
+            "{{ List<Object> in = new ArrayList<>(); in.add({v}); List<Object> out = new ArrayList<>(); out.add(in); System.out.println(out); System.out.println(\"\" + out); }}"
+        ),
+        3 => format!(
+            "{{ Map<String, Object> m = new LinkedHashMap<>(); m.put(\"k\", {v}); System.out.println(m); System.out.println(\"\" + m); }}"
+        ),
+        // A `Set` element and a map *key*, which render on the other side of the
+        // `=` from a value.
+        4 => format!(
+            "{{ Set<Object> s = new LinkedHashSet<>(); s.add({v}); System.out.println(s); System.out.println(\"\" + s); }}"
+        ),
+        5 => format!(
+            "{{ Map<Object, String> m = new LinkedHashMap<>(); m.put({v}, \"x\"); System.out.println(m); System.out.println(\"\" + m); }}"
+        ),
+        // A reference array, through both `Arrays` renderings.
+        6 => format!(
+            "{{ Object[] a = {{ {v}, {v} }}; System.out.println(Arrays.toString(a)); System.out.println(Arrays.deepToString(new Object[][] {{ a }})); System.out.println(\"\" + a[0]); }}"
+        ),
+        // The `Formatter` conversions that call `toString`, including the
+        // uppercasing one and the receiver-as-format-string spelling.
+        7 => format!(
+            "{{ Object o = {v}; System.out.println(String.format(\"%s|%S|%10s|%.1s\", o, o, o, o)); System.out.println(\"%s\".formatted(o)); }}"
+        ),
+        // The negative case: a class with no override still renders Java's
+        // default form, and the two surfaces still agree about it.
+        8 => "{ Object o = new Bare(1); String a = \"\" + o; String b = String.valueOf(o); System.out.println(a.equals(b)); System.out.println(a.startsWith(\"Bare@\")); }".to_string(),
+        // A `null` reference is the text \"null\" at every surface, never a call.
+        _ => "{ Object o = null; System.out.println(\"\" + o); System.out.println(String.valueOf(o)); System.out.println(String.format(\"%s\", o)); }".to_string(),
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -2182,6 +2253,7 @@ enum Mode {
     ListView,
     Super,
     InstanceOf,
+    Render,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2234,6 +2306,7 @@ const CONCRETE: &[Mode] = &[
     Mode::ListView,
     Mode::Super,
     Mode::InstanceOf,
+    Mode::Render,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2288,6 +2361,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ListView => "listview",
         Mode::Super => "super",
         Mode::InstanceOf => "instanceof",
+        Mode::Render => "render",
     }
 }
 
@@ -2354,6 +2428,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::ListView => g_listview(r),
         Mode::Super => g_super(r),
         Mode::InstanceOf => g_instanceof(r),
+        Mode::Render => g_render(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -2506,24 +2581,115 @@ fn ours_bin() -> PathBuf {
 }
 
 /// Locate a real JDK `java` that is not our own binary.
+///
+/// Every candidate is *run* before it is accepted, twice over, because two
+/// different wrong oracles live on a developer machine and neither announces
+/// itself:
+///
+///   * A `java` on `PATH` is routinely a version-manager shim rather than a
+///     launcher, and a broken shim exits non-zero without printing a banner —
+///     which this harness would read as "the reference produced no output",
+///     reporting a divergence on every single probe. Naming the executable is
+///     not evidence that it launches a JVM; [`jdk_banner`] getting a version
+///     out of it is.
+///   * A launcher that *does* work may still be too old to be the reference.
+///     `Double.toString` was reimplemented in JDK 19 to emit the shortest
+///     round-tripping decimal, so a JDK 17 oracle answers `1.0e23` with
+///     `9.999999999999999E22` where 19+ answers `1.0E23`. That is a *silent*
+///     corruptor: the harness runs green and reports divergences on every
+///     double-valued probe, or worse, blesses the old rendering into the frozen
+///     corpus. [`renders_modern_doubles`] is the probe that catches it.
 fn resolve_oracle(ours: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("JAVA_ORACLE") {
-        return PathBuf::from(p);
+        let p = PathBuf::from(p);
+        match jdk_banner(&p) {
+            Some(v) => {
+                require_modern_doubles(&p, &v);
+                eprintln!("parity-fuzz: oracle {} ({v})", p.display());
+            }
+            None => {
+                eprintln!(
+                    "parity-fuzz: JAVA_ORACLE={} does not run — `--version` failed",
+                    p.display()
+                );
+                std::process::exit(2);
+            }
+        }
+        return p;
     }
     let ours_canon = ours.canonicalize().ok();
+    let mut rejected = Vec::new();
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
             let cand = Path::new(dir).join("java");
-            if !cand.exists() {
+            if !cand.exists() || cand.canonicalize().ok() == ours_canon {
                 continue;
             }
-            if cand.canonicalize().ok() == ours_canon {
-                continue;
+            match jdk_banner(&cand) {
+                Some(v) => {
+                    require_modern_doubles(&cand, &v);
+                    eprintln!("parity-fuzz: oracle {} ({v})", cand.display());
+                    return cand;
+                }
+                None => rejected.push(cand.display().to_string()),
             }
-            return cand;
         }
     }
-    eprintln!("parity-fuzz: no reference `java` on PATH (set JAVA_ORACLE=/path/to/java)");
+    eprintln!("parity-fuzz: no working reference `java` on PATH (set JAVA_ORACLE=/path/to/java)");
+    for r in &rejected {
+        eprintln!("parity-fuzz:   rejected {r} — `--version` failed");
+    }
+    std::process::exit(2);
+}
+
+/// The first line `prog --version` prints, if it exits 0 and prints one.
+/// `None` for anything that is not a working launcher.
+fn jdk_banner(prog: &Path) -> Option<String> {
+    let out = Command::new(prog).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// What the candidate answers for `1.0e23`. JDK 19 replaced `Double.toString`
+/// with the shortest round-tripping decimal (`1.0E23`); every release before it
+/// answers `9.999999999999999E22`.
+fn renders_modern_doubles(prog: &Path) -> Option<bool> {
+    let dir = std::env::temp_dir().join(format!("javars_oracle_probe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("D.java");
+    std::fs::write(
+        &path,
+        "public class D { public static void main(String[] a) { System.out.println(1.0e23); } }\n",
+    )
+    .ok()?;
+    let out = Command::new(prog)
+        .arg(&path)
+        .current_dir(&dir)
+        .output()
+        .ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = out?;
+    Some(String::from_utf8_lossy(&out.stdout).trim() == "1.0E23")
+}
+
+/// Exit rather than measure against a pre-JDK-19 `Double.toString`.
+fn require_modern_doubles(prog: &Path, banner: &str) {
+    if renders_modern_doubles(prog) == Some(true) {
+        return;
+    }
+    eprintln!(
+        "parity-fuzz: {} ({banner}) renders 1.0e23 the pre-JDK-19 way — too old to be the reference",
+        prog.display()
+    );
+    eprintln!(
+        "parity-fuzz: JAVA_HOME={}",
+        std::env::var("JAVA_HOME").unwrap_or_else(|_| "<unset>".into())
+    );
+    eprintln!("parity-fuzz: set JAVA_ORACLE to a JDK 19 or newer `java`");
     std::process::exit(2);
 }
 

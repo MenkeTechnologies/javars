@@ -277,6 +277,7 @@ fn run_debug(path: &str) -> Result<(), String> {
     // `instanceof`/`catch` matching walks, and the exception-machinery flag.
     crate::host::heap_reset();
     crate::host::set_supertypes(crate::supertype_map(&prog));
+    crate::host::set_binary_names(crate::binary_name_map(&prog));
     crate::host::set_exceptions_enabled(prog.uses_exceptions);
     let mut vm = VM::new(chunk);
     crate::host::install_debug(&mut vm);

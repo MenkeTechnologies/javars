@@ -19,7 +19,7 @@
 //!    never a concatenation; see [`java_numeric`].
 
 use fusevm::{NumOp, Value, VM};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// Builtin id for `System.out.println` (one Java-formatted arg + newline).
@@ -286,6 +286,18 @@ pub const JCOMPARE_TO: u16 = 740;
 /// value picks the class for those.
 pub const JFORMAT: u16 = 741;
 
+/// Java's string conversion of one value, run with a VM in hand so a user
+/// `toString()` override can be called. Stack `[value]`; `argc == 1`.
+///
+/// The compiler emits this only for a concatenation operand whose static type
+/// does not name a user class (an `Object`, an erased `get()`) *and* only when
+/// the program declares an override somewhere — see
+/// [`Compiler::emit_stringified`](crate::compiler). Without it the operand
+/// would reach fusevm's `Op::Add`, whose `NumericHook` takes three values and
+/// no VM, so the override could not run and `"" + o` would disagree with
+/// `println(o)` for the same object.
+pub const JSTRINGIFY: u16 = 742;
+
 /// The [`JF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -395,6 +407,10 @@ thread_local! {
     /// interfaces), populated by [`set_supertypes`] before a run. Used by
     /// `instanceof` and default `toString` to walk the supertype graph.
     static SUPERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    /// Simple class name → Java's binary name (`Outer$Nested`), populated by
+    /// [`set_binary_names`] before a run. Only nested types have an entry that
+    /// differs from the key.
+    static BINARY: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     /// The exception in flight, if any. Set by [`JTHROW`], cleared by
     /// [`JEXC_TAKE`] when a handler claims it. Lives here rather than on the
     /// value stack because it has to survive the `Op::ReturnValue` that unwinds
@@ -422,9 +438,15 @@ pub fn set_argv(argv: Vec<String>) {
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
+    BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
     ARGV.with(|a| a.borrow_mut().clear());
+    // Both are keyed to the OUTGOING chunk: the gate answers whether *that*
+    // chunk declared an override, and an entry ip indexes its ops. Carrying
+    // either into the next program would render through unrelated bytecode.
+    USER_TOSTRING.with(|c| c.set(None));
+    TOSTRING_ENTRY.with(|t| t.borrow_mut().clear());
 }
 
 /// Tell the host whether the compiled program carries the exception machinery.
@@ -512,6 +534,31 @@ fn raise(vm: &mut VM, f: Fault) -> Value {
 /// `instanceof` and default `toString`). Call before running the chunk.
 pub fn set_supertypes(map: HashMap<String, Vec<String>>) {
     SUPERS.with(|s| *s.borrow_mut() = map);
+}
+
+/// Record each user class's Java *binary* name (`Outer$Nested`). Call before
+/// running the chunk; read by [`qualified_or_binary`].
+pub fn set_binary_names(map: HashMap<String, String>) {
+    BINARY.with(|b| *b.borrow_mut() = map);
+}
+
+/// The name `getClass().getName()` reports for `class`: the qualified form for a
+/// modeled JDK type (`java.lang.Object`), the binary form for a user one
+/// (`Outer$Nested`), and the simple name for a top-level user class.
+///
+/// javars flattens nesting into one namespace, so the simple name is what every
+/// value carries at runtime; the nesting only has to be recovered at the two
+/// places Java shows it — `getName()` and the default `toString()`.
+fn qualified_or_binary(class: &str) -> String {
+    if let Some(q) = crate::prelude::qualified_class(class) {
+        return q;
+    }
+    BINARY.with(|b| {
+        b.borrow()
+            .get(class)
+            .cloned()
+            .unwrap_or_else(|| class.to_string())
+    })
 }
 
 /// Allocate `obj` on the heap and return its handle.
@@ -684,6 +731,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JF32_ARITH, b_f32_arith);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
+    vm.register_builtin(JSTRINGIFY, b_stringify);
     vm.register_builtin(JTHROW, b_throw);
     vm.register_builtin(JEXC_PENDING, b_exc_pending);
     vm.register_builtin(JEXC_TAKE, b_exc_take);
@@ -1697,7 +1745,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // `toString` renders elements, which re-reads the heap (an element may be
     // another collection), so it runs before any borrow is taken.
     if method == "toString" && args.is_empty() {
-        return Value::str(java_str(recv));
+        return Value::str(java_str_vm(vm, recv));
     }
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
@@ -2376,6 +2424,16 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // A class instance whose own class declares no such method inherits
     // `java.lang.Object`'s — including `new Object()` itself, which has no class
     // body at all.
+    // `o.toString()` on an `Object`-typed receiver resolves the override the
+    // same way rendering does; a class that declares none still falls to the
+    // `Class@hash` form `object_method` supplies just below.
+    if method == "toString"
+        && args.is_empty()
+        && any_user_tostring(vm)
+        && instance_class(&recv).is_some()
+    {
+        return Value::str(java_str_vm(vm, &recv));
+    }
     if let Some(v) = object_method(&recv, &method, &args) {
         return v;
     }
@@ -2390,6 +2448,14 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         );
     }
     let s = recv.as_str_cow().into_owned();
+    // `"%s".formatted(x)` renders `x`, so it needs the VM `string_method` has
+    // not got. Every other `String` method reads text only.
+    if method == "formatted" && any_user_tostring(vm) {
+        return match java_format(&s, &args, &[], Some(&mut *vm)) {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     match string_method(&s, &method, &args) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
@@ -2409,6 +2475,18 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
 /// `None` for any other method and for any non-instance handle (an array, a
 /// collection, and a closure each have their own dispatch), so the caller falls
 /// through to the `String` methods exactly as before.
+/// The runtime class of a class-instance handle; `None` for every other value
+/// (an array, a collection, a closure, a primitive).
+fn instance_class(v: &Value) -> Option<String> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Instance { class, .. }) => Some(class.clone()),
+        _ => None,
+    })
+}
+
 fn object_method(recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
     let Value::Obj(id) = recv else {
         return None;
@@ -2606,9 +2684,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // two accessors land here: the simple name is that string, and the
         // qualified name adds `java.lang.` for the modeled JDK types.
         ("getSimpleName", 0) => Ok(Value::str(s.to_string())),
-        ("getName", 0) => Ok(Value::str(
-            crate::prelude::qualified_class(s).unwrap_or_else(|| s.to_string()),
-        )),
+        ("getName", 0) => Ok(Value::str(qualified_or_binary(s))),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
@@ -2617,7 +2693,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         )))),
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
-        ("formatted", _) => java_format(s, args, &[]),
+        ("formatted", _) => java_format(s, args, &[], None),
         // The four `java.util.regex` methods, on the engine in `crate::regex`.
         // `split(regex)` is `split(regex, 0)`: trailing empty fields are dropped
         // (interior ones are not), and a no-match returns the whole input.
@@ -2735,9 +2811,62 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         Some(Err(f)) => return raise(vm, f),
         None => {}
     }
+    // The statics that *render* an argument come next, for the same reason:
+    // `static_method` has no VM, so it cannot run a user `toString()`. The gate
+    // keeps a program that declares no override on the original path.
+    if any_user_tostring(vm) {
+        if let Some(v) = rendering_static(vm, &class, &method, &args) {
+            return v;
+        }
+    }
     match static_method(&class, &method, &args) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
+    }
+}
+
+/// The stdlib statics whose whole job is to render an argument, re-implemented
+/// here over [`java_str_vm`] so a user `toString()` answers for them too. Each
+/// is the same rendering [`static_method`] does, with the VM-less `java_str`
+/// swapped for the VM-holding one; `None` for every other static, and the
+/// caller only asks when the gate is on.
+fn rendering_static(vm: &mut VM, class: &str, method: &str, args: &[Value]) -> Option<Value> {
+    Some(match (class, method, args.len()) {
+        // `String.valueOf(char[])` concatenates the characters rather than
+        // rendering the array, which is why the array case comes first.
+        ("String", "valueOf", 1) => Value::str(match array_items(&args[0]) {
+            Some(items) => items.iter().map(|v| java_str_vm(vm, v)).collect::<String>(),
+            None => java_str_vm(vm, &args[0]),
+        }),
+        ("String", "join", n) if n >= 2 => {
+            let sep = args[0].as_str_cow().into_owned();
+            let parts: Vec<String> = match (sequence_items(&args[1]), n) {
+                (Some(items), 2) => items.iter().map(|v| java_str_vm(vm, v)).collect(),
+                _ => args[1..].iter().map(|v| java_str_vm(vm, v)).collect(),
+            };
+            Value::str(parts.join(&sep))
+        }
+        ("Arrays", "toString", 1) => match array_items(&args[0]) {
+            Some(items) => {
+                let inner: Vec<String> = items.iter().map(|v| java_str_vm(vm, v)).collect();
+                Value::str(format!("[{}]", inner.join(", ")))
+            }
+            None => Value::str(java_str_vm(vm, &args[0])),
+        },
+        ("Arrays", "deepToString", 1) => Value::str(deep_to_string_vm(vm, &args[0])),
+        _ => return None,
+    })
+}
+
+/// [`arrays_deep_to_string`] with the VM in hand, so a nested array's *elements*
+/// render through their overrides.
+fn deep_to_string_vm(vm: &mut VM, v: &Value) -> String {
+    match array_items(v) {
+        Some(items) => {
+            let inner: Vec<String> = items.iter().map(|e| deep_to_string_vm(vm, e)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        None => java_str_vm(vm, v),
     }
 }
 
@@ -3023,7 +3152,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `String.format(fmt, args…)` — printf-style formatting (subset).
         ("String", "format", _) if !args.is_empty() => {
             let fmt = args[0].as_str_cow().into_owned();
-            java_format(&fmt, &args[1..], &[])
+            java_format(&fmt, &args[1..], &[], None)
         }
 
         // `String.join(sep, a, b, …)`, `String.join(sep, array)`, and
@@ -3298,7 +3427,12 @@ fn arrays_to_string(v: &Value) -> String {
 /// (zero-pad), `+` (leading sign) flags, an optional width, and an optional
 /// `.precision` (decimals for `f`, max length for `s`). Unsupported conversions
 /// surface an error rather than a wrong string.
-fn java_format(fmt: &str, args: &[Value], tags: &[&str]) -> Result<Value, Fault> {
+fn java_format(
+    fmt: &str,
+    args: &[Value],
+    tags: &[&str],
+    mut vm: Option<&mut VM>,
+) -> Result<Value, Fault> {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     let mut argi = 0usize;
@@ -3392,7 +3526,7 @@ fn java_format(fmt: &str, args: &[Value], tags: &[&str]) -> Result<Value, Fault>
                     argi += 1;
                 }
                 check_conversion(conv, arg, tags.get(idx).copied().unwrap_or(""))?;
-                let (mut s, numeric) = format_conversion(conv, arg, prec, plus)?;
+                let (mut s, numeric) = format_conversion(conv, arg, prec, plus, vm.as_deref_mut())?;
                 if group && numeric {
                     s = group_digits(&s);
                 }
@@ -3511,7 +3645,7 @@ fn b_format(vm: &mut VM, argc: u8) -> Value {
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
     let body = &args[1..args.len().saturating_sub(1)];
-    match java_format(&fmt, body, &tags) {
+    match java_format(&fmt, body, &tags, Some(&mut *vm)) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
@@ -3524,6 +3658,7 @@ fn format_conversion(
     arg: &Value,
     prec: Option<usize>,
     plus: bool,
+    vm: Option<&mut VM>,
 ) -> Result<(String, bool), Fault> {
     // The `+` flag shows an explicit sign on a *non-negative* number; a negative
     // one carries its own `-` from the rendering below.
@@ -3567,15 +3702,17 @@ fn format_conversion(
             let x = arg.to_float();
             Ok((signed(x, fixed_half_up(x, prec.unwrap_or(6))), true))
         }
-        's' => {
-            let mut s = java_str(arg);
-            if let Some(p) = prec {
-                s = s.chars().take(p).collect();
+        // `%s`/`%S` are `Formatter`'s call to the argument's own `toString()`, so
+        // they are the two conversions a user override answers for. The rest
+        // read the value numerically and never render an object.
+        's' | 'S' => {
+            let mut s = match vm {
+                Some(vm) => java_str_vm(vm, arg),
+                None => java_str(arg),
+            };
+            if conv == 'S' {
+                s = s.to_uppercase();
             }
-            Ok((s, false))
-        }
-        'S' => {
-            let mut s = java_str(arg).to_uppercase();
             if let Some(p) = prec {
                 s = s.chars().take(p).collect();
             }
@@ -3902,6 +4039,12 @@ fn b_eprint(vm: &mut VM, argc: u8) -> Value {
     print_args(vm, argc, false, true)
 }
 
+/// [`JSTRINGIFY`] — Java's string conversion of one value, with the VM in hand.
+fn b_stringify(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    Value::str(java_str_vm(vm, &v))
+}
+
 fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
     use std::io::Write;
     // Pop the args (pushed left-to-right, so the last is on top) and restore
@@ -3918,8 +4061,19 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
         return raise(vm, f);
     }
     // Format once, then write to the selected stream. Boxing the lock keeps the
-    // two branches on one write path.
-    let text: String = vals.iter().map(java_str).collect();
+    // two branches on one write path. Rendering runs user `toString()` bodies,
+    // which may themselves print — so it happens before the lock is taken, and a
+    // throwable one of them raised aborts the write rather than emitting the
+    // half-built text.
+    let text: String = if any_user_tostring(vm) {
+        let text: String = vals.iter().map(|v| java_str_vm(vm, v)).collect();
+        if PENDING.with(|p| p.borrow().is_some()) {
+            return Value::Undef;
+        }
+        text
+    } else {
+        vals.iter().map(java_str).collect()
+    };
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let mut lock: Box<dyn Write> = if err {
@@ -3945,12 +4099,183 @@ pub fn java_str(v: &Value) -> String {
         Value::Float(f) => format_double(*f),
         Value::Undef => "null".to_string(),
         // A heap handle renders like Java's default `Object.toString`
-        // (`ClassName@hex`). A user `toString()` override is dispatched by the
-        // compiler before the value reaches here (see `Compiler::method_call`),
-        // so this default only shows for classes that declare none.
+        // (`ClassName@hex`). Reaching a user `toString()` override needs a VM to
+        // run the body in, which this signature has not got — every rendering
+        // surface that holds one calls [`java_str_vm`] instead.
         Value::Obj(id) => obj_default_str(*id),
         other => other.as_str_cow().into_owned(),
     }
+}
+
+/// [`java_str`] with a VM in hand, so a class instance whose class (or an
+/// ancestor) declares `toString()` renders through that body, at every depth of
+/// a nested collection.
+///
+/// Every rendering surface that holds a `&mut VM` routes here, which is what
+/// keeps them agreeing: `println(o)`, `"" + o` (via [`JSTRINGIFY`]),
+/// `String.valueOf(o)`, `Arrays.toString`, `list.toString()`, `String.join`,
+/// and `%s`. When the program declares no override at all the gate
+/// ([`any_user_tostring`]) is off and this is [`java_str`] exactly.
+pub fn java_str_vm(vm: &mut VM, v: &Value) -> String {
+    match v {
+        Value::Obj(id) if any_user_tostring(vm) => obj_str_vm(vm, *id),
+        other => java_str(other),
+    }
+}
+
+thread_local! {
+    /// Whether the running chunk registers any `Class#toString#` subroutine,
+    /// computed once per run. `None` until the first rendering asks.
+    static USER_TOSTRING: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Class name → the entry ip of the `toString()` it resolves, walking
+    /// supertypes; `None` for a class that inherits `java.lang.Object`'s.
+    /// Memoised because rendering a list asks once per element.
+    static TOSTRING_ENTRY: RefCell<HashMap<String, Option<usize>>> = RefCell::new(HashMap::new());
+}
+
+/// Whether the chunk declares a user `toString()` anywhere. False means every
+/// rendering surface keeps the bytecode and the code path it always had.
+fn any_user_tostring(vm: &VM) -> bool {
+    USER_TOSTRING.with(|c| match c.get() {
+        Some(b) => b,
+        None => {
+            let b = vm.chunk.names.iter().any(|n| n.contains("#toString#"));
+            c.set(Some(b));
+            b
+        }
+    })
+}
+
+/// The entry ip of the `toString()` a runtime class resolves, following the
+/// supertype chain the way the compiler's own dispatch does — a subclass that
+/// declares none inherits its parent's body, and only a class that reaches
+/// `java.lang.Object` without finding one renders the default form.
+fn tostring_entry(vm: &VM, class: &str) -> Option<usize> {
+    if let Some(hit) = TOSTRING_ENTRY.with(|t| t.borrow().get(class).copied()) {
+        return hit;
+    }
+    let mut stack = vec![class.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut found = None;
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        let key = format!("{cur}#toString#");
+        if let Some(i) = vm.chunk.names.iter().position(|n| *n == key) {
+            if let Some(entry) = vm.chunk.find_sub(i as u16) {
+                found = Some(entry);
+                break;
+            }
+        }
+        SUPERS.with(|s| {
+            if let Some(sups) = s.borrow().get(&cur) {
+                stack.extend(sups.iter().cloned());
+            }
+        });
+    }
+    TOSTRING_ENTRY.with(|t| t.borrow_mut().insert(class.to_string(), found));
+    found
+}
+
+/// What a heap object needs in order to render, read out of the heap in one
+/// borrow so the borrow is dropped before any user body runs — a `toString()`
+/// reads its own fields, and a nested one allocates.
+enum RenderShape {
+    /// A class instance: its runtime class, and the enum constant name when the
+    /// synthesized field carries one.
+    Instance(String, Option<String>),
+    /// A `List`/`SubList`/`Set`, already in presentation order.
+    Sequence(Vec<Value>),
+    /// A `Map`, already in presentation order.
+    Entries(Vec<(Value, Value)>),
+    /// An array, a lambda, or a dangling handle — nothing to recurse into, so
+    /// the pure renderer answers.
+    Opaque,
+}
+
+/// [`java_str_vm`]'s heap case: snapshot the shape, drop the borrow, then either
+/// run the override or recurse into the elements.
+fn obj_str_vm(vm: &mut VM, id: u32) -> String {
+    let shape = HEAP.with(|h| {
+        let h = h.borrow();
+        match h.get(id as usize) {
+            Some(HostObj::Instance { class, fields }) => RenderShape::Instance(
+                class.clone(),
+                fields
+                    .get(crate::ast::ENUM_NAME)
+                    .filter(|n| !matches!(n, Value::Undef))
+                    .map(|n| n.as_str_cow().into_owned()),
+            ),
+            Some(HostObj::List { items, .. }) => RenderShape::Sequence(items.clone()),
+            Some(HostObj::Set { items, order, .. }) => RenderShape::Sequence(
+                present_order(items, *order)
+                    .into_iter()
+                    .map(|i| items[i].clone())
+                    .collect(),
+            ),
+            Some(HostObj::Map { entries, order }) => {
+                let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                RenderShape::Entries(
+                    present_order(&keys, *order)
+                        .into_iter()
+                        .map(|i| entries[i].clone())
+                        .collect(),
+                )
+            }
+            _ => RenderShape::Opaque,
+        }
+    });
+    match shape {
+        // A `SubList` owns no elements, so its window is read through the
+        // parent — outside the borrow above, which `sublist_items` takes itself.
+        RenderShape::Opaque if is_sublist(id as usize) => {
+            let items = sublist_items(id as usize)
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            render_sequence_vm(vm, &items)
+        }
+        RenderShape::Opaque => obj_default_str(id),
+        // `Enum.toString()` returns the constant's name unless the enum declares
+        // its own override, and the override wins — the same precedence Java's
+        // virtual dispatch gives it.
+        RenderShape::Instance(class, enum_name) => match tostring_entry(vm, &class) {
+            Some(entry) => run_tostring(vm, entry, id),
+            None => enum_name.unwrap_or_else(|| obj_default_str(id)),
+        },
+        RenderShape::Sequence(items) => render_sequence_vm(vm, &items),
+        RenderShape::Entries(entries) => {
+            let body: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{}={}", java_str_vm(vm, k), java_str_vm(vm, v)))
+                .collect();
+            format!("{{{}}}", body.join(", "))
+        }
+    }
+}
+
+/// `[a, b, c]` with each element rendered through its own `toString()`.
+fn render_sequence_vm(vm: &mut VM, items: &[Value]) -> String {
+    let body: Vec<String> = items.iter().map(|e| java_str_vm(vm, e)).collect();
+    format!("[{}]", body.join(", "))
+}
+
+/// Run a user `toString()` body on `id` and return what it answered.
+///
+/// A throwable already in flight stops the call: the enclosing frame is
+/// unwinding, and rendering must not start a body whose side effects would run
+/// a second time. One raised *by* the body leaves `PENDING` set for the calling
+/// builtin to surface, and the half-built text is discarded with it.
+fn run_tostring(vm: &mut VM, entry: usize, id: u32) -> String {
+    if PENDING.with(|p| p.borrow().is_some()) {
+        return String::new();
+    }
+    let stack_base = vm.stack.len();
+    vm.stack.push(Value::Obj(id));
+    let out = run_sub(vm, entry, stack_base);
+    // Java's string conversion of a `toString()` that answered `null` is the
+    // four characters "null", not an empty string.
+    java_str(&out)
 }
 
 /// Java's default `toString` for a heap object: `ClassName@<identity-hash>` for
@@ -3972,11 +4297,7 @@ fn obj_default_str(id: u32) -> String {
             // which does not, and the two must not disagree. See BUGS.md.
             Some(HostObj::Instance { class, fields }) => match fields.get(crate::ast::ENUM_NAME) {
                 Some(n) if !matches!(n, Value::Undef) => n.as_str_cow().into_owned(),
-                _ => {
-                    let name =
-                        crate::prelude::qualified_class(class).unwrap_or_else(|| class.to_string());
-                    format!("{name}@{id:x}")
-                }
+                _ => format!("{}@{id:x}", qualified_or_binary(class)),
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
             Some(HostObj::List { items, .. }) => render_sequence(items),
@@ -4841,7 +5162,9 @@ fn jdk_name(n: &str) -> String {
         | "AbstractSet"
         | "AbstractMap"
         | "RandomAccess" => format!("java.util.{n}"),
-        other => other.to_string(),
+        // Not a modeled JDK type, so it is a user class: Java names a nested one
+        // `Outer$Nested`, which is what [`qualified_or_binary`] recovers.
+        other => qualified_or_binary(other),
     }
 }
 
