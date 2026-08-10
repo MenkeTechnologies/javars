@@ -859,7 +859,10 @@ fn g_cast(r: &mut Rng) -> String {
     match r.below(12) {
         0 => p(format!("(int) {d}")),
         1 => p(format!("(long) {d}")),
-        2 => p(format!("(int) -{d}")),
+        // Parenthesised because `DBLS` holds negative literals: `-{d}` spliced
+        // onto `-1.5` is `--1.5`, which Java lexes as the decrement operator and
+        // rejects with "unexpected type / required: variable".
+        2 => p(format!("(int) -({d})")),
         3 => p(format!("(byte) ({i} * 37)")),
         4 => p(format!("(short) ({i} * 5000)")),
         5 => p(format!("(double) {i} / 2")),
@@ -2801,5 +2804,54 @@ mod regex_pairing {
         assert!(pairable("(a)", "\"$1$1\""));
         assert!(pairable("(\\\\w)(\\\\w)", "\"$2$1\""));
         assert!(pairable("(?<g>a)", "\"${g}\""));
+    }
+}
+
+/// A generator may not splice an operator onto a literal that already carries a
+/// sign.
+///
+/// `g_cast` built its negated-operand probe as `-{d}` over a `DBLS` pool that
+/// holds `-1.5`, producing `(int) --1.5`. Java lexes `--` as the decrement
+/// operator, which requires a variable, so `javac` rejected the whole program
+/// and the harness counted it a *skip* — 10 of 40 programs in `--mode cast`,
+/// reported as "not compared" rather than as invalid Java. It is the same
+/// defect class the regex pools had, reached the other way: there the oracle
+/// aborted at run time, here it never compiled.
+#[cfg(test)]
+mod operand_splicing {
+    use super::*;
+
+    /// No mode may emit `--` or `++` against a numeric literal.
+    ///
+    /// Checked over every mode rather than over `cast` alone: the pools are
+    /// shared, so any generator that grows a signed-operand probe inherits the
+    /// same trap. `--x`/`x++` are ordinary and stay legal — it is only a digit
+    /// or a `.` after the doubled operator that cannot be anything but the bug,
+    /// since no literal is assignable.
+    #[test]
+    fn no_generator_prefixes_an_operator_onto_a_signed_literal() {
+        let mut bad = Vec::new();
+        for mode in CONCRETE {
+            for seed in 0..400u64 {
+                for probe in gen_probes(seed, *mode, 8) {
+                    let cs: Vec<char> = probe.chars().collect();
+                    for w in cs.windows(3) {
+                        let doubled = (w[0] == '-' || w[0] == '+') && w[1] == w[0];
+                        if doubled && (w[2].is_ascii_digit() || w[2] == '.') {
+                            bad.push(format!("{}: {probe}", mode_name(*mode)));
+                        }
+                    }
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        assert!(
+            bad.is_empty(),
+            "{} generator(s) spliced an operator onto a signed literal, which \
+             `javac` rejects as a decrement of a non-variable:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
     }
 }
