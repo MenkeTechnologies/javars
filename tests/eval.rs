@@ -3970,3 +3970,274 @@ fn rendering_runs_the_override_as_real_code_and_names_the_nesting() {
          n:null|null|null\n"
     );
 }
+
+// ── round 6: JDK methods whose Rust namesake is not the same function ────────
+//
+// Every expectation below was measured against `openjdk 21.0.12`
+// (`/opt/homebrew/opt/openjdk@21`, root locale) rather than reasoned about.
+// They are grouped by the *kind* of mistake so a future mapping can be checked
+// against the pattern rather than against a list of values.
+
+#[test]
+fn math_round_is_the_jdk_algorithm_not_floor_of_a_plus_half() {
+    // `floor(a + 0.5)` is the pre-Java-7 implementation, and it is wrong
+    // wherever the addition is inexact: `0.49999999999999994 + 0.5` rounds up
+    // to exactly 1.0 (JDK-6430675). Rust's `f64::round` is half-away-from-zero
+    // and so disagrees on every negative tie. Java is half-*up*, computed on
+    // the significand's bits with no intermediate rounding.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Math.round(0.49999999999999994));\
+         System.out.println(Math.round(4503599627370497.0));\
+         System.out.println(Math.round(-2.5) + \",\" + Math.round(2.5) + \",\" + Math.round(-1.5));\
+         System.out.println(Math.round(0.5) + \",\" + Math.round(-0.5));\
+         System.out.println(Math.round(Double.NaN) + \",\" + Math.round(Double.POSITIVE_INFINITY) + \",\" + Math.round(Double.NEGATIVE_INFINITY));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "0\n\
+         4503599627370497\n\
+         -2,3,-1\n\
+         1,0\n\
+         0,9223372036854775807,-9223372036854775808\n"
+    );
+}
+
+#[test]
+fn math_round_of_a_float_narrows_to_int_rather_than_wrapping() {
+    // `Math.round` is two methods. The `float` one returns an `int`, so it
+    // saturates at `Integer.MAX_VALUE` where the `double` one would answer
+    // `Long.MAX_VALUE` — truncating the 64-bit answer to 32 bits would give -1.
+    // Only the static type of the argument distinguishes the two.
+    let (out, ok) = run(&wrap(
+        "float big = 1.0e20f; float neg = -1.0e20f;\
+         System.out.println(Math.round(big) + \",\" + Math.round(neg));\
+         System.out.println(Math.round(Float.NaN) + \",\" + Math.round(Float.POSITIVE_INFINITY));\
+         float half = 2.5f; float nhalf = -2.5f;\
+         System.out.println(Math.round(half) + \",\" + Math.round(nhalf));\
+         System.out.println(Math.round(1.0e20) + \",\" + Math.round(2.5));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "2147483647,-2147483648\n\
+         0,2147483647\n\
+         3,-2\n\
+         9223372036854775807,3\n"
+    );
+}
+
+#[test]
+fn math_max_min_and_pow_propagate_nan_where_ieee_does_not() {
+    // `f64::max`/`min` are `fmax`/`fmin`: they *ignore* a NaN operand. Java
+    // propagates it. `powf` is IEEE `pow`, which answers 1.0 for `pow(1, y)`
+    // whatever `y` is; Java's contract makes a NaN or infinite exponent NaN
+    // once the base's magnitude is 1. The zero-exponent rule still comes first.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Math.max(Double.NaN, 1.0) + \",\" + Math.min(Double.NaN, 1.0));\
+         System.out.println(Math.max(1.0, Double.NaN) + \",\" + Math.min(1.0, Double.NaN));\
+         System.out.println(Math.max(-0.0, 0.0) + \",\" + Math.min(-0.0, 0.0));\
+         System.out.println(Math.pow(1.0, Double.NaN) + \",\" + Math.pow(-1.0, Double.POSITIVE_INFINITY));\
+         System.out.println(Math.pow(Double.NaN, 0.0) + \",\" + Math.pow(2.0, 10.0));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "NaN,NaN\n\
+         NaN,NaN\n\
+         0.0,-0.0\n\
+         NaN,NaN\n\
+         1.0,1024.0\n"
+    );
+}
+
+#[test]
+fn strip_and_isblank_use_javas_whitespace_set_not_unicode_white_space() {
+    // The two sets differ in *both* directions. Java's `Character.isWhitespace`
+    // excludes the three non-breaking spaces (U+00A0, U+2007, U+202F) and
+    // U+0085, which Unicode `White_Space` includes; and it includes the four
+    // information separators U+001C-U+001F, which `White_Space` excludes.
+    // `trim` is a third rule again — everything <= U+0020 — so U+001C is
+    // trimmed by both while U+00A0 is trimmed by neither.
+    let (out, ok) = run(&wrap(
+        "int[] cs = {0x20, 0x1c, 0x1f, 0x85, 0xa0, 0x1680, 0x2007, 0x2028, 0x202f, 0x3000};\
+         String r = \"\";\
+         for (int c : cs) {\
+           String pad = String.valueOf((char) c);\
+           String s = pad + \"x\" + pad;\
+           r = r + Integer.toHexString(c) + \":\" + s.trim().length() + s.strip().length() + pad.isBlank() + Character.isWhitespace((char) c) + \" \";\
+         }\
+         System.out.println(r);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "20:11truetrue 1c:11truetrue 1f:11truetrue 85:33falsefalse a0:33falsefalse \
+         1680:31truetrue 2007:33falsefalse 2028:31truetrue 202f:33falsefalse \
+         3000:31truetrue \n"
+    );
+}
+
+#[test]
+fn parse_double_accepts_javas_grammar_and_not_rusts() {
+    // `str::parse` and `Double.valueOf` disagree at both ends: Rust takes
+    // `inf`/`infinity`/`nan` in any case and refuses the `d`/`D`/`f`/`F` type
+    // suffix, Java does the reverse. The empty input is a third message again —
+    // `FloatingDecimal` throws `empty String` where the integral parsers throw
+    // `For input string: ""`.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Double.parseDouble(\"1d\") + \",\" + Double.parseDouble(\"2.5f\") + \",\" + Double.parseDouble(\"3e2F\"));\
+         System.out.println(Double.parseDouble(\"Infinity\") + \",\" + Double.parseDouble(\"-Infinity\") + \",\" + Double.parseDouble(\"NaN\"));\
+         System.out.println(Double.parseDouble(\".5\") + \",\" + Double.parseDouble(\"5.\") + \",\" + Double.parseDouble(\"  2.5  \"));\
+         for (String bad : new String[]{\"inf\", \"infinity\", \"nan\", \"1_0\", \".\", \"e5\", \"1e\", \"1 2\", \"-\", \"\"}) {\
+           try { Double.parseDouble(bad); System.out.println(\"accepted \" + bad); }\
+           catch (NumberFormatException e) { System.out.println(e.getMessage()); }\
+         }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1.0,2.5,300.0\n\
+         Infinity,-Infinity,NaN\n\
+         0.5,5.0,2.5\n\
+         For input string: \"inf\"\n\
+         For input string: \"infinity\"\n\
+         For input string: \"nan\"\n\
+         For input string: \"1_0\"\n\
+         For input string: \".\"\n\
+         For input string: \"e5\"\n\
+         For input string: \"1e\"\n\
+         For input string: \"1 2\"\n\
+         For input string: \"-\"\n\
+         empty String\n"
+    );
+}
+
+#[test]
+fn a_collection_compares_doubles_by_bits_the_way_double_equals_does() {
+    // `Double.equals` is `doubleToLongBits` equality, not `==`: NaN equals
+    // itself and `-0.0` does not equal `0.0`. That decides whether a
+    // `HashSet<Double>` keeps two NaNs apart, whether `contains(NaN)` can ever
+    // be true, and which key `map.get(-0.0)` finds. `TreeSet` asks the same
+    // question through `compareTo`, which is the same total order.
+    let (out, ok) = run(&wrap(
+        "java.util.Set<Double> h = new java.util.HashSet<>(); h.add(0.0);\
+         System.out.println(h.contains(-0.0) + \",\" + h.contains(0.0));\
+         java.util.Set<Double> n = new java.util.HashSet<>(); n.add(Double.NaN); n.add(Double.NaN);\
+         System.out.println(n.size());\
+         java.util.List<Double> l = new java.util.ArrayList<>(); l.add(Double.NaN);\
+         System.out.println(l.contains(Double.NaN) + \",\" + l.indexOf(Double.NaN));\
+         java.util.Map<Double,String> m = new java.util.HashMap<>(); m.put(0.0, \"z\");\
+         System.out.println(m.get(-0.0) + \",\" + m.containsKey(-0.0));\
+         java.util.Set<Double> t = new java.util.TreeSet<>();\
+         t.add(0.0); t.add(-0.0); t.add(Double.NaN); t.add(1.0);\
+         System.out.println(t);",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "false,true\n\
+         1\n\
+         true,0\n\
+         null,false\n\
+         [-0.0, 0.0, 1.0, NaN]\n"
+    );
+}
+
+#[test]
+fn index_of_clamps_from_index_at_both_ends() {
+    // Java pulls `fromIndex` down to the last position the needle could start
+    // at *before* rejecting a negative one, so an empty needle past the end
+    // answers the string's length going forward and -1 going backward.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\".indexOf(\"\", 9) + \",\" + \"abc\".indexOf(\"\", -5) + \",\" + \"abc\".indexOf(\"b\", 99));\
+         System.out.println(\"abc\".lastIndexOf(\"\", -1) + \",\" + \"abc\".lastIndexOf(\"\", 99) + \",\" + \"abc\".lastIndexOf(\"b\", -1));\
+         System.out.println(\"\".indexOf(\"\", 5) + \",\" + \"\".lastIndexOf(\"\", -1));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "3,0,-1\n-1,3,-1\n0,-1\n");
+}
+
+#[test]
+fn get_class_names_a_modeled_jdk_type_and_an_array() {
+    // `getClass()` answered the empty string for everything that was not a user
+    // instance, while `binary_name` — reached only from the
+    // `ClassCastException` message — already knew the JDK's own spelling,
+    // private collection classes included. An array's element type is erased,
+    // so its descriptor comes from the receiver's static type.
+    let (out, ok) = run(
+        "public class T { static class A {} public static void main(String[] x) {\
+         System.out.println(new java.util.ArrayList<Integer>().getClass().getName());\
+         System.out.println(\"s\".getClass().getName() + \"|\" + \"s\".getClass().getSimpleName());\
+         Object i = 1; Object d = 1.5;\
+         System.out.println(i.getClass().getName() + \"|\" + d.getClass().getName());\
+         System.out.println(java.util.List.of(1,2).getClass().getName());\
+         System.out.println(java.util.List.of(1,2,3).getClass().getName());\
+         System.out.println(java.util.Arrays.asList(1,2).getClass().getName());\
+         int[] v = new int[1]; String[] s = new String[1]; int[][] w = new int[1][1]; A[] u = new A[1];\
+         System.out.println(v.getClass().getName() + \"|\" + v.getClass().getSimpleName());\
+         System.out.println(s.getClass().getName() + \"|\" + w.getClass().getName() + \"|\" + u.getClass().getName());\
+         System.out.println(new A().getClass().getName() + \"|\" + new A().getClass().getSimpleName());\
+         } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.ArrayList\n\
+         java.lang.String|String\n\
+         java.lang.Integer|java.lang.Double\n\
+         java.util.ImmutableCollections$List12\n\
+         java.util.ImmutableCollections$ListN\n\
+         java.util.Arrays$ArrayList\n\
+         [I|int[]\n\
+         [Ljava.lang.String;|[[I|[LT$A;\n\
+         T$A|A\n"
+    );
+}
+
+#[test]
+fn a_host_raised_throwable_is_catchable_whatever_spelling_raised_it() {
+    // A `Fault` built with a package-qualified class name matched no `catch`
+    // clause, because every other part of the machinery reads the simple name.
+    // `Double.parseDouble` and `Math.floorDiv` were raised that way and aborted
+    // the program, while sibling arms spelled simply were catchable. The
+    // constructor now normalises, so the two spellings cannot diverge again.
+    let (out, ok) = run(&wrap(
+        "try { Double.parseDouble(\"q\"); } catch (NumberFormatException e) { System.out.println(\"nfe \" + e.getMessage()); }\
+         try { Math.floorDiv(1, 0); } catch (ArithmeticException e) { System.out.println(\"ae \" + e.getMessage()); }\
+         try { Math.floorMod(1, 0); } catch (ArithmeticException e) { System.out.println(\"ae \" + e.getMessage()); }\
+         try { Float.parseFloat(\"q\"); } catch (NumberFormatException e) { System.out.println(\"nfe \" + e.getMessage()); }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "nfe For input string: \"q\"\n\
+         ae / by zero\n\
+         ae / by zero\n\
+         nfe For input string: \"q\"\n"
+    );
+}
+
+#[test]
+fn a_diagnostic_naming_a_type_uses_the_jdks_own_spelling() {
+    // `Enum.valueOf` names the type with `getCanonicalName()` — the binary name
+    // with `$` written as `.` — so a nested enum is `T.E`, not the simple `E`
+    // the declaration site spells. A failed group reference splits by *which*
+    // kind failed rather than by the shared "No group" prefix: a numbered group
+    // is an `IndexOutOfBoundsException`, a named one an
+    // `IllegalArgumentException`.
+    let (out, ok) = run(
+        "public class T { enum E { A, B } public static void main(String[] x) {\
+         try { E.valueOf(\"Z\"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }\
+         try { \"ab\".replaceAll(\"(a)\", \"$9\"); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { \"ab\".replaceAll(\"a\", \"${nope}\"); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "No enum constant T.E.Z\n\
+         java.lang.IndexOutOfBoundsException: No group 9\n\
+         java.lang.IllegalArgumentException: No group with name {nope}\n"
+    );
+}

@@ -3848,7 +3848,13 @@ fn pattern_fault(msg: &str) -> Fault {
 /// `IndexOutOfBoundsException` for the missing group, and the message text
 /// distinguishes them.
 fn replacement_fault(msg: String) -> Fault {
-    if msg.starts_with("No group") {
+    // The split is by *which* group reference failed, not by the shared "No
+    // group" prefix. `Matcher.appendExpandedReplacement` throws
+    // `IndexOutOfBoundsException` for a numbered group that does not exist
+    // (`$9`) and `IllegalArgumentException` for a named one (`${nope}`), so
+    // keying on the prefix alone gave the named case the numbered case's
+    // class. Measured on `openjdk 21.0.12`.
+    if msg.starts_with("No group") && !msg.starts_with("No group with name") {
         Fault::java("IndexOutOfBoundsException", msg)
     } else {
         Fault::java("IllegalArgumentException", msg)

@@ -39,7 +39,16 @@ fn sources() -> Vec<(PathBuf, String)> {
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut out,
     );
-    assert!(!out.is_empty(), "no sources found under src/");
+    // A floor on files *scanned*. `!out.is_empty()` is satisfied by finding one
+    // file, so a `walk` that stopped recursing — or a `src/` layout change that
+    // moved the builtin table into a subdirectory the walk missed — would leave
+    // every collision test below scanning almost nothing and reporting success.
+    assert!(
+        out.len() >= 15,
+        "expected the whole `src/` tree to be scanned, found {} .rs file(s) — \
+         a partial walk makes every duplicate check below vacuous",
+        out.len()
+    );
     out
 }
 
@@ -69,7 +78,7 @@ fn declared_ids() -> Vec<(String, u16, String)> {
         }
     }
     assert!(
-        out.len() > 30,
+        out.len() >= 44,
         "expected the whole builtin table to be found, got {} constants — the \
          declaration syntax this test scans for must have changed",
         out.len()
@@ -139,6 +148,19 @@ fn every_builtin_is_registered_exactly_once() {
         };
         *counts.entry(id.trim().to_string()).or_default() += 1;
     }
+    // A floor on registrations *seen*. The duplicate check below is a filter
+    // over `counts`, so it reports "no duplicates" just as confidently when
+    // `counts` is empty — which is what a reformat that split
+    // `vm.register_builtin(` across two lines would produce, since the scan is
+    // a line-prefix match. The `missing` check further down would catch a
+    // total failure, but not a partial one, and neither would name the cause.
+    assert!(
+        counts.len() >= 44,
+        "expected every `vm.register_builtin(` call to be found, saw {} — the \
+         call syntax this test scans for must have changed, and a scan that \
+         finds nothing reports no duplicates",
+        counts.len()
+    );
     let twice: Vec<String> = counts
         .iter()
         .filter(|(_, n)| **n > 1)

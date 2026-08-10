@@ -77,7 +77,19 @@ fn frozen_corpus_matches_reference_java() {
         n += 1;
     }
 
-    assert!(n > 0, "parity corpus is empty");
+    // A floor on records *examined*, not merely on the corpus being non-empty.
+    // `n > 0` passes on a corpus a bad merge truncated to one line, and passes
+    // just as happily if the `include_str!` target is replaced by a stub — the
+    // whole test then reports success while checking almost nothing. The real
+    // corpus is 323 records and only ever grows (the capture script appends;
+    // it never rewrites), so a floor near the current size fails loudly on any
+    // truncation while leaving room for the handful a deletion might justify.
+    assert!(
+        n >= 320,
+        "the frozen corpus should hold at least 320 records, found {n} — a \
+         truncated corpus still passes every case it kept, so the count is \
+         asserted rather than the emptiness"
+    );
     assert!(
         failures.is_empty(),
         "{} of {n} frozen parity case(s) diverged from the reference JDK:\n\n{}",

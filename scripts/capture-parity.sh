@@ -82,6 +82,37 @@ if [[ $render != '1.0E23' ]]; then
     exit 2
 fi
 
+# The compiler and the runtime are two independent JDKs, and the probe above
+# measures only the runtime: it runs `$java D.java`, whose single-file launcher
+# compiles with its *own* compiler, so it says nothing about `$javac`. That
+# matters because `javac` folds a constant expression at compile time and bakes
+# the *compiler's* rendering into the class file. A `"" + 1.0e23` in a corpus
+# program is such an expression, so the JDK that lowered it — not the JVM that
+# ran it — chose the text. Measured here:
+#
+#   javac 17 + java 21  ->  9.999999999999999E22   (runtime probe still passes)
+#   javac 21 + java 21  ->  1.0E23
+#   javac 21 + java 17  ->  1.0E23
+#
+# The runtime axis alone therefore cannot see a stale compiler, and `$javac`
+# defaults to whatever is first on PATH — routinely a version-manager shim for
+# a different JDK than `JAVA_ORACLE` names. So the compiler is measured on its
+# own probe, through the same folding a corpus record would go through.
+probe=$(mktemp -d) || exit 2
+print 'public class F { public static void main(String[] a) { System.out.print("" + 1.0e23); } }' > $probe/F.java
+folded=''
+if (cd $probe && $javac F.java) >/dev/null 2>&1; then
+    folded=$( (cd $probe && $java $java_opts -classpath . F) 2>&1 )
+fi
+rm -rf -- $probe
+if [[ $folded != '1.0E23' ]]; then
+    print -u2 "capture-parity: $javac folds \`\"\" + 1.0e23\` to '$folded' — pre-JDK-19 Double.toString in the *compiler*"
+    print -u2 "capture-parity: the runtime probe cannot see this; \`javac\` bakes a constant expression's rendering into the class file"
+    print -u2 "capture-parity: JAVA_HOME=${JAVA_HOME:-<unset>}"
+    print -u2 "capture-parity: set JAVAC to the \`javac\` of the same JDK 19+ as JAVA_ORACLE"
+    exit 2
+fi
+
 work=$(mktemp -d) || exit 2
 trap 'rm -rf -- $work' EXIT
 

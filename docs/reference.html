@@ -875,7 +875,7 @@ System.out.println();</code></pre>
         <article class="doc-entry" id="doc-string-methods-14">
           <h3><a class="doc-anchor" href="#doc-string-methods-14">#</a> <code>trim</code></h3>
           <pre><code class="lang-java">String trim()</code></pre>
-          <p>Removes leading and trailing characters whose code point is at or below <code>U+0020</code> — Java's <code>trim()</code> rule, which is deliberately not the same as <code>strip()</code>'s Unicode whitespace test.</p>
+          <p>Removes leading and trailing characters whose code point is at or below <code>U+0020</code> — Java's <code>trim()</code> rule, which is deliberately not the same as <code>strip()</code>'s <code>Character.isWhitespace</code> test (that one keeps the non-breaking spaces <code>U+00A0</code>/<code>U+2007</code>/<code>U+202F</code> and removes the wider Unicode separators).</p>
           <pre><code class="lang-java">System.out.println("  x ".trim() + "|");   // x|</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-15">
@@ -921,19 +921,19 @@ System.out.println();</code></pre>
         <article class="doc-entry" id="doc-static-library-2">
           <h3><a class="doc-anchor" href="#doc-static-library-2">#</a> <code>Math.max</code></h3>
           <pre><code class="lang-java">int Math.max(int a, int b)   |   double Math.max(double a, double b)</code></pre>
-          <p>The larger of two values; integral when both operands are integral, double otherwise.</p>
+          <p>The larger of two values; integral when both operands are integral, double otherwise. A <code>NaN</code> operand propagates (unlike C's <code>fmax</code> and Rust's <code>f64::max</code>, which return the other operand), and <code>max(-0.0, 0.0)</code> is <code>0.0</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.max(1, 2));   // 2</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-3">
           <h3><a class="doc-anchor" href="#doc-static-library-3">#</a> <code>Math.min</code></h3>
           <pre><code class="lang-java">int Math.min(int a, int b)   |   double Math.min(double a, double b)</code></pre>
-          <p>The smaller of two values, with the same integral-versus-double rule as <code>max</code>.</p>
+          <p>The smaller of two values, with the same integral-versus-double rule as <code>max</code> — and the same <code>NaN</code> propagation, which <code>f64::min</code> does not do.</p>
           <pre><code class="lang-java">System.out.println(Math.min(1.5, 2));   // 1.5</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-4">
           <h3><a class="doc-anchor" href="#doc-static-library-4">#</a> <code>Math.pow</code></h3>
           <pre><code class="lang-java">double Math.pow(double a, double b)</code></pre>
-          <p><code>a</code> raised to the power <code>b</code>, always as a double.</p>
+          <p><code>a</code> raised to the power <code>b</code>, always as a double. Java departs from IEEE <code>pow</code> twice: a <code>NaN</code> exponent gives <code>NaN</code> even for a base of 1, and <code>|a| == 1</code> with an infinite exponent gives <code>NaN</code>. A zero exponent still gives <code>1.0</code> for every base.</p>
           <pre><code class="lang-java">System.out.println(Math.pow(2, 10));   // 1024.0</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-5">
@@ -956,8 +956,8 @@ System.out.println();</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-8">
           <h3><a class="doc-anchor" href="#doc-static-library-8">#</a> <code>Math.round</code></h3>
-          <pre><code class="lang-java">long Math.round(double a)</code></pre>
-          <p>Java's rounding, defined as <code>floor(a + 0.5)</code> — so ties go toward positive infinity and <code>round(-2.5)</code> is <code>-2</code>, which is *not* what Rust's own <code>round</code> would give.</p>
+          <pre><code class="lang-java">long Math.round(double a)   |   int Math.round(float a)</code></pre>
+          <p>Java's rounding: ties go toward positive infinity, so <code>round(-2.5)</code> is <code>-2</code> where Rust's half-away-from-zero <code>round</code> gives <code>-3</code>. It is *not* <code>floor(a + 0.5)</code> either — that was the pre-Java-7 implementation and it answers 1 for <code>0.49999999999999994</code>, where Java answers 0. A <code>float</code> argument selects the overload returning <code>int</code>, which saturates at <code>Integer.MAX_VALUE</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.round(-2.5));   // -2</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-9">

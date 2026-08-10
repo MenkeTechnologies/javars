@@ -178,7 +178,18 @@ fn sources() -> Vec<Scan> {
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut out,
     );
-    assert!(!out.is_empty(), "no sources found under src/");
+    // A floor on files *scanned*, for the same reason `tests/builtin_ids.rs`
+    // carries one: `!out.is_empty()` is satisfied by a single file, and every
+    // duplicate check below is a filter over what this returns — so a walk that
+    // stopped early would report a clean registry while having read almost
+    // none of it. `no_dispatch_arm_key_is_matched_twice` sweeps *all* of `src/`
+    // and is the one with no single-file anchor to fall back on.
+    assert!(
+        out.len() >= 15,
+        "expected the whole `src/` tree to be scanned, found {} .rs file(s) — \
+         a partial walk makes the whole-tree sweeps below vacuous",
+        out.len()
+    );
     out
 }
 

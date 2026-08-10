@@ -190,10 +190,15 @@ Implemented and checked against the reference `java`:
   `println` it was rendering for) and it may throw (the throwable propagates,
   and no half-built text reaches the stream). A program that declares no
   override compiles to byte-identical bytecode.
-- **Nested type names** — `getClass().getName()`, the default `Class@hash`
+- **Binary type names** — `getClass().getName()`, the default `Class@hash`
   rendering, and a `ClassCastException`'s head all spell Java's binary name for
   a nested declaration (`Outer$Nested`, `A$B$C` when doubly nested);
-  `getSimpleName()` stays the simple one.
+  `getSimpleName()` stays the simple one. A modeled JDK type reports the JDK's
+  own spelling, private collection classes included — `java.util.ArrayList`,
+  `java.util.ImmutableCollections$List12` for a two-element `List.of`,
+  `java.util.Arrays$ArrayList`, `java.util.ArrayList$SubList` for a view — and
+  an array reports its descriptor (`[I`, `[[Ljava.lang.String;`, `[LT$A;`),
+  which `getSimpleName()` decodes back to `int[]`.
 - **Abstract classes** — `abstract class Shape { abstract double area(); … }`,
   with `super(…)` chaining and concrete methods that call the abstract one
   (resolved to the subclass's override at runtime).

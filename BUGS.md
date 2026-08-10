@@ -217,8 +217,15 @@ at the bottom, and are summarized in the section right after this one.
   `contentEquals`, `toCharArray`, `formatted`, and the four
   `java.util.regex` methods `split`/`replaceAll`/`replaceFirst`/`matches` (see
   the regular-expression entry below).
-  `x.getClass()` evaluates to the runtime class *name*, over which `getName`
-  and `getSimpleName` are `String` methods.
+  `x.getClass()` evaluates to the runtime class's *binary name*, over which
+  `getName` (the name itself) and `getSimpleName` (that name with the package
+  and enclosing-class qualifiers dropped, or an array descriptor decoded back to
+  `int[]`) are `String` methods.
+  `trim`, `strip` and `isBlank` are three different rules and javars keeps them
+  apart: `trim` removes everything `<= U+0020`, while `strip`/`isBlank` use
+  `Character.isWhitespace`, which excludes the non-breaking spaces `U+00A0`,
+  `U+2007`, `U+202F` and `U+0085` and includes the information separators
+  `U+001C`–`U+001F`. Neither is Rust's `char::is_whitespace`.
   Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
   one unit per astral character (which Java counts as two UTF-16 units).
 - **Reference arrays.** `new T[n]` (default-valued), `{…}` literals (and
@@ -1060,12 +1067,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `toUpperCase`/`toLowerCase` do not need the pin: they are locale-sensitive in
   Java (the Turkish `i`/`İ`), but javars models only the root mapping and no
   frozen record exercises the difference.
-- **An array's `getClass().getName()` is empty.** Java answers with the JVM
-  descriptor — `[I` for an `int[]`, `[Ljava.lang.String;` for a `String[]` — and
-  javars answers the empty string, because array element types are erased at
-  runtime (the same erasure that makes `(String) anIntArray` pass, above). A
-  class-instance handle, an enum, a record and a modeled JDK type all report
-  correctly, nested types included (`Outer$Nested`).
+  This entry previously claimed that "a class-instance handle, an enum, a record
+  and a modeled JDK type all report correctly" from `getClass().getName()`.
+  Half of that was false: only the *user* shapes reported. Measured on
+  `openjdk 21.0.12`, `new ArrayList<>().getClass().getName()`,
+  `"s".getClass().getName()` and `((Object) 1).getClass().getName()` each
+  printed the empty string here against `java.util.ArrayList`,
+  `java.lang.String` and `java.lang.Integer` there — `getClass()` answered from
+  the virtual-dispatch builtin, which names only user instances, while
+  `binary_name` (reached only from the `ClassCastException` message) already
+  knew every one of those answers. The two share one path now, so a modeled JDK
+  type, the private collection classes (`ImmutableCollections$List12`,
+  `Arrays$ArrayList`, `ArrayList$SubList`), and arrays all report the JDK's own
+  spelling. An array's descriptor comes from the receiver's *static* type, since
+  its element type is erased at runtime — so `getClass()` on a value whose
+  static type javars could not infer to be an array still answers the empty
+  string, and `getSimpleName()` of one decodes the descriptor back
+  (`[I` → `int[]`).
 - **A `ClassCastException` message drops the module-and-loader clause for a user
   class, and a cast javars cannot decide passes through.** Reference casts *are*
   checked (see "Checked reference casts" under "Implemented"), with two bounded
@@ -1136,6 +1154,38 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   the callee rather than Java's `Cannot invoke "P.get()"`, and a `null`
   `synchronized` monitor says `Cannot enter synchronized block because the
   monitor is null` where Java names the expression it came from.
+
+  "Keeps the operation half of the wording" holds for a field read, a field
+  assignment, an array element and an array length, and it is *not* true of
+  three sites, each measured on `openjdk 21.0.12`:
+
+  | program | JDK 21 | javars |
+  | --- | --- | --- |
+  | `((Supplier) null).get()` | `Cannot invoke "java.util.function.Supplier.get()" because …` | `Cannot invoke a functional interface method because the target is null` |
+  | `for (int v : (List<Integer>) null)` | `Cannot invoke "java.util.List.iterator()" because …` | `Cannot iterate over a null reference` |
+  | `((List) null).add(1)` | `Cannot invoke "java.util.List.add(Object)" because …` | `Cannot invoke "add()" because the receiver is null` |
+
+  Those three sentences are javars's own, not a truncation of Java's. Two more
+  are truncations that lose more than the provenance clause: a `String` method
+  omits the erased parameter list Java prints (`Cannot invoke
+  "String.substring()"` against Java's `"String.substring(int)"`), and a
+  receiver whose static type is `Object` is still named `String`
+  (`((Object) null).hashCode()` reports `"String.hashCode()"` where Java reports
+  `"Object.hashCode()"`). All five need the compiler to hand the receiver's
+  static type and the callee's erased signature to the raising site, which it
+  does not do today.
+- **Unboxing a `null` wrapper yields `null` instead of throwing.** `Integer a =
+  null; int v = a;` prints `null` here and throws
+  `NullPointerException: Cannot invoke "java.lang.Integer.intValue()" because
+  "<local1>" is null` on `openjdk 21.0.12`. javars has one integral value kind
+  and no unboxing conversion to hang the check on, so the `null` flows into the
+  `int` local unchanged. This is a missing *exception*, not a wrong message.
+- **`Double.parseDouble` rejects a hexadecimal literal.** Java's grammar admits
+  `HexFloatingPointLiteral` (`0x1p3` is 8.0); javars validates only the decimal
+  form and answers `NumberFormatException` for the hex one. Correctly-rounded
+  hex-float parsing is real work and Rust's `str::parse` does not do it either,
+  so the form is refused outright rather than approximated — the same choice the
+  transcendentals entry makes. No frozen record exercises it.
 - **The identity hash is javars's heap handle, not the JVM's.** It shows in
   `Object.hashCode()` and in the `@<hash>` half of the default `toString()`.
   Java's number is not reproducible either — it differs between runs of the same

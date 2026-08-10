@@ -113,6 +113,9 @@ struct ClassInfo {
     /// Direct supertypes (superclass + implemented/extended interfaces), for
     /// `instanceof` and virtual-dispatch subtype tests.
     supertypes: Vec<String>,
+    /// Java's *binary* name for this class (`Outer$Nested`), for the two
+    /// messages that name a type the way the JDK spells it.
+    binary: String,
     /// True when this is an `interface` (not instantiable; a dispatch-only type).
     is_interface: bool,
     /// True when this is an `enum` — the flag that makes a bare `Color` a type
@@ -739,6 +742,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
             cl.name.clone(),
             ClassInfo {
                 superclass: cl.superclass.clone(),
+                binary: cl.binary.clone(),
                 supertypes,
                 is_interface: cl.is_interface,
                 is_enum: cl.is_enum,
@@ -1068,12 +1072,16 @@ impl Compiler {
             let next = self.b.current_pos();
             self.b.patch_jump(jf, next);
         }
-        // No match. The message needs the runtime argument, so it is built with
-        // a concatenation rather than a constant.
+        // No match. `Enum.valueOf` names the type with its *canonical* name —
+        // `getCanonicalName()`, which is the binary name with `$` written as
+        // `.` — so a nested enum reports `T.E.Z` and not the simple `E.Z` the
+        // declaration site spells. The message needs the runtime argument, so
+        // it is built with a concatenation rather than a constant.
         let msg = self.temp();
+        let canonical = self.classes[class].binary.replace('$', ".");
         let prefix = self
             .b
-            .add_constant(Value::str(format!("No enum constant {class}.")));
+            .add_constant(Value::str(format!("No enum constant {canonical}.")));
         self.b.emit(Op::LoadConst(prefix), line);
         self.emit_get(&key, line);
         self.b.emit(Op::Add, line);

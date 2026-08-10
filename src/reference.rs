@@ -920,7 +920,7 @@ pub const REFERENCE: &[Entry] = &[
         "trim",
         "String Methods",
         "String trim()",
-        "Removes leading and trailing characters whose code point is at or below `U+0020` — Java's `trim()` rule, which is deliberately not the same as `strip()`'s Unicode whitespace test.",
+        "Removes leading and trailing characters whose code point is at or below `U+0020` — Java's `trim()` rule, which is deliberately not the same as `strip()`'s `Character.isWhitespace` test (that one keeps the non-breaking spaces `U+00A0`/`U+2007`/`U+202F` and removes the wider Unicode separators).",
         "System.out.println(\"  x \".trim() + \"|\");   // x|",
     ),
     (
@@ -970,21 +970,21 @@ pub const REFERENCE: &[Entry] = &[
         "Math.max",
         "Static Library",
         "int Math.max(int a, int b)   |   double Math.max(double a, double b)",
-        "The larger of two values; integral when both operands are integral, double otherwise.",
+        "The larger of two values; integral when both operands are integral, double otherwise. A `NaN` operand propagates (unlike C's `fmax` and Rust's `f64::max`, which return the other operand), and `max(-0.0, 0.0)` is `0.0`.",
         "System.out.println(Math.max(1, 2));   // 2",
     ),
     (
         "Math.min",
         "Static Library",
         "int Math.min(int a, int b)   |   double Math.min(double a, double b)",
-        "The smaller of two values, with the same integral-versus-double rule as `max`.",
+        "The smaller of two values, with the same integral-versus-double rule as `max` — and the same `NaN` propagation, which `f64::min` does not do.",
         "System.out.println(Math.min(1.5, 2));   // 1.5",
     ),
     (
         "Math.pow",
         "Static Library",
         "double Math.pow(double a, double b)",
-        "`a` raised to the power `b`, always as a double.",
+        "`a` raised to the power `b`, always as a double. Java departs from IEEE `pow` twice: a `NaN` exponent gives `NaN` even for a base of 1, and `|a| == 1` with an infinite exponent gives `NaN`. A zero exponent still gives `1.0` for every base.",
         "System.out.println(Math.pow(2, 10));   // 1024.0",
     ),
     (
@@ -1011,8 +1011,8 @@ pub const REFERENCE: &[Entry] = &[
     (
         "Math.round",
         "Static Library",
-        "long Math.round(double a)",
-        "Java's rounding, defined as `floor(a + 0.5)` — so ties go toward positive infinity and `round(-2.5)` is `-2`, which is *not* what Rust's own `round` would give.",
+        "long Math.round(double a)   |   int Math.round(float a)",
+        "Java's rounding: ties go toward positive infinity, so `round(-2.5)` is `-2` where Rust's half-away-from-zero `round` gives `-3`. It is *not* `floor(a + 0.5)` either — that was the pre-Java-7 implementation and it answers 1 for `0.49999999999999994`, where Java answers 0. A `float` argument selects the overload returning `int`, which saturates at `Integer.MAX_VALUE`.",
         "System.out.println(Math.round(-2.5));   // -2",
     ),
     (
