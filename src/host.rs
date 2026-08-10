@@ -3834,26 +3834,45 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // javars erases the element type at runtime, so the pad is inferred from
         // element 0's kind — the only evidence available — and is `null` for an
         // empty source.
+        // Both copies clamp their arguments, and Java does not: a bad length or
+        // a reversed range threw where javars silently answered an array.
+        // `Arrays.copyOf` allocates before it copies, so a negative length is
+        // the allocation's own `NegativeArraySizeException`.
         ("Arrays", "copyOf", 2) => {
             let items = array_items(&args[0]).unwrap_or_default();
-            let n = args[1].to_int().max(0) as usize;
+            let len = args[1].to_int();
+            if len < 0 {
+                return Err(Fault::java("NegativeArraySizeException", len.to_string()));
+            }
             let pad = element_default(&items);
             let mut out = items;
-            out.resize(n, pad);
+            out.resize(len as usize, pad);
             Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
         }
         ("Arrays", "copyOfRange", 3) => {
             let items = array_items(&args[0]).unwrap_or_default();
-            let (from, to) = (
-                args[1].to_int().max(0) as usize,
-                args[2].to_int().max(0) as usize,
-            );
+            let (from, to) = (args[1].to_int(), args[2].to_int());
+            // `Arrays.copyOfRange` checks the range itself and reports it with
+            // the two endpoints alone; a `from` outside the source is left to
+            // the `System.arraycopy` underneath, whose message names the
+            // element type javars has erased, so that one keeps the class and
+            // omits the text (BUGS.md).
+            if from > to {
+                return Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("{from} > {to}"),
+                ));
+            }
+            if from < 0 || from > items.len() as i64 {
+                return Err(Fault::java("ArrayIndexOutOfBoundsException", String::new()));
+            }
+            let (from, to) = (from as usize, to as usize);
             let pad = element_default(&items);
             let mut out: Vec<Value> = items
                 .get(from..to.min(items.len()))
                 .unwrap_or_default()
                 .to_vec();
-            out.resize(to.saturating_sub(from), pad);
+            out.resize(to - from, pad);
             Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
         }
         // `Arrays.binarySearch` returns `-(insertion point) - 1` when absent,

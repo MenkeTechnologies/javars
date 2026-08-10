@@ -4292,3 +4292,49 @@ fn the_hash_code_statics_fold_each_box_at_its_own_width() {
          1069547520,-1\n"
     );
 }
+
+#[test]
+fn a_replacement_scanner_reports_the_diagnostic_the_jdk_reports() {
+    // `Matcher.appendExpandedReplacement` has four distinct messages here, and
+    // javars collapsed two pairs. It tests for the end of the replacement
+    // before reading the next character (so a trailing `$` names the missing
+    // index), and inside `${…}` it accumulates only ASCII alphanumerics, then
+    // checks for an empty name, then for the brace — which is the order that
+    // makes `"${"` a zero-length name and `"${a"` a missing brace.
+    let (out, ok) = run(&wrap(
+        "String[] r = {\"$\", \"$x\", \"${\", \"${a\", \"a$\", \"${nope}\", \"$9\"};\
+         for (String s : r) {\
+           try { System.out.println(\"[\" + \"ab\".replaceAll(\"(a)\", s) + \"]\"); }\
+           catch (RuntimeException e) { System.out.println(e.getClass().getSimpleName() + \": \" + e.getMessage()); }\
+         }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "IllegalArgumentException: Illegal group reference: group index is missing\n\
+         IllegalArgumentException: Illegal group reference\n\
+         IllegalArgumentException: named capturing group has 0 length name\n\
+         IllegalArgumentException: named capturing group is missing trailing '}'\n\
+         IllegalArgumentException: Illegal group reference: group index is missing\n\
+         IllegalArgumentException: No group with name {nope}\n\
+         IndexOutOfBoundsException: No group 9\n"
+    );
+}
+
+#[test]
+fn the_array_copies_reject_a_bad_range_instead_of_clamping_it() {
+    // Both copies clamped their arguments, so a reversed range and a negative
+    // length each answered an array where Java throws. `copyOfRange` reports a
+    // reversed range with the two endpoints alone; `copyOf` allocates before it
+    // copies, so a negative length is the allocation's own failure.
+    let (out, ok) = run(&wrap(
+        "int[] v = {1, 2, 3};\
+         try { java.util.Arrays.copyOfRange(v, 2, 1); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }\
+         try { java.util.Arrays.copyOf(v, -1); } catch (NegativeArraySizeException e) { System.out.println(\"nas \" + e.getMessage()); }\
+         try { java.util.Arrays.copyOfRange(v, -1, 2); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(\"aioobe\"); }\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOfRange(v, 1, 5)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOfRange(v, 3, 3)));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "2 > 1\nnas -1\naioobe\n[2, 3, 0, 0]\n[]\n");
+}

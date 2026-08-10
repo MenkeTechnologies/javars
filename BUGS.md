@@ -1189,6 +1189,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `"Object.hashCode()"`). All five need the compiler to hand the receiver's
   static type and the callee's erased signature to the raising site, which it
   does not do today.
+- **`Arrays.copyOfRange` with a `from` outside the source omits the message
+  text.** Java's bounds check for that case happens inside `System.arraycopy`,
+  whose message names the element type — `arraycopy: source index -1 out of
+  bounds for int[3]` on `openjdk 21.0.12`. javars erases element types at
+  runtime, so it raises the right class (`ArrayIndexOutOfBoundsException`) with
+  no detail message rather than inventing a type name. The two checks
+  `copyOfRange` performs itself are exact: a reversed range is
+  `IllegalArgumentException: 2 > 1`, and a negative length to `copyOf` is
+  `NegativeArraySizeException: -1`.
 - **An enhanced `for` over a collection iterates a snapshot, so structurally
   modifying it does not raise `ConcurrentModificationException`.** Java's
   iterators are fail-fast on `modCount`; javars copies the elements up front and

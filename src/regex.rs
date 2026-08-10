@@ -220,19 +220,35 @@ fn expand(replacement: &str, caps: &fancy_regex::Captures) -> Result<String, Str
                 None => return Err("character to be escaped is missing".to_string()),
             },
             '$' => {
+                // Java distinguishes a `$` with nothing after it from a `$`
+                // followed by a non-digit, and javars reported the shorter
+                // wording for both. `Matcher.appendExpandedReplacement` checks
+                // for the end of the replacement *before* it looks at the next
+                // character.
+                if it.peek().is_none() {
+                    return Err("Illegal group reference: group index is missing".to_string());
+                }
                 if it.peek() == Some(&'{') {
                     it.next();
+                    // `Matcher.appendExpandedReplacement` accumulates only
+                    // ASCII alphanumerics, then tests for an empty name, then
+                    // for the closing brace — in that order, which is what
+                    // makes `"${"` a zero-length name and `"${a"` a missing
+                    // brace. Consuming everything up to `}` and reporting the
+                    // missing brace for both gave `"${"` the wrong diagnostic.
                     let mut name = String::new();
-                    loop {
-                        match it.next() {
-                            Some('}') => break,
-                            Some(ch) => name.push(ch),
-                            None => {
-                                return Err(
-                                    "named capturing group is missing trailing '}'".to_string()
-                                )
-                            }
+                    while let Some(&ch) = it.peek() {
+                        if !ch.is_ascii_alphanumeric() {
+                            break;
                         }
+                        name.push(ch);
+                        it.next();
+                    }
+                    if name.is_empty() {
+                        return Err("named capturing group has 0 length name".to_string());
+                    }
+                    if it.next() != Some('}') {
+                        return Err("named capturing group is missing trailing '}'".to_string());
                     }
                     match caps.name(&name) {
                         Some(m) => out.push_str(m.as_str()),
