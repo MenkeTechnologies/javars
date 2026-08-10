@@ -1467,6 +1467,16 @@ impl Compiler {
                         {
                             return self.expr_java_type(&args[0]);
                         }
+                        // `Math.round` is `long` over a `double` and `int` over
+                        // a `float`, so the argument picks the return type —
+                        // and only the `int` answer may take the 32-bit wrap.
+                        if class == "Math" && method == "round" && args.len() == 1 {
+                            return Some(if self.is_float32_expr(&args[0]) {
+                                "int".to_string()
+                            } else {
+                                "long".to_string()
+                            });
+                        }
                         if let Some(t) = static_call_java_type(class, method) {
                             return Some(t.to_string());
                         }
@@ -4592,7 +4602,20 @@ impl Compiler {
         // overriding it.
         if method == "getClass" && args.is_empty() {
             self.expr(recv)?;
-            self.b.emit(Op::CallBuiltin(crate::host::JCLASSOF, 1), line);
+            // An array's element type is erased at runtime, so `[I` versus
+            // `[Ljava.lang.String;` is recoverable only from the receiver's
+            // static type. The *source* spelling goes across — the host turns
+            // it into a descriptor, because resolving a user component's
+            // binary name (`A` → `T$A`) needs the map only the host holds.
+            // Every other shape is decided from the value.
+            let array_type = self
+                .expr_java_type(recv)
+                .filter(|t| t.ends_with("[]"))
+                .unwrap_or_default();
+            let d = self.b.add_constant(Value::str(array_type));
+            self.b.emit(Op::LoadConst(d), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JBINARY_CLASS, 2), line);
             return Ok(());
         }
         // A sort with no comparator orders by the elements' own `compareTo`,
@@ -4730,6 +4753,22 @@ impl Compiler {
                     let tags_c = self.b.add_constant(Value::str(tags.join("\x1f")));
                     self.b.emit(Op::LoadConst(tags_c), line);
                     self.emit_raising_builtin(crate::host::JFORMAT, args.len() as u8 + 1, line);
+                    return Ok(());
+                }
+                // `Math.round` is two Java methods: the `double` one answers a
+                // `long`, the `float` one an `int`, and they disagree at the
+                // extremes (`Math.round(1.0e20f)` is `Integer.MAX_VALUE`, not
+                // `Long.MAX_VALUE`). Only the static type says which overload
+                // this call selected, so the `float` one gets its own builtin —
+                // the same split `JF32_ARITH` makes, and unlike `Math.abs`
+                // below the narrowing saturates rather than wraps.
+                if class == "Math"
+                    && method == "round"
+                    && args.len() == 1
+                    && self.is_float32_expr(&args[0])
+                {
+                    self.b
+                        .emit(Op::CallBuiltin(crate::host::JF32_ROUND, 1), line);
                     return Ok(());
                 }
                 let class_c = self.b.add_constant(Value::str(class.clone()));

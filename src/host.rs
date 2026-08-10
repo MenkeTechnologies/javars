@@ -256,6 +256,33 @@ pub const JF32_STR: u16 = 738;
 /// arithmetic in javars that does.
 pub const JF32_ARITH: u16 = 739;
 
+/// `Math.round(float)` of the top-of-stack value. `argc == 1`.
+///
+/// `Math.round` is two methods in Java, and they do not agree: the `double` one
+/// answers a `long`, the `float` one an `int`. Only the compiler knows which
+/// overload a call site selected, and the difference is observable at the
+/// extremes — `Math.round(1.0e20f)` is `Integer.MAX_VALUE` where the `double`
+/// overload's answer is `Long.MAX_VALUE`. So a statically-`float` argument
+/// routes here instead of through [`JSTATIC_DISPATCH`], the same reason
+/// [`JF32_ARITH`] exists.
+pub const JF32_ROUND: u16 = 743;
+
+/// `x.getClass()` — the Java *binary* name of a value's runtime class. Stack
+/// `[value, arrayDescriptor]` (the descriptor on top); `argc == 2`.
+///
+/// Distinct from [`JCLASSOF`], which answers the bare class name the compiler's
+/// virtual-dispatch chain compares against and the empty string for everything
+/// that is not a user instance. That was also what `getClass()` returned, so
+/// `new ArrayList<>().getClass().getName()` printed nothing — while
+/// [`binary_name`], reached only from the `ClassCastException` message, already
+/// knew the answer was `java.util.ArrayList`. The two now share it.
+///
+/// The descriptor argument carries what the *value* cannot: an array's element
+/// type is erased at runtime, so `[I` versus `[Ljava.lang.String;` is knowable
+/// only from the receiver's static type, which the compiler supplies. It is the
+/// empty string when the receiver is not statically an array.
+pub const JBINARY_CLASS: u16 = 744;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -469,9 +496,20 @@ struct Fault {
 
 impl Fault {
     /// A catchable Java throwable of class `class` carrying `msg`.
+    ///
+    /// `class` is stored as the *simple* name, because that is the only spelling
+    /// the rest of the machinery reads: a `catch` clause names its type simply,
+    /// [`crate::prelude::qualified_throwable`] recognises only the simple name,
+    /// and the uncaught report qualifies it on the way out. A call site that
+    /// wrote the qualified form got a throwable whose class matched no `catch`
+    /// clause and whose report was left unqualified — `Double.parseDouble("q")`
+    /// aborted with `javars: Exception in thread "main"
+    /// java.lang.NumberFormatException: …` where the `Float.parseFloat` arm two
+    /// lines away, spelled simply, was catchable. Both spellings now arrive
+    /// here as one, so the defect cannot be reintroduced at a new call site.
     fn java(class: &'static str, msg: impl Into<String>) -> Self {
         Fault {
-            class,
+            class: class.rsplit('.').next().unwrap_or(class),
             msg: msg.into(),
         }
     }
@@ -731,6 +769,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JF32, b_f32);
     vm.register_builtin(JF32_STR, b_f32_str);
     vm.register_builtin(JF32_ARITH, b_f32_arith);
+    vm.register_builtin(JF32_ROUND, b_f32_round);
+    vm.register_builtin(JBINARY_CLASS, b_binary_class);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
     vm.register_builtin(JSTRINGIFY, b_stringify);
@@ -882,6 +922,108 @@ fn b_classof(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// [`JBINARY_CLASS`] — `x.getClass()`, as the binary name `getName()` reports.
+///
+/// Everything the answer depends on already existed: [`value_class`] names the
+/// runtime class of every shape the value model has, and [`binary_name`] maps
+/// that to the JDK's own spelling — including the private classes `List.of`
+/// and `Arrays.asList` return. Only `getClass()` was not asking them.
+fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let array_type = args.get(1).map(|h| h.as_str_cow().into_owned());
+    let Some(v) = args.first() else {
+        return Value::str("");
+    };
+    // An array's element type is erased, so the compiler's static spelling is
+    // the only source for `[I` / `[Ljava.lang.String;`.
+    if matches!(value_class(v).as_deref(), Some("[]")) {
+        return Value::str(
+            array_type
+                .as_deref()
+                .and_then(array_descriptor)
+                .unwrap_or_default(),
+        );
+    }
+    // A lambda keeps the dispatch sentinel: Java names one
+    // `Class$$Lambda/0x…`, which is not reproducible (BUGS.md).
+    match value_class(v) {
+        Some(class) if class == LAMBDA_CLASS => Value::str(class),
+        Some(class) => Value::str(binary_name(&class, v).unwrap_or(class)),
+        None => Value::str(""),
+    }
+}
+
+/// The JVM field descriptor `Class.getName()` reports for the array type `ty`,
+/// spelled the way Java source does (`int[]`, `String[][]`).
+///
+/// Java names an array by its descriptor rather than by its source spelling —
+/// `int[]` is `[I`, `String[][]` is `[[Ljava.lang.String;` — in the dotted form
+/// `getName()` uses rather than the slashed class-file one. A reference
+/// component goes through [`qualified_or_binary`], so a nested user class
+/// resolves to `[LT$A;` and not `[LA;`.
+fn array_descriptor(ty: &str) -> Option<String> {
+    let component = ty.strip_suffix("[]")?;
+    if let Some(inner) = array_descriptor(component) {
+        return Some(format!("[{inner}"));
+    }
+    Some(format!(
+        "[{}",
+        match component {
+            "int" => "I".to_string(),
+            "long" => "J".to_string(),
+            "short" => "S".to_string(),
+            "byte" => "B".to_string(),
+            "char" => "C".to_string(),
+            "double" => "D".to_string(),
+            "float" => "F".to_string(),
+            "boolean" => "Z".to_string(),
+            other => format!("L{};", jdk_name(other)),
+        }
+    ))
+}
+
+/// The simple name `Class.getSimpleName()` reports, given a binary name: the
+/// text after the last `$` of a nested class, else after the last `.` of a
+/// package-qualified one.
+///
+/// An array is the exception — Java answers with the *source* spelling of the
+/// type (`int[]`, `String[]`), not with the descriptor `getName()` gave — so a
+/// descriptor is decoded back rather than truncated.
+fn simple_class_name(binary: &str) -> String {
+    if let Some(component) = binary.strip_prefix('[') {
+        return format!("{}[]", simple_class_name(component));
+    }
+    if let Some(reference) = binary.strip_prefix('L').and_then(|r| r.strip_suffix(';')) {
+        return simple_class_name(reference);
+    }
+    // A one-character descriptor only ever reaches here from inside an array.
+    if let Some(primitive) = descriptor_primitive(binary) {
+        return primitive.to_string();
+    }
+    let after_package = binary.rsplit('.').next().unwrap_or(binary);
+    after_package
+        .rsplit('$')
+        .next()
+        .unwrap_or(after_package)
+        .to_string()
+}
+
+/// The Java source name of a primitive field descriptor, for the array half of
+/// [`simple_class_name`].
+fn descriptor_primitive(d: &str) -> Option<&'static str> {
+    Some(match d {
+        "I" => "int",
+        "J" => "long",
+        "S" => "short",
+        "B" => "byte",
+        "C" => "char",
+        "D" => "double",
+        "F" => "float",
+        "Z" => "boolean",
+        _ => return None,
+    })
+}
+
 // ── Lambdas ─────────────────────────────────────────────────────────────────
 
 /// [`JMAKE_CLOSURE`] — snapshot the captures and register the closure.
@@ -995,9 +1137,12 @@ fn java_hash(v: &Value) -> Option<i32> {
                 (*n ^ ((*n as u64) >> 32) as i64) as i32
             }
         }
-        // `Double.hashCode` folds `doubleToLongBits` the way `Long` does.
+        // `Double.hashCode` folds `doubleToLongBits` the way `Long` does. The
+        // *canonical* bits, not the raw ones: `doubleToLongBits` collapses
+        // every `NaN` encoding to one pattern, so two `NaN`s hash alike — which
+        // they must, since `Double.equals` already calls them equal.
         Value::Float(f) => {
-            let bits = f.to_bits() as i64;
+            let bits = canonical_bits(*f);
             (bits ^ ((bits as u64) >> 32) as i64) as i32
         }
         Value::Bool(b) => {
@@ -1066,6 +1211,16 @@ fn value_eq(a: &Value, b: &Value) -> bool {
             // integral kind, so numeric equality is compared by value.
             match (a, b) {
                 (Value::Int(x), Value::Int(y)) => x == y,
+                // `Double.equals` is *not* `==`: it compares
+                // `doubleToLongBits`, so `NaN` equals itself and `-0.0` does
+                // not equal `0.0` — which is what decides whether a
+                // `HashSet<Double>` keeps two `NaN`s apart and whether
+                // `list.contains(Double.NaN)` can ever answer true. The total
+                // order [`float_compare`] already implements is the same
+                // predicate, so the two cannot drift.
+                (Value::Float(_), Value::Float(_)) => {
+                    float_compare(a.to_float(), b.to_float()) == 0
+                }
                 _ => a.to_float() == b.to_float(),
             }
         }
@@ -1380,6 +1535,15 @@ fn trusted_equals(vm: &VM, v: &Value, hashed: bool) -> bool {
 /// Ascending natural order (`Comparable`) for the sorted collections and
 /// `Collections.sort`: numbers numerically, strings lexicographically by
 /// `char`, `null` first. Mixed kinds fall back to a stable "equal".
+///
+/// The floating fallback is [`float_compare`], not `partial_cmp`. A `TreeSet`
+/// orders its elements by `Double.compareTo`, which is a *total* order —
+/// `partial_cmp` answers `None` for a `NaN` operand and `Equal` for `-0.0`
+/// against `0.0`, so a `TreeSet<Double>` collapsed the two zeroes into one
+/// element and put `NaN` wherever the sort happened to leave it.
+/// `Collections.sort` already reached the right answer through the
+/// `compareTo` lambda the compiler supplies; this is the sibling path that did
+/// not.
 fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -1389,10 +1553,7 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (_, Value::Undef) => Ordering::Greater,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => a
-            .to_float()
-            .partial_cmp(&b.to_float())
-            .unwrap_or(Ordering::Equal),
+        _ => float_compare(a.to_float(), b.to_float()).cmp(&0),
     }
 }
 
@@ -3010,7 +3171,12 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // `indexOf(t, from)` starts the search at `from`; the result is still an
         // index into the whole string.
         ("indexOf", 2) => {
-            let from = args[1].to_int().max(0) as usize;
+            // Java clamps `fromIndex` at *both* ends before searching, so a
+            // start past the end answers `-1` for a real needle and the
+            // string's length for the empty one — `"abc".indexOf("", 9)` is 3,
+            // not 9. Clamping only the negative end returned the unclamped
+            // `from` back through the empty-needle hit.
+            let from = args[1].to_int().clamp(0, char_len()) as usize;
             let tail: String = s.chars().skip(from).collect();
             let hit = char_index_of(&tail, &args[0].as_str_cow());
             Ok(Value::Int(if hit < 0 { -1 } else { hit + from as i64 }))
@@ -3038,21 +3204,26 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // `strip` follows Unicode whitespace where `trim` cuts at U+0020; Rust's
         // `trim` is the Unicode one, so `trim` keeps its own ASCII-control rule
         // above and these three use the Unicode definition.
-        ("strip", 0) => Ok(Value::str(s.trim().to_string())),
-        ("stripLeading", 0) => Ok(Value::str(s.trim_start().to_string())),
-        ("stripTrailing", 0) => Ok(Value::str(s.trim_end().to_string())),
-        ("isBlank", 0) => Ok(Value::bool(s.trim().is_empty())),
+        ("strip", 0) => Ok(Value::str(s.trim_matches(java_is_whitespace).to_string())),
+        ("stripLeading", 0) => Ok(Value::str(
+            s.trim_start_matches(java_is_whitespace).to_string(),
+        )),
+        ("stripTrailing", 0) => Ok(Value::str(
+            s.trim_end_matches(java_is_whitespace).to_string(),
+        )),
+        ("isBlank", 0) => Ok(Value::bool(s.chars().all(java_is_whitespace))),
         ("hashCode", 0) => Ok(Value::Int(
             java_hash(&Value::str(s.to_string())).unwrap_or(0).into(),
         )),
         // Interning is unobservable here: javars compares strings by value.
         ("intern", 0) | ("toString", 0) => Ok(Value::str(s.to_string())),
         ("contentEquals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
-        // `x.getClass()` evaluates to the runtime class *name*, so `Class`'s own
-        // two accessors land here: the simple name is that string, and the
-        // qualified name adds `java.lang.` for the modeled JDK types.
-        ("getSimpleName", 0) => Ok(Value::str(s.to_string())),
-        ("getName", 0) => Ok(Value::str(qualified_or_binary(s))),
+        // `x.getClass()` evaluates to the runtime class's *binary name*
+        // ([`JBINARY_CLASS`]), so `Class`'s own two accessors land here:
+        // `getName()` is that string and `getSimpleName()` drops the package
+        // and enclosing-class qualifiers off it.
+        ("getSimpleName", 0) => Ok(Value::str(simple_class_name(s).to_string())),
+        ("getName", 0) => Ok(Value::str(s.to_string())),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
@@ -3369,20 +3540,21 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Math", "max", 2) => Ok(if both_int(&args[0], &args[1]) {
             Value::Int(args[0].to_int().max(args[1].to_int()))
         } else {
-            Value::float(args[0].to_float().max(args[1].to_float()))
+            Value::float(max_double(args[0].to_float(), args[1].to_float()))
         }),
         ("Math", "min", 2) => Ok(if both_int(&args[0], &args[1]) {
             Value::Int(args[0].to_int().min(args[1].to_int()))
         } else {
-            Value::float(args[0].to_float().min(args[1].to_float()))
+            Value::float(min_double(args[0].to_float(), args[1].to_float()))
         }),
-        ("Math", "pow", 2) => Ok(Value::float(args[0].to_float().powf(args[1].to_float()))),
+        ("Math", "pow", 2) => Ok(Value::float(pow_double(
+            args[0].to_float(),
+            args[1].to_float(),
+        ))),
         ("Math", "sqrt", 1) => Ok(Value::float(args[0].to_float().sqrt())),
         ("Math", "floor", 1) => Ok(Value::float(args[0].to_float().floor())),
         ("Math", "ceil", 1) => Ok(Value::float(args[0].to_float().ceil())),
-        // Java `Math.round(double)` = `(long) Math.floor(a + 0.5d)` — ties round
-        // toward positive infinity (round(-2.5) == -2), unlike Rust's `round`.
-        ("Math", "round", 1) => Ok(Value::Int((args[0].to_float() + 0.5).floor() as i64)),
+        ("Math", "round", 1) => Ok(Value::Int(round_double(args[0].to_float()))),
         // `Math.floorDiv`/`floorMod` round toward negative infinity, unlike `/`
         // and `%` which truncate toward zero: `floorDiv(-7, 2)` is -4.
         ("Math", "floorDiv", 2) => floor_div(args[0].to_int(), args[1].to_int()).map(Value::Int),
@@ -3457,14 +3629,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // ── java.lang.Double ──
         ("Double", "parseDouble", 1) | ("Double", "valueOf", 1) => {
             let s = args[0].as_str_cow();
-            match s.trim().parse::<f64>() {
-                Ok(f) => Ok(Value::float(f)),
-                Err(_) => Err(Fault::java(
-                    "java.lang.NumberFormatException",
-                    // Java quotes the offending text but not the word `For`.
-                    format!("For input string: \"{s}\""),
-                )),
-            }
+            parse_java_double(&s)
+                .map(Value::float)
+                .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
         ("Double", "toString", 1) => Ok(Value::str(format_double(args[0].to_float()))),
 
@@ -3474,13 +3641,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Float", "toString", 1) => Ok(Value::str(format_float(args[0].to_float() as f32))),
         ("Float", "parseFloat", 1) | ("Float", "valueOf", 1) => {
             let s = args[0].as_str_cow();
-            match s.trim().parse::<f32>() {
-                Ok(f) => Ok(Value::float(f as f64)),
-                Err(_) => Err(Fault::java(
-                    "NumberFormatException",
-                    format!("For input string: \"{s}\""),
-                )),
-            }
+            parse_java_double(&s)
+                .map(|f| Value::float(f as f32 as f64))
+                .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
         ("Float", "compare", 2) => Ok(Value::Int(float_compare(
             f64::from(args[0].to_float() as f32),
@@ -3504,7 +3667,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Character", "isLetterOrDigit", 1) => {
             Ok(Value::bool(char_arg(&args[0]).is_alphanumeric()))
         }
-        ("Character", "isWhitespace", 1) => Ok(Value::bool(char_arg(&args[0]).is_whitespace())),
+        ("Character", "isWhitespace", 1) => Ok(Value::bool(java_is_whitespace(char_arg(&args[0])))),
         ("Character", "isUpperCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_uppercase())),
         ("Character", "isLowerCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_lowercase())),
         // Java's `Character.toUpperCase(char)` is a *one-to-one* code-point map:
@@ -3644,15 +3807,24 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
 }
 
 /// The last index (in characters) at which `needle` starts at or before
-/// `from`, or -1. Java's `lastIndexOf` counts an empty needle as `from` itself.
+/// `from`, or -1.
+///
+/// The clamping order is the JDK's (`StringLatin1.lastIndexOf`) and it matters:
+/// `fromIndex` is first pulled *down* to the last position a needle of this
+/// length could start at, and only then rejected for being negative. Testing
+/// the empty needle before that ordering — which is what a `clamp(0, len)`
+/// does — answered `"abc".lastIndexOf("", -1)` with 0 where Java answers -1.
 fn char_last_index_of(hay: &str, needle: &str, from: i64) -> i64 {
     let chars: Vec<char> = hay.chars().collect();
     let pat: Vec<char> = needle.chars().collect();
-    if pat.is_empty() {
-        return from.clamp(0, chars.len() as i64);
-    }
     let start = from.min(chars.len() as i64 - pat.len() as i64);
-    (0..=start.max(-1))
+    if start < 0 {
+        return -1;
+    }
+    if pat.is_empty() {
+        return start;
+    }
+    (0..=start)
         .rev()
         .find(|&i| chars[i as usize..].starts_with(&pat))
         .unwrap_or(-1)
@@ -3694,11 +3866,258 @@ fn engine_fault(msg: String) -> Fault {
 /// rather than toward zero, so `floorDiv(-7, 2)` is -4 where `-7 / 2` is -3.
 fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
     if b == 0 {
-        return Err(Fault::java("java.lang.ArithmeticException", "/ by zero"));
+        return Err(Fault::java("ArithmeticException", "/ by zero"));
     }
     let q = a.wrapping_div(b);
     // One correction step when the signs differ and the division was inexact.
     Ok(if a % b != 0 && (a ^ b) < 0 { q - 1 } else { q })
+}
+
+/// Java's `Character.isWhitespace(int)`.
+///
+/// Rust's `char::is_whitespace` is the Unicode `White_Space` property, and the
+/// two sets are different in *both* directions — which is why neither
+/// `String.strip` nor `String.isBlank` can be spelled with it. Java's
+/// definition (its own Javadoc) is a Unicode space separator that is not one of
+/// the three non-breaking spaces, plus the five ASCII controls `\t\n\f\r`
+/// and the four information separators ``–``. So `White_Space`
+/// includes `U+00A0`, `U+2007`, `U+202F` and `U+0085` that Java excludes, and
+/// excludes `U+001C`–`U+001F` that Java includes.
+///
+/// Enumerated rather than derived: Rust exposes no general-category table, and
+/// the space separators have not changed since Unicode 4, so the list is stable
+/// for as long as the property is.
+fn java_is_whitespace(c: char) -> bool {
+    matches!(c,
+        // The ASCII controls Java names one by one, then SPACE.
+        '\u{09}'..='\u{0D}' | '\u{1C}'..='\u{1F}' | '\u{20}'
+        // Zs (SPACE_SEPARATOR) less the non-breaking U+00A0, U+2007, U+202F.
+        | '\u{1680}' | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200A}'
+        | '\u{205F}' | '\u{3000}'
+        // Zl (LINE_SEPARATOR) and Zp (PARAGRAPH_SEPARATOR).
+        | '\u{2028}' | '\u{2029}')
+}
+
+/// `Double.parseDouble` / `Float.parseFloat` — Java's accepted grammar, which is
+/// not Rust's.
+///
+/// `f64::from_str` and `Double.valueOf` disagree at both ends. Rust accepts
+/// `inf`, `infinity` and `nan` in any case, where Java accepts only the exact
+/// spellings `Infinity` and `NaN` and throws on the rest; Rust rejects the
+/// `d`/`D`/`f`/`F` type suffix that Java's `FloatingPointLiteral` allows, so
+/// `Double.parseDouble("1d")` is 1.0 in Java and an error under `from_str`.
+/// Both were live: `parseDouble("inf")` answered `Infinity` here and
+/// `NumberFormatException` on `openjdk 21.0.12`.
+///
+/// The grammar is validated explicitly rather than delegated, so an input Rust
+/// happens to accept cannot slip through a future toolchain. `None` is the
+/// caller's `NumberFormatException`.
+fn parse_java_double(text: &str) -> Option<f64> {
+    // `FloatingDecimal.readJavaFormatString` trims first, with `String.trim()`
+    // — chars <= U+0020, not the Unicode set.
+    let s = text.trim_matches(|c: char| c <= ' ');
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let signed = |v: f64| if negative { -v } else { v };
+    // Case-sensitive, and the sign is already off: `Double.parseDouble("nan")`
+    // is an error in Java however Rust spells it.
+    if body == "NaN" {
+        return Some(f64::NAN);
+    }
+    if body == "Infinity" {
+        return Some(signed(f64::INFINITY));
+    }
+    // The optional `FloatTypeSuffix`. A hex significand needs a `p` exponent to
+    // be legal at all, so stripping a trailing `D`/`F` off one cannot turn an
+    // invalid literal into a valid one.
+    let digits = match body.as_bytes().last() {
+        Some(b'f' | b'F' | b'd' | b'D') => &body[..body.len() - 1],
+        _ => body,
+    };
+    if !is_java_decimal_literal(digits) {
+        return None;
+    }
+    // The grammar is now known to be a subset of Rust's, so the conversion
+    // itself — correctly rounded in both — can be delegated.
+    digits.parse::<f64>().ok().map(signed)
+}
+
+/// The `NumberFormatException` message `Double.parseDouble`/`Float.parseFloat`
+/// carries for input they reject.
+///
+/// The floating parsers do *not* share the integral ones' single message.
+/// `FloatingDecimal.readJavaFormatString` trims, and answers `empty String` for
+/// what is left of nothing — so `Double.parseDouble("")` and
+/// `Double.parseDouble("   ")` both report that, where `Integer.parseInt("")`
+/// reports `For input string: ""`. Measured on `openjdk 21.0.12`.
+fn float_format_message(text: &str) -> String {
+    if text.trim_matches(|c: char| c <= ' ').is_empty() {
+        "empty String".to_string()
+    } else {
+        format!("For input string: \"{text}\"")
+    }
+}
+
+/// Whether `s` is a Java `FloatingPointLiteral` body: sign and type suffix
+/// already removed, and no `Infinity`/`NaN`/hex form.
+///
+/// Java requires at least one digit somewhere in the significand (so `.` alone
+/// and `e5` are errors) and at least one digit in an exponent that is present
+/// at all. It permits no underscores, no leading/interior whitespace, and no
+/// trailing text.
+fn is_java_decimal_literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut significand_digits = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+        significand_digits += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+            significand_digits += 1;
+        }
+    }
+    if significand_digits == 0 {
+        return false;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let exponent_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exponent_start {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
+/// Java's `Math.max(double, double)`, ported from `java.lang.Math`.
+///
+/// Rust's `f64::max` is `fmax`, which *ignores* a NaN operand and answers the
+/// other one; Java propagates it. The two also part over signed zero, where
+/// `fmax` is permitted to return either. Both departures are load-bearing —
+/// `Math.max(Double.NaN, 1.0)` is `NaN` in Java and `1.0` under `f64::max`.
+fn max_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    // Raw bits are safe here: NaN is already out, and only `-0.0` carries the
+    // sign bit over a zero.
+    if a == 0.0 && b == 0.0 && a.is_sign_negative() {
+        return b;
+    }
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Java's `Math.min(double, double)`, ported from `java.lang.Math` — the mirror
+/// of [`max_double`], including the NaN propagation `f64::min` does not do.
+fn min_double(a: f64, b: f64) -> f64 {
+    if a.is_nan() {
+        return a;
+    }
+    if a == 0.0 && b == 0.0 && b.is_sign_negative() {
+        return b;
+    }
+    if a <= b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Java's `Math.pow`, which is IEEE 754 `pow` with two documented exceptions.
+///
+/// `java.lang.Math.pow`'s contract says "if the second argument is NaN, then
+/// the result is NaN" with no carve-out for a base of 1, and "if the absolute
+/// value of the first argument equals 1 and the second argument is infinite,
+/// then the result is NaN". IEEE 754 — and so Rust's `powf` — instead makes
+/// `pow(1, y)` equal 1 for *every* `y`, NaN and infinity included. The
+/// zero-exponent rule comes first in Java's own list, so `pow(NaN, 0.0)` stays
+/// 1.0; everything outside these cases is left to `powf`.
+fn pow_double(a: f64, b: f64) -> f64 {
+    if b == 0.0 {
+        return 1.0;
+    }
+    if b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) {
+        return f64::NAN;
+    }
+    a.powf(b)
+}
+
+/// Java's `Math.round(double)`, ported from `java.lang.Math`.
+///
+/// The obvious spelling — `(long) Math.floor(a + 0.5)` — is the *pre-Java-7*
+/// implementation, and it is wrong wherever `a + 0.5` is not exactly
+/// representable: `0.49999999999999994 + 0.5` rounds up to exactly `1.0`, so
+/// the naive form answers 1 where every JDK since 7 answers 0 (JDK-6430675).
+/// Rust's `f64::round` is not it either — that is half-away-from-zero, so it
+/// answers -3 for `-2.5` where Java's half-*up* answers -2.
+///
+/// The JDK avoids the addition entirely: it reads the significand as an
+/// integer, shifts it down to leave one fractional bit, and rounds that bit
+/// with `(x + 1) >> 1`. No intermediate rounding can occur, so the tie case is
+/// decided by the bits actually present. `shift` outside `0..64` means the
+/// value is either already a mathematical integer, smaller in magnitude than
+/// 1/2, or non-finite — all four of which `(long) a` answers directly, and
+/// Rust's saturating `as i64` matches Java's narrowing (0 for NaN, the
+/// `Long` extremes for the infinities).
+fn round_double(a: f64) -> i64 {
+    // `DoubleConsts`: SIGNIFICAND_WIDTH 53, EXP_BIAS 1023.
+    const EXP_BIT_MASK: i64 = 0x7FF0_0000_0000_0000u64 as i64;
+    const SIGNIF_BIT_MASK: i64 = 0x000F_FFFF_FFFF_FFFF;
+    let long_bits = a.to_bits() as i64;
+    let biased_exp = (long_bits & EXP_BIT_MASK) >> (53 - 1);
+    let shift = (53 - 2 + 1023) - biased_exp;
+    if (shift & -64) == 0 {
+        let mut r = (long_bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1);
+        if long_bits < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
+    } else {
+        a as i64
+    }
+}
+
+/// Java's `Math.round(float)`, ported from `java.lang.Math`.
+///
+/// The same algorithm one width down, and it is a *separate* method rather than
+/// a narrowing of [`round_double`] because its result is an `int`: Java
+/// saturates `Math.round(1.0e20f)` at `Integer.MAX_VALUE`, where truncating the
+/// `long` answer to 32 bits would give -1.
+fn round_float(a: f32) -> i32 {
+    // `FloatConsts`: SIGNIFICAND_WIDTH 24, EXP_BIAS 127.
+    const EXP_BIT_MASK: i32 = 0x7F80_0000;
+    const SIGNIF_BIT_MASK: i32 = 0x007F_FFFF;
+    let int_bits = a.to_bits() as i32;
+    let biased_exp = (int_bits & EXP_BIT_MASK) >> (24 - 1);
+    let shift = (24 - 2 + 127) - biased_exp;
+    if (shift & -32) == 0 {
+        let mut r = (int_bits & SIGNIF_BIT_MASK) | (SIGNIF_BIT_MASK + 1);
+        if int_bits < 0 {
+            r = -r;
+        }
+        ((r >> shift) + 1) >> 1
+    } else {
+        a as i32
+    }
 }
 
 /// The `-1`/`0`/`1` an `Integer.compare`-style method returns.
@@ -3786,7 +4205,7 @@ fn array_items(v: &Value) -> Option<Vec<Value>> {
 fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault> {
     let Value::Obj(id) = v else {
         return Err(Fault::java(
-            "java.lang.NullPointerException",
+            "NullPointerException",
             "null array".to_string(),
         ));
     };
@@ -3796,7 +4215,7 @@ fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault>
             Ok(())
         }
         _ => Err(Fault::java(
-            "java.lang.NullPointerException",
+            "NullPointerException",
             "null array".to_string(),
         )),
     })
@@ -5335,6 +5754,12 @@ fn b_f32_arith(vm: &mut VM, argc: u8) -> Value {
         _ => a + b,
     };
     Value::float(r as f64)
+}
+
+/// [`JF32_ROUND`] — `Math.round(float)`, answering an `int`.
+fn b_f32_round(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    Value::Int(round_float(v.to_float() as f32).into())
 }
 
 /// [`JF32_STR`] — `Float.toString`, or element-wise over a `float[]`.
