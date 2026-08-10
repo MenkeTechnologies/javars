@@ -518,10 +518,9 @@ fn arm_keys(scan: &Scan, span: std::ops::Range<usize>) -> Option<Vec<Vec<String>
                     .collect();
             }
             out.extend(rows);
-        } else if let Some(s) = as_string_literal(scan, start..start + trimmed.len()) {
-            out.push(vec![format!("{s:?}")]);
         } else {
-            return None;
+            let s = as_string_literal(scan, start..start + trimmed.len())?;
+            out.push(vec![format!("{s:?}")]);
         }
     }
     (!out.is_empty()).then_some(out)
