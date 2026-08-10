@@ -1137,6 +1137,22 @@ const PATTERNS: &[&str] = &[
     "x(?!y)",
     "",
     "\\\\u0061",
+    // Group-bearing patterns. The pool above is almost entirely group-free,
+    // which left the `$n` replacements with nothing legal to pair with; these
+    // give the numbered and named back-references a subject, and cover nesting
+    // (where the group *number* is the order of the opening paren), an optional
+    // group (which can go unmatched, so `$2` expands to nothing rather than
+    // throwing), and a named group that a `${name}` replacement can reach.
+    "(a)",
+    "([a-z])",
+    "(\\\\d)",
+    "(a|b)",
+    "(a)(b)?",
+    "(a(b))",
+    "(\\\\w)(\\\\w)",
+    "(\\\\w)(\\\\w)(\\\\w)",
+    "(?<g>a)",
+    "(?<g>[a-z])(\\\\d)",
 ];
 
 /// The subjects the `regex` mode matches against — ASCII, non-ASCII (where the
@@ -1164,6 +1180,12 @@ const SUBJECTS: &[&str] = &[
 
 /// The replacement strings, covering Java's `$n` / `${name}` grammar and its
 /// backslash escaping (which is not the `regex` crate's).
+///
+/// Entries carry their own enclosing quotes, because a replacement is passed to
+/// `replaceAll` as an expression rather than interpolated into one.
+///
+/// A replacement here may reference groups; it is [`pairable`] that keeps it
+/// from being handed a pattern that does not have them.
 const REPLACEMENTS: &[&str] = &[
     "\"-\"",
     "\"\"",
@@ -1173,15 +1195,195 @@ const REPLACEMENTS: &[&str] = &[
     "\"\\\\$\"",
     "\"x\"",
     "\"\\\\\\\\\"",
+    "\"$2$1\"",
+    "\"$0|$1\"",
+    "\"${g}\"",
+    "\"[${g}]$0\"",
 ];
+
+/// One Java string *literal body* with the compiler's escapes resolved — the
+/// value the running program actually receives. Both pools are written as
+/// literal bodies, so a regex `\d` appears here as `\\d` and has to be collapsed
+/// before the regex or replacement grammar can be read off it.
+///
+/// A `backslash-u` escape resolves too, because javac processes those in the
+/// lexer rather than passing them through: the pool's hex escape for U+0061
+/// reaches `Pattern.compile` as the single character `a`, not as an escape the
+/// regex engine ever sees.
+fn java_unescape(body: &str) -> String {
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        match cs.get(i + 1) {
+            Some('u') => {
+                let hex: String = cs.iter().skip(i + 2).take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(c) => {
+                        out.push(c);
+                        i += 6;
+                    }
+                    None => {
+                        out.push('\\');
+                        i += 1;
+                    }
+                }
+            }
+            Some('n') => {
+                out.push('\n');
+                i += 2;
+            }
+            Some('r') => {
+                out.push('\r');
+                i += 2;
+            }
+            Some('t') => {
+                out.push('\t');
+                i += 2;
+            }
+            Some(&c) => {
+                out.push(c);
+                i += 2;
+            }
+            None => {
+                out.push('\\');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The number of capturing groups a pattern has, and the names of its named
+/// groups — the two facts that decide which replacements are legal against it.
+///
+/// A `(` opens a capturing group unless it is followed by `?`, with `(?<name>`
+/// the exception: that one IS capturing, while the lookbehinds `(?<=` and `(?<!`
+/// are not — the distinguishing character is whether an identifier follows the
+/// `<`. A `(` inside a character class, or escaped, is literal.
+fn pattern_groups(pat: &str) -> (usize, Vec<String>) {
+    let cs: Vec<char> = java_unescape(pat).chars().collect();
+    let (mut count, mut names) = (0usize, Vec::new());
+    let (mut i, mut in_class) = (0usize, false);
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => {
+                if cs.get(i + 1) != Some(&'?') {
+                    count += 1;
+                } else if cs.get(i + 2) == Some(&'<')
+                    && cs.get(i + 3).is_some_and(|c| c.is_ascii_alphabetic())
+                {
+                    count += 1;
+                    names.push(cs[i + 3..].iter().take_while(|c| **c != '>').collect());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (count, names)
+}
+
+/// The highest numbered back-reference, and every `${name}` reference, a
+/// replacement uses. A backslash-escaped `$` is a literal dollar and references
+/// nothing. The entry carries enclosing quotes (see [`REPLACEMENTS`]), which are
+/// stripped before the grammar is read.
+///
+/// Java resolves `$nn` greedily but only as far as a group that exists, so
+/// `$12` against a one-group pattern is group 1 followed by a literal `2`.
+/// Taking every digit instead is deliberately *conservative*: it can only refuse
+/// a pairing Java would have allowed, never allow one Java would abort on. For
+/// this pool, whose references are all single-digit, the two agree exactly.
+fn replacement_refs(rep: &str) -> (usize, Vec<String>) {
+    let body = rep
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(rep);
+    let cs: Vec<char> = java_unescape(body).chars().collect();
+    let (mut max_num, mut names) = (0usize, Vec::new());
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '$' if cs.get(i + 1) == Some(&'{') => {
+                let name: String = cs[i + 2..].iter().take_while(|c| **c != '}').collect();
+                i += name.len() + 2;
+                names.push(name);
+            }
+            '$' => {
+                let digits: String = cs[i + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<usize>() {
+                    max_num = max_num.max(n);
+                }
+                i += digits.len();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (max_num, names)
+}
+
+/// Whether `rep` references only groups `pat` actually has — the invariant that
+/// keeps the generator from emitting a program the reference JDK aborts on.
+fn pairable(pat: &str, rep: &str) -> bool {
+    let (count, names) = pattern_groups(pat);
+    let (max_num, refs) = replacement_refs(rep);
+    max_num <= count && refs.iter().all(|n| names.contains(n))
+}
+
+/// A replacement drawn uniformly from those legal against `pat`.
+///
+/// This bounds the pairing without narrowing the replacement grammar under
+/// test: every entry in [`REPLACEMENTS`] stays reachable, because the
+/// group-bearing patterns admit all of them. Constraining the *pairing* rather
+/// than shrinking the pool is what keeps the fix from trading skips for lost
+/// coverage.
+fn pick_replacement(r: &mut Rng, pat: &str) -> &'static str {
+    let legal: Vec<&'static str> = REPLACEMENTS
+        .iter()
+        .copied()
+        .filter(|rep| pairable(pat, rep))
+        .collect();
+    assert!(
+        !legal.is_empty(),
+        "no replacement is legal against pattern `{pat}`: REPLACEMENTS must keep \
+         at least one entry that references no group"
+    );
+    legal[r.below(legal.len())]
+}
 
 /// `java.util.regex` through `String.split`/`replaceAll`/`replaceFirst`/
 /// `matches` — the pattern *translation* as much as the engine, since Java's
 /// defaults and fancy-regex's disagree on `\d`, `\b`, `(?i)`, `.`, and `$`.
 fn g_regex(r: &mut Rng) -> String {
-    let pat = pick(r, PATTERNS);
+    let pat = *pick(r, PATTERNS);
     let s = pick(r, SUBJECTS);
-    let rep = pick(r, REPLACEMENTS);
+    // The replacement is drawn from the subset legal for *this* pattern, not
+    // from the pool at large. Pairing them independently emitted programs like
+    // `"aabbcc".replaceAll("[a-z]", "$1$1")`, which the reference JDK aborts
+    // with `IndexOutOfBoundsException: No group 1` — so the whole packed program
+    // produced no comparable output and was counted a skip. A skip is
+    // indistinguishable from coverage in the summary, so the corpus reported
+    // agreement it had never actually tested.
+    let rep = pick_replacement(r, pat);
     match r.below(7) {
         0 => format!("System.out.println(Arrays.toString({s}.split(\"{pat}\")) + \"/\" + {s}.split(\"{pat}\").length);"),
         1 => format!(
@@ -2462,5 +2664,142 @@ fn main() {
     );
     if failures > 0 {
         std::process::exit(1);
+    }
+}
+
+/// The regex pools' pairing invariant, checked against the JDK's own answer.
+///
+/// The generator used to draw a pattern and a replacement from independent
+/// pools, so it emitted programs like `"aabbcc".replaceAll("[a-z]", "$1$1")`
+/// that the reference `java` aborts with `IndexOutOfBoundsException: No group
+/// 1`. The whole packed program then produced no comparable output and was
+/// counted a *skip* — which reads in the summary exactly like coverage that
+/// passed. These tests pin the group accounting that replaced it, so the pools
+/// cannot drift back into generating a program the oracle refuses to run.
+#[cfg(test)]
+mod regex_pairing {
+    use super::*;
+
+    /// `Pattern.compile(p).matcher("").groupCount()` for every entry of
+    /// [`PATTERNS`], in order, captured from the reference JDK
+    /// (`openjdk 26.0.2`, Temurin-26.0.2+10). Frozen rather than recomputed so
+    /// the invariant holds in CI without a JDK installed — the same reason
+    /// `tests/data/parity_expected.txt` is frozen.
+    const JDK_GROUP_COUNTS: &[usize] = &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 1, 2,
+    ];
+
+    /// The counter agrees with the JDK on every pattern in the pool — including
+    /// the three shapes a naive `(`-count gets wrong: `(?:ab)+` and `(?i)a` are
+    /// not capturing, `(?<=a)b` is a lookbehind rather than a named group, and
+    /// `(?<g>a)b` is a named group rather than a lookbehind.
+    #[test]
+    fn group_counts_match_the_jdk() {
+        assert_eq!(
+            PATTERNS.len(),
+            JDK_GROUP_COUNTS.len(),
+            "PATTERNS changed without recapturing JDK_GROUP_COUNTS from a real JDK"
+        );
+        let mut wrong = Vec::new();
+        for (p, want) in PATTERNS.iter().zip(JDK_GROUP_COUNTS) {
+            let got = pattern_groups(p).0;
+            if got != *want {
+                wrong.push(format!("`{p}`: jdk={want} ours={got}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "group count diverged:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// The lookaround/named-group boundary, stated directly rather than only
+    /// via the pool, so a rewrite that collapses them is caught by name.
+    #[test]
+    fn lookbehind_is_not_a_named_group() {
+        assert_eq!(pattern_groups("(?<=a)b"), (0, vec![]));
+        assert_eq!(pattern_groups("(?<!a)b"), (0, vec![]));
+        assert_eq!(pattern_groups("(?<g>a)b"), (1, vec!["g".to_string()]));
+        assert_eq!(pattern_groups("(?:ab)+"), (0, vec![]));
+        assert_eq!(pattern_groups("(?i)a"), (0, vec![]));
+        // An escaped paren and a paren inside a character class are literal.
+        assert_eq!(pattern_groups("\\\\(a\\\\)").0, 0);
+        assert_eq!(pattern_groups("[()]").0, 0);
+    }
+
+    /// A `\`-escaped `$` is a literal dollar, not a reference — the pool entry
+    /// that would otherwise look like a bare `$` and be rejected everywhere.
+    #[test]
+    fn replacement_references_are_read_through_both_escape_layers() {
+        assert_eq!(replacement_refs("\"\\\\$\""), (0, vec![]));
+        assert_eq!(replacement_refs("\"\\\\\\\\\""), (0, vec![]));
+        assert_eq!(replacement_refs("\"[$0]\""), (0, vec![]));
+        assert_eq!(replacement_refs("\"$1$1\""), (1, vec![]));
+        assert_eq!(replacement_refs("\"$2$1\""), (2, vec![]));
+        assert_eq!(replacement_refs("\"${g}\""), (0, vec!["g".to_string()]));
+        assert_eq!(replacement_refs("\"[${g}]$0\""), (0, vec!["g".to_string()]));
+    }
+
+    /// Every replacement the generator can hand a pattern is legal against it,
+    /// over the entire cross-product — the invariant the skips violated.
+    #[test]
+    fn every_reachable_pairing_is_legal() {
+        let mut r = Rng::new(0xC0FFEE);
+        for p in PATTERNS {
+            let (count, names) = pattern_groups(p);
+            // Sample enough draws that each legal replacement is hit; the check
+            // is on what `pick_replacement` can return, not on the pool.
+            for _ in 0..REPLACEMENTS.len() * 20 {
+                let rep = pick_replacement(&mut r, p);
+                let (max_num, refs) = replacement_refs(rep);
+                assert!(
+                    max_num <= count,
+                    "`{p}` has {count} group(s) but was paired with `{rep}`"
+                );
+                for n in &refs {
+                    assert!(
+                        names.contains(n),
+                        "`{p}` has no group named `{n}` but was paired with `{rep}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fix constrains the *pairing*, so it must not have cost coverage:
+    /// every replacement in the pool is still reachable from some pattern, and
+    /// every pattern still admits some replacement.
+    #[test]
+    fn no_replacement_and_no_pattern_became_unreachable() {
+        for rep in REPLACEMENTS {
+            assert!(
+                PATTERNS.iter().any(|p| pairable(p, rep)),
+                "replacement `{rep}` is no longer reachable from any pattern — \
+                 the pairing fix would be trading skips for lost coverage"
+            );
+        }
+        for p in PATTERNS {
+            assert!(
+                REPLACEMENTS.iter().any(|rep| pairable(p, rep)),
+                "pattern `{p}` admits no replacement"
+            );
+        }
+    }
+
+    /// The pairing rule is what rejects the exact program that produced the
+    /// skips, and it rejects it for the reason the JDK does.
+    #[test]
+    fn the_program_that_caused_the_skips_is_now_unpairable() {
+        assert!(!pairable("[a-z]", "\"$1$1\""));
+        assert!(!pairable("[a-z]", "\"<$1>\""));
+        assert!(!pairable("(a)", "\"$2$1\""));
+        assert!(!pairable("(a)", "\"${g}\""), "no group named g");
+        // ...and admits the ones the JDK runs.
+        assert!(pairable("[a-z]", "\"[$0]\""));
+        assert!(pairable("(a)", "\"$1$1\""));
+        assert!(pairable("(\\\\w)(\\\\w)", "\"$2$1\""));
+        assert!(pairable("(?<g>a)", "\"${g}\""));
     }
 }
