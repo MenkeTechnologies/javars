@@ -173,7 +173,11 @@ Implemented and checked against the reference `java`:
   declared type drives `/`-truncation and the 32-bit `int` wrap.
 - **`record` types** — `record Pt(int x, int y) { … }` derives the final fields,
   the canonical constructor, an accessor per component, `toString()` in Java's
-  `Pt[x=1, y=2]` form, and a component-wise `equals`. A compact constructor
+  `Pt[x=1, y=2]` form, and a component-wise `equals` that follows JLS 8.10.3 per
+  component kind — `Double.compare`/`Float.compare` for the floating ones (so a
+  `NaN` component equals itself and `0.0` does not equal `-0.0`), `==` for the
+  other primitives, and `Objects.equals` for a reference, which reaches the
+  component class's own `equals`. A compact constructor
   validates before the fields are assigned; a member the body declares itself
   wins over the derived one.
 - **`toString()` overrides, wherever a value renders** — `println(obj)`,

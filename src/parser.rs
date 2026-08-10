@@ -436,6 +436,49 @@ fn record_at(toks: &[Token], j: usize) -> bool {
 /// writes its own `toString()` keeps it.
 ///
 /// Called once per record declaration, after its own members are parsed.
+/// How a `record`'s derived `equals` compares one component, which is not `==`
+/// for two of the three kinds.
+///
+/// JLS 8.10.3: the derived `equals` compares a `float` component with
+/// `Float.compare(…) == 0`, a `double` with `Double.compare(…) == 0`, any other
+/// primitive with `==`, and a reference with `Objects.equals`. The two special
+/// cases are not pedantry — `Double.compare` is a *total* order, so
+/// `new D(Double.NaN).equals(new D(Double.NaN))` is `true` and
+/// `new D(0.0).equals(new D(-0.0))` is `false`, both the opposite of what `==`
+/// answers. `Objects.equals` reaches a component class's own `equals`, where
+/// `==` would compare handles; for a `String` component the two agree already
+/// (javars's `==` on strings is by value) and for an array component they agree
+/// too (arrays inherit identity `equals`), but routing every reference through
+/// one rule is the rule Java states.
+fn component_eq(ty: &str, mine: Expr, theirs: Expr, line: u32) -> Expr {
+    match ty {
+        "float" | "double" => {
+            let owner = if ty == "float" { "Float" } else { "Double" };
+            Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(Expr::MethodCall {
+                    recv: Box::new(Expr::Var(owner.to_string())),
+                    method: "compare".to_string(),
+                    args: vec![mine, theirs],
+                    line,
+                }),
+                rhs: Box::new(Expr::Int(0)),
+            }
+        }
+        "int" | "long" | "short" | "byte" | "char" | "boolean" => Expr::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(mine),
+            rhs: Box::new(theirs),
+        },
+        _ => Expr::MethodCall {
+            recv: Box::new(Expr::Var("Objects".to_string())),
+            method: "equals".to_string(),
+            args: vec![mine, theirs],
+            line,
+        },
+    }
+}
+
 fn record_members(
     line: u32,
     name: &str,
@@ -543,20 +586,18 @@ fn record_members(
         let other = "#other";
         let mut cond = Expr::Bool(true);
         for c in components {
+            let mine = Expr::Field {
+                recv: Box::new(Expr::This),
+                name: c.name.clone(),
+            };
+            let theirs = Expr::Field {
+                recv: Box::new(Expr::Var(other.to_string())),
+                name: c.name.clone(),
+            };
             cond = Expr::Binary {
                 op: BinOp::And,
                 lhs: Box::new(cond),
-                rhs: Box::new(Expr::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(Expr::Field {
-                        recv: Box::new(Expr::This),
-                        name: c.name.clone(),
-                    }),
-                    rhs: Box::new(Expr::Field {
-                        recv: Box::new(Expr::Var(other.to_string())),
-                        name: c.name.clone(),
-                    }),
-                }),
+                rhs: Box::new(component_eq(&c.ty, mine, theirs, line)),
             };
         }
         methods.push(Method {

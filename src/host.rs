@@ -1089,6 +1089,19 @@ fn eq_call(vm: &mut VM, q: &Value, other: &Value) -> bool {
     }
 }
 
+/// `java.util.Objects.equals(a, b)` — `a == b || (a != null && a.equals(b))`.
+/// The null half is what separates it from [`eq_call`]: `Objects.equals(null,
+/// null)` is `true` and `Objects.equals(null, x)` is `false` without calling
+/// anything. It is also what a `record`'s derived `equals` uses for a reference
+/// component.
+fn objects_equals(vm: &mut VM, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Undef, Value::Undef) => true,
+        (Value::Undef, _) => false,
+        _ => eq_call(vm, a, b),
+    }
+}
+
 /// The handle and `equals(Object)` entry ip of a value that is a class instance
 /// whose class resolves a user body; `None` for everything else — a scalar, a
 /// collection handle, or an instance that inherits `java.lang.Object`'s
@@ -3266,6 +3279,12 @@ fn collection_static(
                 fixed: Fixity::Immutable,
             })))
         }
+        // `Objects.equals(a, b)` — `a == b || (a != null && a.equals(b))`. It is
+        // here rather than in the VM-less `static_method` because the `a.equals`
+        // half runs a user body, which needs the VM.
+        ("Objects", "equals") if args.len() == 2 => {
+            Ok(Value::bool(objects_equals(vm, &args[0], &args[1])))
+        }
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
                 Some(i) => i,
@@ -3463,18 +3482,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 )),
             }
         }
-        ("Float", "compare", 2) => Ok(Value::Int(cmp_to_int(
-            (args[0].to_float() as f32)
-                .partial_cmp(&(args[1].to_float() as f32))
-                .unwrap_or(std::cmp::Ordering::Equal),
+        ("Float", "compare", 2) => Ok(Value::Int(float_compare(
+            f64::from(args[0].to_float() as f32),
+            f64::from(args[1].to_float() as f32),
         ))),
         ("Float", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
         ("Float", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
-        ("Double", "compare", 2) => Ok(Value::Int(cmp_to_int(
-            args[0]
-                .to_float()
-                .partial_cmp(&args[1].to_float())
-                .unwrap_or(std::cmp::Ordering::Equal),
+        ("Double", "compare", 2) => Ok(Value::Int(float_compare(
+            args[0].to_float(),
+            args[1].to_float(),
         ))),
         ("Double", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
         ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
@@ -3686,6 +3702,44 @@ fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
 }
 
 /// The `-1`/`0`/`1` an `Integer.compare`-style method returns.
+/// `Double.compare` / `Float.compare` — a *total* order over the doubles, which
+/// `<`/`>`/`==` are not.
+///
+/// Java specifies three departures from the operators, all of which a
+/// `record`'s derived `equals` and a `TreeSet<Double>` depend on: `-0.0` sorts
+/// strictly below `0.0`, `NaN` compares equal to itself, and `NaN` sorts above
+/// every other value including `+Infinity`. `partial_cmp` answers `None` for a
+/// `NaN` operand and `Equal` for `0.0` against `-0.0`, so it cannot express any
+/// of the three; the JDK's own implementation compares the raw bit patterns
+/// once the numeric case is out of the way, and so does this.
+fn float_compare(a: f64, b: f64) -> i64 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    // Neither `<` nor `>` leaves exactly two cases: `0.0` against `-0.0`, and
+    // any pair involving `NaN`. Both are settled the way the JDK settles them,
+    // by comparing `doubleToLongBits` as a signed long — `-0.0` is
+    // `Long.MIN_VALUE` and so below `0.0`'s zero, and a canonical `NaN` is
+    // above every finite pattern and equal to itself. The sign bit needs no
+    // folding here because the ordinary negatives never reach this point.
+    let (ab, bb) = (canonical_bits(a), canonical_bits(b));
+    cmp_to_int(ab.cmp(&bb))
+}
+
+/// `Double.doubleToLongBits` as a signed long: every `NaN` collapses to the one
+/// canonical pattern the JDK reports, so two different `NaN` encodings compare
+/// equal.
+fn canonical_bits(v: f64) -> i64 {
+    if v.is_nan() {
+        0x7ff8_0000_0000_0000u64 as i64
+    } else {
+        v.to_bits() as i64
+    }
+}
+
 fn cmp_to_int(o: std::cmp::Ordering) -> i64 {
     match o {
         std::cmp::Ordering::Less => -1,

@@ -261,7 +261,13 @@ at the bottom, and are summarized in the section right after this one.
 - **`record` types.** `record Pt(int x, int y) { … }` — the components become
   final instance fields plus the canonical constructor, one accessor each
   (`p.x()`), a `toString()` in Java's `Pt[x=1, y=2]` form, and a component-wise
-  `equals`. A compact constructor (`Pt { if (…) throw …; }`) runs its validation
+  `equals` that compares each component the way JLS 8.10.3 says to — a `float`
+  or `double` through `Float.compare`/`Double.compare` (so
+  `new D(Double.NaN).equals(new D(Double.NaN))` is `true` and
+  `new D(0.0).equals(new D(-0.0))` is `false`, both the opposite of `==`), any
+  other primitive with `==`, and a reference through `Objects.equals`, which
+  reaches a component class's own body. A compact constructor
+  (`Pt { if (…) throw …; }`) runs its validation
   before the fields are assigned. The body may add methods, `static` members, and
   `implements`; anything it declares itself (its own `toString()`, its own
   accessor) wins over the derived member. Records nest inside a class or stand at
@@ -817,8 +823,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   answer — but there is no way to name a class without an instance, so
   `synchronized (C.class)` and `C.class.getName()` are parse errors.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
-  `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above, the
-  `String` instance methods, and the `java.util` collections are the whole
+  `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
+  `Objects.equals` (the one `Objects` member, because a `record`'s derived
+  `equals` is specified in terms of it), the `String` instance methods, and the
+  `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
   `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `System` carries
   only its two streams: `System.exit(3)` is
@@ -886,11 +894,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   gives whatever the declaration order already produced (the default value if
   the other class is declared later). A `static` initializer with an observable
   side effect (printing) also runs in a program that never touches its class.
-- **A `record`'s `equals` compares components with javars's `==`.** Java's
-  derived `equals` uses `Objects.equals` for a reference component; javars emits
-  `==`, which is value equality for a `String` component (so those agree) but
-  reference identity for a user-class or array component (where Java would call
-  the component's own `equals`).
 - **Field *hiding* collapses to one cell.** A class's fields are resolved once,
   ancestors first, into a single per-instance map keyed by name, so a subclass
   that re-declares a field its parent already declares does not get a second
