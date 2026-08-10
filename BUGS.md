@@ -931,12 +931,28 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   Fixing only the builtin side would make `System.out.println(list)` print
   `[Pt[x=1, y=2]]` while `System.out.println("" + list)` printed `[Pt@2]`, in the
   same program, for the same list. One consistent wrong rendering is a
-  documented model; two different renderings of one value is a trap. So the
-  whole of it waits on the one change that would close both: lowering
-  concatenation with a reference-typed operand to a *builtin* rather than
-  `Op::Add`, which puts every path on the side that has a VM. That costs
-  `Op::Add`'s JIT-friendliness on the concatenations it applies to, which is why
-  it is a deliberate decision and not a cleanup.
+  documented model; two different renderings of one value is a trap. So both
+  stay until one change closes both.
+
+  That change is **not** to make the hook re-enter — it cannot — but to keep
+  concatenation away from it. `Compiler::binary` already routes a `+` it has
+  typed as string concatenation through `emit_stringified` on each operand
+  (which is why `"" + p` on a `Pt`-typed local already prints the override); the
+  operands that fall through to `java_str` are the ones whose static type does
+  not name a user class — a `List<Pt>`, an `Object`, an erased `get()`. Emitting
+  a rendering *builtin* for those, instead of leaving the value to `Op::Add`,
+  puts every surface on the side that has a VM, and the hook stops being on the
+  concatenation path at all. The builtin then resolves the override the way the
+  compiler's own dispatch does, by looking the mangled `Class#toString#` up in
+  `chunk.sub_entries` and calling `run_sub`.
+
+  Two things that has to demonstrate before it lands. First, depth: a `List` of
+  `List` of `Pt` must render its overrides all the way down, and a `toString()`
+  that itself throws must surface the throwable rather than a half-built string.
+  Second, cost: `Op::Add` is the JIT-friendly lowering, so the rerouting must be
+  gated on a user `toString` actually being declared, and a benchmark of
+  concatenation-heavy code with no override declared must be unchanged — the
+  gate provably off when unused, not merely cheap.
 
   `compareTo` additionally has to answer a *number*, and the boxed types do not
   agree on which: `Integer`/`Long`/`Double`/`Float` answer the sign,

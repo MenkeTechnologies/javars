@@ -3648,3 +3648,45 @@ fn two_sibling_blocks_may_still_reuse_a_local_name() {
     assert!(ok, "stdout was {out:?}");
     assert_eq!(out, "1\n2\n0\n1\n5\n");
 }
+
+#[test]
+fn overloads_get_distinct_subroutines_rather_than_colliding_by_name() {
+    // fusevm's subroutine table is name-keyed and its lookup returns the FIRST
+    // match, so a frontend that registers a class method under `Owner$method`
+    // makes every overload of a name run the first body — silently, with no
+    // duplicate to detect, from ordinary correct user code. A sibling frontend
+    // shipped exactly that.
+    //
+    // javars is safe because `mangle`/`mangle_static` put the parameter types
+    // in the registered name (`C#g#int,int`, `#s#Main#h#int`), so each overload
+    // is its own subroutine. Nothing tested that, and the mangling scheme is
+    // the only thing standing between javars and the same bug — so this pins
+    // it: five same-name instance overloads, four static ones, and a subclass
+    // that overrides only the no-arg form, all in one unit.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         C c = new C();\
+         System.out.println(c.g() + \"|\" + c.g(5) + \"|\" + c.g(5, 6) + \"|\" + c.g(\"s\") + \"|\" + c.g(1.5));\
+         System.out.println(h() + \"|\" + h(5) + \"|\" + h(5, 6) + \"|\" + h(\"s\"));\
+         D d = new D();\
+         System.out.println(d.g() + \"|\" + d.g(5) + \"|\" + d.g(5, 6)); }\
+         static String h() { return \"h0\"; }\
+         static String h(int x) { return \"h1 \" + x; }\
+         static String h(int x, int y) { return \"h2 \" + (x + y); }\
+         static String h(String s) { return \"hS \" + s; } }\
+         class C {\
+         String g() { return \"g0\"; }\
+         String g(int x) { return \"g1 \" + x; }\
+         String g(int x, int y) { return \"g2 \" + (x + y); }\
+         String g(String s) { return \"gS \" + s; }\
+         String g(double d) { return \"gD \" + d; } }\
+         class D extends C { String g() { return \"D0\"; } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    // A name-keyed registration would answer `g0` to all five and `h0` to all
+    // four; an inherited-override collision would answer `D0` to all three.
+    assert_eq!(
+        out,
+        "g0|g1 5|g2 11|gS s|gD 1.5\nh0|h1 5|h2 11|hS s\nD0|g1 5|g2 11\n"
+    );
+}
