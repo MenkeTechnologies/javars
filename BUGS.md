@@ -1189,6 +1189,27 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `"Object.hashCode()"`). All five need the compiler to hand the receiver's
   static type and the callee's erased signature to the raising site, which it
   does not do today.
+- **An enhanced `for` over a collection iterates a snapshot, so structurally
+  modifying it does not raise `ConcurrentModificationException`.** Java's
+  iterators are fail-fast on `modCount`; javars copies the elements up front and
+  walks the copy, so the loop neither sees the change nor objects to it.
+  Measured on `openjdk 21.0.12` against a two-element `ArrayList`:
+
+  ```
+  for (int x : l) l.add(9);      JDK: ConcurrentModificationException
+                                 javars: completes, size 4
+  for (int x : l) l.remove(0);   JDK: completes, size 1  (the check is
+                                       skipped when hasNext() goes false early)
+                                 javars: completes, size 0
+  ```
+
+  The second line is the sharper one: Java does not throw there either, so
+  "always throw" would be as wrong as never throwing. Both answers follow from
+  the snapshot, and matching Java needs a real iterator with `modCount`, which
+  is also what `List.iterator()` would need — that method is unimplemented
+  today, so no program can hold an iterator across a modification in the first
+  place. A `subList` view *does* raise `ConcurrentModificationException`,
+  because it holds a live window rather than a copy.
 - **Unboxing a `null` wrapper yields `null` instead of throwing.** `Integer a =
   null; int v = a;` prints `null` here and throws
   `NullPointerException: Cannot invoke "java.lang.Integer.intValue()" because
