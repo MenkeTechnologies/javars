@@ -3606,6 +3606,44 @@ fn a_reference_cast_names_the_collections_instanceof_already_named() {
 }
 
 #[test]
+fn the_cast_message_names_the_classes_that_depend_on_the_value() {
+    // Four of the JDK's collection classes are not a function of the *kind* of
+    // collection alone, so a message built from the kind gets them wrong:
+    // `List.of`/`Set.of` split on arity at two elements (zero landing on the
+    // N form, not the 12 one), and a `subList` is named for the root list it is
+    // a window onto — so the same `subList` call spells three different classes,
+    // and a view of a view keeps the root's answer rather than naming itself.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class T {\
+         static void t(Object o) {\
+         try { String s = (String) o; System.out.println(\"no throw\"); }\
+         catch (ClassCastException e) { System.out.println(e.getMessage().split(\" cannot\")[0]); } }\
+         public static void main(String[] a) {\
+         t(new ArrayList<>(List.of(\"a\",\"b\",\"c\")).subList(0, 2));\
+         t(Arrays.asList(\"a\",\"b\",\"c\").subList(0, 2));\
+         t(List.of(\"a\",\"b\",\"c\").subList(0, 2));\
+         t(new ArrayList<>(List.of(\"a\",\"b\",\"c\")).subList(0, 3).subList(0, 2));\
+         t(List.of()); t(List.of(\"a\")); t(List.of(\"a\",\"b\",\"c\"));\
+         t(Set.of()); t(Set.of(\"a\",\"b\")); t(Set.of(\"a\",\"b\",\"c\")); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "class java.util.ArrayList$SubList\n\
+         class java.util.AbstractList$RandomAccessSubList\n\
+         class java.util.ImmutableCollections$SubList\n\
+         class java.util.ArrayList$SubList\n\
+         class java.util.ImmutableCollections$ListN\n\
+         class java.util.ImmutableCollections$List12\n\
+         class java.util.ImmutableCollections$ListN\n\
+         class java.util.ImmutableCollections$SetN\n\
+         class java.util.ImmutableCollections$Set12\n\
+         class java.util.ImmutableCollections$SetN\n"
+    );
+}
+
+#[test]
 fn a_widening_reference_cast_still_passes() {
     // The other half of the check: extending it must not start refusing the
     // casts Java accepts. Every collection casts to the interfaces above it,
