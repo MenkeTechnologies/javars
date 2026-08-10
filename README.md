@@ -322,7 +322,15 @@ Implemented and checked against the reference `java`:
   element's own `compareTo`, and `Comparator.naturalOrder`/`reverseOrder`/
   `comparing` build that comparator explicitly. `HashMap`/`HashSet` iterate in Java's **real bucket
   order** — `(capacity - 1) & (h ^ (h >>> 16))` over a power-of-two table,
-  reproduced exactly rather than approximated with insertion order.
+  reproduced exactly rather than approximated with insertion order. A membership
+  test compares with the element's own `equals()`, not with identity, so
+  `list.contains(new R(1))` on a `record` is `true`, `map.get` finds an equal
+  key, and a `Set` de-duplicates equal elements — the query is the receiver and
+  the scan stops at the first hit, which is what Java's own does. A class that
+  overrides `equals` and leaves `hashCode` alone is *not* found by a
+  `HashSet`/`HashMap`, because it is not found by Java's either;
+  [`BUGS.md`](BUGS.md) has the boundary. `Set.of` rejects a repeated element
+  with `IllegalArgumentException` rather than dropping it.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`

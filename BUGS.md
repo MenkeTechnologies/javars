@@ -551,7 +551,58 @@ at the bottom, and are summarized in the section right after this one.
   write to any of them throws `UnsupportedOperationException` exactly as Java's
   does — including `Set.of(1).remove(9)`, which Java refuses before deciding the
   removal would have changed nothing — and an out-of-range `get` throws
-  `IndexOutOfBoundsException` with Java's message.
+  `IndexOutOfBoundsException` with Java's message. `Set.of` is also the one
+  set-building factory that *rejects* a repeat instead of dropping it:
+  `Set.of(1, 2, 1)` is `IllegalArgumentException: duplicate element: 1`, naming
+  the element through its `toString`, where `new HashSet<>(…)` would have
+  answered a two-element set. Silently de-duplicating turned a program Java
+  refuses to run into one that ran and answered.
+- **A collection's membership test calls the element's own `equals()`.**
+  `contains`/`indexOf`/`lastIndexOf`/`remove(Object)`/`List.equals`, `Set`
+  de-duplication (`add`, `addAll`, `Set.of`, `new HashSet<>(seq)`), and
+  `Map.get`/`getOrDefault`/`containsKey`/`containsValue`/`put`/`putIfAbsent`/
+  `remove` all compare through the class's own body, at every depth of a
+  `subList` view, so `list.contains(new R(1))` on a `record` is `true` and a
+  `HashSet` of two equal records has size 1.
+
+  The receiver is the *query*, not the element, because that is the direction
+  the JDK calls in — `ArrayList.indexOf(o)` runs `o.equals(element)`,
+  `HashMap.getNode` runs `key.equals(storedKey)` — so an asymmetric `equals`
+  answers here exactly as it does there. The scan stops at the first hit, in the
+  direction the calling method scans, so a body with a side effect runs the same
+  number of times on both sides. A throwable it raises propagates out of the
+  collection call rather than being swallowed into a verdict.
+
+  Mechanically this is the [`JSTRINGIFY`] shape: a body needs `&mut VM` and no
+  outstanding borrow of the heap slab, so `host::eq_plan` resolves the
+  comparisons *before* the borrow the call takes and the borrowed section reads
+  a plain index. A program that declares no `equals` anywhere never builds a
+  plan and keeps the code path it always had.
+
+  Two boundaries are deliberate rather than missing:
+
+  * **A hash container asks for a `hashCode` too.** `HashMap`/`HashSet` find an
+    element only when its hash puts it in the bucket being searched, so a class
+    that overrides `equals` and leaves `hashCode` alone is not found by *Java*
+    either — the two instances get distinct JVM identity hashes and never meet.
+    javars cannot compute a JVM identity hash, so the declaration is the signal:
+    a class declaring `hashCode`, or a `record`/`enum`, is trusted; anything
+    else keeps the identity comparison Java effectively performs. An
+    `ArrayList` hashes nothing and so asks this of nobody. A class whose
+    `hashCode` contradicts its `equals` is where the two models part, and that
+    program has no defined answer in Java either.
+  * **`TreeSet`/`TreeMap` locate by `compareTo`, not `equals`.** Those keep the
+    value model; a user class in a sorted collection is a separate gap.
+
+  One shape is a real divergence rather than a boundary: an `equals` that
+  *structurally modifies the collection being searched*. javars resolves the
+  position against a snapshot and then indexes the live list, so an insertion
+  the body made **before** that position shifts it —
+  `list.remove(new M(2))` where `M.equals` prepends answers `true` and a
+  three-element list on `openjdk 21.0.12`'s `false` and four. A body that
+  *appends* agrees exactly (frozen in the corpus). Java is scanning a live array
+  and javars a snapshot, and neither answer is specified; the program is one
+  `ConcurrentModificationException` short of being well defined in either.
 - **`List.subList(from, to)` is a real view, not a copy.** It owns no elements:
   every read and write goes to its window of the backing list, so the aliasing
   works in *both* directions — `list.set(i, v)` shows through the view, and
@@ -593,9 +644,18 @@ at the bottom, and are summarized in the section right after this one.
   or `throw`, so only an empty one falls through, and that just groups its labels
   onto the next arm. The classic colon form as a *statement*, with its
   fall-through, is untouched.
-- **`String.compareTo` / `compareToIgnoreCase`**, returning Java's *difference*
-  (the first differing `char`, else the length difference) rather than only its
-  sign — programs print the number, so the sign alone would be wrong.
+- **`compareTo` on every receiver that has one.** `String.compareTo` /
+  `compareToIgnoreCase` return Java's *difference* (the first differing `char`,
+  else the length difference) rather than only its sign — programs print the
+  number, so the sign alone would be wrong. The boxed types do not agree on
+  which number: `Integer`/`Long`/`Double`/`Float` answer the sign,
+  `Byte`/`Short`/`Character` the arithmetic difference, and `Boolean` is
+  `false < true`. The receiver's static Java type therefore rides along to
+  `JCOMPARE_TO` as a tag, and the runtime value classifies the ones the compiler
+  could not name. Before that, every non-`String` `compareTo` compared two
+  `toString`s as text — `Integer.valueOf(10).compareTo(9)` answered -8
+  (`'1' - '9'`) where Java answers 1, and a user `Pt` whose own `compareTo`
+  returns 5 answered -1.
 - **Multi-dimensional arrays.** `new int[m][n]` (rectangular), `new int[m][]`
   (jagged, inner rows `null`), `a[i][j]` read/write, nested array literals
   (`{{1, 2}, {3, 4}}`), and `.length` at each level. Rows are reference arrays,
@@ -873,11 +933,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   * **`Long`/`Short`/`Byte`/`Float`/`Character` cannot be separated from the
     wrapper that shares their representation.** `int` and `long` are one
     `Value::Int` and `double` and `float` one `Value::Float`, so `instanceof`
-    answers the common member: `42 instanceof Long` is `false` (Java agrees) but
-    so is `42L instanceof Long` (Java says `true`). This is the same erasure the
-    reference cast documents just below, decided the other way — a cast cannot
-    prove itself wrong and allows the sibling, while a type test has to answer a
-    boolean and answers for the member programs actually write.
+    answers the common member. Java's left operand has to be a *reference*
+    (`42L instanceof Long` is `error: unexpected type … required: reference`,
+    not an answer), so the observable is a boxed one: after `Object o = 42L;`,
+    `o instanceof Long` is `true` on `openjdk 21.0.12` and `false` here, while
+    `o instanceof Integer` after `Object o = 42;` agrees at `true`. This is the
+    same erasure the reference cast documents just below, decided the other way
+    — a cast cannot prove itself wrong and allows the sibling, while a type test
+    has to answer a boolean and answers for the member programs actually write.
   * **`new LinkedList<>()` is modeled as the mutable list an `ArrayList` is**, so
     it answers `instanceof ArrayList` `true` where Java says `false`. Every
     interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
@@ -948,7 +1011,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `scripts/capture-parity.sh` captured it through `javac` + `java -cp . T`, so
   the script now requires a new record to produce the same output under BOTH
   before it is written. Four records predating that check declare an `enum`
-  first.
+  first, so the reference's source launcher prints nothing for them and only
+  javars's reading produces what they froze; they are kept — the *behaviour*
+  they pin (enum constants, bodies, `values()`, an empty enum) is right under
+  the entry point that ran them — and the same four programs are in the corpus a
+  second time with `public class T` declared first, which both entry points
+  agree on.
 - **`String.format` uses the root locale, always.** javars has no locale model:
   `%,d` groups with `,` and `%,.2f` separates with `.` whatever
   `Locale.getDefault()` is. The reference agrees on this machine (`en_US`) and
@@ -956,6 +1024,20 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `String.format("%,d", 1234567)` as `1.234.567` where javars keeps
   `1,234,567`. javars accepts no `-D` option, so a program cannot ask for the
   other behaviour; the gap is only reachable by changing the machine's locale.
+
+  Four frozen records depend on it — the `%,d`, `%e|%E`, `%.0f,%.0f,%.3f` and
+  `%08.2f` cases — measured by replaying the whole corpus through
+  `java -Duser.language=tr -Duser.country=TR`, where those four and only those
+  four change (`1.234.567`, `1,234568e+03`, `-1,500`, `00003,50`). They were
+  captured under `en_US`, which happens to agree with the root locale, so they
+  are correct today; a re-capture on a machine set to another locale would have
+  frozen the wrong separators. Both harnesses now pin the oracle to
+  `Locale.ROOT` (`-Duser.language= -Duser.country=`) and *measure* that the pin
+  took, for the same reason they measure the `Double.toString` version. The
+  locale of the machine is therefore no longer an input to either.
+  `toUpperCase`/`toLowerCase` do not need the pin: they are locale-sensitive in
+  Java (the Turkish `i`/`İ`), but javars models only the root mapping and no
+  frozen record exercises the difference.
 - **An array's `getClass().getName()` is empty.** Java answers with the JVM
   descriptor — `[I` for an `int[]`, `[Ljava.lang.String;` for a `String[]` — and
   javars answers the empty string, because array element types are erased at
@@ -1042,32 +1124,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
   something a deterministic program does, so this only shows up if you ask for it.
-- **A collection's membership test does not call a user `equals()`.** Java's
-  `contains`/`indexOf`/`remove(Object)`, `Set` de-duplication, and
-  `Map.get`/`containsKey` all compare with the element's own `equals`; javars
-  compares with its value model, which is reference identity for a heap handle.
-  So for a class declaring `equals`, `list.contains(new C(1))` is `false` where
-  Java says `true`, `indexOf` is `-1` where Java says `0`, two equal elements
-  make a `HashSet` of size 2 rather than 1, and `map.get(new C(1))` is `null`.
-  A *direct* call is exact — `p.equals(q)` and `((Object) p).equals(q)` both
-  reach the class's own body, because the compiler emits a dispatch chain keyed
-  on the receiver's runtime class (`Compiler::emit_erased_call`) — so the gap is
-  specifically the comparison the collection performs internally, in the host,
-  where the element is a bare handle with no call site to hang the dispatch on.
-  A `record` is NOT an exception, though its `equals` is derived: it is a heap
-  instance like any other, so `list.contains(new R(1))` is `false` and a
-  `HashSet` holding two equal records has size 2. Only the values javars models
-  as scalars — boxed primitives and `String`s — compare structurally here.
-
-  `compareTo` additionally has to answer a *number*, and the boxed types do not
-  agree on which: `Integer`/`Long`/`Double`/`Float` answer the sign,
-  `Byte`/`Short`/`Character` the arithmetic difference, `Boolean` is
-  `false < true`, and `String` is the first differing `char`. The receiver's
-  static Java type therefore rides along to `JCOMPARE_TO` as a tag, and the
-  runtime value classifies the ones the compiler could not name. Before that,
-  every non-`String` `compareTo` compared two `toString`s as text —
-  `Integer.valueOf(10).compareTo(9)` answered -8 (`'1' - '9'`) where Java
-  answers 1, and a user `Pt` whose own `compareTo` returns 5 answered -1.
 - **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
   spreads a *reference* array (`String[]` → a 3-element list) but not a
   primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element
@@ -1080,3 +1136,31 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   checked cast; javars does not model generic signatures (see the type-erasure
   entry above). A lambda's *parameters* are typed, because those come from the
   interface's own declaration rather than from a type argument.
+
+## What the harnesses cannot see
+
+Every entry above is a divergence somebody *found*. This section is the other
+half: what the three harnesses are structurally incapable of reporting, so that
+a gap's absence from this file is not mistaken for evidence that it does not
+exist. Each row is a property of the harness's own construction, not a bug in
+it.
+
+The three are `tests/parity.rs` (replays the frozen corpus, no JDK needed),
+`scripts/capture-parity.sh` (writes the corpus from a real JDK), and
+`src/bin/parity_fuzz.rs` (generates programs and diffs the two live).
+
+| Harness | Cannot report | Why |
+| --- | --- | --- |
+| all three | **stderr text** | Every comparison reads stdout only (`parity.rs` `run`, the capture script's `2>/dev/null`, `RunOut { stdout, ok }`). A stack trace, a `printStackTrace()`, or an uncaught throwable's report is invisible unless the program catches it and prints the message itself. |
+| all three | **the exit *code*** | Only "exited 0 or not" survives (`status.success()`, `rc != 0`). Java's `System.exit(3)` versus `System.exit(1)` is one bit here. |
+| all three | **`javac` diagnostics** | No harness compares a rejection *message*. The capture script drops a program `javac` refuses; the fuzzer counts it a skip; the corpus can only hold programs that ran. Every "javars: cannot find symbol" wording in this file was checked by hand. |
+| all three | **anything needing a JVM flag** | The launcher is invoked with the source file and (for the oracle) the locale pin. No `-ea`, no `-g`, no `-Xss`, no `--enable-preview`, no classpath beyond the working directory. |
+| all three | **more than one source file** | One `T.java` per run. Packages, imports of a second unit, and split compilation are unreachable by construction. |
+| all three | **stdin** | The fuzzer nulls it; the other two inherit a terminal. `Scanner`/`System.in` has no probe. |
+| `parity.rs` + capture | **empty output** | A record is written only when stdout is non-empty, and the replay asserts a frozen string, so "prints nothing" cannot be frozen as the expected answer. |
+| `parity.rs` + capture | **a non-zero exit** | Rejected at capture time. An uncaught exception's exit status is therefore never frozen. |
+| `parity.rs` + capture | **trailing blank lines** | `$(...)` strips them and the script puts exactly one back, so the number of trailing newlines is pinned to 1 for every record. |
+| `parity.rs` | **the JDK's source-launcher rule** | It replays through `javars T.java`, which is `javac` + `java T` (see the entry above), while the capture script's second entry point is the JDK's real `java T.java`. Four records predate the check that the two agree; they declare an `enum` first, so a real JDK runs the enum and prints nothing where the record says otherwise. The gate rejects any new record of that shape. |
+| fuzzer | **a mutual timeout** | A program both sides hang on yields `ok=false` and empty stdout on both, which `differs` reads as agreement. |
+| fuzzer | **generator-visible axes only** | A divergence has to be *generated* to be found. The pool is one `public class T` with a fixed set of support classes; anything not in a generator is not tested, and the honest way to find those is this table rather than a clean sweep. Two were found this way: no probe rendered a user `toString()` through a collection (closed by the `render` mode), and no probe put a heap element in a collection at all — every element was an `Integer` or a `String`, which javars compares structurally, so the whole `equals` axis was invisible (closed by the `equals` mode). |
+| fuzzer | **non-determinism it pins away** | Identity hashes, `HashSet` iteration of user objects, and lambda `toString` are kept out of the generators on purpose, because they have no reproducible answer. That is correct, and it also means those three are permanently the hand-checked kind. |

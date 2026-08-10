@@ -442,11 +442,13 @@ pub fn heap_reset() {
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
     ARGV.with(|a| a.borrow_mut().clear());
-    // Both are keyed to the OUTGOING chunk: the gate answers whether *that*
-    // chunk declared an override, and an entry ip indexes its ops. Carrying
-    // either into the next program would render through unrelated bytecode.
+    // All three are keyed to the OUTGOING chunk: each gate answers whether
+    // *that* chunk declared an override, and an entry ip indexes its ops.
+    // Carrying any of them into the next program would render — or compare —
+    // through unrelated bytecode.
     USER_TOSTRING.with(|c| c.set(None));
-    TOSTRING_ENTRY.with(|t| t.borrow_mut().clear());
+    USER_EQUALS.with(|c| c.set(None));
+    MEMBER_ENTRY.with(|t| t.borrow_mut().clear());
 }
 
 /// Tell the host whether the compiled program carries the exception machinery.
@@ -1071,6 +1073,297 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Java's `q.equals(other)` where `q` may be a class instance whose class (or
+/// an ancestor) declares one — the comparison every collection membership test
+/// performs internally.
+///
+/// The receiver is `q`, not `other`, because that is the direction the JDK
+/// calls in: `ArrayList.indexOf(o)` runs `o.equals(element)`, `HashMap.getNode`
+/// runs `key.equals(storedKey)`, and `HashSet.add(e)` runs `e.equals(stored)`.
+/// An asymmetric user `equals` therefore answers here exactly as it does there.
+/// With no user body in play this is [`value_eq`].
+fn eq_call(vm: &mut VM, q: &Value, other: &Value) -> bool {
+    match user_equals(vm, q) {
+        Some((id, entry)) => run_equals(vm, entry, id, other),
+        None => value_eq(q, other),
+    }
+}
+
+/// The handle and `equals(Object)` entry ip of a value that is a class instance
+/// whose class resolves a user body; `None` for everything else — a scalar, a
+/// collection handle, or an instance that inherits `java.lang.Object`'s
+/// identity `equals`.
+fn user_equals(vm: &VM, v: &Value) -> Option<(u32, usize)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    if !any_user_equals(vm) {
+        return None;
+    }
+    let class = instance_class(v)?;
+    Some((*id, equals_entry(vm, &class)?))
+}
+
+/// Run a user `equals(Object)` body with `id` as the receiver and return what it
+/// answered.
+///
+/// A throwable already in flight stops the call, for the same reason
+/// [`run_tostring`] stops: the enclosing frame is unwinding and a body's side
+/// effects must not run twice. One raised *by* the body leaves `PENDING` set for
+/// the calling builtin to surface, and the verdict is discarded with it.
+fn run_equals(vm: &mut VM, entry: usize, id: u32, other: &Value) -> bool {
+    if PENDING.with(|p| p.borrow().is_some()) {
+        return false;
+    }
+    let stack_base = vm.stack.len();
+    vm.stack.push(Value::Obj(id));
+    vm.stack.push(other.clone());
+    matches!(run_sub(vm, entry, stack_base), Value::Bool(true))
+}
+
+/// The element comparisons one collection call needs a user `equals()` for,
+/// resolved *before* the heap borrow the call itself takes.
+///
+/// Java compares a collection's elements with `equals`, not with identity, and
+/// running a user body needs `&mut VM` with no borrow of the heap slab
+/// outstanding — the body reads its own fields, and may allocate. So the
+/// comparisons happen up front, in [`eq_plan`], and the borrowed section
+/// consumes plain data. `None` — every program that declares no `equals` — puts
+/// each site back on [`value_eq`] and the code path javars has always taken.
+enum EqPlan {
+    /// The position `args[0]` was found at, as an index into the receiver's
+    /// *storage* order — which is what the borrowed section indexes. For a `Map`
+    /// the search ran over its keys, except under `containsValue`, where it ran
+    /// over its values.
+    Index(Option<usize>),
+    /// `List.equals(other)`: the whole pairwise verdict.
+    Same(bool),
+    /// `Set.addAll(c)`: the elements of `c` not already present, in order,
+    /// counting the ones accepted earlier in the same call.
+    Fresh(Vec<Value>),
+}
+
+/// Where `q` sits in `items`: the position a user `equals()` already found, or
+/// javars's value model when no user body was in play.
+///
+/// The plan scanned in the direction the calling method scans and stopped at the
+/// first hit, so `from_end` only selects the fallback's direction —
+/// `List.lastIndexOf` is the one caller that passes `true`.
+fn eq_index(eq: Option<&EqPlan>, items: &[Value], q: &Value, from_end: bool) -> Option<usize> {
+    match eq {
+        Some(EqPlan::Index(at)) => *at,
+        _ if from_end => items.iter().rposition(|x| value_eq(x, q)),
+        _ => items.iter().position(|x| value_eq(x, q)),
+    }
+}
+
+/// The receiver's elements in *storage* order — the order the borrowed section
+/// indexes. Distinct from [`sequence_items`], which presents a `Set` in its
+/// iteration order and so would misalign the verdict vector. A `Map` answers
+/// with its keys.
+fn eq_elements(recv: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    if let Some(window) = sublist_items(*id as usize) {
+        return window.ok();
+    }
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::List { items, .. }) | Some(HostObj::Set { items, .. }) => Some(items.clone()),
+        Some(HostObj::Map { entries, .. }) => {
+            Some(entries.iter().map(|(k, _)| k.clone()).collect())
+        }
+        _ => None,
+    })
+}
+
+/// A `Map`'s values in storage order, for `containsValue`.
+fn eq_map_values(recv: &Value) -> Option<Vec<Value>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { entries, .. }) => {
+            Some(entries.iter().map(|(_, v)| v.clone()).collect())
+        }
+        _ => None,
+    })
+}
+
+/// Which collection shape a handle is, for deciding whether a method name
+/// compares by value at all — `List.remove(int)` removes by index where
+/// `Set.remove(Object)` removes by equality, and `List.add` appends where
+/// `Set.add` de-duplicates. A `Set`/`Map` carries its iteration order too,
+/// because that is what says whether it is a *hash* container.
+enum EqShape {
+    List,
+    Set(Order),
+    Map(Order),
+}
+
+fn eq_shape(recv: &Value) -> Option<EqShape> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    if is_sublist(*id as usize) {
+        return Some(EqShape::List);
+    }
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::List { .. }) => Some(EqShape::List),
+        Some(HostObj::Set { order, .. }) => Some(EqShape::Set(*order)),
+        Some(HostObj::Map { order, .. }) => Some(EqShape::Map(*order)),
+        _ => None,
+    })
+}
+
+/// Whether a *hash* container may trust `class`'s `equals`.
+///
+/// `HashMap`/`HashSet` find an element only when its `hashCode` puts it in the
+/// bucket being searched, so a class that overrides `equals` and leaves
+/// `hashCode` alone is genuinely not found by Java either — two instances get
+/// distinct JVM identity hashes and never meet. javars cannot compute a JVM
+/// identity hash, so the *declaration* is the signal: a class that declares
+/// `hashCode`, or a `record`/`enum` whose derived one is consistent by
+/// construction, is trusted; anything else keeps the identity comparison Java
+/// effectively performs. `ArrayList` hashes nothing and so asks this of nobody.
+fn hash_consistent(vm: &VM, class: &str) -> bool {
+    member_entry(vm, class, HASHCODE_SUFFIX).is_some()
+        || is_subclass_of(class, "Record")
+        || is_subclass_of(class, "Enum")
+}
+
+/// Whether an iteration order belongs to a hash-bucketed container.
+/// `Order::Sorted` is a `TreeMap`/`TreeSet`, which locates by `compareTo` rather
+/// than by `equals` — a different question, and one javars does not answer here.
+fn is_hashed(order: Order) -> bool {
+    matches!(order, Order::Hash | Order::Insertion)
+}
+
+/// Resolve the comparisons a user `equals()` decides for one collection call.
+///
+/// Only the methods whose answer Java takes from `equals` build a plan, and only
+/// when a body is actually reachable from the value being compared — so a
+/// program with no `equals`, or one whose elements are `String`s and boxed
+/// primitives, pays a flag read and nothing else.
+fn eq_plan(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+    arg_seqs: &[Option<Vec<Value>>],
+) -> Option<EqPlan> {
+    if !any_user_equals(vm) {
+        return None;
+    }
+    let shape = eq_shape(recv)?;
+    // `AbstractList.equals` compares position by position with *this* list's
+    // element as the receiver, so the bodies it reaches are the receiver's.
+    if method == "equals" && args.len() == 1 && matches!(shape, EqShape::List) {
+        let mine = eq_elements(recv)?;
+        let other = arg_seqs.first()?.clone()?;
+        if !mine.iter().any(|v| user_equals(vm, v).is_some()) {
+            return None;
+        }
+        if mine.len() != other.len() {
+            return Some(EqPlan::Same(false));
+        }
+        let mut same = true;
+        for (a, b) in mine.iter().zip(&other) {
+            if !eq_call(vm, a, b) {
+                same = false;
+                break;
+            }
+        }
+        return Some(EqPlan::Same(same));
+    }
+    // `Set.addAll` asks the membership question once per added element, against
+    // a set that grows as the earlier ones are accepted.
+    if method == "addAll" && args.len() == 1 && matches!(shape, EqShape::Set(o) if is_hashed(o)) {
+        let mut items = eq_elements(recv)?;
+        let add = arg_seqs.first()?.clone()?;
+        if !add.iter().any(|v| trusted_equals(vm, v, true)) {
+            return None;
+        }
+        let mut fresh = Vec::new();
+        for v in add {
+            let mut seen = false;
+            for x in &items {
+                if eq_call(vm, &v, x) {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                items.push(v.clone());
+                fresh.push(v);
+            }
+        }
+        return Some(EqPlan::Fresh(fresh));
+    }
+    // Everything else is "where does `args[0]` sit in the receiver".
+    let (by_value, hashed) = match shape {
+        EqShape::List => (
+            matches!(
+                (method, args.len()),
+                ("contains", 1) | ("indexOf", 1) | ("lastIndexOf", 1) | ("removeObject", 1)
+            ),
+            false,
+        ),
+        EqShape::Set(order) => (
+            matches!(
+                (method, args.len()),
+                ("contains", 1) | ("add", 1) | ("remove", 1)
+            ) && is_hashed(order),
+            true,
+        ),
+        EqShape::Map(order) => (
+            matches!(
+                (method, args.len()),
+                ("get", 1)
+                    | ("getOrDefault", 2)
+                    | ("containsKey", 1)
+                    | ("containsValue", 1)
+                    | ("remove", 1)
+                    | ("put", 2)
+                    | ("putIfAbsent", 2)
+            ) && is_hashed(order),
+            true,
+        ),
+    };
+    if !by_value {
+        return None;
+    }
+    let q = args.first()?;
+    if !trusted_equals(vm, q, hashed) {
+        return None;
+    }
+    let against = if method == "containsValue" {
+        eq_map_values(recv)?
+    } else {
+        eq_elements(recv)?
+    };
+    // The scan stops at the first hit, in the direction the calling method
+    // scans, so a user body's side effects fire exactly as often as Java's do.
+    let at = if method == "lastIndexOf" {
+        (0..against.len())
+            .rev()
+            .find(|i| eq_call(vm, q, &against[*i]))
+    } else {
+        (0..against.len()).find(|i| eq_call(vm, q, &against[*i]))
+    };
+    Some(EqPlan::Index(at))
+}
+
+/// Whether `v`'s own `equals` is the one this collection would consult: a body
+/// has to exist, and a hash container additionally needs a `hashCode` it can
+/// trust (see [`hash_consistent`]).
+fn trusted_equals(vm: &VM, v: &Value, hashed: bool) -> bool {
+    if user_equals(vm, v).is_none() {
+        return false;
+    }
+    !hashed || instance_class(v).is_some_and(|c| hash_consistent(vm, &c))
+}
+
 /// Ascending natural order (`Comparable`) for the sorted collections and
 /// `Collections.sort`: numbers numerically, strings lexicographically by
 /// `char`, `null` first. Mixed kinds fall back to a stable "equal".
@@ -1092,7 +1385,7 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 /// Allocate the collection `kind` names, seeded from `seed` when a copy
 /// constructor supplied one.
-fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
+fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault> {
     let obj = match kind {
         "ArrayList" | "LinkedList" | "List" => HostObj::List {
             mods: 0,
@@ -1112,17 +1405,17 @@ fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
             order: Order::Sorted,
         },
         "HashSet" | "Set" => HostObj::Set {
-            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Hash,
             fixed: Fixity::Mutable,
         },
         "LinkedHashSet" => HostObj::Set {
-            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Insertion,
             fixed: Fixity::Mutable,
         },
         "TreeSet" => HostObj::Set {
-            items: distinct(&sequence_items(seed).unwrap_or_default()),
+            items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Sorted,
             fixed: Fixity::Mutable,
         },
@@ -1137,14 +1430,49 @@ fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
 
 /// The distinct values of `vals`, keeping the first of each repeat — what
 /// building a `Set` from a sequence produces.
-fn distinct(vals: &[Value]) -> Vec<Value> {
+///
+/// De-duplication is the same membership question `Set.add` asks, so it goes
+/// through the element's own `equals` when the element declares one; `Set.of`
+/// and `new HashSet<>(list)` would otherwise keep two equal records.
+fn distinct(vm: &mut VM, vals: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(vals.len());
     for v in vals {
-        if !out.iter().any(|x| value_eq(x, v)) {
+        let mut seen = false;
+        for x in &out {
+            let equal = if trusted_equals(vm, v, true) {
+                eq_call(vm, v, x)
+            } else {
+                value_eq(v, x)
+            };
+            if equal {
+                seen = true;
+                break;
+            }
+        }
+        if !seen {
             out.push(v.clone());
         }
     }
     out
+}
+
+/// The first value of `vals` that repeats an earlier one, under the same
+/// comparison [`distinct`] de-duplicates with. `None` when they are all
+/// distinct.
+fn first_repeat(vm: &mut VM, vals: &[Value]) -> Option<Value> {
+    for (i, v) in vals.iter().enumerate() {
+        for x in &vals[..i] {
+            let equal = if trusted_equals(vm, v, true) {
+                eq_call(vm, v, x)
+            } else {
+                value_eq(v, x)
+            };
+            if equal {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
 }
 
 /// The elements of any sequence-shaped heap object — an array, a `List`, or a
@@ -1226,7 +1554,7 @@ fn b_coll_new(vm: &mut VM, argc: u8) -> Value {
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
     let seed = args.get(1).cloned().unwrap_or(Value::Undef);
-    match new_collection(&kind, &seed) {
+    match new_collection(vm, &kind, &seed) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
@@ -1750,8 +2078,18 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
     let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
+    // Java answers a membership question with the element's own `equals`, whose
+    // body needs the VM and no outstanding borrow — so it runs here, ahead of
+    // the borrow, and the sections below read its verdicts.
+    let eq = eq_plan(vm, recv, method, args, &arg_seqs);
+    // A throwable one of those bodies raised aborts the call rather than
+    // answering from a half-resolved plan.
+    if PENDING.with(|p| p.borrow().is_some()) {
+        return Value::Undef;
+    }
+    let eq = eq.as_ref();
     if is_sublist(id) {
-        return match sublist_method(id, method, args, &arg_seqs) {
+        return match sublist_method(id, method, args, &arg_seqs, eq) {
             Ok(v) => v,
             Err(f) => raise(vm, f),
         };
@@ -1764,7 +2102,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         match obj {
             HostObj::List { items, fixed, mods } => {
                 let before = items.len();
-                let r = list_method(items, *fixed, method, args, &arg_seqs);
+                let r = list_method(items, *fixed, method, args, &arg_seqs, eq);
                 // Any length change is a structural modification, which is what
                 // Java's `modCount` counts (a `remove` that finds nothing does
                 // not bump it there either).
@@ -1773,8 +2111,10 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 }
                 r
             }
-            HostObj::Map { entries, order } => map_method(entries, *order, method, args),
-            HostObj::Set { items, fixed, .. } => set_method(items, *fixed, method, args, &arg_seqs),
+            HostObj::Map { entries, order } => map_method(entries, *order, method, args, eq),
+            HostObj::Set { items, fixed, .. } => {
+                set_method(items, *fixed, method, args, &arg_seqs, eq)
+            }
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -1938,6 +2278,7 @@ fn sublist_method(
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
+    eq: Option<&EqPlan>,
 ) -> Result<Value, Fault> {
     let (root, offset, len) = checked_window(id)?;
     let (mut window, fixed) = HEAP
@@ -1948,7 +2289,7 @@ fn sublist_method(
             _ => None,
         })
         .ok_or_else(|| Fault::internal("javars: dangling subList backing"))?;
-    let out = list_method(&mut window, fixed, method, args, arg_seqs)?;
+    let out = list_method(&mut window, fixed, method, args, arg_seqs, eq)?;
     let delta = window.len() as isize - len as isize;
     // The splice is unconditional: `set` rewrites an element without changing
     // the length, and that write has to reach the backing list too.
@@ -2100,6 +2441,7 @@ fn list_method(
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
+    eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
     // A structural change to `Arrays.asList` / `List.of` is Java's
     // `UnsupportedOperationException`, not a silent success.
@@ -2163,7 +2505,7 @@ fn list_method(
         // argument and answers whether one was found.
         ("removeObject", 1) => {
             structural()?;
-            match items.iter().position(|x| value_eq(x, &args[0])) {
+            match eq_index(eq, items, &args[0], false) {
                 Some(i) => {
                     items.remove(i);
                     Value::bool(true)
@@ -2176,19 +2518,11 @@ fn list_method(
             items.clear();
             Value::Undef
         }
-        ("contains", 1) => Value::bool(items.iter().any(|x| value_eq(x, &args[0]))),
-        ("indexOf", 1) => Value::Int(
-            items
-                .iter()
-                .position(|x| value_eq(x, &args[0]))
-                .map_or(-1, |i| i as i64),
-        ),
-        ("lastIndexOf", 1) => Value::Int(
-            items
-                .iter()
-                .rposition(|x| value_eq(x, &args[0]))
-                .map_or(-1, |i| i as i64),
-        ),
+        ("contains", 1) => Value::bool(eq_index(eq, items, &args[0], false).is_some()),
+        ("indexOf", 1) => Value::Int(eq_index(eq, items, &args[0], false).map_or(-1, |i| i as i64)),
+        ("lastIndexOf", 1) => {
+            Value::Int(eq_index(eq, items, &args[0], true).map_or(-1, |i| i as i64))
+        }
         ("addAll", 1) => {
             structural()?;
             let add = arg_seqs[0].clone().unwrap_or_default();
@@ -2196,12 +2530,16 @@ fn list_method(
             items.extend(add);
             Value::bool(changed)
         }
-        ("equals", 1) => {
-            let other = arg_seqs[0].clone().unwrap_or_default();
-            Value::bool(
-                other.len() == items.len() && items.iter().zip(&other).all(|(a, b)| value_eq(a, b)),
-            )
-        }
+        ("equals", 1) => match eq {
+            Some(EqPlan::Same(same)) => Value::bool(*same),
+            _ => {
+                let other = arg_seqs[0].clone().unwrap_or_default();
+                Value::bool(
+                    other.len() == items.len()
+                        && items.iter().zip(&other).all(|(a, b)| value_eq(a, b)),
+                )
+            }
+        },
         _ => {
             return Err(Fault::internal(format!(
                 "javars: unsupported List method `{method}` with {} argument(s)",
@@ -2218,9 +2556,15 @@ fn map_method(
     order: Order,
     method: &str,
     args: &[Value],
+    eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
-    let find =
-        |entries: &Vec<(Value, Value)>, k: &Value| entries.iter().position(|(x, _)| value_eq(x, k));
+    // Only one arm below runs per call, so the single verdict vector is
+    // unambiguous: it indexes the keys for every key-addressed method, and the
+    // values for `containsValue`.
+    let find = |entries: &Vec<(Value, Value)>, k: &Value| match eq {
+        Some(EqPlan::Index(at)) => *at,
+        _ => entries.iter().position(|(x, _)| value_eq(x, k)),
+    };
     let out = match (method, args.len()) {
         ("size", 0) => NewColl::Value(Value::Int(entries.len() as i64)),
         ("isEmpty", 0) => NewColl::Value(Value::bool(entries.is_empty())),
@@ -2247,9 +2591,10 @@ fn map_method(
             find(entries, &args[0]).map_or_else(|| args[1].clone(), |i| entries[i].1.clone()),
         ),
         ("containsKey", 1) => NewColl::Value(Value::bool(find(entries, &args[0]).is_some())),
-        ("containsValue", 1) => NewColl::Value(Value::bool(
-            entries.iter().any(|(_, v)| value_eq(v, &args[0])),
-        )),
+        ("containsValue", 1) => NewColl::Value(Value::bool(match eq {
+            Some(EqPlan::Index(at)) => at.is_some(),
+            _ => entries.iter().any(|(_, v)| value_eq(v, &args[0])),
+        })),
         ("remove", 1) => NewColl::Value(match find(entries, &args[0]) {
             Some(i) => entries.remove(i).1,
             None => Value::Undef,
@@ -2304,6 +2649,7 @@ fn set_method(
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
+    eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
     // A structural change to a `Set.of` is Java's `UnsupportedOperationException`,
     // not a silent success — the same rule `list_method` applies to `List.of`.
@@ -2318,17 +2664,17 @@ fn set_method(
         ("isEmpty", 0) => Value::bool(items.is_empty()),
         ("add", 1) => {
             structural()?;
-            if items.iter().any(|x| value_eq(x, &args[0])) {
+            if eq_index(eq, items, &args[0], false).is_some() {
                 Value::bool(false)
             } else {
                 items.push(args[0].clone());
                 Value::bool(true)
             }
         }
-        ("contains", 1) => Value::bool(items.iter().any(|x| value_eq(x, &args[0]))),
+        ("contains", 1) => Value::bool(eq_index(eq, items, &args[0], false).is_some()),
         ("remove", 1) => {
             structural()?;
-            match items.iter().position(|x| value_eq(x, &args[0])) {
+            match eq_index(eq, items, &args[0], false) {
                 Some(i) => {
                     items.remove(i);
                     Value::bool(true)
@@ -2343,14 +2689,23 @@ fn set_method(
         }
         ("addAll", 1) => {
             structural()?;
-            let mut changed = false;
-            for v in arg_seqs[0].clone().unwrap_or_default() {
-                if !items.iter().any(|x| value_eq(x, &v)) {
-                    items.push(v);
-                    changed = true;
+            match eq {
+                Some(EqPlan::Fresh(fresh)) => {
+                    let changed = !fresh.is_empty();
+                    items.extend(fresh.iter().cloned());
+                    Value::bool(changed)
+                }
+                _ => {
+                    let mut changed = false;
+                    for v in arg_seqs[0].clone().unwrap_or_default() {
+                        if !items.iter().any(|x| value_eq(x, &v)) {
+                            items.push(v);
+                            changed = true;
+                        }
+                    }
+                    Value::bool(changed)
                 }
             }
-            Value::bool(changed)
         }
         _ => {
             return Err(Fault::internal(format!(
@@ -2890,11 +3245,27 @@ fn collection_static(
         // `Arrays.asList` is a fixed-size *view*: `set` works, `add` throws.
         ("Arrays", "asList") => list(varargs_items(args), Fixity::FixedSize),
         ("List", "of") => list(varargs_items(args), Fixity::Immutable),
-        ("Set", "of") => Ok(Value::Obj(heap_alloc(HostObj::Set {
-            items: distinct(&varargs_items(args)),
-            order: Order::Hash,
-            fixed: Fixity::Immutable,
-        }))),
+        // `Set.of` is the one set-building factory that *rejects* a repeat
+        // rather than dropping it — `Set.of(1, 1)` is an
+        // `IllegalArgumentException` naming the element, not a one-element set.
+        // Silently de-duplicating turned a program Java refuses to run into one
+        // that ran and answered.
+        ("Set", "of") => {
+            let items = varargs_items(args);
+            let unique = distinct(vm, &items);
+            if unique.len() != items.len() {
+                let dup = first_repeat(vm, &items).unwrap_or(Value::Undef);
+                return Some(Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("duplicate element: {}", java_str_vm(vm, &dup)),
+                )));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Set {
+                items: unique,
+                order: Order::Hash,
+                fixed: Fixity::Immutable,
+            })))
+        }
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
                 Some(i) => i,
@@ -4123,35 +4494,84 @@ pub fn java_str_vm(vm: &mut VM, v: &Value) -> String {
     }
 }
 
+/// The mangled suffix `toString()`'s subroutine is registered under.
+const TOSTRING_SUFFIX: &str = "#toString#";
+
+/// The mangled suffix an *overriding* `equals` is registered under. Java's
+/// collections call `equals(Object)` and nothing else, so a class that declares
+/// `equals(C)` has written an overload rather than an override and does not
+/// appear here — which is the answer Java gives too.
+const EQUALS_SUFFIX: &str = "#equals#Object";
+
+/// The mangled suffix a user `hashCode()` is registered under. Its *presence* is
+/// what [`hash_consistent`] reads; javars does not call the body.
+const HASHCODE_SUFFIX: &str = "#hashCode#";
+
 thread_local! {
     /// Whether the running chunk registers any `Class#toString#` subroutine,
     /// computed once per run. `None` until the first rendering asks.
     static USER_TOSTRING: Cell<Option<bool>> = const { Cell::new(None) };
-    /// Class name → the entry ip of the `toString()` it resolves, walking
-    /// supertypes; `None` for a class that inherits `java.lang.Object`'s.
-    /// Memoised because rendering a list asks once per element.
-    static TOSTRING_ENTRY: RefCell<HashMap<String, Option<usize>>> = RefCell::new(HashMap::new());
+    /// The same question for `Class#equals#Object`. `None` until the first
+    /// element comparison asks.
+    static USER_EQUALS: Cell<Option<bool>> = const { Cell::new(None) };
+    /// (mangled suffix, class name) → the entry ip that class resolves the
+    /// member to, walking supertypes; `None` for a class that inherits
+    /// `java.lang.Object`'s. Memoised because rendering — or searching — a list
+    /// asks once per element.
+    static MEMBER_ENTRY: RefCell<HashMap<(&'static str, String), Option<usize>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Whether the chunk declares a user `toString()` anywhere. False means every
 /// rendering surface keeps the bytecode and the code path it always had.
 fn any_user_tostring(vm: &VM) -> bool {
-    USER_TOSTRING.with(|c| match c.get() {
+    cached_flag(&USER_TOSTRING, vm, TOSTRING_SUFFIX)
+}
+
+/// Whether the chunk declares an `equals(Object)` anywhere — a class of its own,
+/// or the one a `record` or `enum` has synthesized. False means every collection
+/// comparison keeps [`value_eq`] and the code path javars has always taken.
+fn any_user_equals(vm: &VM) -> bool {
+    cached_flag(&USER_EQUALS, vm, EQUALS_SUFFIX)
+}
+
+/// Whether any subroutine name carries `suffix`, answered once per run.
+fn cached_flag(
+    cell: &'static std::thread::LocalKey<Cell<Option<bool>>>,
+    vm: &VM,
+    suffix: &str,
+) -> bool {
+    cell.with(|c| match c.get() {
         Some(b) => b,
         None => {
-            let b = vm.chunk.names.iter().any(|n| n.contains("#toString#"));
+            let b = vm.chunk.names.iter().any(|n| n.contains(suffix));
             c.set(Some(b));
             b
         }
     })
 }
 
-/// The entry ip of the `toString()` a runtime class resolves, following the
+/// The entry ip of the `toString()` a runtime class resolves.
+fn tostring_entry(vm: &VM, class: &str) -> Option<usize> {
+    member_entry(vm, class, TOSTRING_SUFFIX)
+}
+
+/// The entry ip of the `equals(Object)` a runtime class resolves.
+fn equals_entry(vm: &VM, class: &str) -> Option<usize> {
+    member_entry(vm, class, EQUALS_SUFFIX)
+}
+
+/// The entry ip of the member body a runtime class resolves, following the
 /// supertype chain the way the compiler's own dispatch does — a subclass that
 /// declares none inherits its parent's body, and only a class that reaches
-/// `java.lang.Object` without finding one renders the default form.
-fn tostring_entry(vm: &VM, class: &str) -> Option<usize> {
-    if let Some(hit) = TOSTRING_ENTRY.with(|t| t.borrow().get(class).copied()) {
+/// `java.lang.Object` without finding one has no body at all.
+///
+/// `suffix` is the mangled tail the member's subroutine is registered under
+/// (`Class` + [`TOSTRING_SUFFIX`] / [`EQUALS_SUFFIX`]); the walk is shared
+/// because `toString` and `equals` resolve by exactly the same rule.
+fn member_entry(vm: &VM, class: &str, suffix: &'static str) -> Option<usize> {
+    let cache_key = (suffix, class.to_string());
+    if let Some(hit) = MEMBER_ENTRY.with(|t| t.borrow().get(&cache_key).copied()) {
         return hit;
     }
     let mut stack = vec![class.to_string()];
@@ -4161,7 +4581,7 @@ fn tostring_entry(vm: &VM, class: &str) -> Option<usize> {
         if !seen.insert(cur.clone()) {
             continue;
         }
-        let key = format!("{cur}#toString#");
+        let key = format!("{cur}{suffix}");
         if let Some(i) = vm.chunk.names.iter().position(|n| *n == key) {
             if let Some(entry) = vm.chunk.find_sub(i as u16) {
                 found = Some(entry);
@@ -4174,7 +4594,7 @@ fn tostring_entry(vm: &VM, class: &str) -> Option<usize> {
             }
         });
     }
-    TOSTRING_ENTRY.with(|t| t.borrow_mut().insert(class.to_string(), found));
+    MEMBER_ENTRY.with(|t| t.borrow_mut().insert(cache_key, found));
     found
 }
 
