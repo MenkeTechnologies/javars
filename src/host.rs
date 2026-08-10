@@ -4567,6 +4567,13 @@ fn float_to_string(v: &Value) -> Value {
 }
 
 /// [`JCHECKCAST`] — the reference cast's runtime check.
+///
+/// The value's class comes from [`value_class`] — the same answer `instanceof`
+/// reads. This path used to keep its own, narrower copy of that question, which
+/// named only a `String`, a boxed primitive and a user instance and returned
+/// `None` for every collection and array. The two then disagreed: `aList
+/// instanceof String` was `false` while `(String) aList` passed, though a
+/// program can only observe one runtime class per value.
 fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let value = args.first().cloned().unwrap_or(Value::Undef);
@@ -4574,38 +4581,98 @@ fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
         .get(1)
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
-    // `(Anything) null` succeeds in Java; so does a cast javars cannot decide.
-    let Some(runtime) = runtime_class(&value) else {
+    // `(Anything) null` succeeds in Java, and a lambda carries no interface to
+    // check against — the two shapes [`value_class`] does not name.
+    let Some(runtime) = value_class(&value) else {
         return value;
     };
     if cast_allowed(&runtime, &target, &value) {
         return value;
     }
+    // The cast does not fit — but javars reports only a failure it can *name*.
+    // An array's element type is erased, so `[I` and `[Ljava.lang.String;` are
+    // both unavailable, and a `ClassCastException` whose message had to invent
+    // the class it names would be worse than the miss.
+    let Some(from) = binary_name(&runtime, &value) else {
+        return value;
+    };
     raise(
         vm,
-        Fault::java("ClassCastException", cast_message(&runtime, &target)),
+        Fault::java("ClassCastException", cast_message(&from, &target)),
     );
     Value::Undef
 }
 
-/// The runtime class name of a value, when javars's value model names one
-/// exactly. `None` for `null` and for the values whose class it erases — an
-/// array (whose element type is gone), a collection, a lambda — where a check
-/// could only guess.
-fn runtime_class(v: &Value) -> Option<String> {
-    Some(match v {
-        Value::Undef => return None,
-        Value::Str(_) => "String".to_string(),
-        Value::Int(_) => "Integer".to_string(),
-        Value::Float(_) => "Double".to_string(),
-        Value::Bool(_) => "Boolean".to_string(),
-        Value::Obj(id) => {
-            return HEAP.with(|h| match h.borrow().get(*id as usize) {
-                Some(HostObj::Instance { class, .. }) => Some(class.clone()),
-                _ => None,
-            })
+/// The binary name `getClass().getName()` reports for a value whose class is
+/// `class`, or `None` when javars cannot produce the JDK's exactly.
+///
+/// Most shapes are a straight qualification. The four that are not are the
+/// collections the JDK implements with a private class whose identity depends
+/// on the value rather than on its kind, each measured against the reference
+/// JDK rather than inferred:
+///
+///   * `List.of` is `ImmutableCollections$List12` at one or two elements and
+///     `$ListN` otherwise — including at zero, which is a `ListN`.
+///   * `Set.of` splits the same way between `$Set12` and `$SetN`.
+///   * `Arrays.asList` is `Arrays$ArrayList`, whatever its length.
+///   * a `subList` is named for the *root* list it is a window onto, not for
+///     itself: `ArrayList$SubList` over a mutable list,
+///     `AbstractList$RandomAccessSubList` over `Arrays.asList`, and
+///     `ImmutableCollections$SubList` over `List.of`. A view of a view keeps
+///     the root's answer.
+///
+/// An array is the one shape with no answer at all: its element type is gone,
+/// and `[I` and `[Ljava.lang.String;` differ only by it.
+fn binary_name(class: &str, v: &Value) -> Option<String> {
+    let len = || sequence_len(v).unwrap_or(0);
+    Some(match class {
+        "[]" => return None,
+        "List$fixed" => "java.util.Arrays$ArrayList".to_string(),
+        "List$immutable" => match len() {
+            1 | 2 => "java.util.ImmutableCollections$List12".to_string(),
+            _ => "java.util.ImmutableCollections$ListN".to_string(),
+        },
+        "Set$immutable" => match len() {
+            1 | 2 => "java.util.ImmutableCollections$Set12".to_string(),
+            _ => "java.util.ImmutableCollections$SetN".to_string(),
+        },
+        "List$sub" => match sublist_root_fixity(v) {
+            Some(Fixity::Mutable) => "java.util.ArrayList$SubList".to_string(),
+            Some(Fixity::FixedSize) => "java.util.AbstractList$RandomAccessSubList".to_string(),
+            Some(Fixity::Immutable) => "java.util.ImmutableCollections$SubList".to_string(),
+            None => return None,
+        },
+        other => crate::prelude::qualified_throwable(other).unwrap_or_else(|| jdk_name(other)),
+    })
+}
+
+/// The element count of a list or set value, for the factories whose JDK class
+/// depends on it.
+fn sequence_len(v: &Value) -> Option<usize> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::List { items, .. }) | Some(HostObj::Set { items, .. }) => Some(items.len()),
+        _ => None,
+    })
+}
+
+/// The [`Fixity`] of the list at the root of a `subList` chain — a view of a
+/// view is named for the list that actually owns the elements.
+fn sublist_root_fixity(v: &Value) -> Option<Fixity> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| {
+        let h = h.borrow();
+        let mut cur = *id as usize;
+        // The chain is finite (a view is created from an existing list), but
+        // bound the walk anyway rather than trusting the heap not to cycle.
+        for _ in 0..64 {
+            match h.get(cur) {
+                Some(HostObj::SubList { parent, .. }) => cur = *parent as usize,
+                Some(HostObj::List { fixed, .. }) => return Some(*fixed),
+                _ => return None,
+            }
         }
-        _ => return None,
+        None
     })
 }
 
@@ -4638,6 +4705,12 @@ fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
         "Integer" => matches!(target, "Long" | "Short" | "Byte" | "Character"),
         "Double" => target == "Float",
         "String" => target == "Character" && value.as_str_cow().chars().count() == 1,
+        // `new LinkedList<>()` is modeled as the mutable list an `ArrayList` is,
+        // so a `LinkedList` value arrives here calling itself an `ArrayList`.
+        // Refusing `(LinkedList) aLinkedList` would be inventing a failure out
+        // of javars's own modelling choice, which is exactly what the wrapper
+        // arms above avoid.
+        "ArrayList" => target == "LinkedList",
         _ => false,
     }
 }
@@ -4650,9 +4723,11 @@ fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
 /// loader is identified by an identity hash javars has no counterpart for — so
 /// that clause is emitted for the JDK pair and dropped otherwise, the same
 /// bounded omission `NullPointerException`'s provenance clause already makes.
-fn cast_message(runtime: &str, target: &str) -> String {
+fn cast_message(from: &str, target: &str) -> String {
     let qual = |n: &str| crate::prelude::qualified_throwable(n).unwrap_or_else(|| jdk_name(n));
-    let (r, t) = (qual(runtime), qual(target));
+    // `from` arrives already resolved by [`binary_name`], which is the only
+    // side that can depend on the *value* rather than on the class name.
+    let (r, t) = (from.to_string(), qual(target));
     let head = format!("class {r} cannot be cast to class {t}");
     if r.starts_with("java.") && t.starts_with("java.") {
         format!("{head} ({r} and {t} are in module java.base of loader 'bootstrap')")
@@ -4661,14 +4736,111 @@ fn cast_message(runtime: &str, target: &str) -> String {
     }
 }
 
-/// The qualified name of a modeled `java.lang` type, or the bare name of a user
-/// class.
+/// Whether a reference cast to `ty` is one javars can decide.
+///
+/// This is the *target* half of the same question [`value_class`] answers for a
+/// value, and it lives here so the two halves read one list. The compiler asks
+/// it before emitting a [`JCHECKCAST`] at all: a name that is neither a
+/// declared class nor one of these is a type javars does not model — a type
+/// *variable* after erasure, an array type, a JDK class it has never heard of —
+/// and a check it cannot decide must not invent a failure.
+///
+/// `Object` is deliberately absent: every value satisfies it, so a check would
+/// only cost ops. Every other name here appears in [`jdk_supers`], is produced
+/// by [`value_class`], or is one of the wrapper siblings [`cast_allowed`]
+/// answers for — which `castable_targets_are_closed_over_the_supertype_graph`
+/// asserts, so this list cannot fall behind the graph.
+pub fn is_checkable_cast_target(ty: &str) -> bool {
+    CHECKABLE_CAST_TARGETS.contains(&ty)
+}
+
+/// The list [`is_checkable_cast_target`] answers from. A slice rather than a
+/// `matches!` so the closure test can walk it.
+const CHECKABLE_CAST_TARGETS: &[&str] = &[
+    // java.lang, and the wrapper siblings `cast_allowed` decides by leniency.
+    "String",
+    "Integer",
+    "Long",
+    "Short",
+    "Byte",
+    "Double",
+    "Float",
+    "Boolean",
+    "Character",
+    "Number",
+    "CharSequence",
+    "Comparable",
+    "Cloneable",
+    "Iterable",
+    "Enum",
+    "Record",
+    // java.io
+    "Serializable",
+    // java.util — the concrete kinds, then the interfaces above them.
+    "List",
+    "ArrayList",
+    "LinkedList",
+    "Collection",
+    "SequencedCollection",
+    "AbstractCollection",
+    "AbstractList",
+    "RandomAccess",
+    "Set",
+    "HashSet",
+    "LinkedHashSet",
+    "TreeSet",
+    "SortedSet",
+    "NavigableSet",
+    "SequencedSet",
+    "AbstractSet",
+    "Map",
+    "HashMap",
+    "LinkedHashMap",
+    "TreeMap",
+    "SortedMap",
+    "NavigableMap",
+    "SequencedMap",
+    "AbstractMap",
+];
+
+/// The qualified name of a modeled JDK type, or the bare name of a user class.
+///
+/// The package is part of the `ClassCastException` message and of the
+/// module-and-loader clause that follows it, so a `java.util` type named as
+/// though it were unpackaged would produce a message that is wrong in two
+/// places at once.
 fn jdk_name(n: &str) -> String {
     match n {
         "String" | "Integer" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean"
-        | "Character" | "Number" | "CharSequence" | "Comparable" | "Object" => {
+        | "Character" | "Number" | "CharSequence" | "Comparable" | "Cloneable" | "Iterable"
+        | "Enum" | "Record" | "Object" => {
             format!("java.lang.{n}")
         }
+        "Serializable" => "java.io.Serializable".to_string(),
+        "List"
+        | "ArrayList"
+        | "LinkedList"
+        | "Set"
+        | "HashSet"
+        | "LinkedHashSet"
+        | "TreeSet"
+        | "SortedSet"
+        | "NavigableSet"
+        | "SequencedSet"
+        | "SequencedCollection"
+        | "Collection"
+        | "Map"
+        | "HashMap"
+        | "LinkedHashMap"
+        | "TreeMap"
+        | "SortedMap"
+        | "NavigableMap"
+        | "SequencedMap"
+        | "AbstractCollection"
+        | "AbstractList"
+        | "AbstractSet"
+        | "AbstractMap"
+        | "RandomAccess" => format!("java.util.{n}"),
         other => other.to_string(),
     }
 }
@@ -4714,5 +4886,67 @@ fn as_f64(v: &Value) -> f64 {
             }
         }
         other => other.as_str_cow().parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+#[cfg(test)]
+mod cast_target_tables {
+    use super::*;
+
+    /// Every supertype reachable from a checkable target is itself checkable.
+    ///
+    /// The cast walks [`is_subclass_of`], which climbs [`jdk_supers`] one edge
+    /// at a time. If a name on that graph were missing from
+    /// [`CHECKABLE_CAST_TARGETS`], the compiler would decline to emit the check
+    /// at all for that target and the cast would silently pass — the exact
+    /// shape of the gap this list replaced. Walking the closure means the list
+    /// cannot fall behind the graph as `jdk_supers` grows.
+    #[test]
+    fn castable_targets_are_closed_over_the_supertype_graph() {
+        let mut missing = Vec::new();
+        for t in CHECKABLE_CAST_TARGETS {
+            for sup in jdk_supers(t) {
+                if !is_checkable_cast_target(sup) {
+                    missing.push(format!("{t} -> {sup}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "supertypes reachable from a checkable target but not checkable \
+             themselves (the cast would decline to check them):\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// The internal names exist so a shape can carry supertypes without a user
+    /// type being able to name one. A program cannot write them, so they must
+    /// NOT be castable targets — but they must still carry a supertype line,
+    /// or the value wearing one would reach nothing.
+    #[test]
+    fn the_internal_shape_names_are_unwritable_but_still_carry_supertypes() {
+        for internal in [
+            "[]",
+            "List$immutable",
+            "List$fixed",
+            "List$sub",
+            "Set$immutable",
+        ] {
+            assert!(
+                !is_checkable_cast_target(internal),
+                "`{internal}` is not a legal Java type name and must not be a cast target"
+            );
+            assert!(
+                !jdk_supers(internal).is_empty(),
+                "`{internal}` carries no supertypes, so a value wearing it reaches nothing"
+            );
+        }
+    }
+
+    /// `Object` is deliberately absent: every value satisfies it, so emitting a
+    /// check would only cost ops.
+    #[test]
+    fn object_is_not_a_checkable_target() {
+        assert!(!is_checkable_cast_target("Object"));
     }
 }

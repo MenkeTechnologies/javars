@@ -5651,15 +5651,16 @@ impl Compiler {
     /// Lower `(RefType) expr` — a *checked* reference cast.
     ///
     /// The cast changes no representation (the host heap already carries each
-    /// object's class), so all it can do is verify one. It is emitted only when
-    /// javars can name the runtime class exactly: a user class or interface, or
-    /// one of the `java.lang` types its value model distinguishes. `Object` is
-    /// always satisfied, and an unknown name — a type *variable* after erasure,
-    /// a collection interface, an array type — is passed through rather than
+    /// object's class), so all it can do is verify one. It is emitted when the
+    /// target is a user class or interface, or a JDK type javars models — which
+    /// is [`crate::host::is_checkable_cast_target`], the same list the host
+    /// decides the check against, rather than a second and narrower copy kept
+    /// here. `Object` is always satisfied, and an unknown name — a type
+    /// *variable* after erasure, an array type — is passed through rather than
     /// checked, because a check javars cannot decide must not invent a failure.
     fn reference_cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
         self.expr(e)?;
-        let checkable = self.classes.contains_key(ty) || is_checkable_jdk_type(ty);
+        let checkable = self.classes.contains_key(ty) || crate::host::is_checkable_cast_target(ty);
         if !checkable {
             return Ok(());
         }
@@ -5961,27 +5962,6 @@ fn compound_binop(op: AssignOp) -> Option<BinOp> {
         AssignOp::Mod => BinOp::Mod,
         _ => return None,
     })
-}
-
-/// True when a cast to `ty` is one javars can decide: a `java.lang` type its
-/// value model tells apart from the others. `Object` is deliberately absent —
-/// every value satisfies it, so the check would only cost ops — and so are the
-/// collection interfaces and array types, whose element types javars erases.
-fn is_checkable_jdk_type(ty: &str) -> bool {
-    matches!(
-        ty,
-        "String"
-            | "Integer"
-            | "Long"
-            | "Short"
-            | "Byte"
-            | "Double"
-            | "Float"
-            | "Boolean"
-            | "Character"
-            | "Number"
-            | "CharSequence"
-    )
 }
 
 /// The argument positions (0-based, counted after the format string) a format

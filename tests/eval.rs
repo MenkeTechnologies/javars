@@ -3565,6 +3565,98 @@ fn a_reference_cast_still_walks_the_shared_supertype_graph() {
     );
 }
 
+#[test]
+fn a_reference_cast_names_the_collections_instanceof_already_named() {
+    // The cast path used to keep its own, narrower copy of "what class is this
+    // value", which named a `String`, a boxed primitive and a user instance and
+    // gave up on every collection. So `aList instanceof String` was `false`
+    // while `(String) aList` passed — two answers to a question a program can
+    // only observe one answer to. Both now read `value_class`.
+    //
+    // Every message below is the reference JDK's verbatim, including the
+    // private implementation classes `List.of` and `Arrays.asList` really have.
+    let (out, ok) = run("import java.util.*;\
+         public class T {\
+         static void t(Object o, String what) {\
+         try { Object x = switch (what) {\
+         case \"String\" -> (String) o; case \"Integer\" -> (Integer) o;\
+         case \"Set\" -> (Set) o; case \"ArrayList\" -> (ArrayList) o;\
+         default -> (HashMap) o; };\
+         System.out.println(\"no throw\"); }\
+         catch (ClassCastException e) { System.out.println(e.getMessage()); } }\
+         public static void main(String[] a) {\
+         t(new ArrayList<Integer>(), \"String\");\
+         t(new ArrayList<Integer>(), \"Set\");\
+         t(new HashSet<Integer>(), \"String\");\
+         t(new TreeMap<String, String>(), \"HashMap\");\
+         t(List.of(1, 2), \"ArrayList\");\
+         t(Arrays.asList(1, 2), \"ArrayList\");\
+         t(\"hi\", \"Set\"); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "class java.util.ArrayList cannot be cast to class java.lang.String (java.util.ArrayList and java.lang.String are in module java.base of loader 'bootstrap')\n\
+         class java.util.ArrayList cannot be cast to class java.util.Set (java.util.ArrayList and java.util.Set are in module java.base of loader 'bootstrap')\n\
+         class java.util.HashSet cannot be cast to class java.lang.String (java.util.HashSet and java.lang.String are in module java.base of loader 'bootstrap')\n\
+         class java.util.TreeMap cannot be cast to class java.util.HashMap (java.util.TreeMap and java.util.HashMap are in module java.base of loader 'bootstrap')\n\
+         class java.util.ImmutableCollections$List12 cannot be cast to class java.util.ArrayList (java.util.ImmutableCollections$List12 and java.util.ArrayList are in module java.base of loader 'bootstrap')\n\
+         class java.util.Arrays$ArrayList cannot be cast to class java.util.ArrayList (java.util.Arrays$ArrayList and java.util.ArrayList are in module java.base of loader 'bootstrap')\n\
+         class java.lang.String cannot be cast to class java.util.Set (java.lang.String and java.util.Set are in module java.base of loader 'bootstrap')\n"
+    );
+}
+
+#[test]
+fn a_widening_reference_cast_still_passes() {
+    // The other half of the check: extending it must not start refusing the
+    // casts Java accepts. Every collection casts to the interfaces above it,
+    // `LinkedHashSet`/`LinkedHashMap` cast to the hash kinds they really do
+    // extend (where the tree kinds would not), a `LinkedList` casts to itself,
+    // and `null` casts to anything.
+    let (out, ok) = run("import java.util.*;\
+         public class T { public static void main(String[] a) {\
+         Object l = new ArrayList<Integer>(), s = new LinkedHashSet<Integer>(),\
+         m = new LinkedHashMap<String, String>(), lo = List.of(1), n = null,\
+         ll = new LinkedList<Integer>();\
+         System.out.println(((List) l).size() + \",\" + ((Collection) l).size());\
+         System.out.println(((Set) s).size() + \",\" + ((HashSet) s).size());\
+         System.out.println(((Map) m).size() + \",\" + ((HashMap) m).size());\
+         System.out.println(((List) lo).size() + \",\" + ((LinkedList) ll).size());\
+         System.out.println((String) n); } }");
+    assert!(ok);
+    assert_eq!(out, "0,0\n0,0\n0,0\n1,0\nnull\n");
+}
+
+#[test]
+fn the_cast_and_instanceof_agree_on_every_shape_the_model_names() {
+    // The asymmetry itself, stated as one property rather than as a list of
+    // messages: for every value and every target, a cast throws exactly when
+    // `instanceof` is false. `Object` and `null` are the two documented
+    // exceptions — every reference casts to `Object`, and `null` casts to
+    // anything while being an instance of nothing.
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class T {\
+         static String one(Object o, String t) {\
+         boolean is = switch (t) {\
+         case \"String\" -> o instanceof String; case \"Set\" -> o instanceof Set;\
+         case \"List\" -> o instanceof List; default -> o instanceof HashMap; };\
+         boolean threw = false;\
+         try { Object x = switch (t) {\
+         case \"String\" -> (String) o; case \"Set\" -> (Set) o;\
+         case \"List\" -> (List) o; default -> (HashMap) o; }; }\
+         catch (ClassCastException e) { threw = true; }\
+         return (is != threw) ? \"agree\" : \"DISAGREE\"; }\
+         public static void main(String[] a) {\
+         Object[] vs = { new ArrayList<Integer>(), new HashSet<Integer>(), new TreeMap<String,String>(),\
+         List.of(1), Arrays.asList(1), Set.of(1), \"hi\", 42, 3.5, true };\
+         String[] ts = { \"String\", \"Set\", \"List\", \"HashMap\" };\
+         for (Object v : vs) { for (String t : ts) { System.out.print(one(v, t) + \" \"); } }\
+         System.out.println(); } }",
+    );
+    assert!(ok);
+    assert_eq!(out, ("agree ".repeat(40)).trim_end().to_string() + " \n");
+}
+
 // ── duplicate declarations ──────────────────────────────────────────────────
 //
 // Every one of these is a `javac` error, and every one of them used to run.

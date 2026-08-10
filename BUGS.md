@@ -53,16 +53,23 @@ at the bottom, and are summarized in the section right after this one.
   and the integral narrowings are two's-complement — except `(char)`, which is
   *unsigned* 16-bit, so `(char) -1` is 65535. Widening and identity casts emit
   the operand alone, so `(int) i` stays native.
-- **Checked reference casts.** `(Cat) animal`, `(Integer) o`, `(Marker) x` verify
-  the receiver's *runtime* class against the same supertype graph `instanceof`
-  walks, and throw `ClassCastException` when it does not fit — `class Dog cannot
-  be cast to class Cat`, or Java's full module-and-loader wording when both types
-  are `java.lang` ones. `null` casts to anything, `(Object) x` always passes, and
+- **Checked reference casts.** `(Cat) animal`, `(Integer) o`, `(Marker) x`,
+  `(String) aList`, `(HashMap) aTreeMap` verify the receiver's *runtime* class —
+  read from the same `value_class` `instanceof` reads — against the same
+  supertype graph `instanceof` walks, and throw `ClassCastException` when it does
+  not fit — `class Dog cannot be cast to class Cat`, or Java's full
+  module-and-loader wording when both types are JDK ones. A cast throws exactly
+  when `instanceof` is false, `Object` and `null` aside.
+  `null` casts to anything, `(Object) x` always passes, and
   a cast does not erase what the operand is (`println((Object) dog)` still finds
   `Dog`'s `toString`). The wrapper types javars's value model tells apart
   (`String`, `Integer`, `Double`, `Boolean`, `Number`, `CharSequence`) are checked
-  too; the ones it cannot (`int` and `long` are one integer here) are allowed
-  rather than guessed at.
+  too; the ones it cannot (`int` and `long` are one integer here, and a
+  `LinkedList` is the mutable list an `ArrayList` is) are allowed rather than
+  guessed at. **An array is the one value the cast still declines**: its element
+  type is erased, so javars can produce neither `[I` nor `[Ljava.lang.String;`,
+  and it does not throw an exception whose message would have to invent the class
+  it names — `(String) anIntArray` passes where Java throws.
 - **`char` arithmetic.** A `char` is Java's 16-bit integral type, not a string:
   `"abc".charAt(2) + 1` is 100, `'z' - 'a'` is 25, and `c - '0'` reads a digit.
   It runs as its code point and takes Java's *string conversion* (JLS 5.1.11)
@@ -820,11 +827,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
     interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
     — is exact.
 
-  Two further limits are about reach rather than about the answer: pattern
-  binding (`x instanceof Point p`) does not parse, the right-hand side being a
-  bare type name; and the *reference cast* still declines to name a value whose
-  class it erases, so `(String) aList` passes where Java throws — `instanceof`
-  now names those values, the cast path deliberately still does not.
+  One further limit is about reach rather than about the answer: pattern binding
+  (`x instanceof Point p`) does not parse, the right-hand side being a bare type
+  name.
+
+  The *reference cast* reads the same answer. It used to keep its own, narrower
+  copy of "what class is this value" — one that named a `String`, a boxed
+  primitive and a user instance and gave up on every collection — and a second,
+  narrower copy of "which targets can be checked", an eleven-name `java.lang`
+  list in the compiler that never emitted a check for a collection target at
+  all. So `aList instanceof String` was `false` while `(String) aList` passed.
+  Both copies are gone: the check reads `value_class` and
+  `is_checkable_cast_target`, and a cast throws exactly when `instanceof` is
+  false, `Object` and `null` aside. The `ClassCastException` message names the
+  JDK's own implementation classes, including the ones that depend on the value
+  rather than its kind — `ImmutableCollections$List12` at one or two elements
+  and `$ListN` otherwise, `Arrays$ArrayList`, and a `subList` named for the root
+  list it is a window onto.
 - **A boxed `Character` is a one-character String.** The `char` *type* is a real
   16-bit integral value (see the "`char` arithmetic" entry under "Implemented"),
   but javars boxes no primitive, so a `char` entering an erased position — a
