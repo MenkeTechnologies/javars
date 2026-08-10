@@ -295,7 +295,9 @@ at the bottom, and are summarized in the section right after this one.
   `LinkedHashSet extends HashSet` where the tree kinds do not — the three list
   views (`List.of`, `Arrays.asList`, `subList`) that are `List`s but not
   `ArrayList`s and disagree with each other on `AbstractList` and
-  `Serializable`, a user class or interface over its declared graph, and the two
+  `Serializable`, `Set.of` which is a `Set` but not a `HashSet` (it reaches
+  `AbstractCollection` but not `AbstractSet`, and is not `Cloneable`), a user
+  class or interface over its declared graph, and the two
   supertypes `javac` supplies implicitly so the source never mentions them: an
   `enum` is a `java.lang.Enum` (hence `Comparable`) and a `record` a
   `java.lang.Record`. Every non-null reference is an `Object`, and `null` is an
@@ -496,9 +498,11 @@ at the bottom, and are summarized in the section right after this one.
   exactly, and checked against OpenJDK for `String` and `Integer` keys including
   across the resize at 13 entries. `LinkedHashMap`/`LinkedHashSet` keep insertion
   order and `TreeMap`/`TreeSet` sort, each because Java does, not by default.
-  `Arrays.asList` is fixed-size and `List.of` immutable, so a structural write
-  to either throws `UnsupportedOperationException` exactly as Java's does, and an
-  out-of-range `get` throws `IndexOutOfBoundsException` with Java's message.
+  `Arrays.asList` is fixed-size and `List.of`/`Set.of` immutable, so a structural
+  write to any of them throws `UnsupportedOperationException` exactly as Java's
+  does — including `Set.of(1).remove(9)`, which Java refuses before deciding the
+  removal would have changed nothing — and an out-of-range `get` throws
+  `IndexOutOfBoundsException` with Java's message.
 - **`List.subList(from, to)` is a real view, not a copy.** It owns no elements:
   every read and write goes to its window of the backing list, so the aliasing
   works in *both* directions — `list.set(i, v)` shows through the view, and
@@ -712,6 +716,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **The other collection view methods** (`Map.entrySet`, `List.listIterator`).
   `List.subList` is implemented as a real aliasing view (above); these two are
   not, and an unsupported-method error is the honest answer until they are.
+- **`Map.of`.** `List.of` and `Set.of` are implemented, each as the immutable
+  collection Java returns rather than as a mutable one wearing the same name;
+  the map factory is not, so there is no `HashMap`-vs-`Map.of` pair for the type
+  test or the reference cast to tell apart yet.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
@@ -791,7 +799,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
 - **What `instanceof` still cannot decide is what the value model does not
   record.** The type test is exact for every shape javars names (see the
-  `instanceof` entry under "Implemented"); four answers are left, and each is a
+  `instanceof` entry under "Implemented"); three answers are left, and each is a
   *representation* the model shares rather than a missing branch:
   * **A lambda answers `Object` and nothing else.** The closure carries its body
     and its captures, not the functional interface it was assigned to, so
@@ -811,10 +819,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
     it answers `instanceof ArrayList` `true` where Java says `false`. Every
     interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
     — is exact.
-  * **`Set.of(…)` is modeled as a hash-ordered `Set`**, indistinguishable from
-    `new HashSet<>()`, so it answers `instanceof HashSet` `true` where Java's
-    `ImmutableCollections.SetN` says `false`. `Set`/`Collection`/`Iterable` are
-    exact. (`Map.of` is not modeled at all — see "Not implemented".)
 
   Two further limits are about reach rather than about the answer: pattern
   binding (`x instanceof Point p`) does not parse, the right-hand side being a

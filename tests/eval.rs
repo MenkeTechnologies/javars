@@ -3426,6 +3426,56 @@ fn instanceof_tells_the_three_list_views_apart() {
 }
 
 #[test]
+fn instanceof_tells_set_of_apart_from_a_hash_set() {
+    // `Set.of` is to `HashSet` what `List.of` is to `ArrayList`: a `Set` that is
+    // not one. It reaches `AbstractCollection` but NOT `AbstractSet`, and it is
+    // not `Cloneable` — the two edges that separate it from every `new` set.
+    // Modelled without that distinction it answered `instanceof HashSet` true,
+    // where the JDK answers false.
+    let (out, ok) = run(
+        "import java.util.*;\
+         import java.io.*;\
+         public class T { public static void main(String[] a) {\
+         Object so = Set.of(1, 2), hs = new HashSet<Integer>(),\
+         ls = new LinkedHashSet<Integer>(), ts = new TreeSet<Integer>();\
+         System.out.println((so instanceof Set) + \",\" + (so instanceof HashSet) + \",\" + (so instanceof AbstractSet) + \",\" + (so instanceof AbstractCollection) + \",\" + (so instanceof Cloneable) + \",\" + (so instanceof Serializable));\
+         System.out.println((hs instanceof Set) + \",\" + (hs instanceof HashSet) + \",\" + (hs instanceof AbstractSet) + \",\" + (hs instanceof Cloneable));\
+         System.out.println((ls instanceof HashSet) + \",\" + (ls instanceof LinkedHashSet) + \",\" + (ts instanceof TreeSet) + \",\" + (ts instanceof HashSet)); } }",
+    );
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,false,false,true,false,true\ntrue,true,true,true\ntrue,true,true,false\n"
+    );
+}
+
+#[test]
+fn set_of_refuses_every_structural_change() {
+    // `Set.of` is immutable. Java throws before deciding whether the change
+    // would have been a no-op, so removing an element the set does not contain
+    // throws too — which is what distinguishes a real guard from one that only
+    // fires when the set would actually have changed.
+    let (out, ok) = run("import java.util.*;\
+         public class T {\
+         static void t(String label, Runnable r) {\
+         try { r.run(); System.out.println(label + \"=ok\"); }\
+         catch (UnsupportedOperationException e) { System.out.println(label + \"=uoe\"); } }\
+         public static void main(String[] a) {\
+         t(\"add\", () -> Set.of(1).add(2));\
+         t(\"removePresent\", () -> Set.of(1).remove(1));\
+         t(\"removeAbsent\", () -> Set.of(1).remove(9));\
+         t(\"clear\", () -> Set.of(1).clear());\
+         t(\"addAll\", () -> Set.of(1).addAll(List.of(2)));\
+         t(\"hashSetAdd\", () -> new HashSet<Integer>().add(2));\
+         System.out.println(Set.of(1, 2).size() + \",\" + Set.of(1, 2).contains(1)); } }");
+    assert!(ok);
+    assert_eq!(
+        out,
+        "add=uoe\nremovePresent=uoe\nremoveAbsent=uoe\nclear=uoe\naddAll=uoe\nhashSetAdd=ok\n2,true\n"
+    );
+}
+
+#[test]
 fn instanceof_gives_an_enum_and_a_record_their_implicit_supertypes() {
     // `javac` makes every enum a subclass of `java.lang.Enum` (so `Comparable`
     // and `Serializable`) and every record a subclass of `java.lang.Record`

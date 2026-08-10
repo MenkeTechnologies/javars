@@ -345,7 +345,20 @@ enum HostObj {
         order: Order,
     },
     /// A `java.util.Set`, stored and ordered exactly like [`HostObj::Map`].
-    Set { items: Vec<Value>, order: Order },
+    ///
+    /// `fixed` carries the same distinction [`HostObj::List`] draws: `Set.of` is
+    /// an immutable set, not a `HashSet`. Without it a `Set.of` value was
+    /// indistinguishable from `new HashSet<>()`, so it answered `instanceof
+    /// HashSet` `true` (Java: `false`) and accepted `add`/`remove`/`clear`
+    /// silently (Java: `UnsupportedOperationException`). Only `Mutable` and
+    /// `Immutable` occur — there is no `Arrays.asSet` to produce a fixed-size
+    /// one — but the shared vocabulary keeps the two collections' guards
+    /// identical.
+    Set {
+        items: Vec<Value>,
+        order: Order,
+        fixed: Fixity,
+    },
 }
 
 /// What a collection's iteration order is.
@@ -577,6 +590,11 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // already tell them apart.
         "[]" => &["Cloneable", "Serializable"],
         "List$immutable" => &["AbstractCollection", "List", "RandomAccess", "Serializable"],
+        // `Set.of` reaches `AbstractCollection` but NOT `AbstractSet`, and is
+        // not `Cloneable` — the two edges that separate it from every `new`
+        // set, measured against the JDK rather than assumed from the `List.of`
+        // line above (which does carry `RandomAccess`; a set does not).
+        "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
         "List$fixed" => &["AbstractList", "RandomAccess", "Serializable"],
         "List$sub" => &["AbstractList", "RandomAccess"],
         _ => &[],
@@ -1048,14 +1066,17 @@ fn new_collection(kind: &str, seed: &Value) -> Result<Value, Fault> {
         "HashSet" | "Set" => HostObj::Set {
             items: distinct(&sequence_items(seed).unwrap_or_default()),
             order: Order::Hash,
+            fixed: Fixity::Mutable,
         },
         "LinkedHashSet" => HostObj::Set {
             items: distinct(&sequence_items(seed).unwrap_or_default()),
             order: Order::Insertion,
+            fixed: Fixity::Mutable,
         },
         "TreeSet" => HostObj::Set {
             items: distinct(&sequence_items(seed).unwrap_or_default()),
             order: Order::Sorted,
+            fixed: Fixity::Mutable,
         },
         other => {
             return Err(Fault::internal(format!(
@@ -1094,7 +1115,7 @@ fn sequence_items(v: &Value) -> Option<Vec<Value>> {
         let h = h.borrow();
         match h.get(*id as usize) {
             Some(HostObj::Array(items)) | Some(HostObj::List { items, .. }) => Some(items.clone()),
-            Some(HostObj::Set { items, order }) => Some(
+            Some(HostObj::Set { items, order, .. }) => Some(
                 present_order(items, *order)
                     .into_iter()
                     .map(|i| items[i].clone())
@@ -1505,10 +1526,17 @@ fn value_class(v: &Value) -> Option<String> {
                         Order::Insertion => "LinkedHashMap".to_string(),
                         Order::Sorted => "TreeMap".to_string(),
                     },
-                    HostObj::Set { order, .. } => match order {
-                        Order::Hash => "HashSet".to_string(),
-                        Order::Insertion => "LinkedHashSet".to_string(),
-                        Order::Sorted => "TreeSet".to_string(),
+                    // `Set.of` is not a `HashSet`, exactly as `List.of` is not
+                    // an `ArrayList`; without the fixity it answered to both.
+                    HostObj::Set { order, fixed, .. } => match (fixed, order) {
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Hash) => "HashSet".to_string(),
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Insertion) => {
+                            "LinkedHashSet".to_string()
+                        }
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Sorted) => {
+                            "TreeSet".to_string()
+                        }
+                        (Fixity::Immutable, _) => "Set$immutable".to_string(),
                     },
                     HostObj::Closure { .. } => return None,
                 })
@@ -1698,7 +1726,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 r
             }
             HostObj::Map { entries, order } => map_method(entries, *order, method, args),
-            HostObj::Set { items, .. } => set_method(items, method, args, &arg_seqs),
+            HostObj::Set { items, fixed, .. } => set_method(items, *fixed, method, args, &arg_seqs),
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -2193,6 +2221,10 @@ fn map_method(
             NewColl::Alloc(HostObj::Set {
                 items: ordered,
                 order: Order::Insertion,
+                // A `keySet` view is writable in Java (a removal writes through
+                // to the map); javars models it as a copy, so it is at least not
+                // an immutable one.
+                fixed: Fixity::Mutable,
             })
         }
         ("values", 0) => {
@@ -2220,14 +2252,24 @@ fn map_method(
 /// `java.util.Set` methods.
 fn set_method(
     items: &mut Vec<Value>,
+    fixed: Fixity,
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
 ) -> Result<NewColl, Fault> {
+    // A structural change to a `Set.of` is Java's `UnsupportedOperationException`,
+    // not a silent success — the same rule `list_method` applies to `List.of`.
+    // Java throws before deciding whether the change was a no-op, so the guard
+    // runs before the membership test rather than after it.
+    let structural = || match fixed {
+        Fixity::Mutable => Ok(()),
+        _ => Err(Fault::java("UnsupportedOperationException", String::new())),
+    };
     let v = match (method, args.len()) {
         ("size", 0) => Value::Int(items.len() as i64),
         ("isEmpty", 0) => Value::bool(items.is_empty()),
         ("add", 1) => {
+            structural()?;
             if items.iter().any(|x| value_eq(x, &args[0])) {
                 Value::bool(false)
             } else {
@@ -2236,18 +2278,23 @@ fn set_method(
             }
         }
         ("contains", 1) => Value::bool(items.iter().any(|x| value_eq(x, &args[0]))),
-        ("remove", 1) => match items.iter().position(|x| value_eq(x, &args[0])) {
-            Some(i) => {
-                items.remove(i);
-                Value::bool(true)
+        ("remove", 1) => {
+            structural()?;
+            match items.iter().position(|x| value_eq(x, &args[0])) {
+                Some(i) => {
+                    items.remove(i);
+                    Value::bool(true)
+                }
+                None => Value::bool(false),
             }
-            None => Value::bool(false),
-        },
+        }
         ("clear", 0) => {
+            structural()?;
             items.clear();
             Value::Undef
         }
         ("addAll", 1) => {
+            structural()?;
             let mut changed = false;
             for v in arg_seqs[0].clone().unwrap_or_default() {
                 if !items.iter().any(|x| value_eq(x, &v)) {
@@ -2717,6 +2764,7 @@ fn collection_static(
         ("Set", "of") => Ok(Value::Obj(heap_alloc(HostObj::Set {
             items: distinct(&varargs_items(args)),
             order: Order::Hash,
+            fixed: Fixity::Immutable,
         }))),
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
@@ -3941,7 +3989,7 @@ fn obj_default_str(id: u32) -> String {
                     .and_then(Result::ok)
                     .unwrap_or_default(),
             ),
-            Some(HostObj::Set { items, order }) => render_set(items, *order),
+            Some(HostObj::Set { items, order, .. }) => render_set(items, *order),
             Some(HostObj::Map { entries, order }) => render_map(entries, *order),
             // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,
             // which is not reproducible (and not stable across JVM runs), so
