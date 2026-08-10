@@ -52,10 +52,29 @@ done
 # shortest round-tripping decimal, so an older JVM answers `1.0e23` with
 # `9.999999999999999E22`. Freezing a corpus from one would bless the old
 # rendering as the reference, silently, for every double-valued record.
+# Nor is the JVM's *locale* neutral. javars has no locale model and accepts no
+# `-D` to give it one: it formats in the root locale always. The reference
+# formats in the machine's, so `String.format("%,d", 1234567)` is `1.234.567` on
+# a German desktop — and four records in the corpus (`%,d`, `%e`, `%.3f`,
+# `%08.2f`) would then be frozen with the wrong separators, failing the replay
+# on every machine including this one. Pinning the oracle to `Locale.ROOT` is
+# what makes the capture reproducible; it hides nothing, because a javars
+# program cannot select a locale in the first place.
+java_opts=(-Duser.language= -Duser.country=)
+
 probe=$(mktemp -d) || exit 2
 print 'public class D { public static void main(String[] a) { System.out.println(1.0e23); } }' > $probe/D.java
-render=$($java $probe/D.java 2>&1)
+render=$($java $java_opts $probe/D.java 2>&1)
+# A launcher may ignore an option it does not recognise, so the pin is measured
+# rather than assumed.
+print 'public class L { public static void main(String[] a) { System.out.print(String.format("%,d|%.2f", 1234567, 3.5)); } }' > $probe/L.java
+locale_render=$($java $java_opts $probe/L.java 2>&1)
 rm -rf -- $probe
+if [[ $locale_render != '1,234,567|3.50' ]]; then
+    print -u2 "capture-parity: $java formats \`%,d|%.2f\` as '$locale_render' under $java_opts — not the root locale"
+    print -u2 "capture-parity: javars formats in the root locale always; a corpus captured here would freeze another locale's separators"
+    exit 2
+fi
 if [[ $render != '1.0E23' ]]; then
     print -u2 "capture-parity: $java renders 1.0e23 as '$render' — pre-JDK-19 Double.toString"
     print -u2 "capture-parity: JAVA_HOME=${JAVA_HOME:-<unset>}"
@@ -78,7 +97,7 @@ while IFS= read -r line; do
         (( bad++ ))
         continue
     fi
-    out=$( (cd $work && $java -classpath . T) 2>/dev/null )
+    out=$( (cd $work && $java $java_opts -classpath . T) 2>/dev/null )
     rc=$?
     if (( rc != 0 )); then
         print -u2 "capture-parity: program exited $rc: $line"
@@ -91,7 +110,7 @@ while IFS= read -r line; do
         continue
     fi
     # Both entry points, one answer, or the record does not go in.
-    src_out=$( (cd $work && $java T.java) 2>/dev/null )
+    src_out=$( (cd $work && $java $java_opts T.java) 2>/dev/null )
     if (( $? != 0 )) || [[ $src_out != $out ]]; then
         print -u2 "capture-parity: entry points disagree — \`java T.java\` gave '${src_out}', \`java -cp . T\` gave '${out}': $line"
         (( bad++ ))

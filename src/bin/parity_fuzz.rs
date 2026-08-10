@@ -2463,9 +2463,24 @@ struct RunOut {
 
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
+/// The options the reference `java` is launched with, and javars is not.
+///
+/// An empty `user.language`/`user.country` is `Locale.ROOT` — the locale javars
+/// formats in unconditionally, because it has no locale model and accepts no
+/// `-D` to give it one (see BUGS.md). Without the pin the oracle formats in
+/// whatever locale the *machine* is set to, so `%,d` and `%.2f` would be
+/// compared against `1.234.567` / `3,50` on a German desktop and every format
+/// probe would report a divergence that says nothing about javars. This does not
+/// hide the locale gap: a javars program cannot select a locale at all, so there
+/// is no javars behaviour on the other side of the pin to measure.
+const ORACLE_OPTS: &[&str] = &["-Duser.language=", "-Duser.country="];
+
+/// javars takes no options before the source file.
+const OURS_OPTS: &[&str] = &[];
+
 /// Run one program through `prog`. The file must be named `T.java` for the JDK's
 /// single-file source launcher, so each run gets its own directory.
-fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
+fn run_prog(prog: &Path, opts: &[&str], src: &str, timeout: Duration) -> RunOut {
     let n = TMP_CTR.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("javars_parity_{}_{n}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -2478,6 +2493,7 @@ fn run_prog(prog: &Path, src: &str, timeout: Duration) -> RunOut {
     }
 
     let mut child = match Command::new(prog)
+        .args(opts)
         .arg(&path)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
@@ -2537,8 +2553,8 @@ fn render(bytes: &[u8]) -> String {
 
 fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) -> bool {
     let src = build_program(probes);
-    let a = run_prog(oracle, &src, timeout);
-    let b = run_prog(ours, &src, timeout);
+    let a = run_prog(oracle, ORACLE_OPTS, &src, timeout);
+    let b = run_prog(ours, OURS_OPTS, &src, timeout);
     differs(&a, &b)
 }
 
@@ -2605,6 +2621,7 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
         match jdk_banner(&p) {
             Some(v) => {
                 require_modern_doubles(&p, &v);
+                require_root_locale(&p, &v);
                 eprintln!("parity-fuzz: oracle {} ({v})", p.display());
             }
             None => {
@@ -2628,6 +2645,7 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
             match jdk_banner(&cand) {
                 Some(v) => {
                     require_modern_doubles(&cand, &v);
+                    require_root_locale(&cand, &v);
                     eprintln!("parity-fuzz: oracle {} ({v})", cand.display());
                     return cand;
                 }
@@ -2674,6 +2692,45 @@ fn renders_modern_doubles(prog: &Path) -> Option<bool> {
     let _ = std::fs::remove_dir_all(&dir);
     let out = out?;
     Some(String::from_utf8_lossy(&out.stdout).trim() == "1.0E23")
+}
+
+/// Whether the candidate, launched with [`ORACLE_OPTS`], formats in the root
+/// locale — the one javars formats in unconditionally.
+///
+/// The pin is two `-D` options, and a launcher is free to ignore an option it
+/// does not recognise, so the answer is *measured* rather than assumed: a JVM
+/// that kept a German default would render `1.234.567` / `3,50` and turn every
+/// `format`/`printf` probe into a divergence that says nothing about javars.
+fn formats_in_root_locale(prog: &Path) -> Option<bool> {
+    let dir = std::env::temp_dir().join(format!("javars_locale_probe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("L.java");
+    std::fs::write(
+        &path,
+        "public class L { public static void main(String[] a) { System.out.print(String.format(\"%,d|%.2f\", 1234567, 3.5)); } }\n",
+    )
+    .ok()?;
+    let out = Command::new(prog)
+        .args(ORACLE_OPTS)
+        .arg(&path)
+        .current_dir(&dir)
+        .output()
+        .ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(String::from_utf8_lossy(&out?.stdout).trim() == "1,234,567|3.50")
+}
+
+/// Exit rather than measure `String.format` against another locale's separators.
+fn require_root_locale(prog: &Path, banner: &str) {
+    if formats_in_root_locale(prog) == Some(true) {
+        return;
+    }
+    eprintln!(
+        "parity-fuzz: {} ({banner}) does not honour {ORACLE_OPTS:?} — its `String.format` is not the root locale",
+        prog.display()
+    );
+    eprintln!("parity-fuzz: every `format`/`printf` probe would report a locale difference as a javars divergence");
+    std::process::exit(2);
 }
 
 /// Exit rather than measure against a pre-JDK-19 `Double.toString`.
@@ -2789,7 +2846,7 @@ fn main() {
         };
         let probes = gen_probes(seed, args.mode, args.probes);
         let src = build_program(&probes);
-        let a = run_prog(&oracle, &src, args.timeout);
+        let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
         // A program the reference toolchain itself did not run is no evidence
         // about javars. Comparing anyway would let a probe the JDK rejects be
         // counted as agreement (both sides "fail"), which silently inflates a
@@ -2807,7 +2864,7 @@ fn main() {
             continue;
         }
         probes_run += probes.len();
-        let b = run_prog(&ours, &src, args.timeout);
+        let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
         if !differs(&a, &b) {
             if args.verbose {
                 eprintln!("seed {seed}: ok ({} probes)", probes.len());
@@ -2817,8 +2874,8 @@ fn main() {
         failures += 1;
         let minimal = minimize(&probes, &ours, &oracle, args.timeout);
         let src = build_program(&minimal);
-        let a = run_prog(&oracle, &src, args.timeout);
-        let b = run_prog(&ours, &src, args.timeout);
+        let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
+        let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
         println!("=== DIVERGENCE seed {seed} (replay: --seed {seed} --once) ===");
         for probe in &minimal {
             println!("  {probe}");
@@ -2850,10 +2907,14 @@ mod regex_pairing {
     use super::*;
 
     /// `Pattern.compile(p).matcher("").groupCount()` for every entry of
-    /// [`PATTERNS`], in order, captured from the reference JDK
-    /// (`openjdk 26.0.2`, Temurin-26.0.2+10). Frozen rather than recomputed so
-    /// the invariant holds in CI without a JDK installed — the same reason
-    /// `tests/data/parity_expected.txt` is frozen.
+    /// [`PATTERNS`], in order, captured from a real JDK and re-verified against
+    /// `openjdk 21.0.12` and `openjdk 26.0.2` (Homebrew), which agree on every
+    /// entry. Frozen rather than recomputed so the invariant holds in CI without
+    /// a JDK installed — the same reason `tests/data/parity_expected.txt` is
+    /// frozen. Re-verify by feeding each pattern to
+    /// `Pattern.compile(p).matcher("").groupCount()`; the values are the
+    /// authority, and the JDK build that first produced them is not recorded
+    /// because no build has ever disagreed.
     const JDK_GROUP_COUNTS: &[usize] = &[
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 1, 2,
