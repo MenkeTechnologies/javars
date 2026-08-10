@@ -298,7 +298,10 @@ Implemented and checked against the reference `java`:
 - **`java.util` collections** — `List`/`ArrayList`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
   constructors, `Arrays.asList`, `List.of`/`Set.of`, and
-  `Collections.sort`/`reverse`/`max`/`min`. They are heap objects like arrays, so
+  `Collections.sort`/`reverse`/`max`/`min`. `Arrays.asList` is fixed-size and
+  `List.of`/`Set.of` immutable, so a structural write to one throws
+  `UnsupportedOperationException` as Java's does, and neither factory answers
+  `instanceof` as the mutable kind it is not. They are heap objects like arrays, so
   reference semantics hold; the enhanced `for` iterates them; `sort` and
   `forEach` take a lambda. A sort is a stable merge sort driven by the
   comparator; naming none (`Collections.sort(l)`, `l.sort(null)`) orders by the
@@ -417,7 +420,8 @@ frame ABI, `this`, `new`, field access `obj.f`, single inheritance with `extends
 and `super(…)`, the non-virtual `super.method(args)`/`super.field` access an
 override uses to reach the version it overrides, `instanceof` over every shape
 the value model names (user classes, boxed primitives, collections, arrays,
-`enum` as `Enum` and `record` as `Record`), runtime-class
+`enum` as `Enum` and `record` as `Record`) with the checked reference cast
+reading that same answer, runtime-class
 virtual dispatch for overrides, and
 `toString()` overrides honoured by `println`), **interfaces** (abstract +
 `default` methods, multiple `implements`, `interface extends`, polymorphic
