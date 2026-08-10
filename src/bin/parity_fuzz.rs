@@ -2026,6 +2026,105 @@ fn g_render(r: &mut Rng) -> String {
     }
 }
 
+/// A collection's membership tests, over elements whose `equals` is their own.
+///
+/// Every other collection mode draws its elements from `Integer` and `String`,
+/// which javars models as scalars and compares structurally by value — so no
+/// existing probe can reach the comparison a collection performs on a *heap*
+/// element, and the whole class of divergence where `contains` answers identity
+/// instead of `equals` was invisible to the harness.
+///
+/// The pool is three shapes, because Java's answer differs across them:
+///
+///   * `Eqh` and `Pt`/`Tag` (a `record`) declare `equals` *and* a consistent
+///     hash, so every container finds an equal element.
+///   * `Eqn` declares `equals` and no `hashCode`, so it keeps `Object`'s
+///     identity hash: an `ArrayList` still finds it (no hashing), and a
+///     `HashSet`/`HashMap` does not — two equal instances land in different
+///     buckets and never meet. A membership test that consulted `equals`
+///     unconditionally would report `true` where Java reports `false`.
+///   * `Eqx` declares neither, so identity is the whole answer everywhere.
+///
+/// `Eqc` counts its own invocations, which pins the *number* of comparisons a
+/// list scan performs: `indexOf` stops at the first hit, and an implementation
+/// that resolved every element's verdict up front would run the body too many
+/// times. Only list probes read the counter — a hash container's comparison
+/// count follows bucket layout, which javars does not model.
+///
+/// Nothing here prints a `HashSet`/`HashMap` holding a user object: their
+/// iteration order follows `hashCode`, and javars's identity hash is its heap
+/// handle (see BUGS.md). Order-bearing output uses the insertion-ordered
+/// `Linked*` forms; the hash forms are asked only for booleans, sizes and
+/// looked-up values.
+fn g_equals(r: &mut Rng) -> String {
+    // (constructor for the element, a second equal instance, an unequal one)
+    let (a, b, c) = *pick(
+        r,
+        &[
+            ("new Eqh(1)", "new Eqh(1)", "new Eqh(2)"),
+            ("new Eqn(1)", "new Eqn(1)", "new Eqn(2)"),
+            ("new Pt(1, 2)", "new Pt(1, 2)", "new Pt(3, 4)"),
+            (
+                "new Tag(\"t\", 1.5)",
+                "new Tag(\"t\", 1.5)",
+                "new Tag(\"u\", 2.5)",
+            ),
+            ("new Eqx(1)", "new Eqx(1)", "new Eqx(2)"),
+        ],
+    );
+    match r.below(14) {
+        // `List` never hashes, so `equals` alone decides every one of these.
+        0 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add({a}); l.add({c}); System.out.println(l.contains({b}) + \" \" + l.indexOf({b}) + \" \" + l.lastIndexOf({b}) + \" \" + l.contains({c})); }}"
+        ),
+        1 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add({a}); l.add({b}); System.out.println(l.indexOf({b}) + \" \" + l.lastIndexOf({b}) + \" \" + l.size()); }}"
+        ),
+        2 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add({a}); l.add({c}); Object q = {b}; System.out.println(l.remove(q) + \" \" + l.size() + \" \" + l.contains(q)); }}"
+        ),
+        3 => format!(
+            "{{ List<Object> x = new ArrayList<>(); x.add({a}); List<Object> y = new ArrayList<>(); y.add({b}); List<Object> z = new ArrayList<>(); z.add({c}); System.out.println(x.equals(y) + \" \" + x.equals(z) + \" \" + x.equals(new ArrayList<>())); }}"
+        ),
+        4 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add({c}); l.add({a}); l.add({c}); System.out.println(l.subList(1, 3).contains({b}) + \" \" + l.subList(0, 2).indexOf({b})); }}"
+        ),
+        // The hash containers: `Eqn` is the one that must *not* be found.
+        5 => format!(
+            "{{ Set<Object> s = new HashSet<>(); System.out.println(s.add({a}) + \" \" + s.add({b}) + \" \" + s.size() + \" \" + s.contains({b})); }}"
+        ),
+        6 => format!(
+            "{{ Set<Object> s = new HashSet<>(); s.add({a}); System.out.println(s.remove({b}) + \" \" + s.size() + \" \" + s.remove({c})); }}"
+        ),
+        7 => format!(
+            "{{ Map<Object, Integer> m = new HashMap<>(); m.put({a}, 1); System.out.println(m.get({b}) + \" \" + m.containsKey({b}) + \" \" + m.size() + \" \" + m.getOrDefault({c}, -1)); }}"
+        ),
+        8 => format!(
+            "{{ Map<Object, Integer> m = new HashMap<>(); m.put({a}, 1); m.put({b}, 2); System.out.println(m.size() + \" \" + m.get({a}) + \" \" + m.containsValue(2) + \" \" + m.remove({b})); }}"
+        ),
+        9 => format!(
+            "{{ Map<Object, Integer> m = new HashMap<>(); m.put({a}, 1); System.out.println(m.putIfAbsent({b}, 9) + \" \" + m.size() + \" \" + m.putIfAbsent({c}, 9) + \" \" + m.size()); }}"
+        ),
+        // Insertion-ordered forms, where the contents can be printed.
+        10 => format!(
+            "{{ Set<Object> s = new LinkedHashSet<>(); s.add({a}); s.add({b}); s.add({c}); System.out.println(s.size() + \" \" + s); }}"
+        ),
+        11 => format!(
+            "{{ Set<Object> s = new LinkedHashSet<>(); s.addAll(new ArrayList<>(Arrays.asList({a}, {b}, {c}))); System.out.println(s.size() + \" \" + s); }}"
+        ),
+        // Building a set from a sequence de-duplicates by the same rule.
+        12 => format!(
+            "{{ System.out.println(new HashSet<>(Arrays.asList({a}, {b}, {c})).size()); }}"
+        ),
+        // The comparison *count* a list scan performs, which only a
+        // short-circuiting scan gets right.
+        _ => {
+            "{ Eqc.calls = 0; List<Object> l = new ArrayList<>(); l.add(new Eqc(1)); l.add(new Eqc(2)); l.add(new Eqc(3)); boolean h = l.contains(new Eqc(1)); int n = Eqc.calls; Eqc.calls = 0; int i = l.indexOf(new Eqc(3)); System.out.println(h + \" \" + n + \" \" + i + \" \" + Eqc.calls); }"
+                .to_string()
+        }
+    }
+}
+
 const SUPPORT: &str = concat!(
     "    static int fin1() { try { return 1; } finally { System.out.println(\"f1\"); } }\n",
     "    static int fin2() { int x = 5; try { return x; } finally { x = 99; } }\n",
@@ -2199,6 +2298,40 @@ const SUPPORT_CLASS: &str = concat!(
     "    SupObj(int v) { this.v = v; }\n",
     "    boolean sameAs(Object o) { return super.equals(o); }\n",
     "}\n",
+    // The `equals` mode's element pool. `Eqh` is the correctly written pair;
+    // `Eqn` deliberately omits `hashCode`, which is what makes a hash container
+    // miss an element an `ArrayList` finds; `Eqc` counts its own invocations so
+    // a probe can pin how many comparisons a scan performs.
+    "class Eqh {\n",
+    "    int v;\n",
+    "    Eqh(int v) { this.v = v; }\n",
+    "    public boolean equals(Object o) { return o instanceof Eqh && ((Eqh) o).v == v; }\n",
+    "    public int hashCode() { return v; }\n",
+    "    public String toString() { return \"Eqh\" + v; }\n",
+    "}\n",
+    "class Eqn {\n",
+    "    int v;\n",
+    "    Eqn(int v) { this.v = v; }\n",
+    "    public boolean equals(Object o) { return o instanceof Eqn && ((Eqn) o).v == v; }\n",
+    "    public String toString() { return \"Eqn\" + v; }\n",
+    "}\n",
+    // The negative case: neither `equals` nor `hashCode`, so identity is the
+    // whole answer in every container. It carries a `toString` because the
+    // probes print set contents, and `Object`'s default renders an identity hash
+    // that differs between runs of the same JVM.
+    "class Eqx {\n",
+    "    int v;\n",
+    "    Eqx(int v) { this.v = v; }\n",
+    "    public String toString() { return \"Eqx\" + v; }\n",
+    "}\n",
+    "class Eqc {\n",
+    "    static int calls;\n",
+    "    int v;\n",
+    "    Eqc(int v) { this.v = v; }\n",
+    "    public boolean equals(Object o) { calls++; return o instanceof Eqc && ((Eqc) o).v == v; }\n",
+    "    public int hashCode() { return v; }\n",
+    "    public String toString() { return \"Eqc\" + v; }\n",
+    "}\n",
 );
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2254,6 +2387,7 @@ enum Mode {
     Super,
     InstanceOf,
     Render,
+    Equals,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2307,6 +2441,7 @@ const CONCRETE: &[Mode] = &[
     Mode::Super,
     Mode::InstanceOf,
     Mode::Render,
+    Mode::Equals,
 ];
 
 fn mode_name(m: Mode) -> &'static str {
@@ -2362,6 +2497,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Super => "super",
         Mode::InstanceOf => "instanceof",
         Mode::Render => "render",
+        Mode::Equals => "equals",
     }
 }
 
@@ -2429,6 +2565,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Super => g_super(r),
         Mode::InstanceOf => g_instanceof(r),
         Mode::Render => g_render(r),
+        Mode::Equals => g_equals(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
