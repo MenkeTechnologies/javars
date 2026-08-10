@@ -431,7 +431,11 @@ at the bottom, and are summarized in the section right after this one.
   `NumberFormatException`, `e.getMessage()` works, and `System.out.println(e)`
   prints `java.lang.Foo: message`. A user class may `extend` any of them. An
   exception no handler claims reports Java's `Exception in thread "main" …` line
-  on stderr and exits non-zero.
+  on stderr and exits non-zero — the same exit status (1) Java uses, with the
+  line prefixed `javars: ` and no `at T.main(T.java:1)` frame after it, because
+  javars keeps no call-site table to unwind. Verified one probe against
+  `openjdk 21.0.12`: both print `x` to stdout and exit 1, and stdout is
+  identical.
 - **Runtime faults are catchable exceptions.** javars's own faults raise the
   throwable Java raises, carrying Java's exact detail message, so they are
   caught, typed, and re-thrown like any other: an out-of-range array index
@@ -741,9 +745,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Stream.of`, the intermediate operations (`map`, `filter`, `sorted`,
   `distinct`, `limit`), and the terminals (`collect`, `count`, `sum`, `reduce`,
   `findFirst`, `anyMatch`). Naming any of them is a compile error, not a wrong
-  answer: `list.stream()` is `unsupported List method 'stream'`,
-  `Arrays.stream(a)` is `unsupported static method 'Arrays.stream'`, and
-  `IntStream`/`Stream` are `cannot find symbol`. That last one was *not* true
+  answer — measured on `openjdk 21.0.12`'s side and javars's, one probe each:
+  `list.stream()` is
+  ``javars: unsupported List method `stream` with 0 argument(s)``,
+  `Arrays.stream(a)` is
+  ``javars: unsupported static method `Arrays.stream` with 1 argument(s)``, and
+  a bare `IntStream.range(0, 3)` / `Stream.of(1, 2)` under
+  `import java.util.stream.*;` is ``javars: cannot find symbol: `IntStream` `` /
+  ``javars: cannot find symbol: `Stream` ``. That last one was *not* true
   until the undeclared-name check landed — `IntStream.range(0, 3).sum()` used to
   reach the runtime and report
   `NullPointerException: Cannot read field "util"` / `Cannot invoke
@@ -811,7 +820,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above, the
   `String` instance methods, and the `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O.
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `System` carries
+  only its two streams: `System.exit(3)` is
+  ``javars: only `System.out`/`System.err` are supported, not `System.exit` ``,
+  which also means a program cannot choose its exit status — 0 for a clean run
+  and 1 for an uncaught throwable are the only two javars produces.
 - **`Math`'s transcendentals** (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`,
   `atan2`, `exp`, `log`, `log10`, `cbrt`, `hypot`, `sinh`/`cosh`/`tanh`). The JDK
   answers these from its own fdlibm-derived implementation and permits a 1-ulp
