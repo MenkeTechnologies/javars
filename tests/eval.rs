@@ -4813,8 +4813,7 @@ fn a_compound_assignment_narrows_a_floating_operand_back_to_an_integral_target()
     // because each has its own lowering. The last two lines are the cases that
     // must NOT narrow: a `double` target and `String +=`. Verified byte-for-byte
     // against OpenJDK 26.
-    let (out, ok) = run(
-        "public class Main {\
+    let (out, ok) = run("public class Main {\
          static int sf = 1;\
          int f = 1;\
          public static void main(String[] a) {\
@@ -4830,8 +4829,7 @@ fn a_compound_assignment_narrows_a_floating_operand_back_to_an_integral_target()
          int[] arr = {1}; arr[0] += 1.5; System.out.println(arr[0]);\
          Main t = new Main(); t.f += 1.5; System.out.println(t.f);\
          double d = 1; d += 1.5; System.out.println(d);\
-         String str = \"a\"; str += 1.5; System.out.println(str); } }",
-    );
+         String str = \"a\"; str += 1.5; System.out.println(str); } }");
     assert!(ok, "stdout was {out:?}");
     assert_eq!(
         out,
@@ -4849,8 +4847,7 @@ fn percent_f_rounds_the_shortest_decimal_half_up_not_the_exact_binary_expansion(
     // `%.0f` triple pins that the rule is HALF_UP and not half-to-even, the
     // `%.2e`/`%.20e` pair that `%e` shares the digit source, and `%g` that it
     // reaches both branches. Verified byte-for-byte against OpenJDK 26.
-    let (out, ok) = run(
-        "public class Main { public static void main(String[] a) {\
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
          System.out.println(String.format(\"%.2f|%.2f|%.2f|%.2f\", 1.005, 2.675, 0.125, 8.835));\
          System.out.println(String.format(\"%.20f\", 0.1));\
          System.out.println(String.format(\"%.20f\", 1.0 / 3));\
@@ -4860,8 +4857,7 @@ fn percent_f_rounds_the_shortest_decimal_half_up_not_the_exact_binary_expansion(
          System.out.println(String.format(\"%.3f|%.2f|%.5f\", 1.0005, -1.005, 1.000005));\
          System.out.println(String.format(\"%.2e|%.20e\", 1.005, 0.1));\
          System.out.println(String.format(\"%.3g|%g\", 0.0001005, 1.005));\
-         System.out.printf(\"%.2f %.6f%n\", 5592405.5, 1.0); } }",
-    );
+         System.out.printf(\"%.2f %.6f%n\", 5592405.5, 1.0); } }");
     assert!(ok, "stdout was {out:?}");
     assert_eq!(
         out,
@@ -4888,8 +4884,7 @@ fn an_unqualified_object_method_inside_an_instance_member_is_an_implicit_this_ca
     // reference: getClass`. The call still dispatches on the *runtime* class,
     // which is what makes the inherited `toString` answer `B:1` for a `B`.
     // Verified byte-for-byte against OpenJDK 26.
-    let (out, ok) = run(
-        "public class Main {\
+    let (out, ok) = run("public class Main {\
          static class A { int x = 1;\
          public String toString() { return getClass().getSimpleName() + \":\" + x; }\
          String who() { return getClass().getName(); }\
@@ -4901,8 +4896,7 @@ fn an_unqualified_object_method_inside_an_instance_member_is_an_implicit_this_ca
          A p = new A(); B q = new B();\
          System.out.println(p + \" \" + q + \" \" + q.who());\
          System.out.println(p.same(p) + \" \" + p.same(q) + \" \" + q.wrap());\
-         System.out.println(new D().getClass().getSimpleName()); } }",
-    );
+         System.out.println(new D().getClass().getSimpleName()); } }");
     assert!(ok, "stdout was {out:?}");
     assert_eq!(out, "A:1 B:1 Main$B\ntrue false [B:1]\nD\n");
 }
