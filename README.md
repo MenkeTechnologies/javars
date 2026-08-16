@@ -228,7 +228,10 @@ Implemented and checked against the reference `java`:
   `== != < > <= >=`, `&& ||` (short-circuiting), the bitwise `& | ^` (Java's
   non-short-circuiting logical operators on booleans), and the shifts
   `<< >> >>>` with Java's per-width distance masking; unary `-`, `!`, `~`, and
-  `++`/`--` in both prefix and postfix value position; cast expressions with
+  `+` (which changes no bits but still applies unary numeric promotion, so
+  `"" + +'A'` is `"65"`); `++`/`--` in both prefix and postfix value position on
+  a local, an array element, an instance field, or a `static`, evaluating the
+  index or receiver exactly once; cast expressions with
   Java's saturating and two's-complement narrowing conversions (a *reference*
   cast is checked against the receiver's runtime class and throws
   `ClassCastException`); parenthesised
@@ -476,9 +479,12 @@ variable-arity — phase, so a `T...` parameter is callable with loose arguments
 at every call site), **type-erased
 generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
 diamond), **`static` fields** with `static { }` initializer blocks, **instance
-initialization** (field initializers and bare `{ }` blocks in textual order, the
-implicit `super()` every constructor without an explicit chain runs, and
-`this(…)` delegation), **`record`
+initialization in JLS 12.5 order** (superclass constructor, then this class's
+field initializers and bare `{ }` blocks in textual order, then the constructor
+body — so a virtual call made from a superclass constructor sees the subclass's
+fields at their defaults, as Java specifies; plus the implicit `super()` every
+constructor without an explicit chain runs, and `this(…)` delegation, which
+runs the initializers exactly once), **`record`
 types** with their derived accessors / `toString` / `equals`, **abstract
 classes**, **`enum` constants carrying state or bodies**, and **lambdas +
 method references** (heap closures capturing by value, dispatched through any

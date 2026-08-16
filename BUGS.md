@@ -46,7 +46,17 @@ at the bottom, and are summarized in the section right after this one.
   same rules. `>>` lexes as one token, and the generic-argument skippers weigh a
   closer by how many `>` it spells, so `List<List<String>>` still parses.
 - **`++`/`--` in value position.** The post-form evaluates to the value the
-  variable held, the pre-form to the value it takes.
+  target held, the pre-form to the value it takes — on every lvalue Java allows,
+  not just a plain local: an array element (`a[i]++`, `++g[r][c]`), an instance
+  field (`p.n++`, `++this.n`), and a `static` (`C.total++`). JLS 15.14.2/15.15.1
+  define these as `+= 1`/`-= 1` *with* the implicit narrowing cast a compound
+  assignment carries, so they share that lowering: `byte b = 127; b++` is -128,
+  and the array, index, or receiver is evaluated exactly once
+  (`a[idx()]++` calls `idx()` a single time).
+- **Unary `+`.** It changes no bits, but it is not a no-op: JLS 5.6.1 applies
+  unary numeric promotion, so `+aChar` is an `int`. That is visible wherever the
+  static type picks the rendering — `"" + +'A'` is `"65"`, not `"A"` — and in
+  overload resolution.
 - **Cast expressions** (`(int) d`, `(byte) n`, `(char) 65`, `(Object) x`). Java's
   narrowing primitive conversions are real value changes: floating → integral
   *saturates* (`(int) 1e18` is `Integer.MAX_VALUE`) and truncates toward zero,
@@ -274,15 +284,31 @@ at the bottom, and are summarized in the section right after this one.
   instance methods, `this`, `new C(…)`, field access (`obj.f`, `obj.f = v`), and
   implicit-`this` field/method access. Multiple classes per file, including nested
   `static` classes. Instances are heap objects with reference/aliasing semantics.
-- **Instance initialization (JLS 8.6, 8.8.7).** Every field is seeded with its
-  type's default, then each class in the chain runs its own initialization —
-  field initializers and bare `{ … }` instance-initializer blocks, in textual
-  order — with `this` bound, so a block can call an instance method and a field
-  initializer can read a field declared above it. A constructor body that does
-  not open with `this(…)`/`super(…)` runs an implicit `super()`, and a class that
-  declares no constructor gets Java's default one, which is exactly that call —
-  so a superclass constructor runs whether or not the subclass wrote one, and a
-  virtual call made from it reaches the subclass's override.
+- **Instance initialization (JLS 8.6, 8.8.7, 12.5).** Allocation seeds every
+  field in the whole chain with its type's default. Each constructor then runs
+  the three steps JLS 12.5 fixes, in that order: the **superclass constructor**
+  (an explicit `super(…)`, or the implicit `super()` a body that does not open
+  with `this(…)`/`super(…)` gets), then **this class's** field initializers and
+  bare `{ … }` instance-initializer blocks in textual order, then the
+  **constructor body**. `this` is bound throughout, so a block can call an
+  instance method and a field initializer can read a field declared above it —
+  or an inherited one the superclass constructor just assigned
+  (`class A { int x; A() { x = 100; } } class B extends A { int y = x + 1; }`
+  gives `y == 101`).
+
+  The step order is observable in both directions. A virtual call made from a
+  superclass constructor reaches the subclass's override — and sees the
+  subclass's fields still at their **defaults**, because the subclass's
+  initializers have not run yet. That is why the initializers are emitted inside
+  each constructor rather than at the allocation site: running them all up front
+  would show that override the finished values, and would let a subclass
+  initializer overwrite what the superclass constructor assigned.
+
+  A class that declares no constructor gets Java's default one, whose body is
+  `super()` followed by the same initializers — so a superclass constructor runs
+  whether or not the subclass wrote one, and an intermediate class that declares
+  no constructor still contributes its `{ … }` blocks at its own point in the
+  chain.
 - **Explicit constructor invocation.** `super(args)` chains to the superclass
   constructor and `this(args)` delegates to another constructor of the same class
   (the telescoping-constructor shape); the delegate is what runs the `super()`
@@ -989,6 +1015,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
   `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
   as are the `Math.PI`/`Math.E` constants.
+- **The bit-twiddling and exact-arithmetic statics.** `Integer`/`Long`'s
+  `bitCount`, `highestOneBit`/`lowestOneBit`, `numberOfLeadingZeros`/
+  `numberOfTrailingZeros`, `reverse`/`reverseBytes`, `rotateLeft`/`rotateRight`,
+  and the unsigned family (`divideUnsigned`, `remainderUnsigned`,
+  `toUnsignedLong`, `toUnsignedString`); `Math`'s `addExact`/`subtractExact`/
+  `multiplyExact`/`toIntExact`, `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`,
+  `fma`, and `clamp`; `Double.isFinite`/`max`/`min`; `Character.compare` and
+  `isAlphabetic`. Each is an unregistered static, so a call is a compile error
+  naming the method rather than a wrong answer. `Short` and `Byte` are further
+  along that scale: their `MAX_VALUE`/`MIN_VALUE` constants resolve, but the
+  types carry no statics at all, so `Short.compare(a, b)` is
+  ``javars: cannot find symbol: `Short` ``.
 - **The regular-expression constructs with no faithful translation.** Regular
   expressions themselves are implemented (see the entry under "Implemented");
   what is refused — as a `PatternSyntaxException` naming the construct — is the

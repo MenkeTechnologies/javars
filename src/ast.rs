@@ -457,6 +457,18 @@ pub enum Expr {
         name: String,
         inc: bool,
     },
+    /// `++`/`--` on an lvalue that is not a plain named variable — an array
+    /// element (`a[i]++`) or a field (`p.n++`, `C.total++`). A bare variable
+    /// keeps [`Expr::PostIncDec`]/[`Expr::PreIncDec`], which name it directly;
+    /// this form has to hold the whole target expression so its receiver or
+    /// index is evaluated exactly once. `inc` is `true` for `++`, `post` is
+    /// `true` for the suffix form (which yields the value held before).
+    IncDec {
+        target: Box<Expr>,
+        inc: bool,
+        post: bool,
+        line: u32,
+    },
     /// A cast, `(ty) expr`. Java's narrowing primitive conversions are real
     /// value changes (`(int) 3.9` is 3, `(byte) 200` is -56), so the target type
     /// is kept rather than erased; a reference cast is a no-op at runtime here,
@@ -609,6 +621,10 @@ pub enum UnOp {
     Not,
     /// `~x` — bitwise complement of an integral operand.
     BitNot,
+    /// `+x` — leaves the value alone but still applies unary numeric promotion
+    /// (JLS 5.6.1), so `+aChar` is an `int`. That is observable: `"" + +'A'`
+    /// is `"65"`, not `"A"`.
+    Plus,
 }
 
 /// Binary operators.

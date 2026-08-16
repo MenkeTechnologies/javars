@@ -2284,10 +2284,17 @@ impl Parser {
                     rhs: Box::new(self.unary()?),
                 })
             }
-            // Java's unary `+` is a no-op on an already-promoted operand.
+            // Java's unary `+` leaves the value alone, but it is not a no-op:
+            // JLS 5.6.1 promotes a `byte`/`short`/`char` operand to `int`, and
+            // for `char` that is visible in the result's rendering. Dropping the
+            // node here made `+c` a `char` again, so `"" + +c` printed the
+            // letter where Java prints its code point.
             Tok::Plus => {
                 self.advance();
-                self.unary()
+                Ok(Expr::Unary {
+                    op: UnOp::Plus,
+                    rhs: Box::new(self.unary()?),
+                })
             }
             Tok::Not => {
                 self.advance();
@@ -2304,12 +2311,22 @@ impl Parser {
                 })
             }
             // `++i` / `--i`: update first, and the expression's value is the
-            // *new* one.
+            // *new* one. The operand is a whole lvalue, not just an identifier:
+            // `++a[i]` and `++p.n` are as valid as `++i`, and parsing only an
+            // identifier rejected them outright.
             Tok::PlusPlus | Tok::MinusMinus => {
                 let inc = self.is(&Tok::PlusPlus);
+                let line = self.line();
                 self.advance();
-                let name = self.ident()?;
-                Ok(Expr::PreIncDec { name, inc })
+                match self.postfix()? {
+                    Expr::Var(name) => Ok(Expr::PreIncDec { name, inc }),
+                    target => Ok(Expr::IncDec {
+                        target: Box::new(target),
+                        inc,
+                        post: false,
+                        line,
+                    }),
+                }
             }
             _ => self.postfix(),
         }
@@ -2457,6 +2474,23 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        // `a[i]++` / `p.n++`: a suffix update of the chain just parsed. A bare
+        // `i++` never reaches here — `primary` consumes it — so only the array
+        // and field forms are built, and they must keep the target expression so
+        // the index or receiver is evaluated once.
+        if matches!(e, Expr::Index { .. } | Expr::Field { .. })
+            && matches!(self.peek(), Tok::PlusPlus | Tok::MinusMinus)
+        {
+            let inc = self.is(&Tok::PlusPlus);
+            let line = self.line();
+            self.advance();
+            e = Expr::IncDec {
+                target: Box::new(e),
+                inc,
+                post: true,
+                line,
+            };
         }
         Ok(e)
     }

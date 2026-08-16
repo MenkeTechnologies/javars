@@ -38,6 +38,38 @@ const NULL_LITERAL: &str = "null";
 /// method name (`<` is not an identifier character).
 const INST_INIT: &str = "<instinit>";
 
+/// Where the receiver of a synthesized constructor step comes from. Inside a
+/// constructor it is `this`; at a `new` site the freshly allocated instance is
+/// still only in a compiler temp, because no frame binds it yet.
+#[derive(Clone, Copy)]
+enum Recv<'a> {
+    This,
+    Temp(&'a str),
+}
+
+/// What an update of an lvalue leaves on the stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Yield {
+    /// Nothing — statement position, where the result is discarded.
+    Nothing,
+    /// The value the lvalue held before the update (`x++`).
+    Old,
+    /// The value it takes (`++x`).
+    New,
+}
+
+/// What a constructor body's first statement is, which decides where its
+/// superclass call and its instance initializers go (JLS 8.8.7, 12.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtorChain {
+    /// Opens with `super(…)`.
+    Super,
+    /// Opens with `this(…)` — the delegate runs the chain and the initializers.
+    This,
+    /// Opens with neither, so an implicit `super()` is synthesized.
+    Implicit,
+}
+
 /// The static numeric category of an expression, used to reproduce Java's
 /// binary numeric promotion. Java's `/` truncates when both operands are
 /// integral and divides as floating point when either is `float`/`double`; the
@@ -965,19 +997,55 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         let global = static_global(class, name);
-        if op == AssignOp::Assign {
-            let ty = ty.to_string();
-            self.expr_targeted(value, Some(&ty))?;
-            self.emit_global_set(&global, line);
-            return Ok(());
+        if op != AssignOp::Assign {
+            return self.static_update(&global, ty, op, value, Yield::Nothing, line);
         }
-        let target = numtype_of_ty(ty).unwrap_or(NumType::Other);
-        let wrap = self.compound_wraps(Some(ty), value);
-        self.emit_global_get(&global, line);
-        self.emit_compound(op, value, target, Some(ty), wrap, line)?;
-        self.emit_narrow_to(Some(ty), line);
+        let ty = ty.to_string();
+        self.expr_targeted(value, Some(&ty))?;
         self.emit_global_set(&global, line);
         Ok(())
+    }
+
+    /// Read/modify/write of a static field's `global` cell under a compound
+    /// operator, leaving `want` on the stack — nothing for `C.n += 1`, the old
+    /// value for `C.n++`, the new one for `++C.n`. The cell is named rather than
+    /// re-derived from the class and field, which is all the class and field
+    /// were ever used for here.
+    fn static_update(
+        &mut self,
+        global: &str,
+        ty: &str,
+        op: AssignOp,
+        value: &Expr,
+        want: Yield,
+        line: u32,
+    ) -> Result<(), String> {
+        let target = numtype_of_ty(ty).unwrap_or(NumType::Other);
+        let wrap = self.compound_wraps(Some(ty), value);
+        self.emit_global_get(global, line);
+        let old_t = self.stash_if(want == Yield::Old, line);
+        self.emit_compound(op, value, target, Some(ty), wrap, line)?;
+        self.emit_narrow_to(Some(ty), line);
+        self.emit_global_set(global, line);
+        match (want, old_t) {
+            (Yield::Old, Some(t)) => self.emit_get(&t, line),
+            (Yield::New, _) => self.emit_global_get(global, line),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Copy the top of the stack into a fresh temp and push it back, so a later
+    /// read still sees the pre-update value. Emits nothing when `save` is false,
+    /// which keeps statement-position bytecode exactly as it was.
+    fn stash_if(&mut self, save: bool, line: u32) -> Option<String> {
+        if !save {
+            return None;
+        }
+        let t = self.temp();
+        self.emit_set(&t, line);
+        self.emit_get(&t, line);
+        Some(t)
     }
 
     /// When `e` is `EnumName.CONSTANT`, the enum's name — the one `Expr::Field`
@@ -1346,13 +1414,15 @@ impl Compiler {
             Expr::This => self.this_class.clone(),
             Expr::Var(name) => self.bare_var_type(name),
             Expr::Unary { op, rhs } => match op {
-                // Unary numeric promotion (JLS 5.6.1): `-x` and `~x` widen
+                // Unary numeric promotion (JLS 5.6.1): `+x`, `-x` and `~x` widen
                 // `byte`/`short`/`char` to `int` and leave every other type
                 // alone — a `double` operand stays `double`.
-                UnOp::Neg | UnOp::BitNot => match self.expr_java_type(rhs).as_deref() {
-                    Some("byte" | "short" | "char") => Some("int".to_string()),
-                    other => other.map(|s| s.to_string()),
-                },
+                UnOp::Neg | UnOp::BitNot | UnOp::Plus => {
+                    match self.expr_java_type(rhs).as_deref() {
+                        Some("byte" | "short" | "char") => Some("int".to_string()),
+                        other => other.map(|s| s.to_string()),
+                    }
+                }
                 UnOp::Not => Some("boolean".to_string()),
             },
             Expr::Cast { ty, .. } => Some(ty.clone()),
@@ -1455,6 +1525,9 @@ impl Compiler {
             Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } => {
                 self.bare_var_type(name)
             }
+            // `a[i]++` is the element's type, `p.n++` the field's — the update
+            // never changes it (`char c; c++` stays a `char`).
+            Expr::IncDec { target, .. } => self.expr_java_type(target),
             Expr::Call { name, args, .. } => {
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -2034,47 +2107,61 @@ impl Compiler {
         Some((info.ctors[i].param_tys.clone(), vararg_from))
     }
 
-    /// The ancestor of `class` whose no-argument constructor an implicit
-    /// `super()` runs, and `None` when the chain reaches `java.lang.Object`
-    /// without finding one.
-    ///
-    /// JLS 8.8.7: a constructor body that does not begin with an explicit
-    /// `this(…)` or `super(…)` starts with an implicit `super()`, and a class
-    /// that declares no constructor at all gets a default one that does exactly
-    /// that. javars synthesizes no default constructor subroutine, so the walk
-    /// skips every ancestor that declares none — the default constructor those
-    /// levels would have had is precisely a pass-through — and stops at the
-    /// first that declares one. An ancestor that declares constructors but no
-    /// no-argument one is a `javac` error, so answering `None` there loses
-    /// nothing a valid program could observe.
-    fn implicit_super_ctor(&self, class: &str) -> Option<String> {
-        let mut cur = self.classes.get(class)?.superclass.clone();
-        let mut guard = 0;
-        while let Some(name) = cur {
-            let info = self.classes.get(&name)?;
-            if !info.ctors.is_empty() {
-                return info
-                    .ctors
-                    .iter()
-                    .any(|c| c.param_tys.is_empty())
-                    .then_some(name);
-            }
-            cur = info.superclass.clone();
-            guard += 1;
-            if guard > 10000 {
-                return None;
-            }
+    /// Emit a read of the receiver a synthesized constructor step runs on.
+    fn emit_recv(&mut self, recv: Recv<'_>, line: u32) {
+        match recv {
+            Recv::This => self.emit_this(line),
+            Recv::Temp(name) => self.emit_get(name, line),
         }
-        None
     }
 
-    /// Emit `<ancestor>.<init>()` on the receiver already in `this` — the
-    /// implicit `super()` a constructor prologue runs.
-    fn emit_implicit_super(&mut self, class: &str, line: u32) {
-        let Some(sup) = self.implicit_super_ctor(class) else {
+    /// Emit `Class.<instinit>(recv)` — the class's field initializers and bare
+    /// `{ … }` blocks, in textual order. A class with neither has no subroutine
+    /// to call.
+    fn emit_inst_init(&mut self, class: &str, recv: Recv<'_>, line: u32) {
+        if !self.classes.get(class).is_some_and(|ci| ci.has_inst_init) {
+            return;
+        }
+        self.emit_recv(recv, line);
+        let mangled = mangle(class, INST_INIT, &[]);
+        let idx = self.b.add_name(&mangled);
+        self.b.emit(Op::Call(idx, 1), line);
+        self.emit_exc_check(line);
+        self.b.emit(Op::Pop, line);
+    }
+
+    /// Emit the `super()` that a constructor of `class` runs when its body does
+    /// not open with an explicit `this(…)`/`super(…)` (JLS 8.8.7).
+    ///
+    /// The direct superclass's no-argument constructor is called when it
+    /// declares one; when it declares none, javac gave that level a *default*
+    /// constructor, and that default is not a pass-through — it runs the
+    /// level's own `super()` chain and then its instance initializers. Skipping
+    /// such a level (as an ancestor walk that only looks for a declared
+    /// constructor does) therefore drops its `{ … }` blocks and field
+    /// initializers entirely, so it is synthesized here instead.
+    ///
+    /// A superclass that declares constructors but no no-argument one is a
+    /// `javac` error, so emitting nothing there loses nothing a valid program
+    /// could observe.
+    fn emit_super_chain(&mut self, class: &str, recv: Recv<'_>, line: u32, depth: u32) {
+        if depth > 10_000 {
+            return;
+        }
+        let Some(sup) = self.classes.get(class).and_then(|ci| ci.superclass.clone()) else {
             return;
         };
-        self.emit_this(line);
+        let Some(info) = self.classes.get(&sup) else {
+            return;
+        };
+        if info.ctors.is_empty() {
+            self.emit_default_ctor(&sup, recv, line, depth + 1);
+            return;
+        }
+        if !info.ctors.iter().any(|c| c.param_tys.is_empty()) {
+            return;
+        }
+        self.emit_recv(recv, line);
         let mangled = mangle(&sup, "<init>", &[]);
         let idx = self.b.add_name(&mangled);
         self.b.emit(Op::Call(idx, 1), line);
@@ -2082,13 +2169,24 @@ impl Compiler {
         self.b.emit(Op::Pop, line);
     }
 
-    /// True when `body` opens with an explicit constructor invocation
-    /// (`super(…)` or `this(…)`), which suppresses the implicit `super()`.
-    fn chains_explicitly(body: &[Stmt]) -> bool {
-        matches!(
-            body.first().map(|s| &s.kind),
-            Some(StmtKind::Expr(Expr::Call { name, .. })) if name == "super" || name == "this"
-        )
+    /// Emit the body of the default constructor javac synthesizes for a class
+    /// that declares none: `super()`, then the class's instance initializers,
+    /// then an empty body.
+    fn emit_default_ctor(&mut self, class: &str, recv: Recv<'_>, line: u32, depth: u32) {
+        self.emit_super_chain(class, recv, line, depth);
+        self.emit_inst_init(class, recv, line);
+    }
+
+    /// How a constructor body opens: with an explicit `super(…)`, with an
+    /// explicit `this(…)`, or with neither — in which case JLS 8.8.7 gives it an
+    /// implicit `super()`. The three cases place the instance initializers
+    /// differently, which is why this is not a bool.
+    fn ctor_chain(body: &[Stmt]) -> CtorChain {
+        match body.first().map(|s| &s.kind) {
+            Some(StmtKind::Expr(Expr::Call { name, .. })) if name == "super" => CtorChain::Super,
+            Some(StmtKind::Expr(Expr::Call { name, .. })) if name == "this" => CtorChain::This,
+            _ => CtorChain::Implicit,
+        }
     }
 
     /// True when `class` declares or inherits any method named `method` with
@@ -2599,9 +2697,9 @@ impl Compiler {
             Expr::Char(_) => NumType::Int,
             Expr::Var(name) => self.lookup_type(name),
             Expr::Unary { op, rhs } => match op {
-                // `-x` keeps the operand's numeric type; `~x` is always
+                // `+x`/`-x` keep the operand's numeric type; `~x` is always
                 // integral; `!b` is boolean.
-                UnOp::Neg => self.expr_type(rhs),
+                UnOp::Neg | UnOp::Plus => self.expr_type(rhs),
                 UnOp::BitNot => NumType::Int,
                 UnOp::Not => NumType::Other,
             },
@@ -2636,6 +2734,9 @@ impl Compiler {
                 _ => NumType::Other,
             },
             Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } => self.lookup_type(name),
+            // `a[i]++` has the element's type, `p.n++` the field's — whichever
+            // the target expression already reports.
+            Expr::IncDec { target, .. } => self.expr_type(target),
             Expr::Println { .. } => NumType::Other,
             // A conditional expression's numeric category is the promotion of
             // its two result branches (Java's conditional-expression typing).
@@ -3292,10 +3393,25 @@ impl Compiler {
     }
 
     /// Lower a constructor to a subroutine named `Class#<init>#argc`. Field
-    /// defaults are emitted by [`Compiler::new_object`] before the call, and the
-    /// field initializers and `{ … }` blocks by the `<instinit>` subroutine it
-    /// calls next, so the body only runs the programmer's constructor
-    /// statements. `this` is slot 0; the ctor returns `null` (discarded).
+    /// *defaults* are emitted by [`Compiler::new_object`] before the call — Java
+    /// zeroes the whole object at allocation — but the field *initializers* and
+    /// `{ … }` blocks run here, in the order JLS 12.5 fixes:
+    ///
+    /// 1. the superclass constructor (explicit `super(…)`, or the implicit
+    ///    `super()` of JLS 8.8.7),
+    /// 2. this class's instance initializers,
+    /// 3. the programmer's constructor statements.
+    ///
+    /// A body opening with `this(…)` runs none of 1 and 2: the constructor it
+    /// delegates to already did, and running the initializers again would apply
+    /// them twice.
+    ///
+    /// The order matters wherever the superclass constructor can observe the
+    /// subclass: a virtual call made from it must see the subclass's fields at
+    /// their defaults, and a field the superclass constructor assigns must not
+    /// be overwritten by an initializer that has not run yet.
+    ///
+    /// `this` is slot 0; the ctor returns `null` (discarded).
     fn compile_ctor(&mut self, cl: &Class, ctor: &Ctor) -> Result<(), String> {
         let entry = self.b.current_pos();
         let param_tys: Vec<String> = ctor.params.iter().map(|p| p.ty.clone()).collect();
@@ -3316,10 +3432,24 @@ impl Compiler {
         // implicit `super()` first. Without it a superclass constructor body
         // never ran at all, so anything it did — a field it set, a virtual call
         // it made — was silently lost.
-        if !Self::chains_explicitly(&ctor.body) {
-            self.emit_implicit_super(&cl.name, ctor.line);
-        }
-        let result = ctor.body.iter().try_for_each(|s| self.stmt(s));
+        let result = match Self::ctor_chain(&ctor.body) {
+            // `this(…)` first: the delegate ran the super chain *and* the
+            // instance initializers, so this body adds neither.
+            CtorChain::This => ctor.body.iter().try_for_each(|s| self.stmt(s)),
+            // `super(…)` first: emit it, then the initializers, then the rest.
+            CtorChain::Super => {
+                let (head, rest) = ctor.body.split_at(1);
+                head.iter().try_for_each(|s| self.stmt(s)).and_then(|()| {
+                    self.emit_inst_init(&cl.name, Recv::This, ctor.line);
+                    rest.iter().try_for_each(|s| self.stmt(s))
+                })
+            }
+            CtorChain::Implicit => {
+                self.emit_super_chain(&cl.name, Recv::This, ctor.line, 0);
+                self.emit_inst_init(&cl.name, Recv::This, ctor.line);
+                ctor.body.iter().try_for_each(|s| self.stmt(s))
+            }
+        };
         self.b.emit(Op::LoadUndef, ctor.line);
         self.b.emit(Op::ReturnValue, ctor.line);
 
@@ -3433,6 +3563,11 @@ impl Compiler {
                 Ok(())
             }
             StmtKind::Expr(Expr::PostIncDec { name, inc }) => self.post_inc_dec(name, *inc),
+            // `a[i]++;` / `++p.n;` in statement position — the same update, with
+            // the result discarded rather than left on the stack.
+            StmtKind::Expr(Expr::IncDec {
+                target, inc, line, ..
+            }) => self.inc_dec(target, *inc, Yield::Nothing, *line),
             StmtKind::Expr(e) => {
                 self.expr(e)?;
                 self.b.emit(Op::Pop, line);
@@ -4299,6 +4434,55 @@ impl Compiler {
         })
     }
 
+    /// Lower `name++` / `++name` in value position, where `name` is a local, a
+    /// global, an implicit `this` field, or a static of the enclosing class.
+    /// Post yields the value read before the mutation, pre the one read after.
+    fn var_inc_dec(&mut self, name: &str, inc: bool, want: Yield) -> Result<(), String> {
+        if want == Yield::Old {
+            self.emit_named_read(name);
+        }
+        self.post_inc_dec(name, inc)?;
+        if want == Yield::New {
+            self.emit_named_read(name);
+        }
+        Ok(())
+    }
+
+    /// Emit a read of a bare name, resolving it the way `post_inc_dec` writes
+    /// it: an implicit `this` field, a static of the enclosing class, or a
+    /// local/global.
+    fn emit_named_read(&mut self, name: &str) {
+        if self.implicit_this_field(name).is_some() {
+            self.emit_this(0);
+            self.emit_field_get(name, 0);
+        } else if let Some((class, _)) = self.static_field_owner(name) {
+            self.emit_global_get(&static_global(&class, name), 0);
+        } else {
+            self.emit_get(name, 0);
+        }
+    }
+
+    /// Lower `lv++` / `++lv` where `lv` is an array element or a field.
+    ///
+    /// JLS 15.14.2/15.15.1 define these as `lv += 1` / `lv -= 1` with the
+    /// implicit narrowing cast a compound assignment carries, so the compound
+    /// path does the work — which is also what evaluates the array, index, or
+    /// receiver exactly once, as Java requires when it has side effects.
+    fn inc_dec(&mut self, target: &Expr, inc: bool, want: Yield, line: u32) -> Result<(), String> {
+        let op = if inc { AssignOp::Add } else { AssignOp::Sub };
+        let one = Expr::Int(1);
+        match target {
+            Expr::Index { array, index } => self.index_update(array, index, op, &one, want, line),
+            Expr::Field { recv, name } => self.field_update(recv, name, op, &one, want, line),
+            // A parenthesized variable still reaches here as `Expr::Var`.
+            Expr::Var(name) => self.var_inc_dec(name, inc, want),
+            _ => Err(format!(
+                "javars: `{}` needs a variable, an array element, or a field (line {line})",
+                if inc { "++" } else { "--" }
+            )),
+        }
+    }
+
     /// Lower `name++` / `name--` as a statement (result discarded), mutating a
     /// local/global or — when `name` is an implicit `this` field — that field.
     fn post_inc_dec(&mut self, name: &str, inc: bool) -> Result<(), String> {
@@ -4667,6 +4851,9 @@ impl Compiler {
                     UnOp::BitNot => {
                         self.b.emit(Op::BitNot, 0);
                     }
+                    // Unary `+` changes no bits — only the static type, which
+                    // `expr_java_type` already reports as the promoted one.
+                    UnOp::Plus => {}
                 }
             }
             Expr::Cast { ty, expr, line } => self.cast(ty, expr, *line)?,
@@ -4678,31 +4865,19 @@ impl Compiler {
             Expr::Println { newline, err, arg } => {
                 self.println(*newline, *err, arg.as_deref())?;
             }
-            Expr::PostIncDec { name, inc } => {
-                // Value position: push the old value, then apply the mutation.
-                if self.implicit_this_field(name).is_some() {
-                    self.emit_this(0);
-                    self.emit_field_get(name, 0);
-                } else if let Some((class, _)) = self.static_field_owner(name) {
-                    self.emit_global_get(&static_global(&class, name), 0);
-                } else {
-                    self.emit_get(name, 0);
-                }
-                self.post_inc_dec(name, *inc)?;
-            }
-            Expr::PreIncDec { name, inc } => {
-                // Value position: apply the mutation first, then read back the
-                // new value — the only difference from `PostIncDec`.
-                self.post_inc_dec(name, *inc)?;
-                if self.implicit_this_field(name).is_some() {
-                    self.emit_this(0);
-                    self.emit_field_get(name, 0);
-                } else if let Some((class, _)) = self.static_field_owner(name) {
-                    self.emit_global_get(&static_global(&class, name), 0);
-                } else {
-                    self.emit_get(name, 0);
-                }
-            }
+            Expr::PostIncDec { name, inc } => self.var_inc_dec(name, *inc, Yield::Old)?,
+            Expr::PreIncDec { name, inc } => self.var_inc_dec(name, *inc, Yield::New)?,
+            Expr::IncDec {
+                target,
+                inc,
+                post,
+                line,
+            } => self.inc_dec(
+                target,
+                *inc,
+                if *post { Yield::Old } else { Yield::New },
+                *line,
+            )?,
             Expr::Call { name, args, line } => self.call(name, args, *line)?,
             Expr::MethodCall {
                 recv,
@@ -5352,30 +5527,6 @@ impl Compiler {
         let obj = self.temp();
         self.emit_set(&obj, line);
 
-        // Every class from the root of the chain down to `class`, in Java's
-        // instance-initialization order, so each level's `<instinit>` runs after
-        // its ancestors'.
-        let init_chain: Vec<String> = {
-            let mut chain = Vec::new();
-            let mut cur = Some(class.to_string());
-            let mut guard = 0;
-            while let Some(name) = cur {
-                let Some(ci) = self.classes.get(&name) else {
-                    break;
-                };
-                cur = ci.superclass.clone();
-                if ci.has_inst_init {
-                    chain.push(name);
-                }
-                guard += 1;
-                if guard > 10000 {
-                    break;
-                }
-            }
-            chain.reverse();
-            chain
-        };
-
         // Seed each field: default value, then its declared initializer if any.
         for (fname, fty, finit) in &field_plan {
             self.emit_get(&obj, line);
@@ -5389,15 +5540,11 @@ impl Compiler {
             self.b.emit(Op::Pop, line);
         }
 
-        // Run each level's instance initialization on the seeded instance.
-        for owner in &init_chain {
-            self.emit_get(&obj, line); // this
-            let mangled = mangle(owner, INST_INIT, &[]);
-            let name_idx = self.b.add_name(&mangled);
-            self.b.emit(Op::Call(name_idx, 1), line);
-            self.emit_exc_check(line);
-            self.b.emit(Op::Pop, line);
-        }
+        // The instance initializers are NOT run here. JLS 12.5 places them
+        // between the superclass constructor and the constructor body, so each
+        // level's `<instinit>` is emitted inside that level's constructor; a
+        // class that declares none has its default constructor synthesized
+        // below.
 
         // Run the constructor (resolving the overload by argument type). A class
         // with no declared ctor accepts only `new C()`.
@@ -5418,18 +5565,11 @@ impl Compiler {
                 args.len(),
                 ctor_arities
             ));
-        } else if let Some(sup) = self.implicit_super_ctor(ctor_class) {
-            // The class declares no constructor, so Java gave it a default one
-            // whose whole body is `super()`. There is no subroutine to call for
-            // it, so the chain is run here — otherwise `new Sub()` on a class
-            // that adds nothing to its parent skipped the parent's constructor
-            // entirely.
-            self.emit_get(&obj, line); // this
-            let mangled = mangle(&sup, "<init>", &[]);
-            let name_idx = self.b.add_name(&mangled);
-            self.b.emit(Op::Call(name_idx, 1), line);
-            self.emit_exc_check(line);
-            self.b.emit(Op::Pop, line);
+        } else {
+            // The class declares no constructor, so Java gave it a default one:
+            // `super()` followed by its instance initializers. There is no
+            // subroutine to call for it, so its body is emitted here.
+            self.emit_default_ctor(ctor_class, Recv::Temp(&obj), line, 0);
         }
 
         // The expression value is the new instance.
@@ -5450,18 +5590,36 @@ impl Compiler {
     ) -> Result<(), String> {
         // The element's declared type decides the assignment conversion, the
         // compound-`/` truncation, and the 32-bit wrap.
+        if op != AssignOp::Assign {
+            return self.index_update(array, index, op, value, Yield::Nothing, line);
+        }
         let elem_ty = self
             .expr_array_type(array)
             .and_then(|t| t.strip_suffix("[]").map(str::to_string));
-        if op == AssignOp::Assign {
-            self.expr(array)?;
-            self.expr(index)?;
-            self.expr_targeted(value, elem_ty.as_deref())?;
-            self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
-            self.b.emit(Op::Pop, line);
-            return Ok(());
-        }
-        // Compound: stash array + index in temps, read old, combine, write back.
+        self.expr(array)?;
+        self.expr(index)?;
+        self.expr_targeted(value, elem_ty.as_deref())?;
+        self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
+    /// Read/modify/write of `a[i]` under a compound operator, leaving `want` on
+    /// the stack — nothing for `a[i] += 1`, the old element for `a[i]++`, the
+    /// new one for `++a[i]`. The array and index expressions are evaluated once
+    /// into temps, so `a[i++]++` steps `i` a single time.
+    fn index_update(
+        &mut self,
+        array: &Expr,
+        index: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        want: Yield,
+        line: u32,
+    ) -> Result<(), String> {
+        let elem_ty = self
+            .expr_array_type(array)
+            .and_then(|t| t.strip_suffix("[]").map(str::to_string));
         let arr_t = self.temp();
         let idx_t = self.temp();
         self.expr(array)?;
@@ -5472,6 +5630,7 @@ impl Compiler {
         self.emit_get(&arr_t, line);
         self.emit_get(&idx_t, line);
         self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
+        let old_t = self.stash_if(want == Yield::Old, line);
         let elem_t = elem_ty
             .as_deref()
             .map(|t| numtype_of_ty(t).unwrap_or(NumType::Other))
@@ -5487,6 +5646,11 @@ impl Compiler {
         self.emit_get(&new_t, line);
         self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
         self.b.emit(Op::Pop, line);
+        match (want, old_t) {
+            (Yield::Old, Some(t)) => self.emit_get(&t, line),
+            (Yield::New, _) => self.emit_get(&new_t, line),
+            _ => {}
+        }
         Ok(())
     }
 
@@ -5501,10 +5665,38 @@ impl Compiler {
         value: &Expr,
         line: u32,
     ) -> Result<(), String> {
+        if op != AssignOp::Assign {
+            return self.field_update(recv, name, op, value, Yield::Nothing, line);
+        }
         // `T.n = …` (or a bare `n` naming a static) writes the class's shared
         // cell, not a field of an object.
         if let Some((class, ty)) = self.static_target(recv, name) {
             return self.static_assign(&class, &ty, name, op, value, line);
+        }
+        let field_ty_name = self.field_type_name(recv, name);
+        self.expr(recv)?;
+        let name_c = self.b.add_constant(Value::str(name.to_string()));
+        self.b.emit(Op::LoadConst(name_c), line);
+        self.expr_targeted(value, field_ty_name.as_deref())?;
+        self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
+        self.b.emit(Op::Pop, line);
+        Ok(())
+    }
+
+    /// Read/modify/write of `recv.field` under a compound operator, leaving
+    /// `want` on the stack — nothing for `p.n += 1`, the old value for `p.n++`,
+    /// the new one for `++p.n`. The receiver is evaluated once, into a temp.
+    fn field_update(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        op: AssignOp,
+        value: &Expr,
+        want: Yield,
+        line: u32,
+    ) -> Result<(), String> {
+        if let Some((class, ty)) = self.static_target(recv, name) {
+            return self.static_update(&static_global(&class, name), &ty, op, value, want, line);
         }
         // The field's declared type drives both the compound-`/` truncation and
         // the 32-bit wrap, so it is resolved here rather than at each call site.
@@ -5514,21 +5706,13 @@ impl Compiler {
             .and_then(numtype_of_ty)
             .unwrap_or(NumType::Other);
         let wrap = self.compound_wraps(field_ty_name.as_deref(), value);
-        if op == AssignOp::Assign {
-            self.expr(recv)?;
-            let name_c = self.b.add_constant(Value::str(name.to_string()));
-            self.b.emit(Op::LoadConst(name_c), line);
-            self.expr_targeted(value, field_ty_name.as_deref())?;
-            self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
-            self.b.emit(Op::Pop, line);
-            return Ok(());
-        }
         let obj_t = self.temp();
         self.expr(recv)?;
         self.emit_set(&obj_t, line);
         // old field value
         self.emit_get(&obj_t, line);
         self.emit_field_get(name, line);
+        let old_t = self.stash_if(want == Yield::Old, line);
         self.emit_compound(op, value, field_ty, field_ty_name.as_deref(), wrap, line)?;
         self.emit_narrow_to(field_ty_name.as_deref(), line);
         let new_t = self.temp();
@@ -5540,6 +5724,11 @@ impl Compiler {
         self.emit_get(&new_t, line);
         self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
         self.b.emit(Op::Pop, line);
+        match (want, old_t) {
+            (Yield::Old, Some(t)) => self.emit_get(&t, line),
+            (Yield::New, _) => self.emit_get(&new_t, line),
+            _ => {}
+        }
         Ok(())
     }
 
@@ -5677,9 +5866,10 @@ impl Compiler {
             }
             return Ok(());
         }
-        // `super(args)` — chain to the superclass constructor. Instance fields
+        // `super(args)` — chain to the superclass constructor. Field defaults
         // (including inherited ones) are already seeded by `new_object`, so this
-        // just runs the parent constructor body on the same `this`.
+        // just runs the parent constructor on the same `this`; that parent runs
+        // its own instance initializers.
         if name == "super" {
             if let Some(this_class) = self.this_class.clone() {
                 if let Some(sup) = self
@@ -5697,6 +5887,17 @@ impl Compiler {
                         let idx = self.b.add_name(&mangled);
                         self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
                         self.emit_exc_check(line);
+                        return Ok(());
+                    }
+                    // An explicit `super()` naming a superclass that declares no
+                    // constructor: it names the default one, which has no
+                    // subroutine, so its body is synthesized here. Emitting
+                    // nothing would drop that level's instance initializers.
+                    if args.is_empty()
+                        && self.classes.get(&sup).is_some_and(|ci| ci.ctors.is_empty())
+                    {
+                        self.emit_default_ctor(&sup, Recv::This, line, 0);
+                        self.b.emit(Op::LoadUndef, line);
                         return Ok(());
                     }
                 }
@@ -6187,6 +6388,9 @@ fn expr_has_ffi(e: &Expr) -> bool {
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Cast { expr, .. } => expr_has_ffi(expr),
         Expr::PreIncDec { .. } => false,
+        // The target is an lvalue — an index or a field chain — whose
+        // subexpressions can still carry a `rust { … }` call.
+        Expr::IncDec { target, .. } => expr_has_ffi(target),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Ternary { cond, then, els } => {
             expr_has_ffi(cond) || expr_has_ffi(then) || expr_has_ffi(els)

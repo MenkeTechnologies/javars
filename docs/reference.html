@@ -313,13 +313,13 @@ synchronized (lock) { System.out.println("critical"); }</code></pre>
         <article class="doc-entry" id="doc-contextual-keywords-22">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-22">#</a> <code>this</code></h3>
           <pre><code class="lang-java">this   |   this.field   |   this.method(args)   |   this::method</code></pre>
-          <p>The receiver of the enclosing instance method or constructor, held in call-frame slot 0. A bare field name that is not a local resolves to <code>this.name</code> implicitly. Using <code>this</code> outside an instance method is a compile error. <code>this(...)</code> constructor delegation is not implemented.</p>
+          <p>The receiver of the enclosing instance method or constructor, held in call-frame slot 0. A bare field name that is not a local resolves to <code>this.name</code> implicitly. Using <code>this</code> outside an instance method is a compile error. <code>this(...)</code> as the first statement of a constructor delegates to another constructor of the same class, which is what runs the <code>super()</code> chain and the instance initializers — so they run exactly once.</p>
           <pre><code class="lang-java">class Point { int x; Point(int x) { this.x = x; } int get() { return x; } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-23">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-23">#</a> <code>super</code></h3>
           <pre><code class="lang-java">super(args); super.method(args); super.field</code></pre>
-          <p>Three forms. <code>super(args)</code> is explicit superclass constructor chaining: the instance's fields — inherited ones included — are already seeded when the call runs, so it just executes the parent constructor body on the same receiver. <code>super.method(args)</code> is a **non-virtual** call to the implementation the enclosing class inherits — resolution starts at the declaring class's superclass, never at the receiver's runtime class, which is what lets an override call the version it overrides without recursing; overload selection, varargs packing and a walk past a parent that does not declare the method all happen at that superclass. Everything inside the body it reaches still dispatches virtually, so a <code>super.m()</code> whose callee calls an unqualified <code>n()</code> reaches the subclass's <code>n</code>. <code>super.field</code> is the same field cell <code>this.field</code> names (javars merges a class's fields with its ancestors', so field *hiding* is not modeled — see BUGS.md). When no user class up the chain declares the member, <code>super.toString</code>/<code>equals</code>/<code>hashCode</code> answer <code>java.lang.Object</code>'s.</p>
+          <p>Three forms. <code>super(args)</code> is explicit superclass constructor chaining: every field in the chain is already seeded with its type default when the call runs, so the parent constructor executes on the same receiver — running its *own* instance initializers before its body, per JLS 12.5, which is why a virtual call it makes sees the subclass's fields still at their defaults. <code>super.method(args)</code> is a **non-virtual** call to the implementation the enclosing class inherits — resolution starts at the declaring class's superclass, never at the receiver's runtime class, which is what lets an override call the version it overrides without recursing; overload selection, varargs packing and a walk past a parent that does not declare the method all happen at that superclass. Everything inside the body it reaches still dispatches virtually, so a <code>super.m()</code> whose callee calls an unqualified <code>n()</code> reaches the subclass's <code>n</code>. <code>super.field</code> is the same field cell <code>this.field</code> names (javars merges a class's fields with its ancestors', so field *hiding* is not modeled — see BUGS.md). When no user class up the chain declares the member, <code>super.toString</code>/<code>equals</code>/<code>hashCode</code> answer <code>java.lang.Object</code>'s.</p>
           <pre><code class="lang-java">class Cat extends Animal { public String toString() { return "Cat/" + super.toString(); } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-24">
@@ -533,170 +533,179 @@ System.out.println(7.0 / 0.0);   // Infinity</code></pre>
           <pre><code class="lang-java">int n = -5;</code></pre>
         </article>
         <article class="doc-entry" id="doc-operators-7">
-          <h3><a class="doc-anchor" href="#doc-operators-7">#</a> <code>!</code></h3>
+          <h3><a class="doc-anchor" href="#doc-operators-7">#</a> <code>unary +</code></h3>
+          <pre><code class="lang-java">+a</code></pre>
+          <p>Changes no bits, but it is not a no-op: JLS 5.6.1 applies unary numeric promotion, so a <code>byte</code>, <code>short</code> or <code>char</code> operand becomes an <code>int</code>. For <code>char</code> that is visible, because the promoted type is what picks the rendering — <code>"" + +c</code> prints the code point where <code>"" + c</code> prints the letter.</p>
+          <pre><code class="lang-java">char c = 'A';
+System.out.println("" + +c);   // 65
+System.out.println("" + c);    // A</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-operators-8">
+          <h3><a class="doc-anchor" href="#doc-operators-8">#</a> <code>!</code></h3>
           <pre><code class="lang-java">!a</code></pre>
           <p>Logical negation, lowered to <code>Op::LogNot</code>.</p>
           <pre><code class="lang-java">if (!done) { System.out.println("still going"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-8">
-          <h3><a class="doc-anchor" href="#doc-operators-8">#</a> <code>==</code></h3>
+        <article class="doc-entry" id="doc-operators-9">
+          <h3><a class="doc-anchor" href="#doc-operators-9">#</a> <code>==</code></h3>
           <pre><code class="lang-java">a == b</code></pre>
           <p>Equality. Numbers and booleans compare by value and heap objects by handle identity — but two equal *strings* also compare equal, because javars models a <code>String</code> as a value rather than a reference. That is the one place <code>==</code> diverges: <code>"hi" == "h" + "i"</code> is <code>true</code> here and <code>false</code> in Java.</p>
           <pre><code class="lang-java">System.out.println("hi" == "h" + "i");   // true  (Java prints false)</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-9">
-          <h3><a class="doc-anchor" href="#doc-operators-9">#</a> <code>!=</code></h3>
+        <article class="doc-entry" id="doc-operators-10">
+          <h3><a class="doc-anchor" href="#doc-operators-10">#</a> <code>!=</code></h3>
           <pre><code class="lang-java">a != b</code></pre>
           <p>Inequality — the exact negation of <code>==</code>, including its string behaviour.</p>
           <pre><code class="lang-java">if (n != 0) { System.out.println(100 / n); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-10">
-          <h3><a class="doc-anchor" href="#doc-operators-10">#</a> <code>&lt;</code></h3>
+        <article class="doc-entry" id="doc-operators-11">
+          <h3><a class="doc-anchor" href="#doc-operators-11">#</a> <code>&lt;</code></h3>
           <pre><code class="lang-java">a &lt; b</code></pre>
           <p>Less-than. Numeric operands compare numerically; a string operand compares lexicographically by <code>char</code> through the numeric hook, which Java would reject at compile time.</p>
           <pre><code class="lang-java">if (i &lt; 3) { System.out.println(i); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-11">
-          <h3><a class="doc-anchor" href="#doc-operators-11">#</a> <code>&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-12">
+          <h3><a class="doc-anchor" href="#doc-operators-12">#</a> <code>&gt;</code></h3>
           <pre><code class="lang-java">a &gt; b</code></pre>
           <p>Greater-than, with the same numeric-or-lexicographic behaviour as <code>&lt;</code>.</p>
           <pre><code class="lang-java">if (score &gt; best) { best = score; }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-12">
-          <h3><a class="doc-anchor" href="#doc-operators-12">#</a> <code>&lt;=</code></h3>
+        <article class="doc-entry" id="doc-operators-13">
+          <h3><a class="doc-anchor" href="#doc-operators-13">#</a> <code>&lt;=</code></h3>
           <pre><code class="lang-java">a &lt;= b</code></pre>
           <p>Less-than-or-equal.</p>
           <pre><code class="lang-java">for (int i = 1; i &lt;= 10; i++) { }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-13">
-          <h3><a class="doc-anchor" href="#doc-operators-13">#</a> <code>&gt;=</code></h3>
+        <article class="doc-entry" id="doc-operators-14">
+          <h3><a class="doc-anchor" href="#doc-operators-14">#</a> <code>&gt;=</code></h3>
           <pre><code class="lang-java">a &gt;= b</code></pre>
           <p>Greater-than-or-equal.</p>
           <pre><code class="lang-java">if (n &gt;= 0) { System.out.println("non-negative"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-14">
-          <h3><a class="doc-anchor" href="#doc-operators-14">#</a> <code>&amp;&amp;</code></h3>
+        <article class="doc-entry" id="doc-operators-15">
+          <h3><a class="doc-anchor" href="#doc-operators-15">#</a> <code>&amp;&amp;</code></h3>
           <pre><code class="lang-java">a &amp;&amp; b</code></pre>
           <p>Short-circuiting conjunction: the right operand is not evaluated when the left is false. Lowered to <code>Op::JumpIfFalseKeep</code>, so no builtin call and no allocation are involved.</p>
           <pre><code class="lang-java">if (s != null &amp;&amp; s.length() &gt; 0) { System.out.println(s); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-15">
-          <h3><a class="doc-anchor" href="#doc-operators-15">#</a> <code>||</code></h3>
+        <article class="doc-entry" id="doc-operators-16">
+          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>||</code></h3>
           <pre><code class="lang-java">a || b</code></pre>
           <p>Short-circuiting disjunction, the mirror of <code>&amp;&amp;</code> via <code>Op::JumpIfTrueKeep</code>.</p>
           <pre><code class="lang-java">if (n &lt; 0 || n &gt; 100) { System.out.println("out of range"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-16">
-          <h3><a class="doc-anchor" href="#doc-operators-16">#</a> <code>=</code></h3>
+        <article class="doc-entry" id="doc-operators-17">
+          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>=</code></h3>
           <pre><code class="lang-java">name = expr;   |   a[i] = expr;   |   obj.f = expr;</code></pre>
           <p>Assignment, in the three target forms javars lowers separately: a local or global slot, an array element through <code>JARRAY_SET</code>, and an instance field through <code>JFIELD_SET</code>. Assignment is a statement, not an expression — <code>x = y = 0</code> does not parse.</p>
           <pre><code class="lang-java">int n = 0;
 n = 5;
 arr[0] = n;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-17">
-          <h3><a class="doc-anchor" href="#doc-operators-17">#</a> <code>+=</code></h3>
+        <article class="doc-entry" id="doc-operators-18">
+          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>+=</code></h3>
           <pre><code class="lang-java">target += expr;</code></pre>
           <p>Compound addition, on any of the three assignable targets. When the target is declared <code>int</code> the result is narrowed back to 32 bits on store, so <code>int</code> overflow wraps exactly as <code>javac</code> compiles it. With a <code>String</code> target it appends.</p>
           <pre><code class="lang-java">int i = 5; i += 2;   // 7
 String s = "a"; s += "b";   // "ab"</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-18">
-          <h3><a class="doc-anchor" href="#doc-operators-18">#</a> <code>-=</code></h3>
+        <article class="doc-entry" id="doc-operators-19">
+          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>-=</code></h3>
           <pre><code class="lang-java">target -= expr;</code></pre>
           <p>Compound subtraction, with the same <code>int</code> narrowing on store.</p>
           <pre><code class="lang-java">int i = 5; i -= 2;   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-19">
-          <h3><a class="doc-anchor" href="#doc-operators-19">#</a> <code>*=</code></h3>
+        <article class="doc-entry" id="doc-operators-20">
+          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>*=</code></h3>
           <pre><code class="lang-java">target *= expr;</code></pre>
           <p>Compound multiplication.</p>
           <pre><code class="lang-java">int i = 5; i *= 2;   // 10</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-20">
-          <h3><a class="doc-anchor" href="#doc-operators-20">#</a> <code>/=</code></h3>
+        <article class="doc-entry" id="doc-operators-21">
+          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>/=</code></h3>
           <pre><code class="lang-java">target /= expr;</code></pre>
           <p>Compound division, following the same integral-versus-floating split as <code>/</code>.</p>
           <pre><code class="lang-java">int i = 10; i /= 2;   // 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-21">
-          <h3><a class="doc-anchor" href="#doc-operators-21">#</a> <code>%=</code></h3>
+        <article class="doc-entry" id="doc-operators-22">
+          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>%=</code></h3>
           <pre><code class="lang-java">target %= expr;</code></pre>
           <p>Compound remainder.</p>
           <pre><code class="lang-java">int i = 10; i %= 4;   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-22">
-          <h3><a class="doc-anchor" href="#doc-operators-22">#</a> <code>++</code></h3>
+        <article class="doc-entry" id="doc-operators-23">
+          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>++</code></h3>
           <pre><code class="lang-java">name++;   |   a[i]++;   |   obj.f++;</code></pre>
-          <p>Post-increment, narrowing back to 32 bits when the target is <code>int</code>. In value position it evaluates to the value the variable *held*, with the update applied after; the prefix form <code>++i</code> updates first and evaluates to the new value.</p>
+          <p>Post-increment. JLS 15.14.2 defines it as <code>+= 1</code> with the implicit narrowing cast a compound assignment carries, so <code>byte b = 127; b++</code> is -128 and an <code>int</code> wraps at 32 bits. In value position it evaluates to the value the target *held*, with the update applied after; the prefix form <code>++i</code> updates first and evaluates to the new value. Any lvalue works — a local, an array element, an instance field, a <code>static</code> — and the array, index, or receiver is evaluated exactly once, so <code>a[idx()]++</code> calls <code>idx()</code> a single time.</p>
           <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { }
 int v = 5; System.out.println(v++ + "," + v);   // 5,6
-int w = 5; System.out.println(++w + "," + w);   // 6,6</code></pre>
+int w = 5; System.out.println(++w + "," + w);   // 6,6
+int[] a = {1}; System.out.println(a[0]++ + "," + a[0]);   // 1,2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-23">
-          <h3><a class="doc-anchor" href="#doc-operators-23">#</a> <code>--</code></h3>
+        <article class="doc-entry" id="doc-operators-24">
+          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>--</code></h3>
           <pre><code class="lang-java">name--;   |   a[i]--;   |   obj.f--;</code></pre>
           <p>Post-decrement, with the same value-position rule as <code>++</code>: <code>n--</code> evaluates to the old value, <code>--n</code> to the new one.</p>
           <pre><code class="lang-java">int n = 3; n--;   // 2
 int m = 3; System.out.println(--m);   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-24">
-          <h3><a class="doc-anchor" href="#doc-operators-24">#</a> <code>&amp;</code></h3>
+        <article class="doc-entry" id="doc-operators-25">
+          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>&amp;</code></h3>
           <pre><code class="lang-java">a &amp; b</code></pre>
           <p>Bitwise AND on integral operands (fusevm's native <code>Op::BitAnd</code>), and Java's *non-short-circuiting* logical AND on <code>boolean</code> operands — where the result must stay a boolean rather than the 0/1 an integer op would leave, so it lowers to <code>Op::LogAnd</code> instead. The operand types decide which.</p>
           <pre><code class="lang-java">System.out.println(5 &amp; 3);        // 1
 System.out.println(true &amp; false); // false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-25">
-          <h3><a class="doc-anchor" href="#doc-operators-25">#</a> <code>|</code></h3>
+        <article class="doc-entry" id="doc-operators-26">
+          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>|</code></h3>
           <pre><code class="lang-java">a | b</code></pre>
           <p>Bitwise OR, and the non-short-circuiting logical OR on booleans — the mirror of <code>&amp;</code>. Also the separator of a multi-catch's alternative types.</p>
           <pre><code class="lang-java">System.out.println(5 | 3);       // 7
 System.out.println(true | false); // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-26">
-          <h3><a class="doc-anchor" href="#doc-operators-26">#</a> <code>^</code></h3>
+        <article class="doc-entry" id="doc-operators-27">
+          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>^</code></h3>
           <pre><code class="lang-java">a ^ b</code></pre>
           <p>Bitwise XOR on integers; on two booleans it is exactly "they differ", lowered to <code>Op::NumNe</code> so the result prints <code>true</code>/<code>false</code>.</p>
           <pre><code class="lang-java">System.out.println(5 ^ 3);       // 6
 System.out.println(true ^ true); // false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-27">
-          <h3><a class="doc-anchor" href="#doc-operators-27">#</a> <code>~</code></h3>
+        <article class="doc-entry" id="doc-operators-28">
+          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>~</code></h3>
           <pre><code class="lang-java">~a</code></pre>
           <p>Bitwise complement of an integral operand (<code>Op::BitNot</code>). Unary numeric promotion widens <code>byte</code>/<code>short</code>/<code>char</code> to <code>int</code> and leaves <code>long</code> alone.</p>
           <pre><code class="lang-java">System.out.println(~5);   // -6</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-28">
-          <h3><a class="doc-anchor" href="#doc-operators-28">#</a> <code>&lt;&lt;</code></h3>
+        <article class="doc-entry" id="doc-operators-29">
+          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>&lt;&lt;</code></h3>
           <pre><code class="lang-java">a &lt;&lt; n</code></pre>
           <p>Left shift. Java masks the distance to the width of the **left** operand — 5 bits for <code>int</code>, 6 for <code>long</code> — so <code>1 &lt;&lt; 33</code> is <code>1 &lt;&lt; 1</code>; only that operand is promoted, so <code>1 &lt;&lt; 2L</code> is still an <code>int</code>. The mask is emitted explicitly because fusevm's <code>Op::Shl</code> always masks to 6 bits, and an <code>int</code> result is narrowed afterwards.</p>
           <pre><code class="lang-java">System.out.println(1 &lt;&lt; 31);  // -2147483648
 System.out.println(1 &lt;&lt; 33);  // 2
 System.out.println(1L &lt;&lt; 40); // 1099511627776</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-29">
-          <h3><a class="doc-anchor" href="#doc-operators-29">#</a> <code>&gt;&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-30">
+          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>&gt;&gt;</code></h3>
           <pre><code class="lang-java">a &gt;&gt; n</code></pre>
           <p>Arithmetic (sign-propagating) right shift, with the same width masking as <code>&lt;&lt;</code>. Lexed as one token, which is why every generic-argument skipper weighs a closing token by how many <code>&gt;</code> it spells — otherwise <code>List&lt;List&lt;String&gt;&gt;</code> would not parse.</p>
           <pre><code class="lang-java">System.out.println(-8 &gt;&gt; 1);   // -4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-30">
-          <h3><a class="doc-anchor" href="#doc-operators-30">#</a> <code>&gt;&gt;&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-31">
+          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>&gt;&gt;&gt;</code></h3>
           <pre><code class="lang-java">a &gt;&gt;&gt; n</code></pre>
           <p>Logical (zero-fill) right shift. Java zero-fills at the operand's width, which fusevm has no native op for — <code>Op::Shr</code> is always arithmetic on 64 bits — so this routes through the <code>JUSHR</code> builtin with the width the compiler determined.</p>
           <pre><code class="lang-java">System.out.println(-8 &gt;&gt;&gt; 1);   // 2147483644
 System.out.println(-8L &gt;&gt;&gt; 1);  // 9223372036854775804</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-31">
-          <h3><a class="doc-anchor" href="#doc-operators-31">#</a> <code>&amp;=  |=  ^=  &lt;&lt;=  &gt;&gt;=  &gt;&gt;&gt;=</code></h3>
+        <article class="doc-entry" id="doc-operators-32">
+          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>&amp;=  |=  ^=  &lt;&lt;=  &gt;&gt;=  &gt;&gt;&gt;=</code></h3>
           <pre><code class="lang-java">target &amp;= expr;   |   target &lt;&lt;= expr;   |   target &gt;&gt;&gt;= expr;</code></pre>
           <p>The bitwise and shift compound assignments, on any of the three assignable targets. Each applies the same rules as its binary form: the shifts mask their distance to the *target's* width and <code>&gt;&gt;&gt;=</code> zero-fills at it, and <code>&amp;=</code>/<code>|=</code>/<code>^=</code> stay logical when the operand is a boolean.</p>
           <pre><code class="lang-java">int v = 1; v &lt;&lt;= 3; v |= 1; v &amp;= 14; v ^= 3;
 System.out.println(v);   // 11</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-32">
-          <h3><a class="doc-anchor" href="#doc-operators-32">#</a> <code>(type) expr</code></h3>
+        <article class="doc-entry" id="doc-operators-33">
+          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>(type) expr</code></h3>
           <pre><code class="lang-java">(int) d   |   (byte) n   |   (char) code   |   (Object) x</code></pre>
           <p>A cast. Java's narrowing primitive conversions are real value changes and route through the <code>JCAST</code> builtin: floating to integral *saturates* (<code>(int) 1e18</code> is <code>Integer.MAX_VALUE</code>) and truncates toward zero, and the integral narrowings are two's-complement. A widening or identity cast emits the operand alone, so <code>(int) i</code> stays native. A reference cast is a no-op (see <code>ClassCastException</code>). <code>(char) n</code> produces the one-character string javars models a <code>char</code> as.</p>
           <pre><code class="lang-java">System.out.println((int) 3.99);    // 3
@@ -704,41 +713,41 @@ System.out.println((byte) 200);    // -56
 System.out.println((char) 65);     // A
 System.out.println((double) 7 / 2); // 3.5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-33">
-          <h3><a class="doc-anchor" href="#doc-operators-33">#</a> <code>?:</code></h3>
+        <article class="doc-entry" id="doc-operators-34">
+          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>?:</code></h3>
           <pre><code class="lang-java">cond ? a : b</code></pre>
           <p>The conditional expression. Exactly one arm is evaluated; the untaken arm's code is jumped over, so a side effect in it never runs.</p>
           <pre><code class="lang-java">String label = n &gt; 4 ? "big" : "small";</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-34">
-          <h3><a class="doc-anchor" href="#doc-operators-34">#</a> <code>-&gt;</code></h3>
+        <article class="doc-entry" id="doc-operators-35">
+          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>-&gt;</code></h3>
           <pre><code class="lang-java">(params) -&gt; expr   |   (params) -&gt; { … }   |   p -&gt; expr</code></pre>
           <p>The lambda arrow, and the arrow form of <code>switch</code>. A lambda becomes a heap closure that snapshots every enclosing local by value at the point the literal runs, which is observationally exact because Java only permits capture of effectively-final locals.</p>
           <pre><code class="lang-java">Function&lt;Object,Object&gt; up = s -&gt; s + "!";
 System.out.println(up.apply("hi"));   // hi!</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-35">
-          <h3><a class="doc-anchor" href="#doc-operators-35">#</a> <code>::</code></h3>
+        <article class="doc-entry" id="doc-operators-36">
+          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>::</code></h3>
           <pre><code class="lang-java">Type::member   |   value::method   |   this::method</code></pre>
           <p>The method-reference separator. Every form is desugared in the compiler into an equivalent lambda with synthesized parameter names, so a method reference and the lambda it stands for share one code path.</p>
           <pre><code class="lang-java">Function&lt;Object,Object&gt; up = String::toUpperCase;</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-36">
-          <h3><a class="doc-anchor" href="#doc-operators-36">#</a> <code>[]</code></h3>
+        <article class="doc-entry" id="doc-operators-37">
+          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>[]</code></h3>
           <pre><code class="lang-java">array[index]</code></pre>
           <p>Array subscript, through <code>JARRAY_GET</code> for a read and <code>JARRAY_SET</code> for a write. Both are bounds-checked; an out-of-range index raises <code>ArrayIndexOutOfBoundsException</code> carrying Java's <code>Index N out of bounds for length M</code> message, and a null array raises a NullPointerException.</p>
           <pre><code class="lang-java">int[] a = {1, 2, 3};
 System.out.println(a[1]);   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-37">
-          <h3><a class="doc-anchor" href="#doc-operators-37">#</a> <code>.</code></h3>
+        <article class="doc-entry" id="doc-operators-38">
+          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>.</code></h3>
           <pre><code class="lang-java">recv.field   |   recv.method(args)   |   Class.staticMember</code></pre>
           <p>Member access. A field read routes through <code>JFIELD_GET</code> (which also serves an array's <code>.length</code>), an instance call through the receiver's dispatch chain, and a static member through the owning class's chunk global. A <code>null</code> receiver raises a NullPointerException naming the operation.</p>
           <pre><code class="lang-java">System.out.println(p.x);
 System.out.println(arr.length);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-operators-38">
-          <h3><a class="doc-anchor" href="#doc-operators-38">#</a> <code>()</code></h3>
+        <article class="doc-entry" id="doc-operators-39">
+          <h3><a class="doc-anchor" href="#doc-operators-39">#</a> <code>()</code></h3>
           <pre><code class="lang-java">name(args)   |   recv.name(args)   |   Class.name(args)</code></pre>
           <p>Invocation. A bare name resolves to a user <code>static</code> method (choosing the overload with the lowest assignment cost) or, in a program carrying an inline <code>rust { … }</code> block, to an FFI export dispatched by name. Every call site in a program that uses exceptions also carries a pending-exception check.</p>
           <pre><code class="lang-java">System.out.println(Helper.twice(3));</code></pre>
@@ -1696,22 +1705,22 @@ for (String a : args) { System.out.println(a); }</code></pre>
         <article class="doc-entry" id="doc-class-members-3">
           <h3><a class="doc-anchor" href="#doc-class-members-3">#</a> <code>instance field</code></h3>
           <pre><code class="lang-java">[modifiers] T name [= initializer];</code></pre>
-          <p>Per-instance state, held in the instance's field map on the host heap. Fields are seeded with their type's default when the object is allocated and then run their initializers, before the selected constructor body. Inherited fields are seeded at the same time, which is why an explicit <code>super(...)</code> only has to run the parent's body.</p>
+          <p>Per-instance state, held in the instance's field map on the host heap. Every field in the class chain is seeded with its type's default when the object is allocated. The *initializers* run later, inside each constructor, at the point JLS 12.5 fixes: after the superclass constructor and before the constructor body. So a field initializer may read an inherited field the superclass constructor just assigned, and a superclass constructor that calls an overridden method sees the subclass's fields at their defaults.</p>
           <pre><code class="lang-java">class Point { int x; int y = 5; }</code></pre>
         </article>
         <article class="doc-entry" id="doc-class-members-4">
           <h3><a class="doc-anchor" href="#doc-class-members-4">#</a> <code>constructor</code></h3>
           <pre><code class="lang-java">[modifiers] ClassName(params) { … }</code></pre>
-          <p>Initializes a freshly allocated instance. Constructors overload on parameter type, resolved by the same lowest-assignment-cost rule methods use. A class that declares none gets the implicit no-argument form. <code>this(...)</code> delegation is not implemented.</p>
+          <p>Initializes a freshly allocated instance, in the three steps JLS 12.5 fixes: the superclass constructor, then this class's field initializers and <code>{ … }</code> blocks in textual order, then the body. Constructors overload on parameter type, resolved by the same lowest-assignment-cost rule methods use. A class that declares none gets the implicit no-argument form, whose body is exactly <code>super()</code> followed by those initializers. Opening the body with <code>this(...)</code> delegates instead, and the delegate runs both steps, so they never run twice.</p>
           <pre><code class="lang-java">class Point { int x; Point(int x) { this.x = x; } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-class-members-5">
           <h3><a class="doc-anchor" href="#doc-class-members-5">#</a> <code>implicit super()</code></h3>
           <pre><code class="lang-java">class Sub extends Base { /* no declared constructor */ }</code></pre>
-          <p>A divergence worth stating plainly: javars never emits the implicit <code>super()</code> call. A subclass that declares no constructor of its own — or one whose constructor does not begin with an explicit <code>super(...)</code> — silently skips its parent's constructor body, so fields the parent would have assigned keep their type defaults. Write <code>super(...)</code> explicitly and the parent body runs normally.</p>
+          <p>JLS 8.8.7: a constructor body that does not open with an explicit <code>this(...)</code> or <code>super(...)</code> runs an implicit <code>super()</code> first, and a class that declares no constructor at all gets a default one that does exactly that. Both are emitted, so a parent's constructor body runs whether or not the subclass wrote one, and an intermediate class that declares no constructor still contributes its own <code>{ … }</code> blocks at its point in the chain.</p>
           <pre><code class="lang-java">class Animal { String sound; Animal() { sound = "generic"; } }
 class Dog extends Animal { }
-// new Dog().sound is null here; Java gives "generic"</code></pre>
+System.out.println(new Dog().sound);   // generic</code></pre>
         </article>
         <article class="doc-entry" id="doc-class-members-6">
           <h3><a class="doc-anchor" href="#doc-class-members-6">#</a> <code>static field</code></h3>
