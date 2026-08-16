@@ -137,12 +137,17 @@ at the bottom, and are summarized in the section right after this one.
   subnormal whose shortest form is one digit. Deciding it needs the value's
   *exact* decimal expansion, because `10^exp` is not itself representable down
   there — the arithmetic `v / 10^(exp-1)` underflows to zero.
-- **`%e` and `%g` round HALF_UP.** Java's `Formatter` rounds through
-  `BigDecimal.ROUND_HALF_UP`, so `%e` of 5592405.5 is `5.592406e+06` where
-  half-to-even gives `5.592405e+06`. `%f` already did this; the scientific and
-  general conversions now take their digits from the value's own decimal
-  expansion for the same reason — scaling by a power of ten first would round the
-  tie away before it could be seen.
+- **`%f`, `%e` and `%g` round the *shortest* decimal HALF_UP.** Java's
+  `Formatter` rounds through `BigDecimal.ROUND_HALF_UP`, so `%e` of 5592405.5 is
+  `5.592406e+06` where half-to-even gives `5.592405e+06` — and the digits it
+  rounds are the value's shortest round-trip decimal, not its exact binary
+  expansion. That is the whole of why `%.2f` of 1.005 is `1.01`: the exact value
+  is 1.00499999999999989…, so rounding the expansion answers `1.00`, while the
+  digits `1.005` round up. The same source is why `%.20f` of 0.1 is
+  `0.10000000000000000000` and not `0.10000000000000000555` — a precision past
+  the digits the value has pads with zeros. Scaling by a power of ten before
+  rounding would round the tie away before it could be seen, so all three
+  conversions take their digits from the same place.
 - **Fully-qualified type names.** `java.util.List<String> l`,
   `new java.util.ArrayList<>()`, `static java.lang.String greet(java.lang.String
   who)`, a qualified field type, `catch (java.util.regex.PatternSyntaxException
@@ -172,7 +177,10 @@ at the bottom, and are summarized in the section right after this one.
   the *target's* width, not at `int`'s: `byte` and `short` sign-extend (`-56`,
   `-32768`), `char` masks to 16 unsigned bits (`65535` + 1 is 0). Applies to
   every compound operator and to `++`/`--`, on a local, a field, a `static`, and
-  an array element.
+  an array element. The same rule reads `(T)` literally when `T` is integral and
+  the right-hand side is floating: `int x = 1; x += 1.5;` is `x = (int)(1 + 1.5)`
+  and stores 2, and the cast saturates the way `(int)` does rather than wrapping,
+  so `int o = 2147483647; o += 1.0;` stays `2147483647`.
 - **The whole integer-literal syntax.** Decimal, hex (`0x1F`), binary
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
@@ -194,7 +202,7 @@ at the bottom, and are summarized in the section right after this one.
   `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
   %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, the `-`/`0`/`+`/`,`/`(`
   flags, width, `.precision`, and explicit argument indexes (`%2$s`); `%f` rounds
-  HALF_UP on the double's exact value, as Java's `Formatter` does. Each
+  the value's shortest round-trip decimal HALF_UP, as Java's `Formatter` does. Each
   conversion is type-checked against its argument's boxed class the way
   `java.util.Formatter` is, so `String.format("%.2f", 3)` raises
   `java.util.IllegalFormatConversionException: f != java.lang.Integer` instead of
@@ -262,10 +270,24 @@ at the bottom, and are summarized in the section right after this one.
   to a method, mutate an element, and the caller observes the change. Out-of-range
   indices fault like `ArrayIndexOutOfBoundsException`.
 - **Classes and objects.** `class C { fields; C(params){…}; methods }` — instance
-  fields (with initializers that run before the constructor), constructors,
+  fields, constructors,
   instance methods, `this`, `new C(…)`, field access (`obj.f`, `obj.f = v`), and
   implicit-`this` field/method access. Multiple classes per file, including nested
   `static` classes. Instances are heap objects with reference/aliasing semantics.
+- **Instance initialization (JLS 8.6, 8.8.7).** Every field is seeded with its
+  type's default, then each class in the chain runs its own initialization —
+  field initializers and bare `{ … }` instance-initializer blocks, in textual
+  order — with `this` bound, so a block can call an instance method and a field
+  initializer can read a field declared above it. A constructor body that does
+  not open with `this(…)`/`super(…)` runs an implicit `super()`, and a class that
+  declares no constructor gets Java's default one, which is exactly that call —
+  so a superclass constructor runs whether or not the subclass wrote one, and a
+  virtual call made from it reaches the subclass's override.
+- **Explicit constructor invocation.** `super(args)` chains to the superclass
+  constructor and `this(args)` delegates to another constructor of the same class
+  (the telescoping-constructor shape); the delegate is what runs the `super()`
+  chain, so it is never run twice. Both resolve their target by argument type,
+  variable-arity constructors included.
 - **`java.lang.Object`.** `new Object()` allocates the fieldless root instance,
   with a distinct identity per allocation — so it works as a lock, as a sentinel
   compared with `==`, and as a `HashMap` key or `HashSet` element (two of them
@@ -999,6 +1021,22 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Collections.sort` of an enum list work.
 - **Sealed types, inner (non-`static`) classes,** and **anonymous classes** other
   than the enum-constant body form.
+- **Assignment as an *expression*.** `n = 5` is a statement here, not a value, so
+  the idioms that read the assigned value back — `if (f && (n = 5) > 0)`,
+  `while ((c = next()) != -1)`, `a = b = 0` — stop at
+  ``javars: expected RParen but found Assign``. The AST has no value-producing
+  assignment node: `Assign`/`IndexAssign`/`FieldAssign` are all `StmtKind`, and
+  each of the four target kinds (local, `static`, field, array element) has its
+  own lowering that stores without leaving the value. Compound forms, the
+  narrowing cast above, and the once-only evaluation of a target's subexpressions
+  all have to survive the addition, so it is a real change rather than a parser
+  tweak.
+- **A type *parameter* that shadows a class name.** `class Box<T>` inside a
+  program that also declares a class `T` reads the declared return type `T` as
+  that class, so `box.get().length()` is rejected as ``class `T` has no method
+  `length` `` where Java erases the parameter to `Object` and dispatches at
+  runtime. Generic code whose type parameters do not collide with a declared
+  class name (the ordinary case) is unaffected.
 
 ## Modeled with a documented simplification
 

@@ -116,6 +116,13 @@ pub struct Class {
     /// initializer lowered to an assignment, interleaved with the bodies of the
     /// `static { … }` blocks. Run once, before `main`.
     pub static_init: Vec<Stmt>,
+    /// The class's *instance* initialization, in textual order: each instance
+    /// field initializer lowered to a `this.f = …` assignment, interleaved with
+    /// the bodies of the bare `{ … }` instance-initializer blocks. Run on every
+    /// new instance before its constructor body — which is why the statements
+    /// live here rather than in [`FieldDecl::init`]: a block needs a bound
+    /// `this`, and so does a field initializer that reads an earlier field.
+    pub inst_init: Vec<Stmt>,
     /// Declared constructors. Empty means the implicit no-arg default ctor.
     pub ctors: Vec<Ctor>,
     /// Instance (non-static) methods.

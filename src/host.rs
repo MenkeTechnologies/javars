@@ -1017,14 +1017,17 @@ fn array_descriptor(ty: &str) -> Option<String> {
 /// descriptor is decoded back rather than truncated.
 fn simple_class_name(binary: &str) -> String {
     if let Some(component) = binary.strip_prefix('[') {
-        return format!("{}[]", simple_class_name(component));
+        // A one-character primitive descriptor is only a descriptor *inside* an
+        // array type. At the top level `B` is the ordinary binary name of a
+        // class the program called `B`, and answering `byte` for it renamed
+        // every user class whose name is one of the eight descriptor letters.
+        let elem = descriptor_primitive(component)
+            .map(str::to_string)
+            .unwrap_or_else(|| simple_class_name(component));
+        return format!("{elem}[]");
     }
     if let Some(reference) = binary.strip_prefix('L').and_then(|r| r.strip_suffix(';')) {
         return simple_class_name(reference);
-    }
-    // A one-character descriptor only ever reaches here from inside an array.
-    if let Some(primitive) = descriptor_primitive(binary) {
-        return primitive.to_string();
     }
     let after_package = binary.rsplit('.').next().unwrap_or(binary);
     after_package
@@ -4968,9 +4971,22 @@ fn fixed_half_up(x: f64, prec: usize) -> String {
     if !x.is_finite() {
         return java_str(&Value::float(x));
     }
-    let exact = format!("{:.*}", prec + 30, x.abs());
+    // Java rounds the value's *shortest round-trip decimal*, not its exact
+    // binary expansion. `%.2f` of 1.005 is `1.01` because the digits it rounds
+    // are `1.005`, where the exact value is 1.00499999999999989…, and `%.20f` of
+    // 0.1 is `0.10000000000000000000` rather than …0555. Rust's `{}` for `f64`
+    // is that same shortest representation and never uses exponent notation, so
+    // it is the digit string to cut — padded with zeros when the requested
+    // precision runs past the digits the value actually has.
+    let mut exact = format!("{}", x.abs());
+    if !exact.contains('.') {
+        exact.push('.');
+    }
     let point = exact.find('.').unwrap_or(exact.len());
     let cut = point + if prec == 0 { 0 } else { prec + 1 };
+    while exact.len() <= point + prec + 1 {
+        exact.push('0');
+    }
     let round_up = exact[cut..]
         .chars()
         .find(char::is_ascii_digit)
@@ -5030,9 +5046,12 @@ fn sci_notation(x: f64, prec: usize) -> String {
 /// because scaling by a power of ten is itself inexact and would round the tie
 /// away before it could be seen.
 fn sci_digits_half_up(x: f64, prec: usize) -> (String, i32) {
-    // Enough digits past the cut for the HALF_UP decision, the same margin
-    // `fixed_half_up` uses.
-    let expanded = format!("{:.*e}", prec + 30, x);
+    // The shortest round-trip digits, the same source `fixed_half_up` rounds:
+    // `%.2e` of 1.005 is `1.01e+00`, and `%.20e` of 0.1 is
+    // `1.00000000000000000000e-01` rather than the exact expansion's …05551.
+    // Rust's `{:e}` with no precision is exactly those digits in scientific
+    // form; a precision short of them is what the HALF_UP cut below decides.
+    let expanded = format!("{:e}", x);
     let (mantissa, exp) = expanded.split_once('e').unwrap_or((expanded.as_str(), "0"));
     let mut exp: i32 = exp.parse().unwrap_or(0);
     let all: Vec<u8> = mantissa

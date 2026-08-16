@@ -33,6 +33,11 @@ const SUPER: &str = "super";
 /// so it is a name that legitimately resolves to nothing.
 const NULL_LITERAL: &str = "null";
 
+/// Member name of the per-class instance-initialization subroutine. Spelled the
+/// way the JVM spells the analogous static one so it cannot collide with a Java
+/// method name (`<` is not an identifier character).
+const INST_INIT: &str = "<instinit>";
+
 /// The static numeric category of an expression, used to reproduce Java's
 /// binary numeric promotion. Java's `/` truncates when both operands are
 /// integral and divides as floating point when either is `float`/`double`; the
@@ -144,6 +149,10 @@ struct ClassInfo {
     /// Constructor signatures this class declares (empty ⇒ implicit default
     /// ctor). Enables constructor overload resolution by type.
     ctors: Vec<CtorSig>,
+    /// True when this class declares any instance initialization of its own — a
+    /// field initializer or a bare `{ … }` block. Gates the call to its
+    /// `<instinit>` subroutine when an instance is built.
+    has_inst_init: bool,
 }
 
 /// One declared constructor's compile-time signature.
@@ -566,7 +575,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         || prog
             .classes
             .iter()
-            .any(|cl| !cl.methods.is_empty() || !cl.ctors.is_empty());
+            .any(|cl| !cl.methods.is_empty() || !cl.ctors.is_empty() || !cl.inst_init.is_empty());
     if has_subs {
         let skip = c.b.emit(Op::Jump(0), 0);
         for m in &prog.methods {
@@ -584,6 +593,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             }
             for ctor in &cl.ctors {
                 c.compile_ctor(cl, ctor)?;
+            }
+            if !cl.inst_init.is_empty() {
+                c.compile_inst_init(cl)?;
             }
         }
         // Lambda bodies last, and by draining rather than iterating: emitting one
@@ -752,6 +764,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 static_fields,
                 methods,
                 ctors,
+                has_inst_init: !cl.inst_init.is_empty(),
             },
         );
     }
@@ -2021,6 +2034,63 @@ impl Compiler {
         Some((info.ctors[i].param_tys.clone(), vararg_from))
     }
 
+    /// The ancestor of `class` whose no-argument constructor an implicit
+    /// `super()` runs, and `None` when the chain reaches `java.lang.Object`
+    /// without finding one.
+    ///
+    /// JLS 8.8.7: a constructor body that does not begin with an explicit
+    /// `this(…)` or `super(…)` starts with an implicit `super()`, and a class
+    /// that declares no constructor at all gets a default one that does exactly
+    /// that. javars synthesizes no default constructor subroutine, so the walk
+    /// skips every ancestor that declares none — the default constructor those
+    /// levels would have had is precisely a pass-through — and stops at the
+    /// first that declares one. An ancestor that declares constructors but no
+    /// no-argument one is a `javac` error, so answering `None` there loses
+    /// nothing a valid program could observe.
+    fn implicit_super_ctor(&self, class: &str) -> Option<String> {
+        let mut cur = self.classes.get(class)?.superclass.clone();
+        let mut guard = 0;
+        while let Some(name) = cur {
+            let info = self.classes.get(&name)?;
+            if !info.ctors.is_empty() {
+                return info
+                    .ctors
+                    .iter()
+                    .any(|c| c.param_tys.is_empty())
+                    .then_some(name);
+            }
+            cur = info.superclass.clone();
+            guard += 1;
+            if guard > 10000 {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Emit `<ancestor>.<init>()` on the receiver already in `this` — the
+    /// implicit `super()` a constructor prologue runs.
+    fn emit_implicit_super(&mut self, class: &str, line: u32) {
+        let Some(sup) = self.implicit_super_ctor(class) else {
+            return;
+        };
+        self.emit_this(line);
+        let mangled = mangle(&sup, "<init>", &[]);
+        let idx = self.b.add_name(&mangled);
+        self.b.emit(Op::Call(idx, 1), line);
+        self.emit_exc_check(line);
+        self.b.emit(Op::Pop, line);
+    }
+
+    /// True when `body` opens with an explicit constructor invocation
+    /// (`super(…)` or `this(…)`), which suppresses the implicit `super()`.
+    fn chains_explicitly(body: &[Stmt]) -> bool {
+        matches!(
+            body.first().map(|s| &s.kind),
+            Some(StmtKind::Expr(Expr::Call { name, .. })) if name == "super" || name == "this"
+        )
+    }
+
     /// True when `class` declares or inherits any method named `method` with
     /// `argc` parameters (an existence check for dispatch decisions).
     fn has_instance_method(&self, class: &str, method: &str, argc: usize) -> bool {
@@ -3194,10 +3264,38 @@ impl Compiler {
         result
     }
 
+    /// Lower a class's instance initialization — its field initializers and its
+    /// bare `{ … }` blocks, in textual order — to a subroutine named
+    /// `Class#<instinit>`. [`Compiler::new_object`] seeds the type defaults and
+    /// then calls this on the fresh instance, so `this` is bound (slot 0) while
+    /// the initializers run: a block can call an instance method, and a field
+    /// initializer can read a field declared above it.
+    fn compile_inst_init(&mut self, cl: &Class) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        let mangled = mangle(&cl.name, INST_INIT, &[]);
+        let name_idx = self.b.add_name(&mangled);
+        self.b.add_sub_entry(name_idx, entry);
+
+        self.scope = Some(MethodScope::for_instance());
+        self.this_class = Some(cl.name.clone());
+        let saved_class = self.current_class.replace(cl.name.clone());
+
+        self.b.emit(Op::SetSlot(0), cl.line); // bind `this`
+        let result = cl.inst_init.iter().try_for_each(|s| self.stmt(s));
+        self.b.emit(Op::LoadUndef, cl.line);
+        self.b.emit(Op::ReturnValue, cl.line);
+
+        self.scope = None;
+        self.this_class = None;
+        self.current_class = saved_class;
+        result
+    }
+
     /// Lower a constructor to a subroutine named `Class#<init>#argc`. Field
-    /// defaults/initializers are emitted by [`Compiler::new_object`] before the
-    /// call, so the body only runs the programmer's constructor statements.
-    /// `this` is slot 0; the ctor returns `null` (its result is discarded).
+    /// defaults are emitted by [`Compiler::new_object`] before the call, and the
+    /// field initializers and `{ … }` blocks by the `<instinit>` subroutine it
+    /// calls next, so the body only runs the programmer's constructor
+    /// statements. `this` is slot 0; the ctor returns `null` (discarded).
     fn compile_ctor(&mut self, cl: &Class, ctor: &Ctor) -> Result<(), String> {
         let entry = self.b.current_pos();
         let param_tys: Vec<String> = ctor.params.iter().map(|p| p.ty.clone()).collect();
@@ -3213,6 +3311,13 @@ impl Compiler {
 
         for i in (0..=ctor.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), ctor.line);
+        }
+        // JLS 8.8.7: a body that does not open with `this(…)`/`super(…)` runs an
+        // implicit `super()` first. Without it a superclass constructor body
+        // never ran at all, so anything it did — a field it set, a virtual call
+        // it made — was silently lost.
+        if !Self::chains_explicitly(&ctor.body) {
+            self.emit_implicit_super(&cl.name, ctor.line);
         }
         let result = ctor.body.iter().try_for_each(|s| self.stmt(s));
         self.b.emit(Op::LoadUndef, ctor.line);
@@ -5247,6 +5352,30 @@ impl Compiler {
         let obj = self.temp();
         self.emit_set(&obj, line);
 
+        // Every class from the root of the chain down to `class`, in Java's
+        // instance-initialization order, so each level's `<instinit>` runs after
+        // its ancestors'.
+        let init_chain: Vec<String> = {
+            let mut chain = Vec::new();
+            let mut cur = Some(class.to_string());
+            let mut guard = 0;
+            while let Some(name) = cur {
+                let Some(ci) = self.classes.get(&name) else {
+                    break;
+                };
+                cur = ci.superclass.clone();
+                if ci.has_inst_init {
+                    chain.push(name);
+                }
+                guard += 1;
+                if guard > 10000 {
+                    break;
+                }
+            }
+            chain.reverse();
+            chain
+        };
+
         // Seed each field: default value, then its declared initializer if any.
         for (fname, fty, finit) in &field_plan {
             self.emit_get(&obj, line);
@@ -5257,6 +5386,16 @@ impl Compiler {
                 None => self.emit_type_default(fty, line),
             }
             self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
+            self.b.emit(Op::Pop, line);
+        }
+
+        // Run each level's instance initialization on the seeded instance.
+        for owner in &init_chain {
+            self.emit_get(&obj, line); // this
+            let mangled = mangle(owner, INST_INIT, &[]);
+            let name_idx = self.b.add_name(&mangled);
+            self.b.emit(Op::Call(name_idx, 1), line);
+            self.emit_exc_check(line);
             self.b.emit(Op::Pop, line);
         }
 
@@ -5279,6 +5418,18 @@ impl Compiler {
                 args.len(),
                 ctor_arities
             ));
+        } else if let Some(sup) = self.implicit_super_ctor(ctor_class) {
+            // The class declares no constructor, so Java gave it a default one
+            // whose whole body is `super()`. There is no subroutine to call for
+            // it, so the chain is run here — otherwise `new Sub()` on a class
+            // that adds nothing to its parent skipped the parent's constructor
+            // entirely.
+            self.emit_get(&obj, line); // this
+            let mangled = mangle(&sup, "<init>", &[]);
+            let name_idx = self.b.add_name(&mangled);
+            self.b.emit(Op::Call(name_idx, 1), line);
+            self.emit_exc_check(line);
+            self.b.emit(Op::Pop, line);
         }
 
         // The expression value is the new instance.
@@ -5466,10 +5617,37 @@ impl Compiler {
             }
             self.b.emit(compound_op(op), line);
         }
+        // JLS 15.26.2: `E1 op= E2` is `E1 = (T)(E1 op E2)` — an implicit *cast*
+        // to the left-hand type, not merely a width mask. When `T` is integral
+        // and `E2` promotes the arithmetic to floating point, that cast is the
+        // narrowing one, so `int x = 1; x += 1.5;` is 2 and not 2.5. It is the
+        // same conversion `(int) expr` performs, including its saturation at the
+        // target's range, so it routes through the same host builtin.
+        if let Some(t) = target_ty.filter(|t| self.compound_narrows_float(op, t, value)) {
+            let c = self.b.add_constant(Value::str(t.to_string()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
+        }
         if wrap32 {
             self.emit_wrap32(line);
         }
         Ok(())
+    }
+
+    /// True when `target <op>= value` needs the narrowing cast back to an
+    /// integral `target` because `value` makes the promoted arithmetic floating
+    /// point. The shift and bitwise operators are excluded: `javac` rejects a
+    /// floating operand for them outright, so no valid program reaches this.
+    fn compound_narrows_float(&self, op: AssignOp, target: &str, value: &Expr) -> bool {
+        matches!(target, "int" | "long" | "short" | "byte" | "char")
+            && matches!(
+                op,
+                AssignOp::Add | AssignOp::Sub | AssignOp::Mul | AssignOp::Div | AssignOp::Mod
+            )
+            && matches!(
+                self.expr_java_type(value).as_deref(),
+                Some("float" | "double")
+            )
     }
 
     /// Lower a bare-identifier call `name(args...)`. Slice 1 declares no user
@@ -5528,6 +5706,33 @@ impl Compiler {
             self.b.emit(Op::LoadUndef, line);
             return Ok(());
         }
+        // `this(args)` — delegate to another constructor of the same class on the
+        // same `this` (JLS 8.8.7.1). The delegate runs the `super()` chain, so
+        // the delegating constructor emits none of its own (see
+        // `Compiler::chains_explicitly`).
+        if name == "this" {
+            if let Some(this_class) = self.this_class.clone() {
+                let arg_tys: Vec<Option<String>> =
+                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let (param_tys, vararg_from) =
+                    self.resolve_ctor(&this_class, &arg_tys).ok_or_else(|| {
+                        format!(
+                            "javars: class `{this_class}` has no constructor taking {} argument(s) (line {line})",
+                            args.len()
+                        )
+                    })?;
+                let args = Self::effective_args(args, &param_tys, vararg_from);
+                self.emit_this(line);
+                self.call_args_targeted(&args, &param_tys)?;
+                let mangled = mangle(&this_class, "<init>", &param_tys);
+                let idx = self.b.add_name(&mangled);
+                self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
+                self.emit_exc_check(line);
+                return Ok(());
+            }
+            self.b.emit(Op::LoadUndef, line);
+            return Ok(());
+        }
         // A user-defined static method resolves to the native call-frame ABI,
         // choosing the overload that matches the argument types.
         if self.methods.contains_key(name) {
@@ -5552,6 +5757,29 @@ impl Compiler {
         if let Some(this_class) = self.this_class.clone() {
             if self.has_instance_method(&this_class, name, args.len()) {
                 return self.dispatch_instance_method(&Expr::This, &this_class, name, args, line);
+            }
+            // The `java.lang.Object` methods every class inherits are not in the
+            // class table (they have no Java-level body here), so the check above
+            // cannot see them — yet an unqualified `getClass()` inside an
+            // instance member is an implicit `this.getClass()` exactly like a
+            // declared method is. Without this a `toString()` override written
+            // the ordinary way — `getClass().getSimpleName() + …` — failed to
+            // compile at all.
+            // `hashCode` is left out on purpose, matching the qualified
+            // `x.hashCode()` path: a class that does not declare one has no
+            // answer javars can give that is not silently wrong (see the
+            // `hashCode` entry in BUGS.md), so it stays a compile error rather
+            // than becoming an identity hash.
+            if matches!(
+                (name, args.len()),
+                ("getClass", 0) | ("toString", 0) | ("equals", 1)
+            ) {
+                return self.expr(&Expr::MethodCall {
+                    recv: Box::new(Expr::This),
+                    method: name.to_string(),
+                    args: args.to_vec(),
+                    line,
+                });
             }
         }
         if self.has_ffi {

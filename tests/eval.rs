@@ -4704,3 +4704,234 @@ fn a_boxed_compare_to_null_names_the_boxs_own_parameter() {
          -1\n"
     );
 }
+
+#[test]
+fn a_constructor_that_does_not_chain_explicitly_still_runs_the_implicit_super() {
+    // JLS 8.8.7: a constructor body that does not open with `this(…)`/`super(…)`
+    // begins with an implicit `super()`, and a class declaring no constructor at
+    // all gets a default one that is exactly that call. javars emitted neither,
+    // so a superclass constructor simply never ran: `new Q()` left `p` at its
+    // field default instead of the 9 the parent assigned. `Z` puts a
+    // constructor-less class *between* the two so the chain has to walk past a
+    // level that has no `<init>` subroutine to call, `S` proves the parent's
+    // body still runs before the child's, and `Base`/`Der` pin the consequence
+    // that made the omission visible in real code — a virtual call made from the
+    // parent's constructor reaching the child's override. Verified byte-for-byte
+    // against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class P { int p = 1; P() { tag(\"P\"); p = 9; } void tag(String s) { System.out.println(s); } }\
+         static class Q extends P { }\
+         static class Z extends Q { int z = 4; }\
+         static class S extends P { S() { System.out.println(\"S\"); } void tag(String s) { System.out.println(s + \"!\"); } }\
+         static class U extends P { U() { super(); System.out.println(\"U\"); } }\
+         static class Base { int v = 1; Base() { init(); } void init() { v = 2; } int get() { return v; } }\
+         static class Der extends Base { int w = 10; void init() { v = 3; } int get() { return v + w; } }\
+         public static void main(String[] a) {\
+         System.out.println(new Q().p);\
+         Z z = new Z(); System.out.println(z.p + \" \" + z.z);\
+         System.out.println(new S().p);\
+         System.out.println(new U().p);\
+         Base b = new Der(); System.out.println(b.v + \" \" + b.get()); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "P\n9\nP\n9 4\nP!\nS\n9\nP\nU\n9\n3 13\n");
+}
+
+#[test]
+fn this_delegates_to_another_constructor_of_the_same_class() {
+    // `this(args)` (JLS 8.8.7.1) did not parse at all — `expected Semi but found
+    // LParen` — which rejected the telescoping-constructor shape outright. The
+    // delegate is what runs the `super()` chain, so `C` checks that the
+    // delegating constructor does NOT add a second one (`P6` must print once),
+    // and `V` checks the delegation resolves a variable-arity target. Verified
+    // byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class P { int p; P(int p) { this.p = p; System.out.println(\"P\" + p); } P() { this(7); } }\
+         static class A { int v; String s;\
+         A(int v, String s) { this.v = v; this.s = s; System.out.println(\"full\"); }\
+         A(int v) { this(v, \"def\"); System.out.println(\"one\"); }\
+         A() { this(0); System.out.println(\"zero\"); }\
+         public String toString() { return v + \"/\" + s; } }\
+         static class C extends P { int q; C() { this(3); } C(int q) { super(q * 2); this.q = q; } }\
+         static class V { int n; V(int... xs) { for (int x : xs) n += x; } V(String s) { this(1, 2, 3); n += s.length(); } }\
+         public static void main(String[] a) {\
+         System.out.println(new A());\
+         System.out.println(new A(5));\
+         System.out.println(new P().p);\
+         C c = new C(); System.out.println(c.p + \" \" + c.q);\
+         System.out.println(new V(\"ab\").n); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "full\none\nzero\n0/def\nfull\none\n5/def\nP7\n7\nP6\n6 3\n8\n"
+    );
+}
+
+#[test]
+fn instance_initializer_blocks_run_in_textual_order_with_the_field_initializers() {
+    // A bare `{ … }` at member position is an instance initializer (JLS 8.6).
+    // The parser's `skip_member` used to brace-match and discard it, so
+    // everything it did was silently lost — `C` printed `ctor v=1`. Moving the
+    // whole of a class's instance initialization into one `<instinit>`
+    // subroutine that runs with `this` bound is also what lets a field
+    // initializer read a field declared above it (`D`, which was previously
+    // `cannot find symbol: x`), and `H` pins that an inherited field is already
+    // seeded when the subclass's own initialization runs. Verified byte-for-byte
+    // against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class C { int v = 1; { v = 3; } C() { System.out.println(\"ctor v=\" + v); v += 100; } }\
+         static class D { int x = 2; int y = x + 1; int z; { z = y * 10; } }\
+         static class E { int a = 1; { a += 1; } int b = a + 5; { b *= 2; } }\
+         static class F { int n; { n = seed(); } int seed() { return 42; } }\
+         static class G { int g = 1; }\
+         static class H extends G { int h = g + 1; { h += 100; } }\
+         static class K { String s = \"x\"; { s += \"y\"; } }\
+         public static void main(String[] a) {\
+         System.out.println(new C().v);\
+         D d = new D(); System.out.println(d.x + \" \" + d.y + \" \" + d.z);\
+         E e = new E(); System.out.println(e.a + \" \" + e.b);\
+         System.out.println(new F().n);\
+         H h = new H(); System.out.println(h.g + \" \" + h.h);\
+         System.out.println(new K().s); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "ctor v=3\n103\n2 3 30\n2 14\n42\n1 102\nxy\n");
+}
+
+#[test]
+fn a_compound_assignment_narrows_a_floating_operand_back_to_an_integral_target() {
+    // JLS 15.26.2: `E1 op= E2` is `E1 = (T)(E1 op E2)` — an implicit *cast* to
+    // the left-hand type. javars applied only a width mask, which is a no-op on
+    // a `double`, so `int x = 1; x += 1.5;` stored 2.5 and printed it. Every
+    // integral width is checked (the cast saturates at `int` range rather than
+    // wrapping, which the `2147483647 += 1.0` line pins), as is every kind of
+    // assignment target — local, `static` field, array element, instance field —
+    // because each has its own lowering. The last two lines are the cases that
+    // must NOT narrow: a `double` target and `String +=`. Verified byte-for-byte
+    // against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static int sf = 1;\
+         int f = 1;\
+         public static void main(String[] a) {\
+         int x = 1; x += 1.5; System.out.println(x);\
+         int y = 7; y /= 2.0; System.out.println(y);\
+         int o = 2147483647; o += 1.0; System.out.println(o);\
+         long l = 5; l *= 1.9; System.out.println(l);\
+         char c = 'a'; c += 1.9; System.out.println(c);\
+         byte b = 100; b += 100.7; System.out.println(b);\
+         short s = 1; s -= 0.5; System.out.println(s);\
+         int m = 7; m %= 2.5; System.out.println(m);\
+         sf += 1.5; System.out.println(sf);\
+         int[] arr = {1}; arr[0] += 1.5; System.out.println(arr[0]);\
+         Main t = new Main(); t.f += 1.5; System.out.println(t.f);\
+         double d = 1; d += 1.5; System.out.println(d);\
+         String str = \"a\"; str += 1.5; System.out.println(str); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "2\n3\n2147483647\n9\nb\n-56\n0\n2\n2\n2\n2\n2.5\na1.5\n"
+    );
+}
+
+#[test]
+fn percent_f_rounds_the_shortest_decimal_half_up_not_the_exact_binary_expansion() {
+    // `Formatter`'s floating conversions round the digits of the value's
+    // *shortest round-trip decimal*, not of its exact binary expansion. javars
+    // rounded the expansion, so `%.2f` of 1.005 was 1.00 where Java says 1.01
+    // (1.005 is really 1.00499999999999989…), and `%.20f` of 0.1 trailed
+    // …00555 where Java pads with zeros past the digits the value has. The
+    // `%.0f` triple pins that the rule is HALF_UP and not half-to-even, the
+    // `%.2e`/`%.20e` pair that `%e` shares the digit source, and `%g` that it
+    // reaches both branches. Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main { public static void main(String[] a) {\
+         System.out.println(String.format(\"%.2f|%.2f|%.2f|%.2f\", 1.005, 2.675, 0.125, 8.835));\
+         System.out.println(String.format(\"%.20f\", 0.1));\
+         System.out.println(String.format(\"%.20f\", 1.0 / 3));\
+         System.out.println(String.format(\"%.30f\", 1e-10));\
+         System.out.println(String.format(\"%.2f\", 1e20));\
+         System.out.println(String.format(\"%.0f %.0f %.0f\", 0.5, 1.5, 2.5));\
+         System.out.println(String.format(\"%.3f|%.2f|%.5f\", 1.0005, -1.005, 1.000005));\
+         System.out.println(String.format(\"%.2e|%.20e\", 1.005, 0.1));\
+         System.out.println(String.format(\"%.3g|%g\", 0.0001005, 1.005));\
+         System.out.printf(\"%.2f %.6f%n\", 5592405.5, 1.0); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "1.01|2.68|0.13|8.84\n\
+         0.10000000000000000000\n\
+         0.33333333333333330000\n\
+         0.000000000100000000000000000000\n\
+         100000000000000000000.00\n\
+         1 2 3\n\
+         1.001|-1.01|1.00001\n\
+         1.01e+00|1.00000000000000000000e-01\n\
+         0.000101|1.00500\n\
+         5592405.50 1.000000\n"
+    );
+}
+
+#[test]
+fn an_unqualified_object_method_inside_an_instance_member_is_an_implicit_this_call() {
+    // `getClass()` written without a receiver is `this.getClass()`, but the
+    // `java.lang.Object` methods are not in the class table (they have no
+    // Java-level body here), so the implicit-`this` lookup could not see them
+    // and the ordinary way of writing a `toString()` override —
+    // `getClass().getSimpleName() + …` — failed to compile with `unresolved
+    // reference: getClass`. The call still dispatches on the *runtime* class,
+    // which is what makes the inherited `toString` answer `B:1` for a `B`.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static class A { int x = 1;\
+         public String toString() { return getClass().getSimpleName() + \":\" + x; }\
+         String who() { return getClass().getName(); }\
+         boolean same(Object o) { return equals(o); }\
+         String wrap() { return \"[\" + toString() + \"]\"; } }\
+         static class B extends A { }\
+         static class D { }\
+         public static void main(String[] a) {\
+         A p = new A(); B q = new B();\
+         System.out.println(p + \" \" + q + \" \" + q.who());\
+         System.out.println(p.same(p) + \" \" + p.same(q) + \" \" + q.wrap());\
+         System.out.println(new D().getClass().getSimpleName()); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "A:1 B:1 Main$B\ntrue false [B:1]\nD\n");
+}
+
+#[test]
+fn a_class_named_for_a_descriptor_letter_keeps_its_own_simple_name() {
+    // `getSimpleName` translated a one-character binary name through the JVM
+    // *field descriptor* table, which is only the right reading inside an array
+    // type. A top-level class the program called `B` therefore reported `byte`,
+    // `D` reported `double`, and so on for all eight letters. The array lines
+    // are the half that must keep the descriptor reading. Verified byte-for-byte
+    // against OpenJDK 26.
+    let (out, ok) = run(
+        "class B { }\
+         class D { }\
+         class I { }\
+         class Z { }\
+         public class Main { public static void main(String[] a) {\
+         System.out.println(new B().getClass().getSimpleName() + \" \" + new D().getClass().getSimpleName()\
+         + \" \" + new I().getClass().getSimpleName() + \" \" + new Z().getClass().getSimpleName());\
+         System.out.println(new B().getClass().getName());\
+         B[] bs = new B[2]; System.out.println(bs.getClass().getSimpleName() + \" \" + bs.getClass().getName());\
+         int[] i = new int[1]; double[][] d = new double[1][1]; String[] s = new String[1];\
+         System.out.println(i.getClass().getSimpleName() + \" \" + d.getClass().getSimpleName() + \" \" + s.getClass().getSimpleName());\
+         System.out.println(i.getClass().getName() + \" \" + d.getClass().getName() + \" \" + s.getClass().getName()); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "B D I Z\nB\nB[] [LB;\nint[] double[][] String[]\n[I [[D [Ljava.lang.String;\n"
+    );
+}

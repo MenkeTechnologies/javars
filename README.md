@@ -475,7 +475,10 @@ dispatch through an interface type), **method overloading by parameter type**
 variable-arity — phase, so a `T...` parameter is callable with loose arguments
 at every call site), **type-erased
 generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
-diamond), **`static` fields** with `static { }` initializer blocks, **`record`
+diamond), **`static` fields** with `static { }` initializer blocks, **instance
+initialization** (field initializers and bare `{ }` blocks in textual order, the
+implicit `super()` every constructor without an explicit chain runs, and
+`this(…)` delegation), **`record`
 types** with their derived accessors / `toString` / `equals`, **abstract
 classes**, **`enum` constants carrying state or bodies**, and **lambdas +
 method references** (heap closures capturing by value, dispatched through any

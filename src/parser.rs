@@ -232,6 +232,7 @@ impl Parser {
         let mut fields = Vec::new();
         let mut static_fields = Vec::new();
         let mut static_init = Vec::new();
+        let mut inst_init = Vec::new();
         let mut ctors = Vec::new();
         let mut inst_methods = Vec::new();
         // An `enum` body opens with its constant list; the ordinary members (if
@@ -265,8 +266,15 @@ impl Parser {
                 if is_static {
                     static_declaration(line, fs, &mut static_fields, &mut static_init);
                 } else {
-                    fields.extend(fs);
+                    instance_declaration(line, fs, &mut fields, &mut inst_init);
                 }
+            } else if self.is(&Tok::LBrace) {
+                // A bare `{ … }` at member position is an instance initializer
+                // (JLS 8.6). It runs on every new instance in textual order with
+                // the field initializers; `skip_member` used to drop it, which
+                // silently lost everything it did.
+                self.advance();
+                inst_init.extend(self.block()?);
             } else {
                 self.skip_member()?;
             }
@@ -297,6 +305,7 @@ impl Parser {
             fields,
             static_fields,
             static_init,
+            inst_init,
             ctors,
             methods: inst_methods,
             line,
@@ -389,6 +398,7 @@ impl Parser {
         let mut fields = Vec::new();
         let mut static_fields = Vec::new();
         let mut static_init = Vec::new();
+        let mut inst_init = Vec::new();
         let mut methods = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             if let Some((m, _)) = self.try_any_method(&name)? {
@@ -397,7 +407,7 @@ impl Parser {
                 if is_static {
                     static_declaration(line, fs, &mut static_fields, &mut static_init);
                 } else {
-                    fields.extend(fs);
+                    instance_declaration(line, fs, &mut fields, &mut inst_init);
                 }
             } else {
                 return Err(format!(
@@ -424,6 +434,7 @@ impl Parser {
             fields,
             static_fields,
             static_init,
+            inst_init,
             ctors: Vec::new(),
             methods,
             line,
@@ -667,6 +678,33 @@ fn static_declaration(
             init.push(Stmt::new(
                 line,
                 StmtKind::Assign {
+                    name: f.name.clone(),
+                    op: AssignOp::Assign,
+                    value,
+                },
+            ));
+        }
+        fields.push(FieldDecl { init: None, ..f });
+    }
+}
+
+/// Split an instance field declaration into its storage (the field, seeded with
+/// the type's default) and its initialization (a `this.f = …` assignment run in
+/// textual order with the bare `{ … }` instance-initializer blocks). The mirror
+/// of [`static_declaration`], one level down: an instance initializer needs a
+/// bound `this`, which only the per-instance initialization subroutine has.
+fn instance_declaration(
+    line: u32,
+    decls: Vec<FieldDecl>,
+    fields: &mut Vec<FieldDecl>,
+    init: &mut Vec<Stmt>,
+) {
+    for f in decls {
+        if let Some(value) = f.init.clone() {
+            init.push(Stmt::new(
+                line,
+                StmtKind::FieldAssign {
+                    recv: Expr::This,
                     name: f.name.clone(),
                     op: AssignOp::Assign,
                     value,
@@ -2467,7 +2505,19 @@ impl Parser {
             // A `switch` *expression* — only the arrow form has one.
             Tok::Switch => self.switch_expr(),
             Tok::Ident(name) if name == "this" => {
+                let line = self.line();
                 self.advance();
+                // `this(args)` is an explicit constructor invocation (JLS 8.8.7.1)
+                // — a call, not a read of `this`. It is spelled as a `Call` named
+                // `this`, the same shape `super(args)` already uses.
+                if self.is(&Tok::LParen) {
+                    let args = self.call_args()?;
+                    return Ok(Expr::Call {
+                        name: "this".to_string(),
+                        args,
+                        line,
+                    });
+                }
                 Ok(Expr::This)
             }
             Tok::Ident(name) => {
