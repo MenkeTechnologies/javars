@@ -3645,7 +3645,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     if let Some(v) = boxed_method(&recv, &method, args.len()) {
         return v;
     }
-    let s = recv.as_str_cow().into_owned();
+    // Borrowed, not copied. `into_owned` cloned the whole receiver on every
+    // single `String` method call, so `s.charAt(i)` over an n-character string
+    // moved n bytes per call and n² across the loop — 40k characters meant
+    // 1.6GB of memcpy for a walk that reads 40k of them. `recv` is a local, so
+    // the borrow is independent of the `&mut VM` the arms below take.
+    let s = recv.as_str_cow();
     // `"%s".formatted(x)` renders `x`, so it needs the VM `string_method` has
     // not got. Every other `String` method reads text only.
     if method == "formatted" && any_user_tostring(vm) {
