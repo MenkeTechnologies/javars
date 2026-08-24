@@ -80,8 +80,10 @@ arguments), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
 X>`, the diamond, erased library type args) all run. `String.format` and
 `System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %b
-%B %h %H %x %X %o %c`, the `-`/`0`/`+`/`,`/`(` flags, width, precision, and
-argument indexes) and the `Arrays` statics round out the stdlib essentials; the
+%B %h %H %x %X %o %c`, all seven `-`/`#`/`+`/` `/`0`/`,`/`(` flags, width,
+precision, and argument indexes), the mutable **`StringBuilder`/`StringBuffer`**
+(the full method surface, with `capacity()`'s growth modeled because it is
+observable), and the `Arrays` statics round out the stdlib essentials; the
 wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). **Exceptions**
 (`throw`/`try`/`catch`/`finally`, try-with-resources, and javars's own runtime
 faults raised as catchable throwables), **`static` fields and `static { }`

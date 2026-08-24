@@ -1596,6 +1596,18 @@ impl Compiler {
                         return Some(r.ret_name);
                     }
                 }
+                // A `StringBuilder` receiver's known return types. `append` and
+                // friends answer the receiver, which is what makes the chained
+                // `sb.append(1).append('a')` keep its type — and `charAt` must
+                // report `char`, or the code point it answers would print as a
+                // number.
+                if let Some(t) = self
+                    .expr_java_type(recv)
+                    .as_deref()
+                    .and_then(|t| builder_call_java_type(t, method, args.len()))
+                {
+                    return Some(t.to_string());
+                }
                 // A collection receiver's known return types.
                 if let Some(kind) = self
                     .expr_java_type(recv)
@@ -4520,6 +4532,22 @@ impl Compiler {
     /// return value on the stack.
     fn println(&mut self, newline: bool, err: bool, arg: Option<&Expr>) -> Result<(), String> {
         let n = match arg {
+            // `println(char[])` is its own `PrintStream` overload and writes the
+            // *characters*: `System.out.println(new char[]{'h','i'})` is `hi`,
+            // where `"" + cs` is still `[C@…` because string concatenation has
+            // no such overload. javars rendered the handle for both, so the one
+            // idiom that spells a char array out printed `[@2`. `String.valueOf`
+            // is the same join, so the conversion routes through it rather than
+            // growing a second one.
+            Some(e) if self.is_char_array_expr(e) => {
+                self.emit_char_string(e)?;
+                let class_c = self.b.add_constant(Value::str("String".to_string()));
+                self.b.emit(Op::LoadConst(class_c), 0);
+                let method_c = self.b.add_constant(Value::str("valueOf".to_string()));
+                self.b.emit(Op::LoadConst(method_c), 0);
+                self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 3, 0);
+                1
+            }
             Some(e) => {
                 self.emit_stringified(e)?;
                 1
@@ -5467,6 +5495,35 @@ impl Compiler {
             let class_c = self.b.add_constant(Value::str("Object".to_string()));
             self.b.emit(Op::LoadConst(class_c), line);
             self.b.emit(Op::CallBuiltin(crate::host::JNEW, 1), line);
+            return Ok(());
+        }
+        // `new StringBuilder(…)` / `new StringBuffer(…)` — a host shape, like a
+        // collection. A user class of the same name wins, for the same reason
+        // and by the same ordering.
+        if !self.classes.contains_key(class) && matches!(class, "StringBuilder" | "StringBuffer") {
+            if args.len() > 1 {
+                return Err(format!(
+                    "javars: `new {class}(…)` takes no argument, a capacity, or an \
+                     initial string (line {line})"
+                ));
+            }
+            let kind_c = self.b.add_constant(Value::str(class.to_string()));
+            self.b.emit(Op::LoadConst(kind_c), line);
+            match args.first() {
+                // `new StringBuilder('x')` is not a Java constructor, but the
+                // conversion is what makes `new StringBuilder(aCharSequence)`
+                // and a `float` argument reach the host as text.
+                Some(a) => self.emit_char_string(a)?,
+                // `StringBuilder()` is `StringBuilder(16)` — the JDK's own
+                // definition, and the spelling that keeps `Undef` free to mean
+                // the `(String) null` argument, which is an NPE rather than an
+                // empty builder.
+                None => {
+                    self.b
+                        .emit(Op::LoadInt(crate::host::SB_DEFAULT_CAP as i64), line);
+                }
+            }
+            self.emit_raising_builtin(crate::host::JSB_NEW, 2, line);
             return Ok(());
         }
         // `new ArrayList<>()` / `new HashMap<>(other)` — a `java.util`
@@ -6761,6 +6818,42 @@ fn is_boxing_call(e: &Expr) -> bool {
                     )
                 )
     )
+}
+
+/// The declared Java return type of a `StringBuilder`/`StringBuffer` method.
+///
+/// The mutators all answer `this`, which is what makes a chain
+/// (`sb.append(1).append('a')`) keep its static type — and therefore keep
+/// reaching this table for the next link. `charAt` is the entry that has to be
+/// here rather than left unknown: it answers a `char`, and an untyped code
+/// point renders as its number.
+fn builder_call_java_type(recv_ty: &str, method: &str, argc: usize) -> Option<&'static str> {
+    let this = match recv_ty {
+        "StringBuilder" => "StringBuilder",
+        "StringBuffer" => "StringBuffer",
+        _ => return None,
+    };
+    Some(match (method, argc) {
+        ("append", 1)
+        | ("appendCodePoint", 1)
+        | ("insert", 2)
+        | ("delete", 2)
+        | ("deleteCharAt", 1)
+        | ("replace", 3)
+        | ("reverse", 0)
+        | ("repeat", 2) => this,
+        ("toString", 0) | ("substring", 1) | ("substring", 2) | ("subSequence", 2) => "String",
+        ("length", 0)
+        | ("capacity", 0)
+        | ("indexOf", 1)
+        | ("indexOf", 2)
+        | ("lastIndexOf", 1)
+        | ("lastIndexOf", 2)
+        | ("compareTo", 1) => "int",
+        ("charAt", 1) => "char",
+        ("isEmpty", 0) | ("equals", 1) => "boolean",
+        _ => return None,
+    })
 }
 
 fn collection_kind(ty: &str) -> Option<&'static str> {

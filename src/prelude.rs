@@ -122,8 +122,8 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
 /// keeps it out of the class table on purpose (it is also the erasure of every
 /// type variable), so it is named here directly.
 pub fn qualified_class(name: &str) -> Option<String> {
-    if name == "Object" {
-        return Some("java.lang.Object".to_string());
+    if matches!(name, "Object" | "StringBuilder" | "StringBuffer") {
+        return Some(format!("java.lang.{name}"));
     }
     qualified_throwable(name)
 }

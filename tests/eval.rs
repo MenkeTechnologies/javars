@@ -4929,3 +4929,65 @@ fn a_class_named_for_a_descriptor_letter_keeps_its_own_simple_name() {
         "B D I Z\nB\nB[] [LB;\nint[] double[][] String[]\n[I [[D [Ljava.lang.String;\n"
     );
 }
+
+#[test]
+fn string_builder_is_a_reference_shared_across_frames_and_containers() {
+    // The frozen parity corpus can only assert what a program *prints*, so it
+    // cannot say whether two names denote one builder. That is the property
+    // `StringBuilder` exists for: a method that appends to its parameter must
+    // be visible to the caller, an element read back out of an array or a map
+    // must be the same object that was put in, and a builder accumulated across
+    // loop iterations must keep what earlier iterations wrote. A copy-on-pass
+    // model prints identically for every single-frame program and diverges here.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run(
+        "public class Main {\
+         static void grow(StringBuilder b) { b.append(\"!\"); }\
+         static StringBuilder make() { return new StringBuilder(\"m\"); }\
+         public static void main(String[] a) {\
+         StringBuilder b = new StringBuilder(\"x\"); grow(b); System.out.println(b);\
+         System.out.println(make().append(\"2\"));\
+         StringBuilder[] arr = new StringBuilder[] { new StringBuilder(\"p\") };\
+         arr[0].append(\"q\"); System.out.println(arr[0]);\
+         java.util.Map<String, StringBuilder> m = new java.util.HashMap<>();\
+         m.put(\"k\", new StringBuilder(\"v\")); m.get(\"k\").append(\"!\"); System.out.println(m.get(\"k\"));\
+         StringBuilder acc = new StringBuilder();\
+         for (String s : new String[] { \"a\", \"b\" }) { acc.append(s); }\
+         System.out.println(acc); } }",
+    );
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "x!\nm2\npq\nv!\nab\n");
+}
+
+#[test]
+fn a_user_class_named_string_builder_wins_over_the_jdk_one() {
+    // `new StringBuilder()` is routed to a host shape *before* the class table
+    // is consulted, so the ordering has to put the program's own declaration
+    // first — otherwise declaring a class by that name would silently get the
+    // JDK's, and every call on it would be an unsupported-method error rather
+    // than the user's body. This is the same precedence the collection
+    // constructors already take.
+    let (out, ok) = run("public class Main {\
+         static class StringBuilder { int n; StringBuilder() { n = 7; } int get() { return n; } }\
+         public static void main(String[] a) {\
+         StringBuilder b = new StringBuilder(); System.out.println(b.get()); } }");
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn string_builder_char_at_is_a_char_and_its_arithmetic_is_a_code_point() {
+    // `charAt` answers a `char`, which javars keeps as a code point: printing it
+    // has to render the character while adding to it has to do arithmetic. The
+    // static type is the only thing that decides, so a builder receiver whose
+    // return types were left unknown would print 101 where Java prints `e`.
+    // Verified byte-for-byte against OpenJDK 26.
+    let (out, ok) = run("public class Main { public static void main(String[] a) {\
+         StringBuilder b = new StringBuilder(\"hello\");\
+         System.out.println(b.charAt(1));\
+         System.out.println(b.charAt(1) + 1);\
+         char c = b.charAt(4); System.out.println(c);\
+         System.out.println(\"\" + b.charAt(0) + b.charAt(1)); } }");
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(out, "e\n102\no\nhe\n");
+}

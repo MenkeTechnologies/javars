@@ -126,6 +126,18 @@ pub const JDIV: u16 = 719;
 /// division routes here instead and divides in `i64`.
 pub const JIDIV: u16 = 745;
 
+/// `new StringBuilder(…)` / `new StringBuffer(…)` — stack `[kind, arg]`, where
+/// `kind` is the class's simple name and `arg` is the constructor's single
+/// argument (`Undef` for the no-arg form). Which constructor that is is read
+/// from the value: an `Int` is the capacity, anything else is the initial
+/// content, which is exactly the split Java's `(int)` / `(String)` /
+/// `(CharSequence)` overloads make.
+///
+/// Every method on the builder goes through [`JSTR_DISPATCH`] like any other
+/// erased receiver; only allocation needs a builtin of its own, because the
+/// object is a host shape rather than a class instance.
+pub const JSB_NEW: u16 = 746;
+
 // ── Exception builtins (`throw` / `try` / `catch` / `finally`) ──
 // fusevm has no unwind opcode, so javars models the in-flight exception as a
 // host-side pending value plus a compiler-emitted check after every `Op::Call`.
@@ -416,6 +428,22 @@ enum HostObj {
         order: Order,
         fixed: Fixity,
     },
+    /// A `java.lang.StringBuilder` (or `StringBuffer`) — the mutable character
+    /// sequence, which `+` concatenation cannot stand in for once a program
+    /// builds one in a loop.
+    ///
+    /// `cap` tracks `capacity()` rather than Rust's own allocation, because it
+    /// is *observable*: the JDK starts at 16 (plus the initial content's
+    /// length), and grows to `2 * old + 2` or the required size, whichever is
+    /// larger. A `Vec`'s growth policy would answer a different number.
+    Builder {
+        s: String,
+        cap: usize,
+        /// `true` for a `StringBuffer`, which differs from `StringBuilder` only
+        /// in its class name here: javars runs one thread, so the synchronized
+        /// methods are unobservable.
+        buffer: bool,
+    },
 }
 
 /// What a collection's iteration order is.
@@ -651,6 +679,13 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         "Number" => &["Serializable"],
         "Boolean" | "Character" => &["Comparable", "Serializable"],
         "Enum" => &["Comparable", "Serializable"],
+        // Both builders extend the package-private `AbstractStringBuilder`,
+        // which is what carries `CharSequence` and `Appendable`; only
+        // `Comparable` and `Serializable` are declared on the concrete classes.
+        "StringBuilder" | "StringBuffer" => {
+            &["AbstractStringBuilder", "Comparable", "Serializable"]
+        }
+        "AbstractStringBuilder" => &["CharSequence", "Appendable"],
         // The throwable chain itself comes from the prelude's declarations,
         // which reach `Throwable` and stop; `Throwable implements Serializable`
         // is the one edge above it.
@@ -804,6 +839,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JMAKE_CLOSURE, b_make_closure);
     vm.register_builtin(JCLOSURE_CALL, b_closure_call);
     vm.register_builtin(JCOLL_NEW, b_coll_new);
+    vm.register_builtin(JSB_NEW, b_sb_new);
     vm.register_builtin(JCOLL_DISPATCH, b_coll_dispatch);
     vm.register_builtin(JITER_ARRAY, b_iter_array);
 }
@@ -1749,6 +1785,325 @@ fn is_collection(v: &Value) -> bool {
     })
 }
 
+// ── java.lang.StringBuilder / StringBuffer ───────────────────────────────
+//
+// The builder is a host shape (`HostObj::Builder`) rather than a class
+// instance: its state is one growable string, and every method is a string
+// operation. Allocation gets its own builtin ([`JSB_NEW`]); the methods reach
+// [`builder_method`] from [`b_str_dispatch`], which is where every receiver
+// whose static type is not a user class or a collection already lands.
+//
+// Index and length semantics use Unicode scalar positions, the same
+// simplification [`string_method`] documents: Java counts UTF-16 units, so a
+// builder holding an astral character reports a length one smaller here. Every
+// bounds failure carries the JDK's own detail message, which is not one wording
+// but three — `Index i out of bounds for length n` for a single index,
+// `Range [s, e) out of bounds for length n` for a pair, and
+// `String index out of range: n` for `setLength`.
+
+/// Java's default `StringBuilder` capacity, and the slack `new
+/// StringBuilder(str)` adds to its argument's length.
+pub const SB_DEFAULT_CAP: usize = 16;
+
+/// The `StringIndexOutOfBoundsException` a single out-of-range index raises.
+fn sb_index_fault(i: i64, len: usize) -> Fault {
+    Fault::java(
+        "StringIndexOutOfBoundsException",
+        format!("Index {i} out of bounds for length {len}"),
+    )
+}
+
+/// The `StringIndexOutOfBoundsException` an out-of-range `[start, end)` pair
+/// raises.
+fn sb_range_fault(start: i64, end: i64, len: usize) -> Fault {
+    Fault::java(
+        "StringIndexOutOfBoundsException",
+        format!("Range [{start}, {end}) out of bounds for length {len}"),
+    )
+}
+
+/// Validate a scalar index against `len`, answering its byte offset in `s`.
+fn sb_char_offset(s: &str, i: i64, len: usize) -> Result<usize, Fault> {
+    if i < 0 || i as usize >= len {
+        return Err(sb_index_fault(i, len));
+    }
+    Ok(s.char_indices()
+        .nth(i as usize)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len()))
+}
+
+/// Validate a `[start, end)` pair the way `AbstractStringBuilder`'s
+/// `checkRangeSIOOBE` does, answering the two byte offsets.
+fn sb_range(s: &str, start: i64, end: i64, len: usize) -> Result<(usize, usize), Fault> {
+    if start < 0 || start > end || end as usize > len {
+        return Err(sb_range_fault(start, end, len));
+    }
+    let byte_of = |n: i64| {
+        s.char_indices()
+            .nth(n as usize)
+            .map(|(b, _)| b)
+            .unwrap_or(s.len())
+    };
+    Ok((byte_of(start), byte_of(end)))
+}
+
+/// The next capacity `AbstractStringBuilder` grows to when `min` characters no
+/// longer fit: `2 * old + 2`, or `min` when even that is too small.
+fn sb_grow(cap: usize, min: usize) -> usize {
+    if min <= cap {
+        cap
+    } else {
+        (cap * 2 + 2).max(min)
+    }
+}
+
+/// The text one `append`/`insert` argument contributes. javars has already
+/// converted a `char` argument to its one-character String and a `float` to
+/// `Float.toString` at the call site (`emit_char_string`), so this is the same
+/// rendering every other Java string conversion uses.
+///
+/// An array argument is joined rather than rendered, because `append(char[])`
+/// and `insert(int, char[])` are overloads that write the characters — the same
+/// reading `String.valueOf(char[])` already takes, and for the same reason.
+fn sb_arg_str(vm: &mut VM, v: &Value) -> String {
+    match array_items(v) {
+        Some(items) => items.iter().map(|e| java_str_vm(vm, e)).collect(),
+        None => java_str_vm(vm, v),
+    }
+}
+
+/// Evaluate `recv.method(args)` on a `StringBuilder`/`StringBuffer` receiver.
+///
+/// `None` means the name is not a builder method at all, which lets the caller
+/// fall through to `java.lang.Object`'s (`equals`, `hashCode`, `getClass`) —
+/// the three a builder genuinely inherits, and the reason `equals` compares
+/// identity here as it does in Java rather than comparing the text.
+fn builder_method(
+    vm: &mut VM,
+    id: u32,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    // Arguments render before the heap borrow: a rendering may run a user
+    // `toString()`, which re-enters the VM and can allocate.
+    let rendered: Vec<String> = args.iter().map(|a| sb_arg_str(vm, a)).collect();
+    Some(HEAP.with(|h| {
+        let mut heap = h.borrow_mut();
+        let Some(HostObj::Builder { s, cap, .. }) = heap.get_mut(id as usize) else {
+            return Err(Fault::internal("javars: dangling StringBuilder handle"));
+        };
+        let len = s.chars().count();
+        let this = Value::Obj(id);
+        match (method, args.len()) {
+            ("toString", 0) | ("substring", 0) => Ok(Value::str(s.clone())),
+            ("length", 0) => Ok(Value::Int(len as i64)),
+            ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
+            ("capacity", 0) => Ok(Value::Int(*cap as i64)),
+            // `ensureCapacity` and `trimToSize` are allocation hints. The first
+            // is observable through `capacity()`; the second is not, because
+            // javars stores the text in a `String` that is already trimmed.
+            ("ensureCapacity", 1) => {
+                let want = args[0].to_int();
+                if want > 0 {
+                    *cap = sb_grow(*cap, want as usize);
+                }
+                Ok(Value::Undef)
+            }
+            ("trimToSize", 0) => {
+                *cap = len;
+                Ok(Value::Undef)
+            }
+            ("append", 1) => {
+                s.push_str(&rendered[0]);
+                *cap = sb_grow(*cap, s.chars().count());
+                Ok(this)
+            }
+            ("appendCodePoint", 1) => {
+                let cp = args[0].to_int();
+                match u32::try_from(cp).ok().and_then(char::from_u32) {
+                    Some(c) => {
+                        s.push(c);
+                        *cap = sb_grow(*cap, s.chars().count());
+                        Ok(this)
+                    }
+                    None => Err(Fault::java(
+                        "IllegalArgumentException",
+                        format!("Not a valid Unicode code point: 0x{cp:X}"),
+                    )),
+                }
+            }
+            ("repeat", 2) => {
+                let n = args[1].to_int().max(0) as usize;
+                s.push_str(&rendered[0].repeat(n));
+                *cap = sb_grow(*cap, s.chars().count());
+                Ok(this)
+            }
+            ("charAt", 1) => {
+                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                Ok(Value::Int(s[at..].chars().next().map_or(0, |c| c as i64)))
+            }
+            ("setCharAt", 2) => {
+                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                let old = s[at..].chars().next().map_or(0, char::len_utf8);
+                s.replace_range(at..at + old, &rendered[1]);
+                Ok(Value::Undef)
+            }
+            ("deleteCharAt", 1) => {
+                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                let old = s[at..].chars().next().map_or(0, char::len_utf8);
+                s.replace_range(at..at + old, "");
+                Ok(this)
+            }
+            // `delete` and `replace` clamp the end to the length before the
+            // range check, which is why `delete(2, 100)` truncates rather than
+            // throwing while `substring(1, 9)` throws.
+            ("delete", 2) => {
+                let end = args[1].to_int().min(len as i64);
+                let (a, b) = sb_range(s, args[0].to_int(), end, len)?;
+                s.replace_range(a..b, "");
+                Ok(this)
+            }
+            ("replace", 3) => {
+                let end = args[1].to_int().min(len as i64);
+                let (a, b) = sb_range(s, args[0].to_int(), end, len)?;
+                s.replace_range(a..b, &rendered[2]);
+                *cap = sb_grow(*cap, s.chars().count());
+                Ok(this)
+            }
+            ("substring", 1) => {
+                let (a, b) = sb_range(s, args[0].to_int(), len as i64, len)?;
+                Ok(Value::str(s[a..b].to_string()))
+            }
+            ("substring", 2) | ("subSequence", 2) => {
+                let (a, b) = sb_range(s, args[0].to_int(), args[1].to_int(), len)?;
+                Ok(Value::str(s[a..b].to_string()))
+            }
+            // `insert`'s bounds failure names the *builder's* length as the
+            // range end, which is what `checkOffset` reports:
+            // `Range [9, 3) out of bounds for length 3`.
+            ("insert", 2) => {
+                let at = args[0].to_int();
+                if at < 0 || at as usize > len {
+                    return Err(sb_range_fault(at, len as i64, len));
+                }
+                let byte = s
+                    .char_indices()
+                    .nth(at as usize)
+                    .map(|(b, _)| b)
+                    .unwrap_or(s.len());
+                s.insert_str(byte, &rendered[1]);
+                *cap = sb_grow(*cap, s.chars().count());
+                Ok(this)
+            }
+            ("reverse", 0) => {
+                *s = s.chars().rev().collect();
+                Ok(this)
+            }
+            ("setLength", 1) => {
+                let n = args[0].to_int();
+                if n < 0 {
+                    return Err(Fault::java(
+                        "StringIndexOutOfBoundsException",
+                        format!("String index out of range: {n}"),
+                    ));
+                }
+                let n = n as usize;
+                if n < len {
+                    let byte = s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len());
+                    s.truncate(byte);
+                } else {
+                    // Java pads the extra positions with the NUL character,
+                    // which is observable: after `setLength(4)` on "ab",
+                    // `charAt(3)` is 0.
+                    s.extend(std::iter::repeat('\0').take(n - len));
+                }
+                *cap = sb_grow(*cap, n);
+                Ok(Value::Undef)
+            }
+            ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &rendered[0]))),
+            ("indexOf", 2) => {
+                let from = args[1].to_int().clamp(0, len as i64) as usize;
+                let byte = s
+                    .char_indices()
+                    .nth(from)
+                    .map(|(b, _)| b)
+                    .unwrap_or(s.len());
+                Ok(Value::Int(match char_index_of(&s[byte..], &rendered[0]) {
+                    -1 => -1,
+                    i => i + from as i64,
+                }))
+            }
+            ("lastIndexOf", 1) => Ok(Value::Int(char_last_index_of(s, &rendered[0], len as i64))),
+            ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
+                s,
+                &rendered[0],
+                args[1].to_int(),
+            ))),
+            // `compareTo(StringBuilder)` is `String.compareTo` on the contents
+            // (Java 11+); `equals` is NOT — it stays reference identity, which
+            // is why it is left to `object_method`.
+            ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &rendered[0], false))),
+            ("chars", 0) | ("codePoints", 0) => Err(Fault::internal(format!(
+                "javars: unsupported StringBuilder method `{method}` with 0 argument(s)"
+            ))),
+            _ => Err(Fault::internal(format!(
+                "javars: unsupported StringBuilder method `{method}` with {} argument(s)",
+                args.len()
+            ))),
+        }
+    }))
+}
+
+/// True when the handle points at a `StringBuilder`/`StringBuffer` — the test
+/// that routes a statically-untyped receiver away from the `String` methods.
+fn is_builder(v: &Value) -> Option<u32> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Builder { .. }) => Some(*id),
+        _ => None,
+    })
+}
+
+/// [`JSB_NEW`] — allocate a `StringBuilder`/`StringBuffer`.
+fn b_sb_new(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let buffer = args
+        .first()
+        .map(|v| v.as_str_cow().into_owned())
+        .unwrap_or_default()
+        == "StringBuffer";
+    let seed = args.get(1).cloned().unwrap_or(Value::Undef);
+    // The three constructors, told apart by the argument's runtime shape the
+    // same way Java's overload resolution tells them apart statically.
+    let (s, cap) = match &seed {
+        // `new StringBuilder((String) null)` dereferences its argument before
+        // it sizes anything; the no-argument form reaches here as the capacity
+        // 16 it is defined as, so `Undef` can only be a real `null`.
+        Value::Undef => {
+            return raise(
+                vm,
+                Fault::java(
+                    "NullPointerException",
+                    "Cannot invoke \"String.length()\" because \"str\" is null",
+                ),
+            )
+        }
+        Value::Int(n) => {
+            if *n < 0 {
+                return raise(vm, Fault::java("NegativeArraySizeException", n.to_string()));
+            }
+            (String::new(), *n as usize)
+        }
+        other => {
+            let text = java_str_vm(vm, other);
+            let n = text.chars().count();
+            (text, n + SB_DEFAULT_CAP)
+        }
+    };
+    Value::Obj(heap_alloc(HostObj::Builder { s, cap, buffer }))
+}
+
 /// [`JCOLL_NEW`] — see [`new_collection`].
 fn b_coll_new(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -2117,6 +2472,12 @@ fn value_class(v: &Value) -> Option<String> {
                         }
                         (Fixity::Immutable, _) => "Set$immutable".to_string(),
                     },
+                    HostObj::Builder { buffer, .. } => if *buffer {
+                        "StringBuffer"
+                    } else {
+                        "StringBuilder"
+                    }
+                    .to_string(),
                     HostObj::Closure { .. } => return None,
                 })
             });
@@ -2979,6 +3340,20 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     if is_collection(&recv) {
         return coll_method(vm, &recv, &method, &args);
     }
+    // A `StringBuilder`/`StringBuffer` receiver. This runs ahead of
+    // `object_method` so `sb.toString()` answers the contents rather than
+    // `java.lang.StringBuilder@<id>`, and `builder_method` declines the three
+    // names a builder really does inherit from `Object` so they fall through.
+    if let Some(id) = is_builder(&recv) {
+        if !matches!(method.as_str(), "equals" | "hashCode" | "getClass") {
+            if let Some(r) = builder_method(vm, id, &method, &args) {
+                return match r {
+                    Ok(v) => v,
+                    Err(f) => raise(vm, f),
+                };
+            }
+        }
+    }
     // A class instance whose own class declares no such method inherits
     // `java.lang.Object`'s — including `new Object()` itself, which has no class
     // body at all.
@@ -3056,9 +3431,18 @@ fn object_method(recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
     let Value::Obj(id) = recv else {
         return None;
     };
-    let is_instance =
-        HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Instance { .. })));
-    if !is_instance {
+    // A `StringBuilder` inherits `Object`'s `equals`/`hashCode` unchanged — it
+    // overrides neither, so two builders holding the same text are unequal and
+    // a builder's hash is its identity. Left out of this gate the call reached
+    // the `String` table through the receiver's rendering, and both answered
+    // for the *text*.
+    let inherits_object = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(HostObj::Instance { .. } | HostObj::Builder { .. })
+        )
+    });
+    if !inherits_object {
         return None;
     }
     match (method, args.len()) {
@@ -3209,6 +3593,12 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
                 format!("Cannot read field \"value\" because \"{param}\" is null"),
             ),
         );
+    }
+    // `StringBuilder.compareTo` (Java 11+) is `String.compareTo` on the two
+    // contents. It has to be answered before the arms below, all of which would
+    // read two heap handles as integers and always answer 0.
+    if is_builder(&a).is_some() || is_builder(&b).is_some() {
+        return Value::Int(compare_strings(&java_str(&a), &java_str(&b), false));
     }
     // A class instance here means no user class declares a one-argument
     // `compareTo`, so there is no body to run — `javac` would have rejected the
@@ -5820,6 +6210,10 @@ fn obj_default_str(id: u32) -> String {
                 _ => format!("{}@{id:x}", qualified_or_binary(class)),
             },
             Some(HostObj::Array(_)) => format!("[@{id:x}"),
+            // `StringBuilder.toString()` IS its contents, so every rendering
+            // surface — `println(sb)`, `"" + sb`, `%s`, a list element — shows
+            // the text rather than a handle.
+            Some(HostObj::Builder { s, .. }) => s.clone(),
             Some(HostObj::List { items, .. }) => render_sequence(items),
             // A view renders its window of the backing list. Rendering cannot
             // raise, so a view whose backing list moved prints as though it
@@ -6676,9 +7070,27 @@ const CHECKABLE_CAST_TARGETS: &[&str] = &[
 /// places at once.
 fn jdk_name(n: &str) -> String {
     match n {
-        "String" | "Integer" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Boolean"
-        | "Character" | "Number" | "CharSequence" | "Comparable" | "Cloneable" | "Iterable"
-        | "Enum" | "Record" | "Object" => {
+        "String"
+        | "Integer"
+        | "Long"
+        | "Short"
+        | "Byte"
+        | "Double"
+        | "Float"
+        | "Boolean"
+        | "Character"
+        | "Number"
+        | "CharSequence"
+        | "Comparable"
+        | "Cloneable"
+        | "Iterable"
+        | "Enum"
+        | "Record"
+        | "Object"
+        | "StringBuilder"
+        | "StringBuffer"
+        | "AbstractStringBuilder"
+        | "Appendable" => {
             format!("java.lang.{n}")
         }
         "Serializable" => "java.io.Serializable".to_string(),

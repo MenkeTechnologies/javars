@@ -276,6 +276,31 @@ at the bottom, and are summarized in the section right after this one.
   `U+001C`–`U+001F`. Neither is Rust's `char::is_whitespace`.
   Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
   one unit per astral character (which Java counts as two UTF-16 units).
+- **`StringBuilder` and `StringBuffer`.** The mutable character sequence, as a
+  host shape rather than a class instance: `append` (every overload, including
+  `char[]` and another builder), `appendCodePoint`, `insert`, `delete`,
+  `deleteCharAt`, `replace`, `reverse`, `setCharAt`, `charAt`, `substring`,
+  `subSequence`, `indexOf`/`lastIndexOf` (with and without a start), `length`,
+  `isEmpty`, `setLength`, `capacity`, `ensureCapacity`, `trimToSize`, `repeat`,
+  `compareTo`, and `toString`. A builder is a *reference*: passing one to a
+  method, storing it in an array or a map, and reading it back all denote the
+  one object, and `equals`/`hashCode` stay `Object`'s (two builders holding the
+  same text are unequal, exactly as in Java) while `toString` — and therefore
+  `println(sb)`, `"" + sb`, `%s`, and a list element — is the contents.
+  `capacity()` is modeled rather than delegated to Rust's own allocation,
+  because it is observable: the JDK starts at 16 (plus the initial string's
+  length), and grows to `2 * old + 2` or the required size, whichever is larger.
+  Every bounds failure carries the JDK's own detail message, which is three
+  wordings and not one — `Index i out of bounds for length n` for a single
+  index, `Range [s, e) out of bounds for length n` for a pair, and
+  `String index out of range: n` for `setLength` — and `delete`/`replace` clamp
+  their end to the length before the check while `substring` does not, which is
+  why `delete(2, 100)` truncates and `substring(1, 9)` throws. `StringBuffer`
+  differs only in its class name: javars runs one thread, so the synchronized
+  methods are unobservable. Index and length semantics use Unicode scalar
+  positions, the same simplification the `String` methods take.
+  `System.out.println(char[])` writes the characters too — it is a distinct
+  `PrintStream` overload, and it was rendering the array handle.
 - **A boxed primitive's own methods.** `Number`'s six converters
   (`intValue`/`longValue`/`shortValue`/`byteValue`/`doubleValue`/`floatValue`),
   `Boolean.booleanValue`, `Character.charValue` and `Object.hashCode` answer on
@@ -917,11 +942,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   above), so a stack trace has nothing to print, but the cause and suppressed
   lists have no such obstacle and are simply not built. `getLocalizedMessage()`
   *is* supplied, being `getMessage()` verbatim.
-- **`StringBuilder`** — ``javars: unknown class `StringBuilder` ``. Every method
-  on it is therefore unreachable, including the four bounds failures the JDK
-  raises (`setLength(-1)`, `deleteCharAt(9)`, `insert(9, …)`, `charAt(-1)` are
-  each a `StringIndexOutOfBoundsException`). Concatenation with `+` covers the
-  common case; the mutable builder does not exist.
+- **`StringBuilder.append(char[])` cannot tell a `null` array from a `null`
+  reference.** The builder itself is implemented (see the entry under
+  "Implemented"); this is the one call on it that still differs. Java's
+  `append((char[]) null)` dereferences the array to read its length and throws
+  ``NullPointerException: Cannot read the array length because "str" is null``,
+  while `append((Object) null)` and `append((String) null)` both *append* the
+  four characters `null`. javars erases the argument's type by the time the
+  value reaches the host, where all three are one `Undef` — so the appending
+  reading wins for all of them, which is the right answer for two of the three.
+  `new StringBuilder((String) null)` is not affected: the no-argument
+  constructor reaches the host as the capacity 16 it is defined as, which leaves
+  `null` unambiguous there.
 - **An unmodeled `catch` type is a compile error.** javars models the throwable
   subset in `src/prelude.rs`; a `catch` naming anything else — a name that does
   not exist (`catch (TotallyBogusException e)`), or a real JDK throwable outside
