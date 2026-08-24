@@ -3704,6 +3704,52 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     })
 }
 
+/// `Math.nextAfter(start, direction)`: the representable `double` adjacent to
+/// `start` in `direction`, or `direction` itself when the two are equal.
+///
+/// Consecutive `double`s of the same sign are consecutive integers when their
+/// bits are read as an `i64`, which is what makes the step one increment.
+/// Crossing zero is the one place that breaks — the two zeros are `0` and the
+/// sign bit — so it is handled directly.
+fn next_after(start: f64, direction: f64) -> f64 {
+    if start.is_nan() || direction.is_nan() {
+        return f64::NAN;
+    }
+    if start == direction {
+        return direction;
+    }
+    let up = direction > start;
+    if start == 0.0 {
+        // Both zeros step to the smallest subnormal of the target's sign.
+        return if up {
+            f64::from_bits(1)
+        } else {
+            -f64::from_bits(1)
+        };
+    }
+    let bits = start.to_bits() as i64;
+    // Away from zero is "up" in magnitude for a positive value and "down" for a
+    // negative one, which is exactly whether the step matches the sign.
+    let step = if (start > 0.0) == up { 1 } else { -1 };
+    f64::from_bits((bits + step) as u64)
+}
+
+/// `Math.ulp(d)`: the distance from `d` to the next `double` away from zero.
+fn double_ulp(d: f64) -> f64 {
+    if d.is_nan() {
+        return f64::NAN;
+    }
+    if d.is_infinite() {
+        return f64::INFINITY;
+    }
+    let d = d.abs();
+    if d == f64::MAX {
+        // One step further would be infinity, so the gap is measured downward.
+        return d - next_after(d, f64::NEG_INFINITY);
+    }
+    next_after(d, f64::INFINITY) - d
+}
+
 /// The number of Unicode scalars in `s` — javars's `String.length()`.
 ///
 /// Counting the bytes that are not UTF-8 continuation bytes is the same answer
@@ -3733,6 +3779,17 @@ fn char_at(s: &str, i: usize) -> Option<char> {
         return s[i..].chars().next();
     }
     s.chars().nth(i)
+}
+
+/// The byte offset of the `i`-th character of `s`, clamped to its end. The same
+/// ASCII-prefix shortcut [`char_at`] takes, for the callers that want to slice
+/// rather than to read one character.
+fn char_byte_of(s: &str, i: usize) -> usize {
+    let bytes = s.as_bytes();
+    if i <= bytes.len() && bytes[..i].is_ascii() {
+        return i;
+    }
+    s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
@@ -3873,6 +3930,16 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // Java `trim()` removes leading/trailing chars ≤ U+0020.
         ("trim", 0) => Ok(Value::str(s.trim_matches(|c: char| c <= ' ').to_string())),
         ("startsWith", 1) => Ok(Value::bool(s.starts_with(args[0].as_str_cow().as_ref()))),
+        // `startsWith(prefix, offset)` tests at a character offset instead of at
+        // the start. An offset outside the string is `false`, not a fault —
+        // Java bounds-checks it rather than throwing.
+        ("startsWith", 2) => {
+            let off = args[1].to_int();
+            let len = char_count(s);
+            Ok(Value::bool(usize::try_from(off).is_ok_and(|o| {
+                o <= len && s[char_byte_of(s, o)..].starts_with(args[0].as_str_cow().as_ref())
+            })))
+        }
         ("endsWith", 1) => Ok(Value::bool(s.ends_with(args[0].as_str_cow().as_ref()))),
         ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
         ("replace", 2) => Ok(Value::str(
@@ -4194,6 +4261,33 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // is not, so they stay out until a StrictMath port can answer exactly.
         ("Math", "toRadians", 1) => Ok(Value::float(args[0].to_float().to_radians())),
         ("Math", "toDegrees", 1) => Ok(Value::float(args[0].to_float().to_degrees())),
+        // The exactly-specified `double` statics, as opposed to the
+        // transcendentals just above. Each is an IEEE operation or a walk over
+        // the bit pattern, so there is one right answer and Rust gives it:
+        // `rint` is roundToIntegralTiesToEven (2.5 is 2.0, 3.5 is 4.0, unlike
+        // `round`'s half-up), `fma` is fusedMultiplyAdd with a single rounding,
+        // and `ulp`/`nextUp`/`nextDown`/`nextAfter` step the representable
+        // neighbours. They were unregistered — an error at the call site — for
+        // want of a reason rather than for one.
+        ("Math", "rint", 1) => Ok(Value::float(args[0].to_float().round_ties_even())),
+        ("Math", "copySign", 2) => Ok(Value::float(
+            args[0].to_float().copysign(args[1].to_float()),
+        )),
+        ("Math", "fma", 3) => Ok(Value::float(
+            args[0]
+                .to_float()
+                .mul_add(args[1].to_float(), args[2].to_float()),
+        )),
+        ("Math", "ulp", 1) => Ok(Value::float(double_ulp(args[0].to_float()))),
+        ("Math", "nextUp", 1) => Ok(Value::float(next_after(args[0].to_float(), f64::INFINITY))),
+        ("Math", "nextDown", 1) => Ok(Value::float(next_after(
+            args[0].to_float(),
+            f64::NEG_INFINITY,
+        ))),
+        ("Math", "nextAfter", 2) => Ok(Value::float(next_after(
+            args[0].to_float(),
+            args[1].to_float(),
+        ))),
 
         // ── java.lang.Integer / Long ──
         // A null argument is rejected before the text is looked at; without the
@@ -4349,7 +4443,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `String.valueOf(x)` renders any value with Java's `println` rules —
         // except a `char[]`, whose overload concatenates the characters rather
         // than printing the array.
-        ("String", "valueOf", 1) => Ok(Value::str(match array_items(&args[0]) {
+        // `copyValueOf(char[])` is `valueOf(char[])` — the JDK's own
+        // implementation is one call to the other — so it takes the same arm
+        // rather than a second reading of the array.
+        ("String", "valueOf" | "copyValueOf", 1) => Ok(Value::str(match array_items(&args[0]) {
             Some(items) => items.iter().map(java_str).collect::<String>(),
             None => java_str(&args[0]),
         })),

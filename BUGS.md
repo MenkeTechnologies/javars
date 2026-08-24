@@ -196,7 +196,8 @@ at the bottom, and are summarized in the section right after this one.
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
   `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
-  `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees` (with
+  `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees`/`rint`/
+  `copySign`/`ulp`/`nextUp`/`nextDown`/`nextAfter`/`fma` (with
   Java's int-vs-double overload result typing) and the `Math.PI`/`Math.E`
   constants; the `Integer`/`Long`/`Short`/`Byte`/`Double` `MAX_VALUE`/`MIN_VALUE`
   constants plus `Double.NaN` and the infinities; `Integer.parseInt` (with
@@ -207,7 +208,7 @@ at the bottom, and are summarized in the section right after this one.
   predicates and case conversions; `Integer`/`Long`/`Double`/`Float`/`Boolean`/
   `Character`'s `hashCode(x)`, each folding at its own width (so
   `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers);
-  `String.valueOf`/`join`/`format`; and
+  `String.valueOf`/`copyValueOf`/`join`/`format`; and
   `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
   `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
   %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
@@ -260,7 +261,8 @@ at the bottom, and are summarized in the section right after this one.
   receivers through the host: `length`, `isEmpty`, `charAt`, `substring`,
   `indexOf`, `contains`, `equals`, `equalsIgnoreCase`, `toUpperCase`,
   `toLowerCase`, `trim`, `startsWith`, `endsWith`, `concat`, `replace`,
-  `repeat`, `indexOf(t, from)`, `lastIndexOf`, `codePointAt`, `strip`,
+  `repeat`, `indexOf(t, from)`, `startsWith(p, offset)`, `lastIndexOf`,
+  `codePointAt`, `strip`,
   `stripLeading`, `stripTrailing`, `isBlank`, `hashCode`, `intern`,
   `contentEquals`, `toCharArray`, `formatted`, and the four
   `java.util.regex` methods `split`/`replaceAll`/`replaceFirst`/`matches` (see
@@ -1061,16 +1063,28 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   unregistered static is a clear error, a silently different last digit is not.
   `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
   `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
-  as are the `Math.PI`/`Math.E` constants.
+  as are the `Math.PI`/`Math.E` constants — and so are `rint`, `copySign`,
+  `ulp`, `nextUp`/`nextDown`/`nextAfter` and `fma`, which sit on the exact side
+  of the same line: each is an IEEE operation or a walk over the bit pattern, so
+  there is one right answer rather than a 1-ulp allowance. A 30x30 sweep of
+  every pair drawn from the boundary values (both zeros, both infinities, NaN,
+  `MIN_VALUE`, `MAX_VALUE`, the ties `rint` rounds to even, the subnormals) is
+  byte-identical to openjdk 26.0.2.
 - **The bit-twiddling and exact-arithmetic statics.** `Integer`/`Long`'s
   `bitCount`, `highestOneBit`/`lowestOneBit`, `numberOfLeadingZeros`/
   `numberOfTrailingZeros`, `reverse`/`reverseBytes`, `rotateLeft`/`rotateRight`,
   and the unsigned family (`divideUnsigned`, `remainderUnsigned`,
   `toUnsignedLong`, `toUnsignedString`); `Math`'s `addExact`/`subtractExact`/
-  `multiplyExact`/`toIntExact`, `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`,
-  `fma`, and `clamp`; `Double.isFinite`/`max`/`min`; `Character.compare` and
-  `isAlphabetic`. Each is an unregistered static, so a call is a compile error
-  naming the method rather than a wrong answer. `Short` and `Byte` are further
+  `multiplyExact`/`toIntExact` and `clamp`; `Double.isFinite`/`max`/`min`;
+  `Character.compare` and `isAlphabetic`. Each is an unregistered static, so a
+  call is a compile error naming the method rather than a wrong answer. The
+  `Exact` family and `clamp` are the ones that need more than an implementation:
+  both are overloaded on `int` *and* `long`, and the two disagree exactly where
+  they are interesting (`Math.addExact(2000000000, 2000000000)` throws for the
+  `int` overload and answers 4000000000 for the `long` one), so answering
+  without the argument's static type would give the wrong one silently.
+  `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`/`nextAfter` and `fma` were on
+  this list and are now implemented — see the `Math` entry above. `Short` and `Byte` are further
   along that scale: their `MAX_VALUE`/`MIN_VALUE` constants resolve, but the
   types carry no statics at all, so `Short.compare(a, b)` is
   ``javars: cannot find symbol: `Short` ``.
@@ -1189,6 +1203,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
+- **`==` between two boxed integers ignores the `Integer` cache.** javars boxes
+  no primitive, so an `Integer` is the same `Value::Int` an `int` is and `==`
+  compares the numbers. Java compares *references*, and caches only
+  `-128..=127`, which is why `Integer a = 127, b = 127; a == b` is `true` there
+  and `Integer a = 128, b = 128; a == b` is `false` — javars answers `true` for
+  both. `Long`/`Short`/`Byte`/`Character` cache the same range and read the same
+  way; `Double`/`Float` cache nothing, so Java is `false` for every pair of them
+  while javars is `true` when the values are equal.
+
+  Reproducing the boundary alone would be worse than the current answer, not
+  better: the model has no object to be identical *to*, so
+  `Integer a = 1000; Integer b = a; a == b` — which is `true` in Java, the two
+  names denoting one box — would become `false` the moment `==` started
+  answering "equal and inside the cache". A faithful answer needs boxing to
+  allocate a heap object with an identity, which is a change to how every
+  integral value crosses into an erased position rather than a change to `==`.
+  `.equals` is exact for all of them.
 - **What `instanceof` still cannot decide is what the value model does not
   record.** The type test is exact for every shape javars names (see the
   `instanceof` entry under "Implemented"); three answers are left, and each is a

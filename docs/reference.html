@@ -894,25 +894,31 @@ System.out.println();</code></pre>
           <pre><code class="lang-java">System.out.println("Hello".startsWith("He"));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-16">
-          <h3><a class="doc-anchor" href="#doc-string-methods-16">#</a> <code>endsWith</code></h3>
+          <h3><a class="doc-anchor" href="#doc-string-methods-16">#</a> <code>startsWith</code></h3>
+          <pre><code class="lang-java">boolean startsWith(String prefix, int offset)</code></pre>
+          <p>True when the string begins with <code>prefix</code> at <code>offset</code>. An offset outside the string answers <code>false</code> rather than throwing.</p>
+          <pre><code class="lang-java">System.out.println("Hello".startsWith("ll", 2));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-string-methods-17">
+          <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>endsWith</code></h3>
           <pre><code class="lang-java">boolean endsWith(String suffix)</code></pre>
           <p>True when the string ends with <code>suffix</code>.</p>
           <pre><code class="lang-java">System.out.println("Hello".endsWith("lo"));   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-17">
-          <h3><a class="doc-anchor" href="#doc-string-methods-17">#</a> <code>concat</code></h3>
+        <article class="doc-entry" id="doc-string-methods-18">
+          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>concat</code></h3>
           <pre><code class="lang-java">String concat(String str)</code></pre>
           <p>The receiver followed by <code>str</code>. Equivalent to <code>+</code> here, since javars's <code>+</code> already concatenates through the same value-to-string rules.</p>
           <pre><code class="lang-java">System.out.println("Hello".concat("!"));   // Hello!</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-18">
-          <h3><a class="doc-anchor" href="#doc-string-methods-18">#</a> <code>replace</code></h3>
+        <article class="doc-entry" id="doc-string-methods-19">
+          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>replace</code></h3>
           <pre><code class="lang-java">String replace(CharSequence target, CharSequence replacement)</code></pre>
           <p>Every occurrence of <code>target</code> replaced by <code>replacement</code>. This is the literal two-argument overload; there is no regex <code>replaceAll</code>.</p>
           <pre><code class="lang-java">System.out.println("Hello".replace("l", "L"));   // HeLLo</code></pre>
         </article>
-        <article class="doc-entry" id="doc-string-methods-19">
-          <h3><a class="doc-anchor" href="#doc-string-methods-19">#</a> <code>repeat</code></h3>
+        <article class="doc-entry" id="doc-string-methods-20">
+          <h3><a class="doc-anchor" href="#doc-string-methods-20">#</a> <code>repeat</code></h3>
           <pre><code class="lang-java">String repeat(int count)</code></pre>
           <p>The string repeated <code>count</code> times. A negative count raises <code>IllegalArgumentException</code> with Java's <code>count is negative: n</code> message.</p>
           <pre><code class="lang-java">System.out.println("ab".repeat(3));   // ababab</code></pre>
@@ -970,61 +976,111 @@ System.out.println();</code></pre>
           <pre><code class="lang-java">System.out.println(Math.round(-2.5));   // -2</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-9">
-          <h3><a class="doc-anchor" href="#doc-static-library-9">#</a> <code>Integer.parseInt</code></h3>
+          <h3><a class="doc-anchor" href="#doc-static-library-9">#</a> <code>Math.rint</code></h3>
+          <pre><code class="lang-java">double Math.rint(double a)</code></pre>
+          <p>Rounds to the nearest integral <code>double</code>, ties going to the **even** neighbour — the IEEE <code>roundToIntegralTiesToEven</code> operation, and therefore not <code>Math.round</code>'s ties-toward-positive-infinity: <code>rint(2.5)</code> is <code>2.0</code> while <code>round(2.5)</code> is <code>3</code>.</p>
+          <pre><code class="lang-java">System.out.println(Math.rint(2.5) + " " + Math.rint(3.5));   // 2.0 4.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-10">
+          <h3><a class="doc-anchor" href="#doc-static-library-10">#</a> <code>Math.copySign</code></h3>
+          <pre><code class="lang-java">double Math.copySign(double magnitude, double sign)</code></pre>
+          <p>The magnitude of the first argument with the sign of the second. The sign of a zero counts, so <code>copySign(3.0, -0.0)</code> is <code>-3.0</code>.</p>
+          <pre><code class="lang-java">System.out.println(Math.copySign(3.0, -0.0));   // -3.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-11">
+          <h3><a class="doc-anchor" href="#doc-static-library-11">#</a> <code>Math.ulp</code></h3>
+          <pre><code class="lang-java">double Math.ulp(double d)</code></pre>
+          <p>The distance from <code>d</code> to the next representable <code>double</code> away from zero — the size of one unit in the last place. <code>ulp(Double.MAX_VALUE)</code> is measured downward, because one step further would be infinity.</p>
+          <pre><code class="lang-java">System.out.println(Math.ulp(1.0));   // 2.220446049250313E-16</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-12">
+          <h3><a class="doc-anchor" href="#doc-static-library-12">#</a> <code>Math.nextUp</code></h3>
+          <pre><code class="lang-java">double Math.nextUp(double d)   |   double Math.nextDown(double d)</code></pre>
+          <p>The representable <code>double</code> adjacent to <code>d</code> toward positive (<code>nextUp</code>) or negative (<code>nextDown</code>) infinity. Both zeros step to the smallest subnormal of the target's sign.</p>
+          <pre><code class="lang-java">System.out.println(Math.nextUp(1.0));   // 1.0000000000000002</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-13">
+          <h3><a class="doc-anchor" href="#doc-static-library-13">#</a> <code>Math.nextAfter</code></h3>
+          <pre><code class="lang-java">double Math.nextAfter(double start, double direction)</code></pre>
+          <p>The representable <code>double</code> adjacent to <code>start</code> in the direction of <code>direction</code>, or <code>direction</code> itself when the two are equal.</p>
+          <pre><code class="lang-java">System.out.println(Math.nextAfter(1.0, 0.0));   // 0.9999999999999999</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-14">
+          <h3><a class="doc-anchor" href="#doc-static-library-14">#</a> <code>Math.fma</code></h3>
+          <pre><code class="lang-java">double Math.fma(double a, double b, double c)</code></pre>
+          <p><code>a * b + c</code> computed as one fused operation, rounded **once** — so it is not the same number as writing the two operations separately when the exact product needs more than 53 bits.</p>
+          <pre><code class="lang-java">System.out.println(Math.fma(2.0, 3.0, 4.0));   // 10.0</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-15">
+          <h3><a class="doc-anchor" href="#doc-static-library-15">#</a> <code>Integer.parseInt</code></h3>
           <pre><code class="lang-java">int Integer.parseInt(String s)</code></pre>
           <p>Parses a signed decimal integer with <code>java.lang.Integer</code>'s exact rules: no surrounding whitespace is tolerated and the value must fit 32 bits. Every failure raises <code>NumberFormatException</code> carrying Java's own <code>For input string: "…"</code> message.</p>
           <pre><code class="lang-java">System.out.println(Integer.parseInt("42"));   // 42</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-10">
-          <h3><a class="doc-anchor" href="#doc-static-library-10">#</a> <code>Integer.parseInt</code></h3>
+        <article class="doc-entry" id="doc-static-library-16">
+          <h3><a class="doc-anchor" href="#doc-static-library-16">#</a> <code>Integer.parseInt</code></h3>
           <pre><code class="lang-java">int Integer.parseInt(String s, int radix)</code></pre>
           <p>As above in the given radix, which must lie between <code>Character.MIN_RADIX</code> and <code>Character.MAX_RADIX</code>. A bad radix and a bad digit string produce Java's two distinct <code>NumberFormatException</code> messages.</p>
           <pre><code class="lang-java">System.out.println(Integer.parseInt("ff", 16));   // 255</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-11">
-          <h3><a class="doc-anchor" href="#doc-static-library-11">#</a> <code>Integer.valueOf</code></h3>
+        <article class="doc-entry" id="doc-static-library-17">
+          <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>Integer.valueOf</code></h3>
           <pre><code class="lang-java">int Integer.valueOf(String s)   |   int Integer.valueOf(int i)</code></pre>
           <p>Parses a decimal string with <code>parseInt</code>'s rules, or returns an integral argument unchanged. javars does no boxing, so there is no <code>Integer</code> object and no identity cache to observe.</p>
           <pre><code class="lang-java">System.out.println(Integer.valueOf("7"));   // 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-12">
-          <h3><a class="doc-anchor" href="#doc-static-library-12">#</a> <code>Integer.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-18">
+          <h3><a class="doc-anchor" href="#doc-static-library-18">#</a> <code>Integer.toString</code></h3>
           <pre><code class="lang-java">String Integer.toString(int i)</code></pre>
           <p>The decimal rendering of an integer.</p>
           <pre><code class="lang-java">System.out.println(Integer.toString(255));   // 255</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-13">
-          <h3><a class="doc-anchor" href="#doc-static-library-13">#</a> <code>Integer.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-19">
+          <h3><a class="doc-anchor" href="#doc-static-library-19">#</a> <code>Integer.toString</code></h3>
           <pre><code class="lang-java">String Integer.toString(int i, int radix)</code></pre>
           <p>The rendering in radix 2 through 36, sign-prefixed for negatives. An out-of-range radix falls back to 10, exactly as Java specifies.</p>
           <pre><code class="lang-java">System.out.println(Integer.toString(255, 16));   // ff</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-14">
-          <h3><a class="doc-anchor" href="#doc-static-library-14">#</a> <code>Long.parseLong</code></h3>
+        <article class="doc-entry" id="doc-static-library-20">
+          <h3><a class="doc-anchor" href="#doc-static-library-20">#</a> <code>Long.parseLong</code></h3>
           <pre><code class="lang-java">long Long.parseLong(String s)</code></pre>
           <p>Parses a signed decimal <code>long</code>, using the same rules and the same <code>NumberFormatException</code> messages as <code>parseInt</code> but with the 64-bit width check.</p>
           <pre><code class="lang-java">System.out.println(Long.parseLong("9000000000"));   // 9000000000</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-15">
-          <h3><a class="doc-anchor" href="#doc-static-library-15">#</a> <code>Boolean.parseBoolean</code></h3>
+        <article class="doc-entry" id="doc-static-library-21">
+          <h3><a class="doc-anchor" href="#doc-static-library-21">#</a> <code>Boolean.parseBoolean</code></h3>
           <pre><code class="lang-java">boolean Boolean.parseBoolean(String s)</code></pre>
           <p>True when the string equals <code>"true"</code> ignoring ASCII case, false for everything else — including <code>null</code> and malformed input, which Java also never rejects here.</p>
           <pre><code class="lang-java">System.out.println(Boolean.parseBoolean("TRUE"));   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-16">
-          <h3><a class="doc-anchor" href="#doc-static-library-16">#</a> <code>String.valueOf</code></h3>
+        <article class="doc-entry" id="doc-static-library-22">
+          <h3><a class="doc-anchor" href="#doc-static-library-22">#</a> <code>String.valueOf</code></h3>
           <pre><code class="lang-java">String String.valueOf(Object x)</code></pre>
           <p>Renders any value with Java's <code>println</code> rules: <code>true</code>/<code>false</code>, a whole double with its trailing <code>.0</code>, <code>null</code> for a null reference, and <code>ClassName@hash</code> for an instance whose class declares no <code>toString()</code>.</p>
           <pre><code class="lang-java">System.out.println(String.valueOf(3.0));   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-17">
-          <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>String.format</code></h3>
+        <article class="doc-entry" id="doc-static-library-23">
+          <h3><a class="doc-anchor" href="#doc-static-library-23">#</a> <code>String.copyValueOf</code></h3>
+          <pre><code class="lang-java">String String.copyValueOf(char[] data)</code></pre>
+          <p>The characters of <code>data</code> as a <code>String</code>. The JDK implements it as one call to <code>String.valueOf(char[])</code>, and so does javars.</p>
+          <pre><code class="lang-java">System.out.println(String.copyValueOf(new char[]{'a', 'b'}));   // ab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-24">
+          <h3><a class="doc-anchor" href="#doc-static-library-24">#</a> <code>StringBuilder</code></h3>
+          <pre><code class="lang-java">new StringBuilder()   |   new StringBuilder(int capacity)   |   new StringBuilder(String s)</code></pre>
+          <p>The mutable character sequence, and <code>StringBuffer</code> alongside it (javars runs one thread, so the two differ only in their class name). <code>append</code>/<code>insert</code>/<code>delete</code>/<code>deleteCharAt</code>/<code>replace</code>/<code>reverse</code>/<code>setCharAt</code>/<code>setLength</code>/<code>charAt</code>/<code>substring</code>/<code>indexOf</code>/<code>lastIndexOf</code>/<code>length</code>/<code>isEmpty</code>/<code>capacity</code>/<code>compareTo</code>/<code>toString</code> are implemented, the mutators answering the receiver so a chain keeps building. A builder is a reference: passing one to a method or storing it in a collection denotes the one object, <code>equals</code> stays <code>Object</code>'s identity comparison, and <code>toString</code> — and therefore <code>println(sb)</code>, <code>"" + sb</code> and <code>%s</code> — is the contents. <code>capacity()</code> reproduces the JDK's growth curve (16 to start, then <code>2 * old + 2</code>), because it is observable.</p>
+          <pre><code class="lang-java">StringBuilder b = new StringBuilder();
+for (int i = 0; i &lt; 3; i++) { b.append(i).append(','); }
+System.out.println(b);   // 0,1,2,</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-25">
+          <h3><a class="doc-anchor" href="#doc-static-library-25">#</a> <code>String.format</code></h3>
           <pre><code class="lang-java">String String.format(String fmt, Object... args)</code></pre>
-          <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f e E g G b B h H x X o c %</code> and <code>%n</code>, the flags <code>-</code> <code>0</code> <code>+</code> <code>,</code> <code>(</code>, an optional width, an optional <code>.precision</code>, and explicit argument indexes (<code>%2$s</code>). <code>%f</code> rounds HALF_UP on the double's exact value, as Java does. <code>System.out.printf</code> is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.</p>
+          <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f e E g G b B h H x X o c %</code> and <code>%n</code>, all seven flags <code>-</code> <code>#</code> <code>+</code> <code> </code> <code>0</code> <code>,</code> <code>(</code>, an optional width, an optional <code>.precision</code>, and explicit argument indexes (<code>%2$s</code>). <code>%f</code> rounds HALF_UP on the double's exact value, as Java does. <code>System.out.printf</code> is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.</p>
           <pre><code class="lang-java">System.out.println(String.format("%05.2f|%-6s|%+d", 3.14159, "ab", 7));   // 03.14|ab    |+7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-18">
-          <h3><a class="doc-anchor" href="#doc-static-library-18">#</a> <code>Arrays.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-26">
+          <h3><a class="doc-anchor" href="#doc-static-library-26">#</a> <code>Arrays.toString</code></h3>
           <pre><code class="lang-java">String Arrays.toString(Object[] a)</code></pre>
           <p>The shallow <code>[e0, e1, …]</code> rendering of an array, each element through the same Java value-to-string rules. A null reference renders as <code>null</code>; a nested array renders as its handle, since the rendering is shallow.</p>
           <pre><code class="lang-java">System.out.println(Arrays.toString(new int[]{1, 2, 3}));   // [1, 2, 3]</code></pre>

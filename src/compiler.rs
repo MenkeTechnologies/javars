@@ -6738,7 +6738,16 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // must NOT be treated as `int` — that is exactly the case where the
         // wrap would be wrong.
         ("Long", "parseLong") | ("Math", "round") => "long",
-        ("Math", "pow") | ("Math", "sqrt") | ("Math", "floor") | ("Math", "ceil") => "double",
+        // The `double`-returning `Math` statics. Every one of these is exactly
+        // specified — an IEEE operation or a bit-pattern walk — so Rust
+        // reproduces it digit for digit; the transcendentals, which the JDK
+        // answers to within 1 ulp from its own fdlibm port, stay out (see
+        // `static_method`).
+        (
+            "Math",
+            "pow" | "sqrt" | "floor" | "ceil" | "rint" | "copySign" | "ulp" | "nextUp" | "nextDown"
+            | "nextAfter" | "fma",
+        ) => "double",
         ("Float", "parseFloat") | ("Float", "valueOf") => "float",
         ("Float", "toString") => "String",
         ("Float", "compare") => "int",
