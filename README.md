@@ -286,8 +286,9 @@ Implemented and checked against the reference `java`:
   `Integer.parseInt(null)` is a `NumberFormatException` while
   `Double.parseDouble(null)` is a `NullPointerException`, exactly as the JDK
   splits them. The `String.format` failures — missing argument, unknown
-  conversion, and a width or precision too large for an `int` — are catchable
-  `java.util.IllegalFormatException`s too.
+  conversion, a width or precision too large for an `int`, and every flag
+  combination `java.util.Formatter` rejects (`%,x`, `%#d`, `%+ d`, `%-d`) — are
+  catchable `java.util.IllegalFormatException`s too.
 - **`int` width** — Java's 32-bit `int` wrapping, for operations whose operand
   types are statically `int`; `long` stays 64-bit.
 - **Division** — Java's binary numeric promotion: `int / int` truncates toward

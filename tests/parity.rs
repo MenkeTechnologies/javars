@@ -10,8 +10,15 @@
 //! `String.format` — stay locked WITHOUT a JDK installed. CI runs this; the live
 //! `parity-fuzz` differential harness is a developer tool.
 //!
-//! Format: one record per line, `program<TAB>expected`, with `\n` in `expected`
-//! encoded as the two characters backslash-n.
+//! Format: one record per line, `program<TAB>expected`, with `\n` in EITHER
+//! field encoded as the two characters backslash-n.
+//!
+//! The program field is decoded the same way `scripts/capture-parity.sh` decodes
+//! it before handing the source to `javac`. It used to be replayed verbatim,
+//! which silently limited the corpus to one-line programs: a captured
+//! multi-line record was written to `T.java` with the two characters `\n` still
+//! in it, `javars` reported a lex error, and the record failed as a
+//! "frontend failed" divergence that no frontend change could fix.
 
 use std::process::Command;
 
@@ -55,12 +62,13 @@ fn frozen_corpus_matches_reference_java() {
         if line.trim().is_empty() {
             continue;
         }
-        let (prog, expected_enc) = line
+        let (prog_enc, expected_enc) = line
             .split_once('\t')
             .unwrap_or_else(|| panic!("line {}: missing TAB separator", i + 1));
+        let prog = prog_enc.replace("\\n", "\n");
         let expected = expected_enc.replace("\\n", "\n");
 
-        let (got, ok) = run(prog);
+        let (got, ok) = run(&prog);
         if !ok {
             failures.push(format!(
                 "line {}: frontend failed\n  program: {prog}",
@@ -81,12 +89,12 @@ fn frozen_corpus_matches_reference_java() {
     // `n > 0` passes on a corpus a bad merge truncated to one line, and passes
     // just as happily if the `include_str!` target is replaced by a stub — the
     // whole test then reports success while checking almost nothing. The real
-    // corpus is 359 records and only ever grows (the capture script appends;
+    // corpus is 393 records and only ever grows (the capture script appends;
     // it never rewrites), so a floor near the current size fails loudly on any
     // truncation while leaving room for the handful a deletion might justify.
     assert!(
-        n >= 355,
-        "the frozen corpus should hold at least 355 records, found {n} — a \
+        n >= 388,
+        "the frozen corpus should hold at least 388 records, found {n} — a \
          truncated corpus still passes every case it kept, so the count is \
          asserted rather than the emptiness"
     );

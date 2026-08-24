@@ -4559,6 +4559,12 @@ fn java_format(
         let mut plus = false;
         let mut group = false;
         let mut parens = false;
+        // `%​ d` shows a leading space where `%+d` would show a `+`, and `%#x`
+        // writes the radix prefix Java calls the "alternate form". Both were
+        // parsed and discarded, so ``String.format("% d", 42)`` answered `42`
+        // (Java: ` 42`) and `%#x` of 255 answered `ff` (Java: `0xff`).
+        let mut space = false;
+        let mut alt = false;
         // A leading `0` already consumed as part of `lead` is the zero-pad flag,
         // not a width digit — Java has no zero-width conversion.
         if lead.starts_with('0') {
@@ -4572,7 +4578,8 @@ fn java_format(
                 '+' => plus = true,
                 ',' => group = true,
                 '(' => parens = true,
-                ' ' | '#' => {}
+                ' ' => space = true,
+                '#' => alt = true,
                 _ => break,
             }
             spec.push(f);
@@ -4624,8 +4631,20 @@ fn java_format(
         } else {
             Some(int_format_field(&width, "IllegalFormatWidthException")?)
         };
+        let flags = FmtFlags {
+            left,
+            alt,
+            plus,
+            space,
+            zero,
+            group,
+            parens,
+        };
+        check_format_flags(conv, &flags, width_n, prec, &spec)?;
         match conv {
-            '%' => out.push('%'),
+            // Width applies to the literal conversions too: `%5%` is four
+            // spaces and a `%`.
+            '%' => out.push_str(&pad("", "%", "", width_n, left, false)),
             'n' => out.push('\n'),
             _ => {
                 // An explicit `%n$` index does not advance the implicit cursor,
@@ -4643,19 +4662,27 @@ fn java_format(
                 if explicit_index.is_none() {
                     argi += 1;
                 }
-                check_conversion(conv, arg, tags.get(idx).copied().unwrap_or(""))?;
-                let (mut s, numeric) = format_conversion(conv, arg, prec, plus, vm.as_deref_mut())?;
+                let tag = tags.get(idx).copied().unwrap_or("");
+                check_conversion(conv, arg, tag)?;
+                let Rendered {
+                    mut prefix,
+                    mut body,
+                    numeric,
+                } = format_conversion(conv, arg, prec, &flags, tag, vm.as_deref_mut())?;
                 if group && numeric {
-                    s = group_digits(&s);
+                    body = group_digits(&body);
                 }
                 // The `(` flag wraps a negative number in parentheses instead of
-                // showing its minus sign.
-                if parens && numeric {
-                    if let Some(rest) = s.strip_prefix('-') {
-                        s = format!("({rest})");
-                    }
+                // showing its minus sign. The parentheses count toward the
+                // width and the zero padding goes *inside* them, which is why
+                // the sign travels as its own piece rather than glued to the
+                // digits: `%(08d` of -1 is `(000001)`.
+                let mut suffix = "";
+                if parens && numeric && prefix == "-" {
+                    prefix = "(".to_string();
+                    suffix = ")";
                 }
-                out.push_str(&pad(&s, width_n, left, zero && numeric));
+                out.push_str(&pad(&prefix, &body, suffix, width_n, left, zero && numeric));
             }
         }
     }
@@ -4769,24 +4796,209 @@ fn b_format(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
-/// Render one `String.format` conversion. Returns the rendered text and whether
-/// it is a numeric conversion (which may be zero-padded).
+/// The flag characters of one `String.format` conversion.
+struct FmtFlags {
+    left: bool,
+    alt: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    group: bool,
+    parens: bool,
+}
+
+impl FmtFlags {
+    /// The flags this set holds that are also in `want`, spelled in
+    /// `java.util.Formatter$Flags`' declaration order (`-`, `#`, `+`, ` `, `0`,
+    /// `,`, `(`) — the order its `toString` uses, and therefore the order every
+    /// flag-related exception message spells them in.
+    fn spell(&self, want: &[char]) -> String {
+        [
+            ('-', self.left),
+            ('#', self.alt),
+            ('+', self.plus),
+            (' ', self.space),
+            ('0', self.zero),
+            (',', self.group),
+            ('(', self.parens),
+        ]
+        .iter()
+        .filter(|(c, set)| *set && want.contains(c))
+        .map(|(c, _)| *c)
+        .collect()
+    }
+}
+
+/// Reject the flag/conversion combinations `java.util.Formatter` rejects, with
+/// its own exception class and detail message.
+///
+/// Every one of these used to be accepted and silently ignored, so
+/// `String.format("%,x", 1)` answered `1` where Java throws — the format string
+/// said something the program could not have meant, and nothing said so. The
+/// checks run in the JDK's order, which is observable: `%,(x` reports `,` (the
+/// per-conversion group check) rather than `(` (the later sign-flag check).
+fn check_format_flags(
+    conv: char,
+    f: &FmtFlags,
+    width: Option<usize>,
+    prec: Option<usize>,
+    spec: &str,
+) -> Result<(), Fault> {
+    let mismatch = |want: &[char]| -> Result<(), Fault> {
+        let bad = f.spell(want);
+        if bad.is_empty() {
+            return Ok(());
+        }
+        Err(Fault::java(
+            "FormatFlagsConversionMismatchException",
+            format!("Conversion = {conv}, Flags = {bad}"),
+        ))
+    };
+    let bad_flags = |want: &[char]| -> Fault {
+        Fault::java(
+            "IllegalFormatFlagsException",
+            format!("Flags = '{}'", f.spell(want)),
+        )
+    };
+    let missing_width = || Fault::java("MissingFormatWidthException", spec.to_string());
+    let bad_precision = || {
+        Fault::java(
+            "IllegalFormatPrecisionException",
+            prec.unwrap_or(0).to_string(),
+        )
+    };
+    const ALL: &[char] = &['-', '#', '+', ' ', '0', ',', '('];
+    // `%n` is a line separator, not a conversion: it takes no flag, no width,
+    // and no precision.
+    if conv == 'n' {
+        if !f.spell(ALL).is_empty() {
+            return Err(bad_flags(ALL));
+        }
+        if let Some(w) = width {
+            return Err(Fault::java("IllegalFormatWidthException", w.to_string()));
+        }
+        if let Some(p) = prec {
+            return Err(Fault::java(
+                "IllegalFormatPrecisionException",
+                p.to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if conv == '%' {
+        if f.left && width.is_none() {
+            return Err(missing_width());
+        }
+        return Ok(());
+    }
+    match conv {
+        // The general conversions take neither a sign nor a numeric layout.
+        // `#` is checked *after* the width, which is why `%,#s` reports `,`.
+        's' | 'S' | 'b' | 'B' | 'h' | 'H' => {
+            let mut bad: Vec<char> = vec!['+', ' ', '0', ',', '('];
+            if !matches!(conv, 's' | 'S') {
+                bad.push('#');
+            }
+            mismatch(&bad)?;
+            if f.left && width.is_none() {
+                return Err(missing_width());
+            }
+            if matches!(conv, 's' | 'S') {
+                mismatch(&['#'])?;
+            }
+        }
+        'c' | 'C' => {
+            if prec.is_some() {
+                return Err(bad_precision());
+            }
+            mismatch(&['#', '+', ' ', '0', ',', '('])?;
+            if f.left && width.is_none() {
+                return Err(missing_width());
+            }
+        }
+        // The numeric conversions share `checkNumeric`: `-`/`0` need a width,
+        // and `+`/` ` and `-`/`0` are mutually exclusive.
+        _ => {
+            if width.is_none() && (f.left || f.zero) {
+                return Err(missing_width());
+            }
+            if f.plus && f.space {
+                return Err(bad_flags(&['+', ' ']));
+            }
+            if f.left && f.zero {
+                return Err(bad_flags(&['-', '0']));
+            }
+            match conv {
+                'd' => {
+                    mismatch(&['#'])?;
+                    if prec.is_some() {
+                        return Err(bad_precision());
+                    }
+                }
+                // The radix conversions render a two's-complement bit pattern,
+                // which has no sign to decorate and no groups to separate.
+                'o' | 'x' | 'X' => {
+                    mismatch(&[','])?;
+                    mismatch(&['+', ' ', '('])?;
+                    if prec.is_some() {
+                        return Err(bad_precision());
+                    }
+                }
+                'e' | 'E' => mismatch(&[','])?,
+                'g' | 'G' => mismatch(&['#'])?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One rendered conversion, split so the padding can be inserted in the right
+/// place. `prefix` is the sign or radix marker (`-`, `+`, a leading space,
+/// `0x`), `body` the digits or text; zero padding goes *between* them, which is
+/// what makes `% 08d` of 1 ` 0000001` and `%#010x` of 255 `0x000000ff`.
+struct Rendered {
+    prefix: String,
+    body: String,
+    numeric: bool,
+}
+
+impl Rendered {
+    fn text(body: String) -> Self {
+        Rendered {
+            prefix: String::new(),
+            body,
+            numeric: false,
+        }
+    }
+}
+
+/// Render one `String.format` conversion.
 fn format_conversion(
     conv: char,
     arg: &Value,
     prec: Option<usize>,
-    plus: bool,
+    flags: &FmtFlags,
+    tag: &str,
     vm: Option<&mut VM>,
-) -> Result<(String, bool), Fault> {
-    // The `+` flag shows an explicit sign on a *non-negative* number; a negative
-    // one carries its own `-` from the rendering below.
-    let sign = |neg: bool| {
-        if neg {
-            ""
-        } else if plus {
+) -> Result<Rendered, Fault> {
+    // The sign piece a non-negative number carries: `+` for the `+` flag, a
+    // space for the ` ` flag, nothing otherwise. A negative one carries its own
+    // `-`, which the callers below put in `prefix`.
+    let pos_sign = || {
+        if flags.plus {
             "+"
+        } else if flags.space {
+            " "
         } else {
             ""
+        }
+    };
+    let float_sign = |x: f64| {
+        if x.is_sign_negative() {
+            "-".to_string()
+        } else {
+            pos_sign().to_string()
         }
     };
     // Every `Formatter.print*` starts with `if (arg == null) print("null")`, so
@@ -4798,27 +5010,34 @@ fn format_conversion(
         if conv.is_ascii_uppercase() {
             s = s.to_uppercase();
         }
-        return Ok((s, false));
+        return Ok(Rendered::text(s));
     }
-    // Renderings that build from `x.abs()` need the sign put back explicitly.
-    let signed = |x: f64, body: String| {
-        format!(
-            "{}{body}",
-            if x.is_sign_negative() {
-                "-"
-            } else {
-                sign(false)
-            }
-        )
+    let num = |prefix: String, body: String| Rendered {
+        prefix,
+        body,
+        numeric: true,
     };
     match conv {
         'd' => {
             let n = arg.to_int();
-            Ok((format!("{}{n}", sign(n < 0)), true))
+            Ok(num(
+                if n < 0 {
+                    "-".to_string()
+                } else {
+                    pos_sign().to_string()
+                },
+                n.unsigned_abs().to_string(),
+            ))
         }
         'f' => {
             let x = arg.to_float();
-            Ok((signed(x, fixed_half_up(x, prec.unwrap_or(6))), true))
+            // `#` on a fixed conversion forces the decimal point to appear even
+            // at precision 0: `%#.0f` of 1.0 is `1.`.
+            let mut body = fixed_half_up(x, prec.unwrap_or(6));
+            if flags.alt && !body.contains('.') {
+                body.push('.');
+            }
+            Ok(num(float_sign(x), body))
         }
         // `%s`/`%S` are `Formatter`'s call to the argument's own `toString()`, so
         // they are the two conversions a user override answers for. The rest
@@ -4834,34 +5053,64 @@ fn format_conversion(
             if let Some(p) = prec {
                 s = s.chars().take(p).collect();
             }
-            Ok((s, false))
+            Ok(Rendered::text(s))
         }
-        'b' => Ok((java_bool(arg).to_string(), false)),
-        'B' => Ok((java_bool(arg).to_string().to_uppercase(), false)),
-        'x' => Ok((format!("{:x}", arg.to_int()), true)),
-        'X' => Ok((format!("{:X}", arg.to_int()), true)),
-        'o' => Ok((format!("{:o}", arg.to_int()), true)),
-        'c' => Ok((
-            match arg {
-                // `%c` on an integer renders its code point as a character.
-                Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
-                other => java_str(other),
-            },
-            false,
-        )),
+        // The general conversions all truncate to the precision, not just `%s`
+        // — `%.2b` of `true` is `tr`.
+        'b' | 'B' => {
+            let mut s = java_bool(arg).to_string();
+            if conv == 'B' {
+                s = s.to_uppercase();
+            }
+            if let Some(p) = prec {
+                s = s.chars().take(p).collect();
+            }
+            Ok(Rendered::text(s))
+        }
+        // The radix conversions read the argument as an *unsigned* bit pattern
+        // at the width its declared type has — `%x` of the `int` -1 is
+        // `ffffffff` and of the `long` -1 eight more `f`s. javars stores both in
+        // one 64-bit `Value::Int`, so the width comes from the compiler's type
+        // tag; without it every negative `int` rendered sixteen digits.
+        'x' | 'X' | 'o' => {
+            let bits = radix_bits(arg, tag);
+            let body = match conv {
+                'x' => format!("{bits:x}"),
+                'X' => format!("{bits:X}"),
+                _ => format!("{bits:o}"),
+            };
+            // `#` writes Java's alternate form: `0x`/`0X` for hex, a leading
+            // `0` for octal. It sits ahead of any zero padding.
+            let prefix = if flags.alt {
+                match conv {
+                    'x' => "0x",
+                    'X' => "0X",
+                    _ => "0",
+                }
+            } else {
+                ""
+            };
+            Ok(num(prefix.to_string(), body))
+        }
+        'c' => Ok(Rendered::text(match arg {
+            // `%c` on an integer renders its code point as a character.
+            Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
+            other => java_str(other),
+        })),
         // Java's `%e` always writes a two-digit exponent with an explicit sign
         // (`1.234568e+03`), where Rust's `{:e}` writes `1.234568e3`.
         'e' | 'E' => {
             let x = arg.to_float();
-            // `sci_notation` already carries a negative sign; only the `+` flag's
-            // explicit plus has to be added.
+            // `sci_notation` carries a negative sign; the split rendering wants
+            // the magnitude, so it is stripped and re-supplied as the prefix.
             let s = sci_notation(x, prec.unwrap_or(6));
-            let s = if x.is_sign_negative() {
-                s
+            let body = s.strip_prefix('-').unwrap_or(&s).to_string();
+            let body = if conv == 'E' {
+                body.to_uppercase()
             } else {
-                format!("{}{s}", sign(false))
+                body
             };
-            Ok((if conv == 'E' { s.to_uppercase() } else { s }, true))
+            Ok(num(float_sign(x), body))
         }
         // `%g` picks fixed or scientific by the value's magnitude; Java's
         // precision counts *significant* digits and defaults to 6.
@@ -4876,15 +5125,15 @@ fn format_conversion(
                 } else {
                     x.abs().log10().floor() as i32
                 };
-                signed(x, fixed_half_up(x, (p as i32 - 1 - exp).max(0) as usize))
+                fixed_half_up(x, (p as i32 - 1 - exp).max(0) as usize)
             };
-            // Both branches already carry a negative sign.
-            let s = if x.is_sign_negative() {
-                s
+            let body = s.strip_prefix('-').unwrap_or(&s).to_string();
+            let body = if conv == 'G' {
+                body.to_uppercase()
             } else {
-                format!("{}{s}", sign(false))
+                body
             };
-            Ok((if conv == 'G' { s.to_uppercase() } else { s }, true))
+            Ok(num(float_sign(x), body))
         }
         // `%h` is the argument's `hashCode()` in hex, or "null".
         'h' | 'H' => {
@@ -4892,7 +5141,11 @@ fn format_conversion(
                 Value::Undef => "null".to_string(),
                 other => format!("{:x}", java_hash(other).unwrap_or(0) as u32),
             };
-            Ok((if conv == 'H' { s.to_uppercase() } else { s }, false))
+            let mut s = if conv == 'H' { s.to_uppercase() } else { s };
+            if let Some(p) = prec {
+                s = s.chars().take(p).collect();
+            }
+            Ok(Rendered::text(s))
         }
         // Java's own class and wording for a conversion character it does not
         // define. javars reported an internal error, which the program could not
@@ -5116,30 +5369,54 @@ fn java_bool(v: &Value) -> bool {
     }
 }
 
-/// Pad `s` to `width` (char count). Left-justify with `-`; otherwise right-
-/// justify, zero-padding after any leading sign when `zero` is set.
-fn pad(s: &str, width: Option<usize>, left: bool, zero: bool) -> String {
+/// The unsigned bit pattern `%x`/`%X`/`%o` renders, read at the width of the
+/// argument's *declared* type. javars keeps every integral value in one 64-bit
+/// `Value::Int`, so the width has to come from the compiler's type tag; an
+/// argument it could not type falls back to the narrowest width that still
+/// holds the value, which is `int` for everything an `int` can hold — the same
+/// default [`boxed_class`] applies.
+fn radix_bits(arg: &Value, tag: &str) -> u64 {
+    let n = arg.to_int();
+    match tag {
+        "byte" | "Byte" => n as u8 as u64,
+        "short" | "Short" => n as u16 as u64,
+        "long" | "Long" => n as u64,
+        "int" | "Integer" => n as i32 as u32 as u64,
+        _ if i32::try_from(n).is_ok() => n as i32 as u32 as u64,
+        _ => n as u64,
+    }
+}
+
+/// Lay one conversion out in `width` columns (char count).
+///
+/// `prefix` is the sign or radix marker and `suffix` the `(` flag's closing
+/// parenthesis; both count toward the width, and zero padding goes *between*
+/// the prefix and the body — which is what makes `% 08d` of 1 ` 0000001` and
+/// `%(08d` of -1 `(000001)`. Left-justify with `-`, otherwise right-justify.
+fn pad(
+    prefix: &str,
+    body: &str,
+    suffix: &str,
+    width: Option<usize>,
+    left: bool,
+    zero: bool,
+) -> String {
+    let joined = || format!("{prefix}{body}{suffix}");
     let w = match width {
         Some(w) => w,
-        None => return s.to_string(),
+        None => return joined(),
     };
-    let len = s.chars().count();
+    let len = prefix.chars().count() + body.chars().count() + suffix.chars().count();
     if len >= w {
-        return s.to_string();
+        return joined();
     }
     let fill = w - len;
     if left {
-        format!("{s}{}", " ".repeat(fill))
+        format!("{prefix}{body}{suffix}{}", " ".repeat(fill))
     } else if zero {
-        // Zero-pad after a leading sign (`-`/`+`).
-        if let Some(rest) = s.strip_prefix(['-', '+']) {
-            let sign = &s[..1];
-            format!("{sign}{}{rest}", "0".repeat(fill))
-        } else {
-            format!("{}{s}", "0".repeat(fill))
-        }
+        format!("{prefix}{}{body}{suffix}", "0".repeat(fill))
     } else {
-        format!("{}{s}", " ".repeat(fill))
+        format!("{}{prefix}{body}{suffix}", " ".repeat(fill))
     }
 }
 

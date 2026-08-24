@@ -69,6 +69,16 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("IllegalFormatPrecisionException", "IllegalFormatException"),
     ("MissingFormatArgumentException", "IllegalFormatException"),
     ("UnknownFormatConversionException", "IllegalFormatException"),
+    // The two the flag validator raises. A flag the conversion does not accept
+    // (`%,x`) and a pair that contradict each other (`%+ d`) were both accepted
+    // and ignored before it existed, so the format string said something the
+    // program could not have meant and nothing reported it.
+    (
+        "FormatFlagsConversionMismatchException",
+        "IllegalFormatException",
+    ),
+    ("IllegalFormatFlagsException", "IllegalFormatException"),
+    ("MissingFormatWidthException", "IllegalFormatException"),
 ];
 
 /// True when `name` is one of the modeled JDK throwables.
@@ -95,7 +105,10 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
         | "IllegalFormatWidthException"
         | "IllegalFormatPrecisionException"
         | "MissingFormatArgumentException"
-        | "UnknownFormatConversionException" => format!("java.util.{name}"),
+        | "UnknownFormatConversionException"
+        | "FormatFlagsConversionMismatchException"
+        | "IllegalFormatFlagsException"
+        | "MissingFormatWidthException" => format!("java.util.{name}"),
         _ => format!("java.lang.{name}"),
     })
 }

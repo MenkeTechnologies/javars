@@ -210,9 +210,24 @@ at the bottom, and are summarized in the section right after this one.
   `String.valueOf`/`join`/`format`; and
   `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
   `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
-  %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, the `-`/`0`/`+`/`,`/`(`
-  flags, width, `.precision`, and explicit argument indexes (`%2$s`); `%f` rounds
-  the value's shortest round-trip decimal HALF_UP, as Java's `Formatter` does. Each
+  %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
+  (`-`/`#`/`+`/` `/`0`/`,`/`(`), width, `.precision`, and explicit argument
+  indexes (`%2$s`); `%f` rounds
+  the value's shortest round-trip decimal HALF_UP, as Java's `Formatter` does.
+  The ` ` and `#` flags used to be *parsed and discarded*, so `% d` of 42
+  answered `42` where Java answers ` 42` and `%#x` of 255 answered `ff` where
+  Java answers `0xff`. The radix conversions read the argument as an unsigned
+  bit pattern **at its declared width**, which is a static-type question in a
+  value model that keeps every integral in one 64-bit slot: `%x` of the `int`
+  -1 is `ffffffff`, of the `long` -1 sixteen `f`s, and of a `byte` -1 just `ff`.
+  Zero padding goes between the sign and the digits and inside the `(` flag's
+  parentheses, so `% 08d` of 1 is ` 0000001` and `%(08d` of -1 is `(000001)`.
+  A flag the conversion does not accept (`%,x`, `%#d`, `%0s`), a pair that
+  contradict each other (`%+ d`, `%-05d`), and `-`/`0` without a width (`%-d`)
+  are `FormatFlagsConversionMismatchException` / `IllegalFormatFlagsException` /
+  `MissingFormatWidthException`, each with Java's own detail message and each
+  catchable — they were silently ignored before, so the format string said
+  something the program could not have meant and nothing reported it. Each
   conversion is type-checked against its argument's boxed class the way
   `java.util.Formatter` is, so `String.format("%.2f", 3)` raises
   `java.util.IllegalFormatConversionException: f != java.lang.Integer` instead of
