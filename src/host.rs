@@ -438,6 +438,16 @@ enum HostObj {
     /// larger. A `Vec`'s growth policy would answer a different number.
     Builder {
         s: String,
+        /// `s.chars().count()`, maintained by every mutation.
+        ///
+        /// Recomputing it per call made `append` — the one method a builder
+        /// exists for — walk the whole buffer every time, so building a string
+        /// of n characters cost O(n²): 400k appends took 9.96s of CPU against
+        /// 0.30s for 50k, where linear would be 2.4s. It also answers "is this
+        /// buffer all ASCII?" in O(1) (`s.len() == len`, since UTF-8 spends one
+        /// byte per character exactly then), which is what lets `charAt` and
+        /// the rest index by byte instead of decoding to the i-th character.
+        len: usize,
         cap: usize,
         /// `true` for a `StringBuffer`, which differs from `StringBuilder` only
         /// in its class name here: javars runs one thread, so the synchronized
@@ -1827,10 +1837,21 @@ fn sb_char_offset(s: &str, i: i64, len: usize) -> Result<usize, Fault> {
     if i < 0 || i as usize >= len {
         return Err(sb_index_fault(i, len));
     }
-    Ok(s.char_indices()
-        .nth(i as usize)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len()))
+    Ok(sb_byte_of(s, len, i as usize))
+}
+
+/// The byte offset of the `n`-th character of a builder holding `len` of them.
+///
+/// A buffer whose byte length equals its character count holds nothing but
+/// ASCII — UTF-8 spends one byte per character exactly then — so the character
+/// index *is* the byte index and no decoding is needed. That is the common case
+/// by a wide margin, and it turns `charAt` (and every other indexed operation)
+/// from a walk from the start into an O(1) read.
+fn sb_byte_of(s: &str, len: usize, n: usize) -> usize {
+    if s.len() == len {
+        return n.min(s.len());
+    }
+    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Validate a `[start, end)` pair the way `AbstractStringBuilder`'s
@@ -1839,13 +1860,10 @@ fn sb_range(s: &str, start: i64, end: i64, len: usize) -> Result<(usize, usize),
     if start < 0 || start > end || end as usize > len {
         return Err(sb_range_fault(start, end, len));
     }
-    let byte_of = |n: i64| {
-        s.char_indices()
-            .nth(n as usize)
-            .map(|(b, _)| b)
-            .unwrap_or(s.len())
-    };
-    Ok((byte_of(start), byte_of(end)))
+    Ok((
+        sb_byte_of(s, len, start as usize),
+        sb_byte_of(s, len, end as usize),
+    ))
 }
 
 /// The next capacity `AbstractStringBuilder` grows to when `min` characters no
@@ -1890,10 +1908,16 @@ fn builder_method(
     let rendered: Vec<String> = args.iter().map(|a| sb_arg_str(vm, a)).collect();
     Some(HEAP.with(|h| {
         let mut heap = h.borrow_mut();
-        let Some(HostObj::Builder { s, cap, .. }) = heap.get_mut(id as usize) else {
+        let Some(HostObj::Builder {
+            s, len: count, cap, ..
+        }) = heap.get_mut(id as usize)
+        else {
             return Err(Fault::internal("javars: dangling StringBuilder handle"));
         };
-        let len = s.chars().count();
+        // The maintained character count. Every arm that changes the text
+        // writes the new one back through `count`, from the delta it already
+        // knows — no method walks the buffer to find out how long it is.
+        let len = *count;
         let this = Value::Obj(id);
         match (method, args.len()) {
             ("toString", 0) | ("substring", 0) => Ok(Value::str(s.clone())),
@@ -1916,7 +1940,8 @@ fn builder_method(
             }
             ("append", 1) => {
                 s.push_str(&rendered[0]);
-                *cap = sb_grow(*cap, s.chars().count());
+                *count = len + rendered[0].chars().count();
+                *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("appendCodePoint", 1) => {
@@ -1924,7 +1949,8 @@ fn builder_method(
                 match u32::try_from(cp).ok().and_then(char::from_u32) {
                     Some(c) => {
                         s.push(c);
-                        *cap = sb_grow(*cap, s.chars().count());
+                        *count = len + 1;
+                        *cap = sb_grow(*cap, *count);
                         Ok(this)
                     }
                     None => Err(Fault::java(
@@ -1936,7 +1962,8 @@ fn builder_method(
             ("repeat", 2) => {
                 let n = args[1].to_int().max(0) as usize;
                 s.push_str(&rendered[0].repeat(n));
-                *cap = sb_grow(*cap, s.chars().count());
+                *count = len + rendered[0].chars().count() * n;
+                *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("charAt", 1) => {
@@ -1947,28 +1974,34 @@ fn builder_method(
                 let at = sb_char_offset(s, args[0].to_int(), len)?;
                 let old = s[at..].chars().next().map_or(0, char::len_utf8);
                 s.replace_range(at..at + old, &rendered[1]);
+                *count = len - 1 + rendered[1].chars().count();
                 Ok(Value::Undef)
             }
             ("deleteCharAt", 1) => {
                 let at = sb_char_offset(s, args[0].to_int(), len)?;
                 let old = s[at..].chars().next().map_or(0, char::len_utf8);
                 s.replace_range(at..at + old, "");
+                *count = len - 1;
                 Ok(this)
             }
             // `delete` and `replace` clamp the end to the length before the
             // range check, which is why `delete(2, 100)` truncates rather than
             // throwing while `substring(1, 9)` throws.
             ("delete", 2) => {
+                let start = args[0].to_int();
                 let end = args[1].to_int().min(len as i64);
-                let (a, b) = sb_range(s, args[0].to_int(), end, len)?;
+                let (a, b) = sb_range(s, start, end, len)?;
                 s.replace_range(a..b, "");
+                *count = len - (end - start) as usize;
                 Ok(this)
             }
             ("replace", 3) => {
+                let start = args[0].to_int();
                 let end = args[1].to_int().min(len as i64);
-                let (a, b) = sb_range(s, args[0].to_int(), end, len)?;
+                let (a, b) = sb_range(s, start, end, len)?;
                 s.replace_range(a..b, &rendered[2]);
-                *cap = sb_grow(*cap, s.chars().count());
+                *count = len - (end - start) as usize + rendered[2].chars().count();
+                *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("substring", 1) => {
@@ -1987,15 +2020,14 @@ fn builder_method(
                 if at < 0 || at as usize > len {
                     return Err(sb_range_fault(at, len as i64, len));
                 }
-                let byte = s
-                    .char_indices()
-                    .nth(at as usize)
-                    .map(|(b, _)| b)
-                    .unwrap_or(s.len());
-                s.insert_str(byte, &rendered[1]);
-                *cap = sb_grow(*cap, s.chars().count());
+                s.insert_str(sb_byte_of(s, len, at as usize), &rendered[1]);
+                *count = len + rendered[1].chars().count();
+                *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
+            // `reverse` reverses code points, not UTF-16 units, so a surrogate
+            // pair survives it — which is what Java's own `reverse` guarantees.
+            // The length is unchanged, so `count` is left alone.
             ("reverse", 0) => {
                 *s = s.chars().rev().collect();
                 Ok(this)
@@ -2010,25 +2042,21 @@ fn builder_method(
                 }
                 let n = n as usize;
                 if n < len {
-                    let byte = s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len());
-                    s.truncate(byte);
+                    s.truncate(sb_byte_of(s, len, n));
                 } else {
                     // Java pads the extra positions with the NUL character,
                     // which is observable: after `setLength(4)` on "ab",
                     // `charAt(3)` is 0.
                     s.extend(std::iter::repeat('\0').take(n - len));
                 }
+                *count = n;
                 *cap = sb_grow(*cap, n);
                 Ok(Value::Undef)
             }
             ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &rendered[0]))),
             ("indexOf", 2) => {
                 let from = args[1].to_int().clamp(0, len as i64) as usize;
-                let byte = s
-                    .char_indices()
-                    .nth(from)
-                    .map(|(b, _)| b)
-                    .unwrap_or(s.len());
+                let byte = sb_byte_of(s, len, from);
                 Ok(Value::Int(match char_index_of(&s[byte..], &rendered[0]) {
                     -1 => -1,
                     i => i + from as i64,
@@ -2101,7 +2129,13 @@ fn b_sb_new(vm: &mut VM, argc: u8) -> Value {
             (text, n + SB_DEFAULT_CAP)
         }
     };
-    Value::Obj(heap_alloc(HostObj::Builder { s, cap, buffer }))
+    let len = s.chars().count();
+    Value::Obj(heap_alloc(HostObj::Builder {
+        s,
+        len,
+        cap,
+        buffer,
+    }))
 }
 
 /// [`JCOLL_NEW`] — see [`new_collection`].
@@ -2186,6 +2220,25 @@ fn pop_args(vm: &mut VM, argc: u8) -> Vec<Value> {
     }
     v.reverse();
     v
+}
+
+/// Pop the operands of a **fixed-shape** builtin into `N` slots, deepest first
+/// — the order [`pop_args`] answers in, without the `Vec` it allocates.
+///
+/// A field read and a field write know exactly how many operands they take, so
+/// the heap allocation buys them nothing, and they sit on the hottest path an
+/// object-heavy loop has: one per field access. Operands beyond the `N` the
+/// builtin declares (a shape the compiler does not emit) are discarded, and
+/// fewer than `N` leaves the missing slots `Undef` rather than underflowing.
+fn pop_fixed<const N: usize>(vm: &mut VM, argc: u8) -> [Value; N] {
+    let mut out = std::array::from_fn(|_| Value::Undef);
+    for _ in N..argc as usize {
+        let _ = vm.stack.pop();
+    }
+    for slot in out.iter_mut().take(N.min(argc as usize)).rev() {
+        *slot = vm.stack.pop().unwrap_or(Value::Undef);
+    }
+    out
 }
 
 /// `new T[n]` — build an `n`-element array filled with the element default
@@ -2338,12 +2391,15 @@ fn b_new(vm: &mut VM, argc: u8) -> Value {
 /// `recv.field` read (stack `[recv, name]`): an array's `.length` or an instance
 /// field.
 fn b_field_get(vm: &mut VM, argc: u8) -> Value {
-    let args = pop_args(vm, argc);
-    let recv = args.first().cloned().unwrap_or(Value::Undef);
-    let name = args
-        .get(1)
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
+    // The compiler emits this builtin with the receiver pushed first and the
+    // field name on top, so both come off the stack directly. Going through
+    // `pop_args` cost a `Vec` allocation, and copying the name out of its
+    // `Cow` cost a `String` allocation — two mallocs on the path a loop over an
+    // object's fields takes once per read. `Value::Str`'s `as_str_cow` borrows,
+    // and `HashMap<String, _>` looks up by `&str`, so neither is needed.
+    let [recv, name_v] = pop_fixed::<2>(vm, argc);
+    let name = name_v.as_str_cow();
+    let name = name.as_ref();
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
@@ -2362,7 +2418,7 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
         match h.get(id as usize) {
             Some(HostObj::Array(a)) if name == "length" => Ok(Value::Int(a.len() as i64)),
             Some(HostObj::Instance { fields, .. }) => {
-                Ok(fields.get(&name).cloned().unwrap_or(Value::Undef))
+                Ok(fields.get(name).cloned().unwrap_or(Value::Undef))
             }
             _ => Err(Fault::internal(format!("javars: no field `{name}`"))),
         }
@@ -2375,13 +2431,10 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
 
 /// `recv.field = v` write (stack `[recv, name, value]`). Returns `v`.
 fn b_field_set(vm: &mut VM, argc: u8) -> Value {
-    let args = pop_args(vm, argc);
-    let recv = args.first().cloned().unwrap_or(Value::Undef);
-    let name = args
-        .get(1)
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
-    let val = args.get(2).cloned().unwrap_or(Value::Undef);
+    // Same fixed shape as [`b_field_get`], and the same two allocations saved.
+    let [recv, name_v, val] = pop_fixed::<3>(vm, argc);
+    let name = name_v.as_str_cow();
+    let name = name.as_ref();
     let id = match recv {
         Value::Obj(id) => id,
         _ => {
@@ -2398,7 +2451,15 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
             Some(HostObj::Instance { fields, .. }) => {
-                fields.insert(name.clone(), val.clone());
+                // The name is only copied when the field is *new*; an
+                // assignment to an existing one — which every loop body does —
+                // writes through the entry already there.
+                match fields.get_mut(name) {
+                    Some(slot) => *slot = val.clone(),
+                    None => {
+                        fields.insert(name.to_string(), val.clone());
+                    }
+                }
                 true
             }
             _ => false,
@@ -3643,6 +3704,37 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     })
 }
 
+/// The number of Unicode scalars in `s` — javars's `String.length()`.
+///
+/// Counting the bytes that are not UTF-8 continuation bytes is the same answer
+/// `chars().count()` gives without decoding anything, and the compiler
+/// vectorizes it.
+fn char_count(s: &str) -> usize {
+    s.as_bytes().iter().filter(|b| (*b & 0xC0) != 0x80).count()
+}
+
+/// The `i`-th character of `s`, or `None` when `i` is past the end.
+///
+/// `chars().nth(i)` decodes every character before the wanted one, which made
+/// the ordinary `for (i = 0; i < s.length(); i++) s.charAt(i)` walk quadratic:
+/// 40k characters took 13.9s where 5k took 0.25s. Java's `charAt` is a constant-
+/// time array read, so the shape a program writes has to stay affordable.
+///
+/// The prefix test is what recovers it. If every byte before `i` is ASCII then
+/// each of those characters is one byte, so the character index *is* the byte
+/// index and the character at it can be read directly. `is_ascii` on a slice is
+/// a vectorized byte scan rather than a decode loop, which leaves the walk with
+/// a constant small enough that the quadratic shape stops mattering at the
+/// sizes a program actually reaches. A string that really does hold multi-byte
+/// characters falls back to decoding.
+fn char_at(s: &str, i: usize) -> Option<char> {
+    let bytes = s.as_bytes();
+    if i < bytes.len() && bytes[..i].is_ascii() {
+        return s[i..].chars().next();
+    }
+    s.chars().nth(i)
+}
+
 /// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
 /// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
 /// consistent with javars's existing "a `char` literal is a one-character
@@ -3651,7 +3743,7 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
 /// index raises Java's `StringIndexOutOfBoundsException` with its exact detail
 /// message; an unknown method is a javars internal error.
 fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
-    let char_len = || s.chars().count() as i64;
+    let char_len = || char_count(s) as i64;
     null_string_argument(method, args)?;
     match (method, args.len()) {
         ("length", 0) => Ok(Value::Int(char_len())),
@@ -3668,7 +3760,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // Java's string conversion applies.
         ("charAt", 1) => {
             let i = args[0].to_int();
-            match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
+            match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
                 Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(
                     "StringIndexOutOfBoundsException",
@@ -3704,7 +3796,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ))),
         ("codePointAt", 1) => {
             let i = args[0].to_int();
-            match usize::try_from(i).ok().and_then(|i| s.chars().nth(i)) {
+            match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
                 Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(
                     "StringIndexOutOfBoundsException",
