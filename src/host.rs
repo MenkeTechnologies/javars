@@ -412,6 +412,8 @@ enum HostObj {
     Map {
         entries: Vec<(Value, Value)>,
         order: Order,
+        /// Key -> position accelerator; see [`KeyIndex`].
+        index: KeyIndex,
     },
     /// A `java.util.Set`, stored and ordered exactly like [`HostObj::Map`].
     ///
@@ -427,6 +429,8 @@ enum HostObj {
         items: Vec<Value>,
         order: Order,
         fixed: Fixity,
+        /// Element -> position accelerator; see [`KeyIndex`].
+        index: KeyIndex,
     },
     /// A `java.lang.StringBuilder` (or `StringBuffer`) — the mutable character
     /// sequence, which `+` concatenation cannot stand in for once a program
@@ -454,6 +458,137 @@ enum HostObj {
         /// methods are unobservable.
         buffer: bool,
     },
+}
+
+/// A hashable stand-in for the [`Value`]s a `Map` key or a `Set` element can
+/// take, used only to bucket them inside [`KeyIndex`].
+///
+/// Two values that [`value_eq`] calls equal MUST produce the same key, or a
+/// lookup would miss where the scan it replaces would hit. Equal keys need not
+/// mean equal values — the candidates in a bucket are still checked with
+/// `value_eq` — so a collision is free and only a *missing* one would be a bug.
+/// `index_key` therefore declines (answering `None`, which makes the caller
+/// scan) for exactly the values where the correspondence is not provable.
+#[derive(PartialEq, Eq, Hash)]
+enum IndexKey {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    Obj(u32),
+    Null,
+}
+
+/// The magnitude below which an `i64` and an `f64` denote the same integers
+/// one-for-one. Above it several `i64`s round to one `f64`, so
+/// `value_eq(Int, Float)` can hold for a pair whose [`IndexKey`]s differ.
+const EXACT_INT_FLOAT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// The bucket `v` belongs in, or `None` when no provably-correct one exists.
+fn index_key(v: &Value) -> Option<IndexKey> {
+    Some(match v {
+        Value::Int(n) => IndexKey::Int(*n),
+        Value::Str(s) => IndexKey::Str(s.as_str().to_string()),
+        Value::Bool(b) => IndexKey::Bool(*b),
+        Value::Obj(id) => IndexKey::Obj(*id),
+        Value::Undef => IndexKey::Null,
+        // `value_eq` compares an integral and a floating value numerically, so
+        // a `Float` has to land in the same bucket the equal `Int` does. That
+        // is only sound where the two representations agree exactly: below
+        // 2^53 an integral `f64` names one `i64` and vice versa. Everything
+        // else — a fraction, a NaN, a magnitude past 2^53 — declines.
+        Value::Float(f) => {
+            let f = *f;
+            if f.fract() != 0.0 || f.abs() >= EXACT_INT_FLOAT {
+                return None;
+            }
+            IndexKey::Int(f as i64)
+        }
+        _ => return None,
+    })
+}
+
+/// The key -> position accelerator a `Map` and a `Set` carry.
+///
+/// Both store their entries in a `Vec` (insertion order is what every
+/// `toString` and every iteration is derived from), so finding a key was a
+/// linear scan and `n` insertions cost O(n²): 20k `HashMap.put`s took 1.53s
+/// against 0.10s for 5k. Java's is O(1), and a program that fills a map in a
+/// loop is ordinary.
+///
+/// The index is an accelerator, never the authority: a hit is confirmed with
+/// [`value_eq`] against the candidates in the bucket, and anything it cannot
+/// represent falls back to the scan it replaces. Two conditions force that
+/// fallback — a stored key with no [`IndexKey`] (`unindexed > 0`), and a
+/// structural change that moved existing positions (`dirty`), which is repaired
+/// by one rebuild on the next lookup rather than by tracking the shift.
+struct KeyIndex {
+    by_key: HashMap<IndexKey, Vec<usize>>,
+    /// Stored keys with no `IndexKey`. While non-zero the index is incomplete.
+    unindexed: usize,
+    /// Positions have moved since the index was built.
+    dirty: bool,
+}
+
+impl Default for KeyIndex {
+    /// A fresh index is **stale**, not empty. A collection can be constructed
+    /// already holding entries (`new HashMap<>(other)`, `Set.of(…)`, a `keySet`
+    /// view), and an index that claimed to be complete would then answer
+    /// "absent" for every one of them. Starting dirty makes the first lookup
+    /// build it from whatever the collection actually holds, so no construction
+    /// site has to remember to.
+    fn default() -> Self {
+        KeyIndex {
+            by_key: HashMap::new(),
+            unindexed: 0,
+            dirty: true,
+        }
+    }
+}
+
+impl KeyIndex {
+    /// Record the key now sitting at `at`, which must be the last position.
+    fn push(&mut self, k: &Value, at: usize) {
+        match index_key(k) {
+            Some(key) => self.by_key.entry(key).or_default().push(at),
+            None => self.unindexed += 1,
+        }
+    }
+
+    /// Mark every recorded position stale. The next lookup rebuilds.
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    fn rebuild<'a>(&mut self, keys: impl Iterator<Item = &'a Value>) {
+        self.by_key.clear();
+        self.unindexed = 0;
+        self.dirty = false;
+        for (i, k) in keys.enumerate() {
+            self.push(k, i);
+        }
+    }
+
+    /// Where `q` sits among `items`, whose key is read by `key_of`.
+    ///
+    /// `None` means the index cannot answer and the caller must scan;
+    /// `Some(None)` is a confirmed absence.
+    fn find<T>(
+        &self,
+        items: &[T],
+        key_of: impl Fn(&T) -> &Value,
+        q: &Value,
+    ) -> Option<Option<usize>> {
+        if self.dirty || self.unindexed > 0 {
+            return None;
+        }
+        let key = index_key(q)?;
+        Some(self.by_key.get(&key).and_then(|cands| {
+            cands
+                .iter()
+                .copied()
+                .find(|&i| items.get(i).is_some_and(|it| value_eq(key_of(it), q)))
+        }))
+    }
 }
 
 /// What a collection's iteration order is.
@@ -1644,29 +1779,35 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         "HashMap" | "Map" => HostObj::Map {
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Hash,
+            index: KeyIndex::default(),
         },
         "LinkedHashMap" => HostObj::Map {
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Insertion,
+            index: KeyIndex::default(),
         },
         "TreeMap" => HostObj::Map {
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Sorted,
+            index: KeyIndex::default(),
         },
         "HashSet" | "Set" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Hash,
             fixed: Fixity::Mutable,
+            index: KeyIndex::default(),
         },
         "LinkedHashSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Insertion,
             fixed: Fixity::Mutable,
+            index: KeyIndex::default(),
         },
         "TreeSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Sorted,
             fixed: Fixity::Mutable,
+            index: KeyIndex::default(),
         },
         other => {
             return Err(Fault::internal(format!(
@@ -2736,10 +2877,17 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 }
                 r
             }
-            HostObj::Map { entries, order } => map_method(entries, *order, method, args, eq),
-            HostObj::Set { items, fixed, .. } => {
-                set_method(items, *fixed, method, args, &arg_seqs, eq)
-            }
+            HostObj::Map {
+                entries,
+                order,
+                index,
+            } => map_method(entries, *order, index, method, args, eq),
+            HostObj::Set {
+                items,
+                fixed,
+                index,
+                ..
+            } => set_method(items, *fixed, index, method, args, &arg_seqs, eq),
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -3179,53 +3327,79 @@ fn list_method(
 fn map_method(
     entries: &mut Vec<(Value, Value)>,
     order: Order,
+    index: &mut KeyIndex,
     method: &str,
     args: &[Value],
     eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
+    // A stale index is repaired once, here, rather than at every arm: the
+    // methods below either read it or invalidate it, and only this entry point
+    // knows the keys to rebuild it from.
+    if index.dirty {
+        index.rebuild(entries.iter().map(|(k, _)| k));
+    }
     // Only one arm below runs per call, so the single verdict vector is
     // unambiguous: it indexes the keys for every key-addressed method, and the
     // values for `containsValue`.
-    let find = |entries: &Vec<(Value, Value)>, k: &Value| match eq {
+    //
+    // A user `equals` puts the verdict in `eq` and it wins; otherwise
+    // [`value_eq`] decides and the index answers in its place when it can.
+    let find = |entries: &Vec<(Value, Value)>, index: &KeyIndex, k: &Value| match eq {
         Some(EqPlan::Index(at)) => *at,
-        _ => entries.iter().position(|(x, _)| value_eq(x, k)),
+        _ => match index.find(entries, |(x, _)| x, k) {
+            Some(at) => at,
+            None => entries.iter().position(|(x, _)| value_eq(x, k)),
+        },
     };
     let out = match (method, args.len()) {
         ("size", 0) => NewColl::Value(Value::Int(entries.len() as i64)),
         ("isEmpty", 0) => NewColl::Value(Value::bool(entries.is_empty())),
         // A re-`put` keeps the entry's original insertion position, which is
         // what Java's linked/bucket layouts both do.
-        ("put", 2) => NewColl::Value(match find(entries, &args[0]) {
+        // A fresh key lands at the end, which is the one shape the index can
+        // record without rebuilding — and the shape a loop that fills a map
+        // takes every iteration.
+        ("put", 2) => NewColl::Value(match find(entries, index, &args[0]) {
             Some(i) => std::mem::replace(&mut entries[i].1, args[1].clone()),
             None => {
+                index.push(&args[0], entries.len());
                 entries.push((args[0].clone(), args[1].clone()));
                 Value::Undef
             }
         }),
-        ("putIfAbsent", 2) => NewColl::Value(match find(entries, &args[0]) {
+        ("putIfAbsent", 2) => NewColl::Value(match find(entries, index, &args[0]) {
             Some(i) => entries[i].1.clone(),
             None => {
+                index.push(&args[0], entries.len());
                 entries.push((args[0].clone(), args[1].clone()));
                 Value::Undef
             }
         }),
-        ("get", 1) => {
-            NewColl::Value(find(entries, &args[0]).map_or(Value::Undef, |i| entries[i].1.clone()))
-        }
-        ("getOrDefault", 2) => NewColl::Value(
-            find(entries, &args[0]).map_or_else(|| args[1].clone(), |i| entries[i].1.clone()),
+        ("get", 1) => NewColl::Value(
+            find(entries, index, &args[0]).map_or(Value::Undef, |i| entries[i].1.clone()),
         ),
-        ("containsKey", 1) => NewColl::Value(Value::bool(find(entries, &args[0]).is_some())),
+        ("getOrDefault", 2) => NewColl::Value(
+            find(entries, index, &args[0])
+                .map_or_else(|| args[1].clone(), |i| entries[i].1.clone()),
+        ),
+        ("containsKey", 1) => NewColl::Value(Value::bool(find(entries, index, &args[0]).is_some())),
         ("containsValue", 1) => NewColl::Value(Value::bool(match eq {
             Some(EqPlan::Index(at)) => at.is_some(),
             _ => entries.iter().any(|(_, v)| value_eq(v, &args[0])),
         })),
-        ("remove", 1) => NewColl::Value(match find(entries, &args[0]) {
-            Some(i) => entries.remove(i).1,
+        // A removal shifts every later position, so the index is marked stale
+        // instead of being repaired here; the next lookup rebuilds it, which
+        // costs no more than the scan the index replaced.
+        ("remove", 1) => NewColl::Value(match find(entries, index, &args[0]) {
+            Some(i) => {
+                index.invalidate();
+                entries.remove(i).1
+            }
             None => Value::Undef,
         }),
         ("clear", 0) => {
             entries.clear();
+            index.rebuild(std::iter::empty());
             NewColl::Value(Value::Undef)
         }
         ("keySet", 0) => {
@@ -3243,6 +3417,7 @@ fn map_method(
                 // to the map); javars models it as a copy, so it is at least not
                 // an immutable one.
                 fixed: Fixity::Mutable,
+                index: KeyIndex::default(),
             })
         }
         ("values", 0) => {
@@ -3271,11 +3446,26 @@ fn map_method(
 fn set_method(
     items: &mut Vec<Value>,
     fixed: Fixity,
+    index: &mut KeyIndex,
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
     eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
+    // See the note at the top of `map_method`: one repair point, here.
+    if index.dirty {
+        index.rebuild(items.iter());
+    }
+    // The membership question every arm below asks. `eq` (a user `equals`) wins
+    // when it has a verdict; otherwise the index answers in `value_eq`'s place
+    // when it can, and the scan runs when it cannot.
+    let member = |items: &Vec<Value>, index: &KeyIndex, q: &Value| match eq {
+        Some(EqPlan::Index(at)) => *at,
+        _ => match index.find(items, |x| x, q) {
+            Some(at) => at,
+            None => items.iter().position(|x| value_eq(x, q)),
+        },
+    };
     // A structural change to a `Set.of` is Java's `UnsupportedOperationException`,
     // not a silent success — the same rule `list_method` applies to `List.of`.
     // Java throws before deciding whether the change was a no-op, so the guard
@@ -3289,18 +3479,20 @@ fn set_method(
         ("isEmpty", 0) => Value::bool(items.is_empty()),
         ("add", 1) => {
             structural()?;
-            if eq_index(eq, items, &args[0], false).is_some() {
+            if member(items, index, &args[0]).is_some() {
                 Value::bool(false)
             } else {
+                index.push(&args[0], items.len());
                 items.push(args[0].clone());
                 Value::bool(true)
             }
         }
-        ("contains", 1) => Value::bool(eq_index(eq, items, &args[0], false).is_some()),
+        ("contains", 1) => Value::bool(member(items, index, &args[0]).is_some()),
         ("remove", 1) => {
             structural()?;
-            match eq_index(eq, items, &args[0], false) {
+            match member(items, index, &args[0]) {
                 Some(i) => {
+                    index.invalidate();
                     items.remove(i);
                     Value::bool(true)
                 }
@@ -3310,6 +3502,7 @@ fn set_method(
         ("clear", 0) => {
             structural()?;
             items.clear();
+            index.rebuild(std::iter::empty());
             Value::Undef
         }
         ("addAll", 1) => {
@@ -3317,13 +3510,17 @@ fn set_method(
             match eq {
                 Some(EqPlan::Fresh(fresh)) => {
                     let changed = !fresh.is_empty();
-                    items.extend(fresh.iter().cloned());
+                    for v in fresh {
+                        index.push(v, items.len());
+                        items.push(v.clone());
+                    }
                     Value::bool(changed)
                 }
                 _ => {
                     let mut changed = false;
                     for v in arg_seqs[0].clone().unwrap_or_default() {
-                        if !items.iter().any(|x| value_eq(x, &v)) {
+                        if member(items, index, &v).is_none() {
+                            index.push(&v, items.len());
                             items.push(v);
                             changed = true;
                         }
@@ -4122,6 +4319,7 @@ fn collection_static(
                 items: unique,
                 order: Order::Hash,
                 fixed: Fixity::Immutable,
+                index: KeyIndex::default(),
             })))
         }
         // `Objects.equals(a, b)` — `a == b || (a != null && a.equals(b))`. It is
@@ -6313,7 +6511,7 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
                     .map(|i| items[i].clone())
                     .collect(),
             ),
-            Some(HostObj::Map { entries, order }) => {
+            Some(HostObj::Map { entries, order, .. }) => {
                 let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
                 RenderShape::Entries(
                     present_order(&keys, *order)
@@ -6414,7 +6612,7 @@ fn obj_default_str(id: u32) -> String {
                     .unwrap_or_default(),
             ),
             Some(HostObj::Set { items, order, .. }) => render_set(items, *order),
-            Some(HostObj::Map { entries, order }) => render_map(entries, *order),
+            Some(HostObj::Map { entries, order, .. }) => render_map(entries, *order),
             // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,
             // which is not reproducible (and not stable across JVM runs), so
             // javars prints a fixed marker instead. See `BUGS.md`.

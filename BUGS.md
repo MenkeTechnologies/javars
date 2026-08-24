@@ -1212,6 +1212,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   way; `Double`/`Float` cache nothing, so Java is `false` for every pair of them
   while javars is `true` when the values are equal.
 
+  The same one kind-per-family model decides `equals` between an integral and a
+  floating value, and there it goes the other way — javars calls them equal
+  where Java does not. `Integer.valueOf(1).equals(Double.valueOf(1.0))` is
+  `false` in Java (different classes), so a `HashMap` keyed on `1` and on `1.0`
+  holds two entries; javars compares the numbers, so the second `put` replaces
+  the first and the map holds one. `Integer` against `Long` reads the same way.
+  The collection key index takes this as given rather than working around it:
+  a value's index bucket is derived so that anything `value_eq` calls equal
+  lands in one bucket, and the cases where that correspondence is not provable
+  (a `Float` key, a magnitude past 2^53 where several `long`s round to one
+  `double`) fall back to the linear scan the index replaced.
+
   Reproducing the boundary alone would be worse than the current answer, not
   better: the model has no object to be identical *to*, so
   `Integer a = 1000; Integer b = a; a == b` — which is `true` in Java, the two
