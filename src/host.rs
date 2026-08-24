@@ -16,7 +16,7 @@
 //!    the same [`java_str`] — and the numeric pairs it cannot answer exactly: an
 //!    `i64` overflow, and a mixed `Int`/`Float` pair whose integer is past 2^53.
 //!    The numeric pairs get Java's `long` wrapping and binary numeric promotion,
-//!    never a concatenation; see [`java_numeric`].
+//!    never a concatenation; see `java_numeric`.
 
 use fusevm::{NumOp, Value, VM};
 use std::cell::{Cell, RefCell};
@@ -292,7 +292,7 @@ pub const JF32_ROUND: u16 = 743;
 /// virtual-dispatch chain compares against and the empty string for everything
 /// that is not a user instance. That was also what `getClass()` returned, so
 /// `new ArrayList<>().getClass().getName()` printed nothing — while
-/// [`binary_name`], reached only from the `ClassCastException` message, already
+/// `binary_name`, reached only from the `ClassCastException` message, already
 /// knew the answer was `java.util.ArrayList`. The two now share it.
 ///
 /// The descriptor argument carries what the *value* cannot: an array's element
@@ -595,7 +595,7 @@ pub fn set_supertypes(map: HashMap<String, Vec<String>>) {
 }
 
 /// Record each user class's Java *binary* name (`Outer$Nested`). Call before
-/// running the chunk; read by [`qualified_or_binary`].
+/// running the chunk; read by `qualified_or_binary`.
 pub fn set_binary_names(map: HashMap<String, String>) {
     BINARY.with(|b| *b.borrow_mut() = map);
 }
@@ -5309,7 +5309,7 @@ pub fn java_str(v: &Value) -> String {
 /// keeps them agreeing: `println(o)`, `"" + o` (via [`JSTRINGIFY`]),
 /// `String.valueOf(o)`, `Arrays.toString`, `list.toString()`, `String.join`,
 /// and `%s`. When the program declares no override at all the gate
-/// ([`any_user_tostring`]) is off and this is [`java_str`] exactly.
+/// (`any_user_tostring`) is off and this is [`java_str`] exactly.
 pub fn java_str_vm(vm: &mut VM, v: &Value) -> String {
     match v {
         Value::Obj(id) if any_user_tostring(vm) => obj_str_vm(vm, *id),
@@ -5961,7 +5961,7 @@ const NO_POW: &str = "javars: Java has no `**` operator";
 /// falsified it. Under the old text every mixed pair fell through to the
 /// `String` arms below — `Add` returned a concatenation, the comparisons
 /// answered by lexicographic string order, and the rest returned a type error.
-/// [`java_numeric`] now answers all three cases and is reached on operand
+/// `java_numeric` now answers all three cases and is reached on operand
 /// shape, so no numeric pair can fall into a `String` arm again.
 pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     // `Neg` is unary — fusevm passes `Undef` as the second operand, so it can
@@ -6326,7 +6326,7 @@ fn cast_message(from: &str, target: &str) -> String {
 
 /// Whether a reference cast to `ty` is one javars can decide.
 ///
-/// This is the *target* half of the same question [`value_class`] answers for a
+/// This is the *target* half of the same question `value_class` answers for a
 /// value, and it lives here so the two halves read one list. The compiler asks
 /// it before emitting a [`JCHECKCAST`] at all: a name that is neither a
 /// declared class nor one of these is a type javars does not model — a type
@@ -6334,8 +6334,8 @@ fn cast_message(from: &str, target: &str) -> String {
 /// and a check it cannot decide must not invent a failure.
 ///
 /// `Object` is deliberately absent: every value satisfies it, so a check would
-/// only cost ops. Every other name here appears in [`jdk_supers`], is produced
-/// by [`value_class`], or is one of the wrapper siblings [`cast_allowed`]
+/// only cost ops. Every other name here appears in `jdk_supers`, is produced
+/// by `value_class`, or is one of the wrapper siblings `cast_allowed`
 /// answers for — which `castable_targets_are_closed_over_the_supertype_graph`
 /// asserts, so this list cannot fall behind the graph.
 pub fn is_checkable_cast_target(ty: &str) -> bool {
