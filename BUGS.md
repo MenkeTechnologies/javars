@@ -226,6 +226,12 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **Unbound method references on a wrapper class** (`Integer::intValue`,
+  `Double::longValue`, `Integer::compareTo`) — `Number`'s six converters,
+  `Boolean.booleanValue`, `Character.charValue`, and the `Object` methods a box
+  overrides. The set is the one [`crate::host::boxed_method`] serves, because a
+  reference that desugared to a call javars cannot make would be a worse error
+  than refusing the reference.
 - **`switch` type patterns and `when` guards.** `case Circle c ->` tests and
   binds the way an `instanceof` pattern does, in both the arrow and the colon
   form, and a `when` guard runs after its label matched — a failed guard is a
@@ -265,7 +271,9 @@ at the bottom, and are summarized in the section right after this one.
   predicates and case conversions; `Integer`/`Long`/`Double`/`Float`/`Boolean`/
   `Character`'s `hashCode(x)`, each folding at its own width (so
   `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers);
-  `String.valueOf`/`copyValueOf`/`join`/`format`; and
+  `String.valueOf`/`copyValueOf`/`join`/`format`;
+  `StringBuilder.append(char[], int, int)`, which is the one `append` that
+  rejects a window outside the array; and
   `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
   `copyOfRange`/`binarySearch`/`hashCode`; `List.of`/`Set.of`/`Map.of`, each
   immutable and each rejecting what the JDK's factory rejects (a repeated
@@ -1092,11 +1100,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Objects.equals` (the one `Objects` member, because a `record`'s derived
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
-  library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math.powExact` and
-  the `unsignedMultiplyExact`/`unsignedPowExact` pair, and
-  `StringBuilder.append(char[], int, int)`, are on the same footing: a call is a
-  compile error naming the method. `System` carries
+  library surface — no `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no
+  streams, no I/O. `Math.powExact` and the
+  `unsignedMultiplyExact`/`unsignedPowExact` pair are on the same footing: a
+  call is a compile error naming the method. `System` carries
   only its two streams: `System.exit(3)` is
   ``javars: only `System.out`/`System.err` are supported, not `System.exit` ``,
   which also means a program cannot choose its exit status — 0 for a clean run

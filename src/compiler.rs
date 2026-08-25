@@ -3576,6 +3576,24 @@ impl Compiler {
                 },
             )));
         }
+        // `Integer::intValue` — an unbound instance method on a wrapper class.
+        // These are the converters `Number` declares plus the two `Object` ones
+        // every box answers, and they are what a `mapToInt`/`sorted`/`map`
+        // pipeline over boxed elements is written with.
+        if crate::host::box_class_code(name).is_some() {
+            if let Some(arity) = boxed_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
         // `String::length` — an unbound `String` instance method.
         if name == "String" {
             if let Some(arity) = string_instance_ref_arity(method) {
@@ -5714,7 +5732,7 @@ impl Compiler {
         // array overload reaches the host under a name of its own.
         let method = if matches!(tag.as_str(), "StringBuilder" | "StringBuffer")
             && method == "append"
-            && args.len() == 1
+            && matches!(args.len(), 1 | 3)
             && self.expr_java_type(&args[0]).as_deref() == Some("char[]")
         {
             "appendChars"
@@ -7415,6 +7433,10 @@ fn builder_call_java_type(recv_ty: &str, method: &str, argc: usize) -> Option<&'
     };
     Some(match (method, argc) {
         ("append", 1)
+        // `append(char[], int, int)` answers the receiver like every other
+        // `append`; without it a chained call lost the builder's static type
+        // and the second link dispatched as a `String` method.
+        | ("append", 3)
         | ("appendCodePoint", 1)
         | ("insert", 2)
         | ("delete", 2)
@@ -7552,6 +7574,24 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
 /// The parameter count of a `String` instance method a method reference can name
 /// (`String::length` → 0, so the synthesized lambda takes 1: the receiver).
 /// `substring` and `indexOf` are overloaded on arity in Java and so are absent.
+/// The parameter count of an unbound instance-method reference on a wrapper
+/// class (`Integer::intValue`), *excluding* the receiver, or `None` for a name
+/// no box answers.
+///
+/// The set is `Number`'s six converters, `Boolean.booleanValue`,
+/// `Character.charValue`, and the two `Object` methods a box overrides — the
+/// same set [`crate::host::boxed_method`] serves, because a reference that
+/// desugars to a call javars cannot make would be a worse error than refusing
+/// the reference.
+fn boxed_instance_ref_arity(method: &str) -> Option<usize> {
+    Some(match method {
+        "intValue" | "longValue" | "shortValue" | "byteValue" | "doubleValue" | "floatValue"
+        | "booleanValue" | "charValue" | "hashCode" | "toString" => 0,
+        "equals" | "compareTo" => 1,
+        _ => return None,
+    })
+}
+
 fn string_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
         "length" | "isEmpty" | "toUpperCase" | "toLowerCase" | "trim" => 0,

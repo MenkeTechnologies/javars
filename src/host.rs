@@ -2517,6 +2517,25 @@ fn builder_method(
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
+            // `append(char[], int, int)` — the array's characters from
+            // `offset`, `len` of them. Java checks the window against the
+            // array's length and reports the same `IndexOutOfBoundsException`
+            // a bad `String.valueOf(char[], int, int)` does.
+            ("appendChars", 3) => {
+                let chars: Vec<char> = rendered[0].chars().collect();
+                let (off, n) = (args[1].jint(), args[2].jint());
+                if off < 0 || n < 0 || off + n > chars.len() as i64 {
+                    return Err(Fault::java(
+                        "IndexOutOfBoundsException",
+                        format!("offset {off}, count {n}, length {}", chars.len()),
+                    ));
+                }
+                let text: String = chars[off as usize..(off + n) as usize].iter().collect();
+                s.push_str(&text);
+                *count = len + n as usize;
+                *cap = sb_grow(*cap, *count);
+                Ok(this)
+            }
             ("appendCodePoint", 1) => {
                 let cp = args[0].jint();
                 match u32::try_from(cp).ok().and_then(char::from_u32) {
