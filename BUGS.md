@@ -1015,6 +1015,24 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   class is modeled, `catch (StackOverflowError e)` is now a compile error (see
   the catch-type entry below) rather than an arm that compiles and can never
   fire.
+- **A loop that touches an array element does not reach native code.** Every
+  `for`, `while` and enhanced `for` is emitted rotated, which is the shape
+  fusevm's tracing JIT needs, and `--tiers` reports `reaches native code true`
+  for all three over primitives. An *array* loop is refused a step earlier —
+  `trace-eligible=false`, not `traced=false` — because javars models a Java
+  array as a host handle whose element access lowers to `Op::CallBuiltin`,
+  which the trace tier rejects outright (`is_trace_op_allowed_at`, fusevm
+  0.23.0 `src/jit.rs:6670`).
+
+  Lowering arrays onto fusevm's *own* array ops would not close it: neither
+  tier compiles `ArrayGet`, `ArraySet`, `ArrayLen`, `MakeArray` or `ArrayPush`
+  either, so the refusal would move one op earlier rather than lift. That is
+  asserted rather than asserted-about — `src/tiers.rs` asks the JIT directly,
+  op by op, and is the test that will say when a later fusevm compiles them.
+  Closing this needs codegen inside fusevm, not a different lowering here.
+
+  `for (;;)` is a separate and permanent boundary: it has no test to branch on,
+  so its back edge cannot be the conditional branch a trace closes with.
 - **`ArrayStoreException` is never raised.** A reference array carries no
   element type at runtime, so storing the wrong type through a widened reference
   succeeds silently: `Object[] o = new String[2]; o[0] = Integer.valueOf(3);`

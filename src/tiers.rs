@@ -325,6 +325,38 @@ mod tests {
         }
     }
 
+    /// Moving Java's arrays onto fusevm's **native** array ops would not close
+    /// the gap the test below reports — it would move it one op earlier.
+    ///
+    /// The array loop does not trace because javars models a Java array as a
+    /// host handle whose element access is an `Op::CallBuiltin`, which the
+    /// trace tier refuses. The obvious next step is to lower an array to
+    /// `Value::Array` and index it with `Op::ArrayGet`, so this asks the JIT
+    /// directly whether it would take that op — the same way
+    /// [`op_is_eligible`] asks about every other one — rather than reading its
+    /// eligibility list and hoping.
+    ///
+    /// It would not: no array op is compiled by either tier. So closing the gap
+    /// needs codegen inside fusevm, not a different lowering in javars. If a
+    /// later fusevm compiles them, this test is the one that says so.
+    #[test]
+    fn fusevms_native_array_ops_are_no_more_compilable_than_the_builtin() {
+        let jit = JitCompiler::new();
+        for op in [
+            Op::ArrayGet(0),
+            Op::ArraySet(0),
+            Op::ArrayLen(0),
+            Op::MakeArray(0),
+            Op::ArrayPush(0),
+        ] {
+            assert!(
+                !op_is_eligible(&jit, &op),
+                "`{op:?}` is compilable — javars's arrays could move onto the \
+                 native ops and an array loop would then trace"
+            );
+        }
+    }
+
     /// A loop that touches an **array element** is rotated like the rest and
     /// still does not trace, for a reason rotation cannot reach: javars models
     /// a Java array as a host handle, so reading or writing one lowers to
@@ -334,8 +366,11 @@ mod tests {
     /// way. Lifting this needs Java's array model moved onto fusevm's native
     /// array ops, not a change to loop shape.
     ///
-    /// Asserting it keeps the boundary honest: give arrays native ops and this
-    /// test is the one that says the gap closed.
+    /// Asserting it keeps the boundary honest. Note what would *not* close it:
+    /// [`fusevms_native_array_ops_are_no_more_compilable_than_the_builtin`]
+    /// shows fusevm compiles none of its own array ops either, so moving
+    /// javars's arrays onto them would move the refusal one op earlier rather
+    /// than lift it.
     #[test]
     fn an_array_loop_does_not_trace_because_element_access_is_a_builtin() {
         let report = report(
