@@ -195,6 +195,12 @@ at the bottom, and are summarized in the section right after this one.
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
   `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
+- **`sealed` / `non-sealed` types and their `permits` clause.** Parsed and
+  erased. The restriction is a *compile-time* one: `javac` has already rejected
+  every implementation outside the `permits` list, and each permitted subtype
+  declares its own `implements`/`extends` edge, so the list adds nothing the
+  supertype graph does not already carry. Both remain contextual keywords, so a
+  variable named `sealed` or `permits` still parses.
 - **`instanceof` type patterns.** `o instanceof String s` tests and binds in
   one step, and the binding carries the pattern's type — so `s.length()`
   resolves as a `String` method and `l / 3` on an `o instanceof Long l` is

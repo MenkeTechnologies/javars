@@ -147,11 +147,14 @@ impl Parser {
         methods: &mut Vec<Method>,
         classes: &mut Vec<Class>,
     ) -> Result<(), String> {
-        // modifiers (`public`, `static`, and ident-form `final`/`abstract`)
-        while matches!(self.peek(), Tok::Public | Tok::Static)
-            || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract")
-        {
-            self.advance();
+        // modifiers (`public`, `static`, and the ident-form ones — see
+        // [`class_modifier_len`], which also spells `non-sealed`)
+        loop {
+            let n = class_modifier_len(&self.toks, self.pos);
+            if n == 0 {
+                break;
+            }
+            self.pos += n;
         }
         let line = self.line();
         // `class Name`, `interface Name`, or `enum Name`. Neither `interface`
@@ -220,6 +223,23 @@ impl Parser {
             self.advance();
             loop {
                 interfaces.push(self.type_name()?);
+                if self.is(&Tok::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        // `permits A, B` — a `sealed` type's list of allowed subtypes. It is a
+        // *compile-time* restriction: `javac` has already rejected every
+        // implementation outside the list, and a permitted subtype declares its
+        // own `implements`/`extends` edge, so the list adds nothing the
+        // supertype graph does not already carry. Parsed and discarded, like the
+        // generic parameters above.
+        if matches!(self.peek(), Tok::Ident(w) if w == "permits") {
+            self.advance();
+            loop {
+                self.type_name()?;
                 if self.is(&Tok::Comma) {
                     self.advance();
                 } else {
@@ -443,6 +463,33 @@ impl Parser {
 }
 
 /// True when `toks[j]` starts a `record Name(` header.
+/// How many tokens the class-declaration modifier at `j` spans, or 0 when there
+/// is none.
+///
+/// Most modifiers are one token. `non-sealed` is three — the lexer has no
+/// hyphenated identifier, so it arrives as `non`, `-`, `sealed` — which is the
+/// reason this answers a length rather than a bool.
+///
+/// `sealed` and `non-sealed` are contextual keywords: a variable named `sealed`
+/// is still legal Java, so only the *declaration* position reads them as
+/// modifiers, which is exactly where this is asked.
+fn class_modifier_len(toks: &[Token], j: usize) -> usize {
+    if matches!(toks[j].kind, Tok::Public | Tok::Static) {
+        return 1;
+    }
+    let word = match &toks[j].kind {
+        Tok::Ident(w) => w.as_str(),
+        _ => return 0,
+    };
+    if word == "non"
+        && matches!(toks.get(j + 1).map(|t| &t.kind), Some(Tok::Minus))
+        && matches!(toks.get(j + 2).map(|t| &t.kind), Some(Tok::Ident(w)) if w == "sealed")
+    {
+        return 3;
+    }
+    usize::from(matches!(word, "final" | "abstract" | "sealed"))
+}
+
 fn record_at(toks: &[Token], j: usize) -> bool {
     matches!(&toks[j].kind, Tok::Ident(w) if w == "record")
         && matches!(toks.get(j + 1).map(|t| &t.kind), Some(Tok::Ident(_)))
@@ -856,12 +903,17 @@ impl Parser {
 
     /// True when the member at the cursor is a (possibly modifier-prefixed)
     /// nested `class`, `interface`, `enum`, or `record` declaration.
+    ///
+    /// The modifier scan is [`class_modifier_len`]'s, so a `sealed` nested type
+    /// is recognised here exactly as at the top level.
     fn at_nested_class(&self) -> bool {
         let mut j = self.pos;
-        while matches!(self.toks[j].kind, Tok::Public | Tok::Static)
-            || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "final" || w == "abstract")
-        {
-            j += 1;
+        loop {
+            let n = class_modifier_len(&self.toks, j);
+            if n == 0 {
+                break;
+            }
+            j += n;
         }
         matches!(self.toks[j].kind, Tok::Class)
             || matches!(&self.toks[j].kind, Tok::Ident(w) if w == "interface" || w == "enum")
