@@ -1072,6 +1072,27 @@ pub const REFERENCE: &[Entry] = &[
         "System.out.println(Math.fma(2.0, 3.0, 4.0));   // 10.0",
     ),
     (
+        "Math.addExact",
+        "Static Library",
+        "int Math.addExact(int a, int b)   |   long Math.addExact(long a, long b)   |   subtractExact   |   multiplyExact",
+        "The arithmetic that raises `ArithmeticException` instead of wrapping. The overload is chosen from the arguments' **static** types and the two disagree exactly where the method is interesting: the `int` one overflows at 2^31 with `integer overflow`, the `long` one at 2^63 with `long overflow`. A call whose argument types javars cannot infer is refused, naming the method.",
+        "System.out.println(Math.addExact(2000000000L, 2000000000L));   // 4000000000",
+    ),
+    (
+        "Math.toIntExact",
+        "Static Library",
+        "int Math.toIntExact(long value)",
+        "`value` narrowed to an `int`, or `ArithmeticException: integer overflow` when it does not fit — the checked counterpart of the `(int)` cast, which wraps silently.",
+        "System.out.println(Math.toIntExact(5L));   // 5",
+    ),
+    (
+        "Math.clamp",
+        "Static Library",
+        "int Math.clamp(long v, int min, int max)   |   long   |   double   |   float",
+        "`v` confined to `[min, max]`. The **bounds** pick the overload, so `clamp(aLong, 1, 10)` answers an `int` and `clamp(aLong, 1L, 10L)` a `long`. `min > max` is `IllegalArgumentException: \"<min> > <max>\"`, a NaN bound is `min is NaN` / `max is NaN`, and a NaN value passes through.",
+        "System.out.println(Math.clamp(15, 1, 10));   // 10",
+    ),
+    (
         "Integer.parseInt",
         "Static Library",
         "int Integer.parseInt(String s)",

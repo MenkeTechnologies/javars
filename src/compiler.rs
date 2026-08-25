@@ -1575,6 +1575,14 @@ impl Compiler {
                                 "long".to_string()
                             });
                         }
+                        // The width-overloaded family answers at the width its
+                        // arguments selected, so `Math.addExact(1L, 2L)` is a
+                        // `long` where `Math.addExact(1, 2)` is an `int` — and
+                        // `Math.clamp(0.1f, 0f, 3f)` is a `float`, which is what
+                        // makes it print `0.1` rather than the `double` widening.
+                        if let Some(t) = self.width_overload_java_type(class, method, args) {
+                            return Some(t.to_string());
+                        }
                         if let Some(t) = static_call_java_type(class, method) {
                             return Some(t.to_string());
                         }
@@ -2694,6 +2702,125 @@ impl Compiler {
         }
     }
 
+    /// The overload-width operand a `Math` static needs, or `None` for a static
+    /// that is not overloaded on width.
+    ///
+    /// `0` selects the `int` overload, `1` the `long` one, `2` `float` and `3`
+    /// `double` — the codes [`crate::host::width`] names. Java resolves
+    /// these from the arguments' static types; javars does the same, and
+    /// *refuses* the call when it cannot type an argument rather than picking
+    /// one and being silently wrong at exactly the values these methods exist
+    /// to catch.
+    fn overload_width(
+        &self,
+        class: &str,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Option<i64>, String> {
+        if !is_width_overloaded(class, method, args.len()) {
+            return Ok(None);
+        }
+        let width = self.width_overload(class, method, args).ok_or_else(|| {
+            format!(
+                "javars: `Math.{method}` is overloaded on argument width and javars cannot infer an argument's type, so it cannot tell which overload the call selects"
+            )
+        })?;
+        // Only `clamp` has floating overloads. `Math.addExact(1.0, 2.0)` does
+        // not compile in Java either, and refusing here says so rather than
+        // inventing an integral answer for it.
+        if method != "clamp" && width > crate::host::width::LONG {
+            return Err(format!(
+                "javars: `Math.{method}` has no floating-point overload"
+            ));
+        }
+        Ok(Some(width))
+    }
+
+    /// The [`crate::host::width`] code a width-overloaded `Math` static
+    /// resolves to, or `None` when an argument's type is not statically known.
+    ///
+    /// Asked from two places, which is why it is separate from the diagnostic
+    /// [`Compiler::overload_width`] puts on top of it: the call site needs the
+    /// operand, and [`Compiler::expr_java_type`] needs the *result* type, since
+    /// `Math.addExact(1L, 2L)` is a `long` and `Math.addExact(1, 2)` an `int`.
+    fn width_overload(&self, class: &str, method: &str, args: &[Expr]) -> Option<i64> {
+        if !is_width_overloaded(class, method, args.len()) {
+            return None;
+        }
+        // `toIntExact(long)` has exactly one shape; the operand it carries is
+        // there to name the method, not to choose between overloads.
+        if method == "toIntExact" {
+            return self
+                .expr_java_type(&args[0])
+                .and(Some(crate::host::width::LONG));
+        }
+        let ranks: Option<Vec<u32>> = args
+            .iter()
+            .map(|a| self.expr_java_type(a).and_then(|t| numeric_rank(&t)))
+            .collect();
+        let ranks = ranks?;
+        // `clamp`'s overloads are picked by its *bounds*: `clamp(long, int, int)`
+        // answers an `int` and `clamp(long, long, long)` a `long`, so the first
+        // argument being wide does not widen the result. The floating overloads
+        // take all three at one type.
+        let deciding = if method == "clamp" {
+            &ranks[1..]
+        } else {
+            &ranks[..]
+        };
+        let top = deciding.iter().copied().max()?;
+        Some(match rank_name(top) {
+            "double" => crate::host::width::DOUBLE,
+            "float" => crate::host::width::FLOAT,
+            "long" => crate::host::width::LONG,
+            _ => crate::host::width::INT,
+        })
+    }
+
+    /// The Java type a width-overloaded `Math` static answers, or `None` when
+    /// this is not one or its overload cannot be resolved.
+    ///
+    /// `toIntExact` is the one whose result is not its operand width: it takes a
+    /// `long` and answers an `int`, which is what it is for.
+    fn width_overload_java_type(
+        &self,
+        class: &str,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<&'static str> {
+        if method == "toIntExact" {
+            return is_width_overloaded(class, method, args.len()).then_some("int");
+        }
+        Some(match self.width_overload(class, method, args)? {
+            crate::host::width::LONG => "long",
+            crate::host::width::FLOAT => "float",
+            crate::host::width::DOUBLE => "double",
+            _ => "int",
+        })
+    }
+
+    /// The wrapper `e` is boxed into when it enters a collection element or key
+    /// position, or `None` when it enters unchanged.
+    ///
+    /// `char` and `boolean` are absent on purpose. A `char` in an erased
+    /// position is javars's one-character String (see BUGS.md), which is what
+    /// makes `System.out.println(aCharacterList)` print `[p, q]`; `boolean` is
+    /// not a boxed class here at all. An expression javars cannot type is left
+    /// alone, so it compares by value exactly as it did before.
+    fn collection_box_code(&self, e: &Expr) -> Option<i64> {
+        let ty = self.expr_java_type(e)?;
+        let wrapper = match ty.as_str() {
+            "int" => "Integer",
+            "long" => "Long",
+            "short" => "Short",
+            "byte" => "Byte",
+            "float" => "Float",
+            "double" => "Double",
+            _ => return None,
+        };
+        crate::host::box_class_code(wrapper)
+    }
+
     /// Lower `e` and unbox the result when its static type is a wrapper class.
     ///
     /// For the operators that do **not** reach [`crate::host::numeric_hook`] —
@@ -2752,10 +2879,17 @@ impl Compiler {
         if is_reference_type(target) {
             return;
         }
-        if self
-            .expr_java_type(e)
-            .is_some_and(|src| crate::host::box_class_code(&src).is_some())
-        {
+        // A source javars cannot type unboxes too. `int x = list.get(0)` reads
+        // an element whose static type erasure has thrown away, and that element
+        // may be a box — leaving it in an `int` slot would make `==` between two
+        // such variables compare handles. The call is `JUNBOX`, which is the
+        // identity on everything that is not a box, so a source that was never
+        // boxed is unaffected.
+        let unwrapped = match self.expr_java_type(e) {
+            Some(src) => crate::host::box_class_code(&src).is_some(),
+            None => true,
+        };
+        if unwrapped {
             self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
         }
     }
@@ -2870,6 +3004,12 @@ impl Compiler {
                 // Static stdlib calls that yield an `int` participate in `/`
                 // truncation typing.
                 if let Expr::Var(class) = recv.as_ref() {
+                    // The width-overloaded `Math` statics answer at the width
+                    // their arguments selected, and `/` truncation follows it:
+                    // `Math.addExact(1L, 2L) / 2` is integral division.
+                    if let Some(t) = self.width_overload_java_type(class, method, args) {
+                        return numtype_of_ty(t).unwrap_or(NumType::Other);
+                    }
                     if let Some(nt) = static_call_numtype(class, method) {
                         return nt;
                     }
@@ -5258,14 +5398,27 @@ impl Compiler {
                         .emit(Op::CallBuiltin(crate::host::JF32_ROUND, 1), line);
                     return Ok(());
                 }
+                // `Math`'s `Exact` family and `clamp` are overloaded on `int`
+                // AND `long`, and the two disagree exactly where they are
+                // interesting: `Math.addExact(2000000000, 2000000000)` throws
+                // for the `int` overload and answers 4000000000 for the `long`
+                // one. Only the arguments' static types say which overload the
+                // call selected, so the width goes to the host as one more
+                // operand — which is also what makes the arity it dispatches on
+                // (`("Math", "addExact", 3)`) distinct from any real overload's.
+                let widened = self.overload_width(class, method, args)?;
+                if let Some(code) = widened {
+                    self.b.emit(Op::LoadInt(code), line);
+                }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
                 let method_c = self.b.add_constant(Value::str(method.to_string()));
                 self.b.emit(Op::LoadConst(method_c), line);
-                // argc counts the args plus the class-name and method-name strings.
+                // argc counts the args plus the class-name and method-name
+                // strings, plus the width operand when there is one.
                 self.emit_raising_builtin(
                     crate::host::JSTATIC_DISPATCH,
-                    args.len() as u8 + 2,
+                    args.len() as u8 + 2 + u8::from(widened.is_some()),
                     line,
                 );
                 // The `Math` overloads that overflow at `int` width:
@@ -5355,8 +5508,20 @@ impl Compiler {
             self.expr(recv)?;
             // A collection element is a *boxed* `Character`, which javars models
             // as the one-character String — so it prints and compares like Java's.
-            for a in args {
+            // Every other primitive entering an element or key position is boxed
+            // for real, which is what keeps a `Map` keyed on `1`, `1.0` and `1L`
+            // at three entries the way Java's is. An *index* argument is not an
+            // element and stays the `int` it is.
+            for (i, a) in args.iter().enumerate() {
+                if list_index_arg(kind, method, args.len(), i) {
+                    self.expr_unboxed(a)?;
+                    continue;
+                }
                 self.emit_char_string(a)?;
+                if let Some(code) = self.collection_box_code(a) {
+                    self.b.emit(Op::LoadInt(code), line);
+                    self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                }
             }
             let name_c = self.b.add_constant(Value::str(method.to_string()));
             self.b.emit(Op::LoadConst(name_c), line);
@@ -5397,6 +5562,21 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         let tag = self.expr_java_type(recv).unwrap_or_default();
+        // `StringBuilder.append(char[])` and `append(Object)` are one value at
+        // runtime and two methods in Java: the array one reads the array's
+        // length, so `sb.append((char[]) null)` is an NPE where
+        // `sb.append((Object) null)` appends `"null"`. Only the argument's
+        // static type says which was called, so the choice is made here and the
+        // array overload reaches the host under a name of its own.
+        let method = if matches!(tag.as_str(), "StringBuilder" | "StringBuffer")
+            && method == "append"
+            && args.len() == 1
+            && self.expr_java_type(&args[0]).as_deref() == Some("char[]")
+        {
+            "appendChars"
+        } else {
+            method
+        };
         let is_compare = method == "compareTo" && args.len() == 1;
         // A `char`/`Character` receiver compares as a code point, so `compareTo`
         // keeps its argument a number; every other call keeps the
@@ -7067,6 +7247,47 @@ fn builder_call_java_type(recv_ty: &str, method: &str, argc: usize) -> Option<&'
         ("isEmpty", 0) | ("equals", 1) => "boolean",
         _ => return None,
     })
+}
+
+/// True when a static call is one of the `Math` methods overloaded on argument
+/// width, at an arity one of those overloads has.
+///
+/// The set is closed and small, and the arity is part of it: `Math.clamp` takes
+/// three arguments and the `Exact` family two (one for `toIntExact`), so a
+/// user's own `Math`-named static cannot fall in by having the same name.
+fn is_width_overloaded(class: &str, method: &str, argc: usize) -> bool {
+    class == "Math"
+        && match method {
+            "addExact" | "subtractExact" | "multiplyExact" => argc == 2,
+            "toIntExact" => argc == 1,
+            "clamp" => argc == 3,
+            _ => false,
+        }
+}
+
+/// True when argument `i` of a collection call is an **index** rather than an
+/// element or a key.
+///
+/// `java.util.List` is the only one of the three that takes an `int` position,
+/// and the set of methods that do is closed — so the table is the whole
+/// question rather than a heuristic. Getting it wrong in either direction is
+/// silent: an index boxed as an `Integer` would index nothing, and an element
+/// left unboxed would compare by value where Java compares references.
+/// `remove(int)` is here because the by-value overload has already been renamed
+/// to `removeObject` by the time this is asked.
+fn list_index_arg(kind: &str, method: &str, argc: usize, i: usize) -> bool {
+    kind == "list"
+        && matches!(
+            (method, argc, i),
+            ("get", 1, 0)
+                | ("remove", 1, 0)
+                | ("set", 2, 0)
+                | ("add", 2, 0)
+                | ("addAll", 2, 0)
+                | ("listIterator", 1, 0)
+                | ("subList", 2, 0)
+                | ("subList", 2, 1)
+        )
 }
 
 fn collection_kind(ty: &str) -> Option<&'static str> {

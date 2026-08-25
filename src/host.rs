@@ -373,6 +373,26 @@ pub const JFORMAT: u16 = 741;
 /// `println(o)` for the same object.
 pub const JSTRINGIFY: u16 = 742;
 
+/// The overload-width codes a `Math` static that is overloaded on width takes
+/// as its extra operand, shared with the compiler.
+///
+/// `Math.addExact` and friends are declared at `int` *and* `long`, and
+/// `Math.clamp` at four widths; the two integral ones disagree exactly where
+/// the method is interesting (`Math.addExact(2000000000, 2000000000)` throws
+/// for the `int` overload and answers 4000000000 for the `long` one). Java
+/// resolves that from the arguments' static types, which only the compiler has,
+/// so it sends the answer along.
+pub mod width {
+    /// `int`.
+    pub const INT: i64 = 0;
+    /// `long`.
+    pub const LONG: i64 = 1;
+    /// `float` — `Math.clamp` only.
+    pub const FLOAT: i64 = 2;
+    /// `double` — `Math.clamp` only.
+    pub const DOUBLE: i64 = 3;
+}
+
 /// The [`JF32_ARITH`] operator codes, shared with the compiler.
 pub mod f32_op {
     pub const ADD: i64 = 0;
@@ -2335,6 +2355,24 @@ fn builder_method(
                 Ok(Value::Undef)
             }
             ("append", 1) => {
+                s.push_str(&rendered[0]);
+                *count = len + rendered[0].chars().count();
+                *cap = sb_grow(*cap, *count);
+                Ok(this)
+            }
+            // `append(char[])` is a different method from `append(Object)`, and
+            // it is the *only* one-argument `append` that rejects `null`: it
+            // reads the array's length, so a null argument is an NPE where
+            // `append((Object) null)` appends `"null"`. The two are one value at
+            // runtime, so the compiler picks the overload from the argument's
+            // static type and sends this name when it is `char[]`.
+            ("appendChars", 1) => {
+                if matches!(args[0], Value::Undef) {
+                    return Err(Fault::java(
+                        "NullPointerException",
+                        "Cannot read the array length because \"str\" is null",
+                    ));
+                }
                 s.push_str(&rendered[0]);
                 *count = len + rendered[0].chars().count();
                 *cap = sb_grow(*cap, *count);
@@ -4726,6 +4764,30 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             // `q * b` overflows, which panicked and aborted. Java answers 0.
             floor_div(a, b).map(|q| Value::Int(a.wrapping_sub(q.wrapping_mul(b))))
         }
+        // ── The width-overloaded `Math` statics ──
+        // Each carries one extra operand, the [`width`] code the compiler
+        // resolved from the arguments' static types. That is also what makes
+        // the arity here (`3` for a two-argument method) distinct from any real
+        // overload's, so a program cannot reach these arms by accident.
+        ("Math", "addExact", 3) => {
+            exact_arith(args[0].jint(), args[1].jint(), args[2].jint(), Exact::Add)
+        }
+        ("Math", "subtractExact", 3) => {
+            exact_arith(args[0].jint(), args[1].jint(), args[2].jint(), Exact::Sub)
+        }
+        ("Math", "multiplyExact", 3) => {
+            exact_arith(args[0].jint(), args[1].jint(), args[2].jint(), Exact::Mul)
+        }
+        // `Math.toIntExact(long)` is the narrowing the `Exact` family exists
+        // for: in range it is the value, out of range it is `integer overflow`.
+        ("Math", "toIntExact", 2) => {
+            let v = args[0].jint();
+            match i32::try_from(v) {
+                Ok(n) => Ok(Value::Int(n.into())),
+                Err(_) => Err(Fault::java("ArithmeticException", "integer overflow")),
+            }
+        }
+        ("Math", "clamp", 4) => math_clamp(&args[0], &args[1], &args[2], args[3].jint()),
         ("Math", "signum", 1) => Ok(Value::float(match args[0].jfloat() {
             f if f > 0.0 => 1.0,
             f if f < 0.0 => -1.0,
@@ -5117,6 +5179,118 @@ fn replacement_fault(msg: String) -> Fault {
 /// reports rather than guessing.
 fn engine_fault(msg: String) -> Fault {
     Fault::internal(format!("javars: regular expression failed: {msg}"))
+}
+
+/// Which of the three exact binary operations [`exact_arith`] performs.
+enum Exact {
+    /// `Math.addExact`.
+    Add,
+    /// `Math.subtractExact`.
+    Sub,
+    /// `Math.multiplyExact`.
+    Mul,
+}
+
+/// `Math.addExact` / `subtractExact` / `multiplyExact` at the width the
+/// compiler resolved.
+///
+/// The `int` overloads compute in `i64` and then check the `i32` range, which is
+/// exact: no sum, difference or product of two `i32`s can leave `i64`. The
+/// `long` ones use the checked operations, because there is nothing wider to
+/// compute in. Java's messages are `integer overflow` and `long overflow`, and
+/// which one a program sees is the whole reason the width travels with the call.
+fn exact_arith(a: i64, b: i64, width: i64, op: Exact) -> Result<Value, Fault> {
+    if width == width::LONG {
+        let r = match op {
+            Exact::Add => a.checked_add(b),
+            Exact::Sub => a.checked_sub(b),
+            Exact::Mul => a.checked_mul(b),
+        };
+        return match r {
+            Some(v) => Ok(Value::Int(v)),
+            None => Err(Fault::java("ArithmeticException", "long overflow")),
+        };
+    }
+    let r = match op {
+        Exact::Add => a + b,
+        Exact::Sub => a - b,
+        Exact::Mul => a * b,
+    };
+    match i32::try_from(r) {
+        Ok(n) => Ok(Value::Int(n.into())),
+        Err(_) => Err(Fault::java("ArithmeticException", "integer overflow")),
+    }
+}
+
+/// `Math.clamp(value, min, max)` at the width the compiler resolved.
+///
+/// The bounds decide the overload, so `clamp(aLong, 1, 10)` answers an `int` and
+/// `clamp(aLong, 1L, 10L)` a `long`. Verified against openjdk 26.0.2 for the
+/// cases that are not `min(max(v, lo), hi)`: `min` or `max` being NaN is
+/// `IllegalArgumentException: min is NaN` / `max is NaN`, `min > max` is
+/// `IllegalArgumentException: "<min> > <max>"` rendered at the overload's width,
+/// a NaN *value* passes through as NaN, and the signed zeros order
+/// (`clamp(-1.0, -0.0, 0.0)` is `-0.0`).
+fn math_clamp(value: &Value, min: &Value, max: &Value, width: i64) -> Result<Value, Fault> {
+    if width == width::INT || width == width::LONG {
+        let (v, lo, hi) = (value.jint(), min.jint(), max.jint());
+        if lo > hi {
+            return Err(Fault::java(
+                "IllegalArgumentException",
+                format!("{lo} > {hi}"),
+            ));
+        }
+        return Ok(Value::Int(v.max(lo).min(hi)));
+    }
+    let (v, lo, hi) = (value.jfloat(), min.jfloat(), max.jfloat());
+    let render = |x: f64| {
+        if width == width::FLOAT {
+            format_float(x as f32)
+        } else {
+            format_double(x)
+        }
+    };
+    if lo.is_nan() {
+        return Err(Fault::java("IllegalArgumentException", "min is NaN"));
+    }
+    if hi.is_nan() {
+        return Err(Fault::java("IllegalArgumentException", "max is NaN"));
+    }
+    if float_compare(lo, hi) > 0 {
+        return Err(Fault::java(
+            "IllegalArgumentException",
+            format!("{} > {}", render(lo), render(hi)),
+        ));
+    }
+    Ok(Value::float(java_min(java_max(v, lo), hi)))
+}
+
+/// Java's `Math.max(double, double)`: NaN wins, and `-0.0` is below `0.0`.
+///
+/// Rust's `f64::max` disagrees on both — it *drops* a NaN operand and treats the
+/// two zeros as interchangeable — so the ordering comes from
+/// [`float_compare`], which is `Double.compare`'s total order.
+fn java_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if float_compare(a, b) >= 0 {
+        a
+    } else {
+        b
+    }
+}
+
+/// Java's `Math.min(double, double)`; [`java_max`]'s counterpart.
+fn java_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if float_compare(a, b) <= 0 {
+        a
+    } else {
+        b
+    }
 }
 
 /// Java's `Math.floorDiv`: integer division rounded toward negative infinity

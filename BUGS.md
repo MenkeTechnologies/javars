@@ -199,7 +199,13 @@ at the bottom, and are summarized in the section right after this one.
   `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees`/`rint`/
   `copySign`/`ulp`/`nextUp`/`nextDown`/`nextAfter`/`fma` (with
   Java's int-vs-double overload result typing) and the `Math.PI`/`Math.E`
-  constants; the `Integer`/`Long`/`Short`/`Byte`/`Double` `MAX_VALUE`/`MIN_VALUE`
+  constants; `Math.addExact`/`subtractExact`/`multiplyExact`/`toIntExact` and
+  `Math.clamp`, each resolved to the overload the arguments' static types select
+  — so `Math.addExact(2000000000, 2000000000)` is `ArithmeticException: integer
+  overflow` where `Math.addExact(2000000000L, 2000000000L)` is 4000000000, and
+  `Math.clamp(0.1f, 0f, 3f)` renders as a `float`. A call whose argument types
+  javars cannot infer is refused, naming the method, rather than answered from a
+  guessed overload; the `Integer`/`Long`/`Short`/`Byte`/`Double` `MAX_VALUE`/`MIN_VALUE`
   constants plus `Double.NaN` and the infinities; `Integer.parseInt` (with
   radix)/`valueOf`/`toString` (with radix)/`toBinaryString`/`toHexString`/
   `toOctalString`/`compare`/`max`/`min`/`sum`/`signum` and the `Long`
@@ -944,18 +950,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   above), so a stack trace has nothing to print, but the cause and suppressed
   lists have no such obstacle and are simply not built. `getLocalizedMessage()`
   *is* supplied, being `getMessage()` verbatim.
-- **`StringBuilder.append(char[])` cannot tell a `null` array from a `null`
-  reference.** The builder itself is implemented (see the entry under
-  "Implemented"); this is the one call on it that still differs. Java's
-  `append((char[]) null)` dereferences the array to read its length and throws
-  ``NullPointerException: Cannot read the array length because "str" is null``,
-  while `append((Object) null)` and `append((String) null)` both *append* the
-  four characters `null`. javars erases the argument's type by the time the
-  value reaches the host, where all three are one `Undef` — so the appending
-  reading wins for all of them, which is the right answer for two of the three.
-  `new StringBuilder((String) null)` is not affected: the no-argument
-  constructor reaches the host as the capacity 16 it is defined as, which leaves
-  `null` unambiguous there.
 - **An unmodeled `catch` type is a compile error.** javars models the throwable
   subset in `src/prelude.rs`; a `catch` naming anything else — a name that does
   not exist (`catch (TotallyBogusException e)`), or a real JDK throwable outside
@@ -1049,7 +1043,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `System` carries
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math`'s remaining
+  exact-arithmetic statics (`divideExact`, `floorDivExact`, `ceilDivExact`,
+  `incrementExact`, `decrementExact`, `negateExact`, `absExact`, `powExact` and
+  the `unsigned` pair) and `StringBuilder.append(char[], int, int)` are on the
+  same footing: a call is a compile error naming the method. `System` carries
   only its two streams: `System.exit(3)` is
   ``javars: only `System.out`/`System.err` are supported, not `System.exit` ``,
   which also means a program cannot choose its exit status — 0 for a clean run
@@ -1070,21 +1068,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   every pair drawn from the boundary values (both zeros, both infinities, NaN,
   `MIN_VALUE`, `MAX_VALUE`, the ties `rint` rounds to even, the subnormals) is
   byte-identical to openjdk 26.0.2.
-- **The bit-twiddling and exact-arithmetic statics.** `Integer`/`Long`'s
+- **The bit-twiddling statics.** `Integer`/`Long`'s
   `bitCount`, `highestOneBit`/`lowestOneBit`, `numberOfLeadingZeros`/
   `numberOfTrailingZeros`, `reverse`/`reverseBytes`, `rotateLeft`/`rotateRight`,
   and the unsigned family (`divideUnsigned`, `remainderUnsigned`,
-  `toUnsignedLong`, `toUnsignedString`); `Math`'s `addExact`/`subtractExact`/
-  `multiplyExact`/`toIntExact` and `clamp`; `Double.isFinite`/`max`/`min`;
+  `toUnsignedLong`, `toUnsignedString`); `Double.isFinite`/`max`/`min`;
   `Character.compare` and `isAlphabetic`. Each is an unregistered static, so a
-  call is a compile error naming the method rather than a wrong answer. The
-  `Exact` family and `clamp` are the ones that need more than an implementation:
-  both are overloaded on `int` *and* `long`, and the two disagree exactly where
-  they are interesting (`Math.addExact(2000000000, 2000000000)` throws for the
-  `int` overload and answers 4000000000 for the `long` one), so answering
-  without the argument's static type would give the wrong one silently.
-  `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`/`nextAfter` and `fma` were on
-  this list and are now implemented — see the `Math` entry above. `Short` and `Byte` are further
+  call is a compile error naming the method rather than a wrong answer.
+  `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`/`nextAfter`, `fma`, and the
+  `Exact` family with `clamp` were on this list and are now implemented — see
+  the `Math` entries above. `Short` and `Byte` are further
   along that scale: their `MAX_VALUE`/`MIN_VALUE` constants resolve, but the
   types carry no statics at all, so `Short.compare(a, b)` is
   ``javars: cannot find symbol: `Short` ``.
