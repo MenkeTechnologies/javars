@@ -530,6 +530,27 @@ enum HostObj {
     /// `Boolean`. Every numeric surface unboxes it (see [`unboxed`]), so the
     /// box is observable only where Java makes it observable: `==`, `equals`,
     /// `hashCode`, and `getClass`.
+    /// A `java.util.Iterator` over a `List` or a `Set`.
+    ///
+    /// It reads its source *live* rather than snapshotting it, which is what
+    /// makes `remove()` write through and — for a `List`, the one collection
+    /// that carries a `mods` counter — makes a structural change underneath the
+    /// iterator the `ConcurrentModificationException` Java raises rather than a
+    /// silent walk of stale elements.
+    Iterator {
+        /// The collection being walked.
+        source: u32,
+        /// The index `next()` will return.
+        pos: usize,
+        /// The index `next()` last returned, which `remove()` deletes. `None`
+        /// before the first `next()` and after a `remove()`, both of which make
+        /// `remove()` an `IllegalStateException` in Java.
+        last: Option<usize>,
+        /// The source `List`'s `mods` when this iterator was created, bumped by
+        /// its own `remove()`. Always 0 for a `Set`, which has no counter — see
+        /// the note in `iterator_method`.
+        exp_mods: u64,
+    },
     /// A marker: the payload lives in [`BOXES`], not here.
     ///
     /// Both halves — the class and the primitive — are read from surfaces that
@@ -1121,6 +1142,7 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // set, measured against the JDK rather than assumed from the `List.of`
         // line above (which does carry `RandomAccess`; a set does not).
         "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
+        "Iterator$of" => &["Iterator"],
         // `Map.of` reaches `AbstractMap` — unlike `Set.of`, which stops at
         // `AbstractCollection` — and is not `Cloneable`. Measured against the
         // JDK rather than copied from the line above.
@@ -1680,6 +1702,100 @@ fn element_hash(v: &Value) -> i32 {
             _ => 0,
         },
     }
+}
+
+/// `hasNext` / `next` / `remove` on an [`HostObj::Iterator`] receiver.
+///
+/// `None` for any other receiver or method, which leaves the call to the
+/// dispatch that follows.
+fn iterator_method(recv: &Value, method: &str, argc: usize) -> Option<Result<Value, Fault>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let state = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Iterator {
+            source,
+            pos,
+            last,
+            exp_mods,
+        }) => Some((*source, *pos, *last, *exp_mods)),
+        _ => None,
+    })?;
+    let (source, pos, last, exp_mods) = state;
+    let items = sequence_items(&Value::Obj(source)).unwrap_or_default();
+    Some(match (method, argc) {
+        ("hasNext", 0) => Ok(Value::bool(pos < items.len())),
+        ("next", 0) => {
+            if iter_mods(source) != exp_mods {
+                return Some(Err(comodification()));
+            }
+            match items.get(pos) {
+                Some(v) => {
+                    let v = v.clone();
+                    HEAP.with(|h| {
+                        if let Some(HostObj::Iterator { pos, last, .. }) =
+                            h.borrow_mut().get_mut(*id as usize)
+                        {
+                            *last = Some(*pos);
+                            *pos += 1;
+                        }
+                    });
+                    Ok(v)
+                }
+                None => Err(Fault::java("NoSuchElementException", String::new())),
+            }
+        }
+        // `remove()` deletes the element `next()` last returned and leaves the
+        // walk where it was, so the following `next()` sees the element that
+        // shifted into the gap. Calling it twice, or before any `next()`, is
+        // Java's `IllegalStateException`.
+        ("remove", 0) => {
+            let Some(at) = last else {
+                return Some(Err(Fault::java("IllegalStateException", String::new())));
+            };
+            if iter_mods(source) != exp_mods {
+                return Some(Err(comodification()));
+            }
+            let removed = HEAP.with(|h| {
+                let mut heap = h.borrow_mut();
+                match heap.get_mut(source as usize) {
+                    Some(HostObj::List { items, mods, .. }) if at < items.len() => {
+                        items.remove(at);
+                        *mods += 1;
+                        Some(*mods)
+                    }
+                    Some(HostObj::Set { items, index, .. }) if at < items.len() => {
+                        items.remove(at);
+                        index.invalidate();
+                        Some(0)
+                    }
+                    _ => None,
+                }
+            });
+            match removed {
+                Some(mods) => {
+                    HEAP.with(|h| {
+                        if let Some(HostObj::Iterator {
+                            pos,
+                            last,
+                            exp_mods,
+                            ..
+                        }) = h.borrow_mut().get_mut(*id as usize)
+                        {
+                            *pos = at;
+                            *last = None;
+                            *exp_mods = mods;
+                        }
+                    });
+                    Ok(Value::Undef)
+                }
+                None => Err(Fault::java("IllegalStateException", String::new())),
+            }
+        }
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Iterator method `{method}` with {argc} argument(s)"
+        ))),
+    })
 }
 
 /// `AbstractList.hashCode` — `31 * result + e.hashCode()`, seeded at 1.
@@ -3101,6 +3217,9 @@ fn value_class(v: &Value) -> Option<String> {
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
                     HostObj::Boxed => box_class(v)?.to_string(),
+                    // Not a name a program can write, like the other internal
+                    // shapes — it exists so an iterator carries supertypes.
+                    HostObj::Iterator { .. } => "Iterator$of".to_string(),
                     HostObj::Array(_) => "[]".to_string(),
                     // `Arrays.asList` and `List.of` are `List`s that are not
                     // `ArrayList`s, and a `subList` view is a third answer
@@ -3301,6 +3420,18 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     if let Some(h) = collection_hash(vm, recv, method, args.len()) {
         return h;
     }
+    // An iterator names a *second* heap object, so both its construction and
+    // its own methods run outside the exclusive borrow below.
+    if method == "iterator" && args.is_empty() {
+        if let Value::Obj(id) = recv {
+            return Value::Obj(heap_alloc(HostObj::Iterator {
+                source: *id,
+                pos: 0,
+                last: None,
+                exp_mods: iter_mods(*id),
+            }));
+        }
+    }
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
     let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
@@ -3448,6 +3579,16 @@ fn list_mods(id: usize) -> Option<u64> {
         Some(HostObj::List { mods, .. }) => Some(*mods),
         _ => None,
     })
+}
+
+/// The `mods` counter of the `List` at `id`, or 0 for anything else — the
+/// baseline an [`HostObj::Iterator`] compares against.
+///
+/// A `Set` has no counter, so an iterator over one cannot be fail-fast. Java's
+/// is; javars's walks the set as it stands, which is noted in BUGS.md rather
+/// than papered over with a counter invented here.
+fn iter_mods(id: u32) -> u64 {
+    list_mods(id as usize).unwrap_or(0)
 }
 
 /// Java's `ConcurrentModificationException`: the view's snapshot of the backing
@@ -4136,6 +4277,15 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             vm.stack.push(a);
         }
         return b_closure_call(vm, n as u8 + 1);
+    }
+    // An `Iterator` receiver. It is not a collection, so without this it fell
+    // through to the `String` table and `it.hasNext()` was
+    // ``unsupported String method `hasNext` ``.
+    if let Some(r) = iterator_method(&recv, &method, args.len()) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
     }
     // A collection receiver whose static type the compiler could not pin down
     // (an erased `Map.get` result, say) routes to the collection methods.
@@ -7479,6 +7629,7 @@ fn obj_default_str(id: u32) -> String {
             // javars prints a fixed marker instead. See `BUGS.md`.
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
+            Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
             None => format!("(obj:{id})"),
         }
     })
@@ -8509,6 +8660,7 @@ mod cast_target_tables {
             "List$sub",
             "Set$immutable",
             "Map$immutable",
+            "Iterator$of",
         ] {
             assert!(
                 !is_checkable_cast_target(internal),

@@ -226,6 +226,13 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **`Iterator` over a `List` or a `Set`.** `hasNext`, `next` and `remove`,
+  reading the source *live* rather than from a snapshot — which is what makes
+  `remove()` write through to the collection and, for a `List`, makes a
+  structural change underneath the iterator the
+  `ConcurrentModificationException` Java raises rather than a silent walk of
+  stale elements. `remove()` before any `next()`, or twice in a row, is Java's
+  `IllegalStateException`; walking off the end is `NoSuchElementException`.
 - **Unbound method references on a wrapper class** (`Integer::intValue`,
   `Double::longValue`, `Integer::compareTo`) — `Number`'s six converters,
   `Boolean.booleanValue`, `Character.charValue`, and the `Object` methods a box
@@ -1100,8 +1107,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Objects.equals` (the one `Objects` member, because a `record`'s derived
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
-  library surface — no `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no
-  streams, no I/O. `Math.powExact` and the
+  library surface — no `entrySet`/`Deque`/`Queue`/`Optional`, no streams, no
+  I/O. An iterator over a `Set` is not fail-fast, because a `Set` carries no
+  modification counter for it to check; Java's raises
+  `ConcurrentModificationException` there too. `Math.powExact` and the
   `unsignedMultiplyExact`/`unsignedPowExact` pair are on the same footing: a
   call is a compile error naming the method. `System` carries
   only its two streams: `System.exit(3)` is
