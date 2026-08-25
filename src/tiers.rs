@@ -304,4 +304,48 @@ mod tests {
         assert!(!counted.blacklisted, "{report}");
         assert!(report.reaches_native(), "{report}");
     }
+
+    /// A `while` reaches native code too. `do`/`while` already closed on a
+    /// conditional branch and always traced; it is here so a regression in the
+    /// rotation cannot be mistaken for one in the recorder.
+    #[test]
+    fn while_and_do_while_reach_a_compiled_trace() {
+        for (form, src) in [
+            (
+                "while",
+                "public class Main {\n static int f(int n) { int t = 0; int i = 0; while (i < n) { t = i % 1000; i++; } return t; }\n public static void main(String[] a) { f(200000); }\n}",
+            ),
+            (
+                "do/while",
+                "public class Main {\n static int f(int n) { int t = 0; int i = 0; do { t = i % 1000; i++; } while (i < n); return t; }\n public static void main(String[] a) { f(200000); }\n}",
+            ),
+        ] {
+            let report = report(src).unwrap_or_else(|e| panic!("{form} runs: {e}"));
+            assert!(report.reaches_native(), "{form}: {report}");
+        }
+    }
+
+    /// A loop that touches an **array element** is rotated like the rest and
+    /// still does not trace, for a reason rotation cannot reach: javars models
+    /// a Java array as a host handle, so reading or writing one lowers to
+    /// `Op::CallBuiltin`, and fusevm's trace tier refuses that op outright
+    /// (`is_trace_op_allowed_at`, fusevm 0.23.0 `src/jit.rs:6670`). The
+    /// enhanced `for` reads its element the same way and is refused the same
+    /// way. Lifting this needs Java's array model moved onto fusevm's native
+    /// array ops, not a change to loop shape.
+    ///
+    /// Asserting it keeps the boundary honest: give arrays native ops and this
+    /// test is the one that says the gap closed.
+    #[test]
+    fn an_array_loop_does_not_trace_because_element_access_is_a_builtin() {
+        let report = report(
+            "public class Main {\n static int f(int[] xs) { int t = 0; for (int v : xs) { t = v % 1000; } return t; }\n public static void main(String[] a) { f(new int[200000]); }\n}",
+        )
+        .expect("runs");
+        assert!(!report.reaches_native(), "{report}");
+        assert!(
+            report.chunks[0].loops.iter().all(|l| !l.trace_eligible),
+            "{report}"
+        );
+    }
 }
