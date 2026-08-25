@@ -1240,11 +1240,30 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   widens both to `7.0`/`9.0`. This is the same erasure limit as the
   `s.get() / 2` entry above. Every source javars can type — a literal, a local,
   a field, an array element, a declared-return method — converts.
-- **`==` on objects is reference identity; on strings it compares by value.**
-  Object and array handles (`Value::Obj`) are identity-comparable, so `x == y`,
-  `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
-  `==`. String `==`, however, compares by *value* (Java's is identity) — this
-  matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
+- **`==` on objects is reference identity; on strings it is identity only for
+  the ones that have one.** Object and array handles (`Value::Obj`) are
+  identity-comparable, so `x == y`, `x == z` after `z = x`, and
+  `obj.field == null` all behave like Java's reference `==`.
+
+  `new String(…)` allocates a `String` with an identity of its own — the same
+  kind of box a wrapper class gets, carrying the class `String`, which no
+  compiler-side autoboxing produces — so `new String("ab") == "ab"` is `false`,
+  `new String("ab") == new String("ab")` is `false`, and an aliasing assignment
+  keeps `==` `true`. `intern()` answers the canonical value, so
+  `new String("ab").intern() == "ab"` is `true`. Everything that reads a
+  `String` reads through the box: its methods, `compareTo` and the natural
+  order a sort uses, `equals` and `hashCode`, collection membership and map
+  keys, rendering and `String.format`, `instanceof` and `getClass`. A `switch`
+  on a `String` unboxes its discriminant, because Java's `switch` compares with
+  `equals` rather than with `==`.
+
+  Every *other* `String` compares by value where Java compares identity, and
+  that is where the model stops: a `String` javars did not see constructed —
+  one produced by a runtime concatenation, `substring`, or `String.valueOf` —
+  has no handle, so `(s1 + s2) == "ab"` is `true` where Java answers `false`.
+  Giving those an identity means giving every `String` a handle, which is a
+  different change from this one: it would put an allocation on every
+  concatenation and a dereference on every read.
 - **A boxed primitive is a real reference, in a *statically typed* position
   only.** `Integer`, `Long`, `Short`, `Byte`, `Character`, `Float` and `Double`
   each allocate a heap object with the `java.lang` class they name, cached over

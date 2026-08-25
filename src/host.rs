@@ -322,6 +322,18 @@ pub const JBINARY_CLASS: u16 = 744;
 /// which is what the language says it is.
 pub const JBOX: u16 = 747;
 
+/// `new String(x)` — a `String` with an **identity of its own**. Stack
+/// `[text]`; `argc == 1`.
+///
+/// Java's `String` is a reference type, so `new String("ab") == "ab"` is
+/// `false`: the constructor is specified to produce a *fresh* object, which is
+/// the only reason the expression is ever written. javars models an ordinary
+/// `String` as [`Value::Str`], which has no identity to distinguish, so this
+/// one allocates the same kind of box a wrapper class gets — carrying the class
+/// `String`, which no compiler-side autoboxing produces, so nothing else can
+/// create one by accident.
+pub const JNEW_STRING: u16 = 749;
+
 /// Unbox a wrapper back to its primitive; the identity function on a value that
 /// is not boxed. Stack `[value]`; `argc == 1`.
 ///
@@ -1205,6 +1217,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JBINARY_CLASS, b_binary_class);
     vm.register_builtin(JBOX, b_box);
     vm.register_builtin(JUNBOX, b_unbox);
+    vm.register_builtin(JNEW_STRING, b_new_string);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
     vm.register_builtin(JSTRINGIFY, b_stringify);
@@ -1388,6 +1401,13 @@ fn b_box(vm: &mut VM, argc: u8) -> Value {
         return v;
     }
     box_value(code, v)
+}
+
+/// [`JNEW_STRING`] — a `String` with a fresh identity.
+fn b_new_string(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let text = args.first().map(deboxed).unwrap_or(Value::Undef);
+    Value::Obj(alloc_box("String", text))
 }
 
 /// [`JUNBOX`] — the primitive inside a wrapper, or the value unchanged.
@@ -2144,6 +2164,9 @@ fn trusted_equals(vm: &VM, v: &Value, hashed: bool) -> bool {
 /// not.
 fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // Through any box: a `new String(…)` handle orders by its text, and a boxed
+    // wrapper by its number, exactly as the values they hold do.
+    let (a, b) = (&deboxed(a), &deboxed(b));
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Undef, Value::Undef) => Ordering::Equal,
@@ -4172,6 +4195,11 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // moved n bytes per call and n² across the loop — 40k characters meant
     // 1.6GB of memcpy for a walk that reads 40k of them. `recv` is a local, so
     // the borrow is independent of the `&mut VM` the arms below take.
+    // Every remaining path reads the receiver as text, and an *argument* may
+    // still be a box — a `new String(…)` handle, or a wrapper in
+    // `s.equals(anInteger)`. Unboxing them here is the mirror of the receiver
+    // unboxing above, and is the identity on everything that is not a box.
+    let args: Vec<Value> = args.iter().map(deboxed).collect();
     let s = recv.as_str_cow();
     // `"%s".formatted(x)` renders `x`, so it needs the VM `string_method` has
     // not got. Every other `String` method reads text only.
@@ -4336,8 +4364,10 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
         .pop()
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
-    let b = vm.stack.pop().unwrap_or(Value::Undef);
-    let a = vm.stack.pop().unwrap_or(Value::Undef);
+    // Through any box, for the same reason [`natural_cmp`] is: `compareTo` reads
+    // the value, not the handle.
+    let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
     // Java's own `Integer.compareTo(null)` is an NPE, and so is a call on a
     // `null` receiver. Both report the same way every other javars NPE does.
     if matches!(a, Value::Undef) {
@@ -7845,12 +7875,21 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     if op == NumOp::Neg && is_java_number(a) {
         return java_numeric(op, &deboxed(a), &Value::Int(0));
     }
-    // `==`/`!=` between two heap references is reference identity — before the
-    // numeric gate below, because two boxed wrappers are numbers as well as
-    // references and Java compares them as references. A mixed box/primitive
-    // pair is *not* caught here and falls through to the numeric path, which is
-    // Java's rule too: `anInteger == anInt` unboxes (JLS 15.21.1).
-    if matches!((a, b), (Value::Obj(_), Value::Obj(_))) {
+    // `==`/`!=` involving a heap reference is reference identity — before the
+    // numeric gate below, because a boxed wrapper is a number as well as a
+    // reference and Java compares two of them as references.
+    //
+    // The one exception is a *mixed* box/primitive pair of numbers, which Java
+    // unboxes (JLS 15.21.1): `anInteger == anInt` compares the numbers. Two
+    // boxes are NOT that case however numeric they are — that is the whole
+    // point of the wrapper model — so the exception needs exactly one handle.
+    // Everything else a handle can be compared against stays identity,
+    // including a `new String(…)` box against a `String` literal, which is
+    // `false` because the constructor produced a fresh object.
+    let both_handles = matches!((a, b), (Value::Obj(_), Value::Obj(_)));
+    let one_handle = matches!(a, Value::Obj(_)) || matches!(b, Value::Obj(_));
+    let unboxing_pair = one_handle && !both_handles && is_java_number(a) && is_java_number(b);
+    if one_handle && !unboxing_pair {
         match op {
             NumOp::Eq => return Ok(Value::bool(ref_eq(a, b))),
             NumOp::Ne => return Ok(Value::bool(!ref_eq(a, b))),

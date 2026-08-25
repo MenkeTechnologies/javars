@@ -4521,6 +4521,11 @@ impl Compiler {
             .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
         let disc_t = self.temp();
         self.expr(disc)?;
+        // See the note in `switch_stmt`: a `String` discriminant switches by
+        // value, so a `new String(…)` handle is read as its text.
+        if self.expr_java_type(disc).as_deref() == Some("String") {
+            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), line);
+        }
         self.emit_set(&disc_t, line);
 
         let mut end_jumps: Vec<usize> = Vec::new();
@@ -4630,6 +4635,13 @@ impl Compiler {
             .expr_java_type(disc)
             .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
         self.expr(disc)?;
+        // Java's `switch` on a `String` compares with `equals`, not `==`, so a
+        // `new String(…)` handle must be read as its text. Unboxing once here
+        // is enough: a `String`-typed discriminant can carry no pattern label,
+        // which is the only thing that would want the handle.
+        if self.expr_java_type(disc).as_deref() == Some("String") {
+            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
+        }
         self.emit_set(&temp, 0);
 
         // Dispatch: for each group's labels, compare and jump-if-equal to that
@@ -5973,6 +5985,13 @@ impl Compiler {
             let method_c = self.b.add_constant(Value::str("valueOf".to_string()));
             self.b.emit(Op::LoadConst(method_c), line);
             self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 3, line);
+            // `new String(…)` is specified to produce a *fresh* object, which is
+            // the only reason the expression is ever written — so the text gets
+            // an identity of its own here. Without it `new String("ab") == "ab"`
+            // was `true`, javars's `String` being a value with nothing to
+            // distinguish.
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JNEW_STRING, 1), line);
             return Ok(());
         }
         // `new Object()` — the fieldless root instance programs use as a lock or

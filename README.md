@@ -69,7 +69,9 @@ pure frontend over the shared engine. Highlights:
   `true`. A primitive crossing into any reference position boxes — an `Object`
   slot, a cast, a generic, an `equals` argument, a collection element or key —
   so `((Object) 1000L).getClass().getName()` is `java.lang.Long` and a `Map`
-  keyed on `1`, `1.0` and `1L` holds the three entries Java's holds. Every arithmetic, rendering and hashing surface unboxes them, so the
+  keyed on `1`, `1.0` and `1L` holds the three entries Java's holds.
+  `new String(…)` gets an identity the same way, so `new String("ab") == "ab"`
+  is `false` and `.intern()` brings it back. Every arithmetic, rendering and hashing surface unboxes them, so the
   box is visible only where Java makes it visible.
 - **Verified against OpenJDK** — the example programs and the test corpus are
   diffed byte-for-byte against a reference `java`; the tests freeze that output
