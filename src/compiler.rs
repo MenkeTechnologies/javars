@@ -7060,6 +7060,7 @@ fn is_static_class(name: &str) -> bool {
             | "Collections"
             | "List"
             | "Set"
+            | "Map"
             | "Objects"
     )
 }

@@ -219,7 +219,14 @@ at the bottom, and are summarized in the section right after this one.
   `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers);
   `String.valueOf`/`copyValueOf`/`join`/`format`; and
   `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
-  `copyOfRange`/`binarySearch`/`hashCode`. `String.format` covers `%d %s %S %f
+  `copyOfRange`/`binarySearch`/`hashCode`; `List.of`/`Set.of`/`Map.of`, each
+  immutable and each rejecting what the JDK's factory rejects (a repeated
+  element or key, a `null`); and `hashCode`/`equals` on all three collections,
+  computed by the `AbstractList`/`AbstractSet`/`AbstractMap` rules — the list's
+  `31 * h + e` fold, the set's order-independent sum, the map's sum of
+  `key ^ value` — so an `ArrayList` and an `Arrays.asList` holding the same
+  elements hash alike and a `HashMap` equals a `LinkedHashMap` holding the same
+  entries. `String.format` covers `%d %s %S %f
   %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
   (`-`/`#`/`+`/` `/`0`/`,`/`(`), width, `.precision`, and explicit argument
   indexes (`%2$s`); `%f` rounds
@@ -1046,7 +1053,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math.powExact` and
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. A `hashCode` a
+  collection computes reads each element's, and a class that declares its own
+  `hashCode` body still does not have that body run (see the `hashCode` entry
+  below), so a collection of such instances hashes by identity where Java hashes
+  by value. `Math.powExact` and
   the `unsignedMultiplyExact`/`unsignedPowExact` pair, and
   `StringBuilder.append(char[], int, int)`, are on the same footing: a call is a
   compile error naming the method. `System` carries

@@ -450,6 +450,13 @@ enum HostObj {
     Map {
         entries: Vec<(Value, Value)>,
         order: Order,
+        /// The same distinction [`HostObj::List`] draws: `Map.of` is an
+        /// immutable map, not a `HashMap`. Without it a `Map.of` value was
+        /// indistinguishable from `new HashMap<>()`, so it answered
+        /// `instanceof HashMap` `true` (Java: `false`) and accepted
+        /// `put`/`remove`/`clear` silently (Java:
+        /// `UnsupportedOperationException`).
+        fixed: Fixity,
         /// Key -> position accelerator; see [`KeyIndex`].
         index: KeyIndex,
     },
@@ -1102,6 +1109,10 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // set, measured against the JDK rather than assumed from the `List.of`
         // line above (which does carry `RandomAccess`; a set does not).
         "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
+        // `Map.of` reaches `AbstractMap` — unlike `Set.of`, which stops at
+        // `AbstractCollection` — and is not `Cloneable`. Measured against the
+        // JDK rather than copied from the line above.
+        "Map$immutable" => &["AbstractMap", "Map", "Serializable"],
         "List$fixed" => &["AbstractList", "RandomAccess", "Serializable"],
         "List$sub" => &["AbstractList", "RandomAccess"],
         _ => &[],
@@ -1633,6 +1644,48 @@ fn java_hash(v: &Value) -> Option<i32> {
     })
 }
 
+/// The hash one *element* of a collection contributes, which is what
+/// `e.hashCode()` on that element answers.
+///
+/// [`java_hash`] declines a heap handle; `Object.hashCode` on one is the handle
+/// itself (see [`object_method`]), and `null` contributes 0 the way Java's
+/// `AbstractList.hashCode` specifies. A class that declares its own `hashCode`
+/// still does not have that body run — see BUGS.md — so this is the identity
+/// hash for a user instance, exactly as a direct `x.hashCode()` is.
+fn element_hash(v: &Value) -> i32 {
+    match java_hash(v) {
+        Some(h) => h,
+        None => match v {
+            Value::Obj(id) => *id as i32,
+            _ => 0,
+        },
+    }
+}
+
+/// `AbstractList.hashCode` — `31 * result + e.hashCode()`, seeded at 1.
+fn list_hash(items: &[Value]) -> i64 {
+    items.iter().fold(1i32, |acc, e| {
+        acc.wrapping_mul(31).wrapping_add(element_hash(e))
+    }) as i64
+}
+
+/// `AbstractSet.hashCode` — the *sum* of the element hashes, so it does not
+/// depend on iteration order (which is the point: two equal sets in different
+/// orders must hash alike).
+fn set_hash(items: &[Value]) -> i64 {
+    items
+        .iter()
+        .fold(0i32, |acc, e| acc.wrapping_add(element_hash(e))) as i64
+}
+
+/// `AbstractMap.hashCode` — the sum of the entries', each being
+/// `keyHash ^ valueHash` (`Map.Entry.hashCode`).
+fn map_hash(entries: &[(Value, Value)]) -> i64 {
+    entries.iter().fold(0i32, |acc, (k, v)| {
+        acc.wrapping_add(element_hash(k) ^ element_hash(v))
+    }) as i64
+}
+
 /// The order a `HashMap`/`HashSet` iterates `keys` in, as indices into `keys`.
 ///
 /// Java lays entries out in a power-of-two table, indexing with
@@ -2052,16 +2105,19 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             fixed: Fixity::Mutable,
         },
         "HashMap" | "Map" => HostObj::Map {
+            fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Hash,
             index: KeyIndex::default(),
         },
         "LinkedHashMap" => HostObj::Map {
+            fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Insertion,
             index: KeyIndex::default(),
         },
         "TreeMap" => HostObj::Map {
+            fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
             order: Order::Sorted,
             index: KeyIndex::default(),
@@ -2953,10 +3009,11 @@ fn value_class(v: &Value) -> Option<String> {
                         Fixity::Immutable => "List$immutable".to_string(),
                     },
                     HostObj::SubList { .. } => "List$sub".to_string(),
-                    HostObj::Map { order, .. } => match order {
-                        Order::Hash => "HashMap".to_string(),
-                        Order::Insertion => "LinkedHashMap".to_string(),
-                        Order::Sorted => "TreeMap".to_string(),
+                    HostObj::Map { order, fixed, .. } => match (fixed, order) {
+                        (Fixity::Immutable, _) => "Map$immutable".to_string(),
+                        (_, Order::Hash) => "HashMap".to_string(),
+                        (_, Order::Insertion) => "LinkedHashMap".to_string(),
+                        (_, Order::Sorted) => "TreeMap".to_string(),
                     },
                     // `Set.of` is not a `HashSet`, exactly as `List.of` is not
                     // an `ArrayList`; without the fixity it answered to both.
@@ -3140,6 +3197,10 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
     let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
+    // `Map.equals` reads the *other* map's entries, which `sequence_items` does
+    // not carry (a map is not a sequence). Snapshot it here for the same reason:
+    // the borrow below is exclusive, and reading the heap under it panics.
+    let arg_entries: Vec<Option<Vec<(Value, Value)>>> = args.iter().map(map_entries).collect();
     // Java answers a membership question with the element's own `equals`, whose
     // body needs the VM and no outstanding borrow — so it runs here, ahead of
     // the borrow, and the sections below read its verdicts.
@@ -3176,8 +3237,20 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             HostObj::Map {
                 entries,
                 order,
+                fixed,
                 index,
-            } => map_method(entries, *order, index, method, args, eq),
+            } => map_method(
+                entries,
+                MapShape {
+                    order: *order,
+                    fixed: *fixed,
+                },
+                index,
+                method,
+                args,
+                &arg_entries,
+                eq,
+            ),
             HostObj::Set {
                 items,
                 fixed,
@@ -3609,6 +3682,7 @@ fn list_method(
                 )
             }
         },
+        ("hashCode", 0) => Value::Int(list_hash(items)),
         _ => {
             return Err(Fault::internal(format!(
                 "javars: unsupported List method `{method}` with {} argument(s)",
@@ -3620,14 +3694,49 @@ fn list_method(
 }
 
 /// `java.util.Map` methods.
+/// The two properties of a `Map` that are not its contents: how it iterates and
+/// whether it can be written to. Passed as one value because they always travel
+/// together and always come from the same heap object.
+#[derive(Clone, Copy)]
+struct MapShape {
+    /// What order iteration and `toString` present the entries in.
+    order: Order,
+    /// Whether the map accepts a mutator (`Map.of` does not).
+    fixed: Fixity,
+}
+
 fn map_method(
     entries: &mut Vec<(Value, Value)>,
-    order: Order,
+    shape: MapShape,
     index: &mut KeyIndex,
     method: &str,
     args: &[Value],
+    arg_entries: &[Option<Vec<(Value, Value)>>],
     eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
+    // Every mutator on a `Map.of` map is Java's `UnsupportedOperationException`,
+    // not a silent success. Checked once here, by name, rather than at each
+    // arm: an immutable map refuses the whole set, and listing them in one
+    // place is what keeps a newly added mutator from quietly escaping the rule.
+    let MapShape { order, fixed } = shape;
+    if fixed == Fixity::Immutable
+        && matches!(
+            method,
+            "put"
+                | "remove"
+                | "clear"
+                | "putAll"
+                | "putIfAbsent"
+                | "merge"
+                | "replace"
+                | "replaceAll"
+                | "compute"
+                | "computeIfAbsent"
+                | "computeIfPresent"
+        )
+    {
+        return Err(Fault::java("UnsupportedOperationException", String::new()));
+    }
     // A stale index is repaired once, here, rather than at every arm: the
     // methods below either read it or invalidate it, and only this entry point
     // knows the keys to rebuild it from.
@@ -3728,6 +3837,25 @@ fn map_method(
                 fixed: Fixity::FixedSize,
             })
         }
+        ("hashCode", 0) => NewColl::Value(Value::Int(map_hash(entries))),
+        // `AbstractMap.equals` — same size, and every key maps to an equal
+        // value. Order does not enter into it, which is what makes a `HashMap`
+        // equal to a `LinkedHashMap` holding the same entries.
+        ("equals", 1) => {
+            let other = arg_entries.first().cloned().flatten();
+            NewColl::Value(Value::bool(match other {
+                Some(other) => {
+                    other.len() == entries.len()
+                        && entries.iter().all(|(k, v)| {
+                            other
+                                .iter()
+                                .find(|(ok, _)| value_eq(ok, k))
+                                .is_some_and(|(_, ov)| value_eq(ov, v))
+                        })
+                }
+                None => false,
+            }))
+        }
         _ => {
             return Err(Fault::internal(format!(
                 "javars: unsupported Map method `{method}` with {} argument(s)",
@@ -3824,6 +3952,19 @@ fn set_method(
                     Value::bool(changed)
                 }
             }
+        }
+        ("hashCode", 0) => Value::Int(set_hash(items)),
+        // `AbstractSet.equals` — same size and every element present in the
+        // other, again independent of order.
+        ("equals", 1) => {
+            let other = arg_seqs[0].clone();
+            Value::bool(match other {
+                Some(other) => {
+                    other.len() == items.len()
+                        && items.iter().all(|e| other.iter().any(|o| value_eq(o, e)))
+                }
+                None => false,
+            })
         }
         _ => {
             return Err(Fault::internal(format!(
@@ -4638,6 +4779,32 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Set {
                 items: unique,
+                order: Order::Hash,
+                fixed: Fixity::Immutable,
+                index: KeyIndex::default(),
+            })))
+        }
+        // `Map.of(k1, v1, k2, v2, …)` — an immutable map, rejecting a repeated
+        // key rather than letting the later pair win, and rejecting a `null`
+        // key outright. Both are what `java.util.ImmutableCollections` does, and
+        // both turn a program Java refuses to run into one that answers.
+        ("Map", "of") if args.len() % 2 == 0 => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(args.len() / 2);
+            for pair in args.chunks(2) {
+                let (k, v) = (pair[0].clone(), pair[1].clone());
+                if matches!(k, Value::Undef) || matches!(v, Value::Undef) {
+                    return Some(Err(Fault::java("NullPointerException", String::new())));
+                }
+                if entries.iter().any(|(prev, _)| value_eq(prev, &k)) {
+                    return Some(Err(Fault::java(
+                        "IllegalArgumentException",
+                        format!("duplicate key: {}", java_str_vm(vm, &k)),
+                    )));
+                }
+                entries.push((k, v));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Map {
+                entries,
                 order: Order::Hash,
                 fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
@@ -7884,6 +8051,13 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
             1 | 2 => "java.util.ImmutableCollections$Set12".to_string(),
             _ => "java.util.ImmutableCollections$SetN".to_string(),
         },
+        // The JDK's map factory has a one-entry specialization and nothing
+        // between it and the general one, so `Map.of()` — with no entries at
+        // all — is a `MapN` too.
+        "Map$immutable" => match len() {
+            1 => "java.util.ImmutableCollections$Map1".to_string(),
+            _ => "java.util.ImmutableCollections$MapN".to_string(),
+        },
         "List$sub" => match sublist_root_fixity(v) {
             Some(Fixity::Mutable) => "java.util.ArrayList$SubList".to_string(),
             Some(Fixity::FixedSize) => "java.util.AbstractList$RandomAccessSubList".to_string(),
@@ -7900,6 +8074,10 @@ fn sequence_len(v: &Value) -> Option<usize> {
     let Value::Obj(id) = v else { return None };
     HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::List { items, .. }) | Some(HostObj::Set { items, .. }) => Some(items.len()),
+        // A map's size is its entry count. It is here because the JDK names its
+        // immutable map classes by size the way it names the list and set ones,
+        // and `binary_name` asks all three the same question.
+        Some(HostObj::Map { entries, .. }) => Some(entries.len()),
         _ => None,
     })
 }
@@ -8207,6 +8385,7 @@ mod cast_target_tables {
             "List$fixed",
             "List$sub",
             "Set$immutable",
+            "Map$immutable",
         ] {
             assert!(
                 !is_checkable_cast_target(internal),
