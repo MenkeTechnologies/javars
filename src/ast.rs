@@ -349,10 +349,14 @@ pub enum StmtKind {
 /// is a single group with two labels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchGroup {
-    /// The `case` label constant expressions selecting this group.
+    /// The `case` label constant expressions selecting this group. A
+    /// [`Expr::TypePattern`] here is a *pattern* label rather than a constant.
     pub labels: Vec<Expr>,
     /// True when this group carries the `default:` label.
     pub is_default: bool,
+    /// A `when` guard: the group matches only when its label matched *and* this
+    /// is true. `None` for an unguarded group.
+    pub guard: Option<Expr>,
     /// The statements of this group.
     pub body: Vec<Stmt>,
 }
@@ -543,6 +547,19 @@ pub enum Expr {
     /// `this` — the receiver of the enclosing instance method or constructor
     /// (frame slot 0).
     This,
+    /// A `switch` *pattern* label — `case Circle c ->`. It appears only in a
+    /// [`SwitchArm`]'s or [`SwitchGroup`]'s `labels`, never as a value: the
+    /// subject it tests is the `switch`'s own discriminant, which the label has
+    /// no way to name, so the compiler supplies it.
+    ///
+    /// This is deliberately a separate node from [`Expr::InstanceOf`] rather
+    /// than one carrying a placeholder subject — a label that *looks* like an
+    /// expression but silently means something else is the kind of thing that
+    /// goes wrong at the next call site that treats labels uniformly.
+    TypePattern {
+        class: String,
+        binding: Option<String>,
+    },
     /// `expr instanceof ClassName` — true when `expr` is a non-null instance of
     /// `ClassName` or a subclass.
     ///
@@ -592,10 +609,14 @@ pub enum Expr {
 /// One arm of an arrow `switch`: `case A, B -> body` or `default -> body`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchArm {
-    /// The `case` label constant expressions selecting this arm.
+    /// The `case` label constant expressions selecting this arm. A
+    /// [`Expr::TypePattern`] here is a *pattern* label rather than a constant.
     pub labels: Vec<Expr>,
     /// True when this arm carries `default`.
     pub is_default: bool,
+    /// A `when` guard: the arm matches only when its label matched *and* this is
+    /// true. `None` for an unguarded arm.
+    pub guard: Option<Expr>,
     pub body: SwitchArmBody,
 }
 

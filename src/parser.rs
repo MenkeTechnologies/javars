@@ -2099,12 +2099,19 @@ impl Parser {
             // Collect the run of labels that introduce this group.
             let mut labels = Vec::new();
             let mut is_default = false;
+            let mut guard = None;
             loop {
                 if self.is(&Tok::Case) {
                     self.advance();
-                    // Case labels are constant expressions; parse below the
-                    // ternary so the group-terminating `:` is not swallowed.
-                    labels.push(self.binary(0)?);
+                    loop {
+                        labels.push(self.case_label()?);
+                        if self.is(&Tok::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    guard = self.case_guard()?;
                     self.eat(&Tok::Colon)?;
                 } else if self.is(&Tok::Default) {
                     self.advance();
@@ -2132,6 +2139,7 @@ impl Parser {
             groups.push(SwitchGroup {
                 labels,
                 is_default,
+                guard,
                 body,
             });
         }
@@ -2206,8 +2214,7 @@ impl Parser {
             } else {
                 self.eat(&Tok::Case)?;
                 loop {
-                    // Below the ternary, so the arm's `->` is not swallowed.
-                    labels.push(self.binary(0)?);
+                    labels.push(self.case_label()?);
                     if self.is(&Tok::Comma) {
                         self.advance();
                     } else {
@@ -2215,6 +2222,7 @@ impl Parser {
                     }
                 }
             }
+            let guard = self.case_guard()?;
             // Java allows both arm forms in a switch *expression*: `case X ->`
             // and the classic `case X:`. In the colon form every arm must
             // complete with `yield` or `throw`, so there is no fall-through
@@ -2240,6 +2248,7 @@ impl Parser {
                 arms.push(SwitchArm {
                     labels,
                     is_default,
+                    guard,
                     body: SwitchArmBody::Block(stmts),
                 });
                 continue;
@@ -2264,6 +2273,7 @@ impl Parser {
             arms.push(SwitchArm {
                 labels,
                 is_default,
+                guard,
                 body,
             });
         }
@@ -2273,6 +2283,66 @@ impl Parser {
             arms,
             line,
         })
+    }
+
+    /// One `case` label: a *type pattern* (`case Circle c`) or a constant
+    /// expression (`case 1`, `case RED`, `case "x"`, `case null`).
+    ///
+    /// The two are told apart by shape rather than by looking up the name: a
+    /// type pattern is an identifier, optional type arguments, then a *second*
+    /// identifier, and no constant label has that shape — an enum constant, a
+    /// `static final` name and a literal are each one token where the label
+    /// ends. The binding is optional so `case Circle` (a type pattern with no
+    /// variable, legal in a `switch` over a sealed type) is one too, but only
+    /// when the discriminant is not an enum; that ambiguity is resolved in the
+    /// compiler, which knows the discriminant's type, by treating a bare
+    /// identifier as a constant.
+    fn case_label(&mut self) -> Result<Expr, String> {
+        if let Tok::Ident(class) = self.peek().clone() {
+            let mut j = self.pos + 1;
+            if matches!(self.toks[j].kind, Tok::Lt) {
+                let mut depth = 0;
+                while j < self.toks.len() {
+                    match &self.toks[j].kind {
+                        Tok::Lt => depth += 1,
+                        t if t.generic_closers() > 0 => {
+                            depth -= t.generic_closers();
+                            if depth <= 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        Tok::Eof => break,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            if let Tok::Ident(binding) = &self.toks[j].kind {
+                // `when` is a contextual keyword: `case Foo when …` is a guarded
+                // *constant* label, not a pattern binding named `when`.
+                if binding != "when" {
+                    let binding = binding.clone();
+                    self.pos = j + 1;
+                    return Ok(Expr::TypePattern {
+                        class,
+                        binding: Some(binding),
+                    });
+                }
+            }
+        }
+        // Below the ternary, so the label's terminator (`:` or `->`) is not
+        // swallowed.
+        self.binary(0)
+    }
+
+    /// A `when <expr>` guard following a `case` label list, if there is one.
+    fn case_guard(&mut self) -> Result<Option<Expr>, String> {
+        if !matches!(self.peek(), Tok::Ident(w) if w == "when") {
+            return Ok(None);
+        }
+        self.advance();
+        Ok(Some(self.binary(0)?))
     }
 
     // ── expressions (precedence climbing) ─────────────────────────────────

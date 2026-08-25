@@ -226,6 +226,14 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **`switch` type patterns and `when` guards.** `case Circle c ->` tests and
+  binds the way an `instanceof` pattern does, in both the arrow and the colon
+  form, and a `when` guard runs after its label matched — a failed guard is a
+  miss like any other, so the next arm is tried. A pattern label is a distinct
+  AST node rather than an `instanceof` carrying a placeholder subject, because
+  the subject it tests is the `switch`'s own discriminant, which the label has
+  no way to name. `when` stays a contextual keyword: `int when = 5;` still
+  parses.
 - **`instanceof` type patterns.** `o instanceof String s` tests and binds in
   one step, and the binding carries the pattern's type — so `s.length()`
   resolves as a `String` method and `l / 3` on an `o instanceof Long l` is

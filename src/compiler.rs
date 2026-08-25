@@ -2937,6 +2937,9 @@ impl Compiler {
     /// Drives the truncating-vs-floating choice for `/`.
     fn expr_type(&self, e: &Expr) -> NumType {
         match e {
+            // A pattern label is a `switch` label, never a value; it has no
+            // numeric category because it never reaches an operator.
+            Expr::TypePattern { .. } => NumType::Other,
             Expr::Int(_) | Expr::Long(_) => NumType::Int,
             Expr::Float(_) | Expr::Float32(_) => NumType::Float,
             Expr::Str(_) | Expr::Bool(_) => NumType::Other,
@@ -4529,26 +4532,26 @@ impl Compiler {
                 default_arm = Some(arm);
                 continue;
             }
-            // if (disc == L1 || disc == L2 …) { <arm>; jump end }
+            // if (disc matches L1 || disc matches L2 …) { <arm>; jump end }
             let mut hits: Vec<usize> = Vec::new();
             let mut miss: Vec<usize> = Vec::new();
             for (i, label) in arm.labels.iter().enumerate() {
-                self.emit_get(&disc_t, line);
-                match (&enum_disc, label) {
-                    (Some(class), Expr::Var(c)) => {
-                        let g = enum_global(class, c);
-                        self.emit_global_get(&g, line);
-                    }
-                    _ => self.expr(label)?,
-                }
-                // The same `NumEq` the classic `switch` uses: value equality for
-                // `int`/`String` and handle identity for an enum singleton.
-                self.b.emit(Op::NumEq, line);
+                self.emit_case_test(&disc_t, label, enum_disc.as_ref(), line)?;
                 if i + 1 == arm.labels.len() {
                     miss.push(self.b.emit(Op::JumpIfFalse(0), line));
                 } else {
                     hits.push(self.b.emit(Op::JumpIfTrue(0), line));
                 }
+            }
+            // A `when` guard runs after a label matched, and a failed guard is a
+            // miss like any other — the arm is skipped and the next one tried.
+            if let Some(guard) = &arm.guard {
+                let at_guard = self.b.current_pos();
+                for j in hits.drain(..) {
+                    self.b.patch_jump(j, at_guard);
+                }
+                self.expr(guard)?;
+                miss.push(self.b.emit(Op::JumpIfFalse(0), line));
             }
             let body_at = self.b.current_pos();
             for j in hits {
@@ -4636,18 +4639,29 @@ impl Compiler {
         let mut default_group: Option<usize> = None;
         for (gi, g) in groups.iter().enumerate() {
             let mut jumps = Vec::new();
+            // A `when` guard applies to the whole group, so a label that matched
+            // still has to clear it. The label jumps forward to the guard rather
+            // than straight to the body, and only the guard reaches the body.
+            let mut hits = Vec::new();
             for lab in &g.labels {
-                self.emit_get(&temp, 0);
-                match (&enum_disc, lab) {
-                    (Some(class), Expr::Var(c)) => {
-                        self.emit_global_get(&enum_global(class, c), 0);
-                    }
-                    _ => self.expr(lab)?,
+                self.emit_case_test(&temp, lab, enum_disc.as_ref(), 0)?;
+                let target = if g.guard.is_some() {
+                    &mut hits
+                } else {
+                    &mut jumps
+                };
+                target.push(self.b.emit(Op::JumpIfTrue(0), 0));
+            }
+            if let Some(guard) = &g.guard {
+                let skip = self.b.emit(Op::Jump(0), 0);
+                let at_guard = self.b.current_pos();
+                for j in hits {
+                    self.b.patch_jump(j, at_guard);
                 }
-                // Enum constants are singletons, so identity is equality — the
-                // same `NumEq` handle comparison `==` on objects already uses.
-                self.b.emit(Op::NumEq, 0);
+                self.expr(guard)?;
                 jumps.push(self.b.emit(Op::JumpIfTrue(0), 0));
+                let after = self.b.current_pos();
+                self.b.patch_jump(skip, after);
             }
             if g.is_default {
                 default_group = Some(gi);
@@ -4683,6 +4697,48 @@ impl Compiler {
         for op in scope.break_ops {
             self.b.patch_jump(op, end);
         }
+        Ok(())
+    }
+
+    /// Emit the test for one `case` label, leaving a boolean on the stack.
+    ///
+    /// `disc_t` names the temp holding the already-evaluated discriminant, so
+    /// the label is tested against it however many labels the group has and
+    /// whatever the label's shape.
+    ///
+    /// A **pattern** label is an `instanceof` against that discriminant, and it
+    /// binds its variable exactly as `Expr::InstanceOf`'s does — unconditionally,
+    /// because Java's flow scoping already guarantees no arm but the matching
+    /// one can read it. A **constant** label is the value comparison every
+    /// `switch` has always used: `NumEq`, which is value equality for `int` and
+    /// `String` and handle identity for an enum singleton.
+    fn emit_case_test(
+        &mut self,
+        disc_t: &str,
+        label: &Expr,
+        enum_disc: Option<&String>,
+        line: u32,
+    ) -> Result<(), String> {
+        if let Expr::TypePattern { class, binding } = label {
+            self.emit_get(disc_t, line);
+            if let Some(name) = binding {
+                let ty = class.clone();
+                self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
+                self.emit_set(name, line);
+                self.emit_get(name, line);
+            }
+            let c = self.b.add_constant(Value::str(class.clone()));
+            self.b.emit(Op::LoadConst(c), line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
+            return Ok(());
+        }
+        self.emit_get(disc_t, line);
+        match (enum_disc, label) {
+            (Some(class), Expr::Var(c)) => self.emit_global_get(&enum_global(class, c), line),
+            _ => self.expr(label)?,
+        }
+        self.b.emit(Op::NumEq, line);
         Ok(())
     }
 
@@ -5032,6 +5088,14 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
+            // A pattern label carries no subject of its own — the `switch`
+            // supplies its discriminant — so it is lowered by
+            // [`Compiler::emit_case_test`] and never reaches here.
+            Expr::TypePattern { class, .. } => {
+                return Err(format!(
+                    "javars: `{class}` pattern is only valid as a `case` label"
+                ))
+            }
             Expr::Int(n) | Expr::Long(n) => {
                 self.b.emit(Op::LoadInt(*n), 0);
             }
@@ -6890,6 +6954,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
+        Expr::TypePattern { .. } => false,
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),
         Expr::Cast { expr, .. } => expr_has_ffi(expr),
