@@ -339,6 +339,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
+        // text blocks (JLS 3.10.6) — `"""` opens one, and it is checked before
+        // the ordinary string literal because `"""` also starts with a `"`.
+        if c == '"' && src[i..].starts_with("\"\"\"") {
+            let (block, consumed, lines) = text_block(src, i, line)?;
+            i += consumed;
+            out.push(Token {
+                kind: Tok::Str(block),
+                line,
+            });
+            line += lines;
+            continue;
+        }
+
         // string literals
         if c == '"' {
             i += 1;
@@ -526,4 +539,110 @@ fn unescape(c: char) -> char {
         '\'' => '\'',
         other => other,
     }
+}
+
+/// Lex a **text block** (JLS 3.10.6) starting at `start`, where `src[start..]`
+/// begins with `"""`.
+///
+/// Returns the block's value, how many bytes it consumed, and how many newlines
+/// it spanned (so the caller's line counter stays right).
+///
+/// The value is built in the order the specification gives, and the order
+/// matters:
+///
+///   1. The opening delimiter must be followed by optional whitespace and then
+///      a line terminator, which is *not* part of the content.
+///   2. **Incidental** leading whitespace is stripped: the minimum indentation
+///      over every non-blank line, and over the closing delimiter's line when
+///      that delimiter sits on a line of its own. That last part is what lets a
+///      block be indented to match its surrounding code and still start at
+///      column 0 — and what makes a closing `"""` on the content's last line
+///      contribute nothing.
+///   3. Trailing whitespace is stripped from every line.
+///   4. Escapes are processed **last**, so a `\n` written in the source is a
+///      newline in the value but is not a line for steps 2 and 3 to see.
+fn text_block(src: &str, start: usize, line: u32) -> Result<(String, usize, u32), String> {
+    let after_open = start + 3;
+    let rest = &src[after_open..];
+    // Step 1: whitespace, then the line terminator that opens the content.
+    let header = rest
+        .find('\n')
+        .ok_or_else(|| format!("javars: unterminated text block on line {line}"))?;
+    if rest[..header].trim().is_empty() {
+        // ok — only whitespace (and a possible `\r`) before the terminator
+    } else {
+        return Err(format!(
+            "javars: a text block's opening `\"\"\"` must be followed by a line terminator (line {line})"
+        ));
+    }
+    let body_start = after_open + header + 1;
+    let body_end = src[body_start..]
+        .find("\"\"\"")
+        .map(|k| body_start + k)
+        .ok_or_else(|| format!("javars: unterminated text block on line {line}"))?;
+    let body = &src[body_start..body_end];
+    let newlines = body.matches('\n').count() as u32 + 1;
+
+    let mut lines: Vec<&str> = body.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    // The closing delimiter's own line is the last element when it sits alone;
+    // it is blank in that case, and it *does* count toward the indentation.
+    let closer_alone = lines
+        .last()
+        .is_some_and(|l| l.chars().all(|c| c == ' ' || c == '\t'));
+    let indent_of = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
+    let mut indent = usize::MAX;
+    for (n, l) in lines.iter().enumerate() {
+        let last = n + 1 == lines.len();
+        if l.trim().is_empty() && !(last && closer_alone) {
+            continue;
+        }
+        indent = indent.min(indent_of(l));
+    }
+    if indent == usize::MAX {
+        indent = 0;
+    }
+    if closer_alone {
+        // Its line contributes indentation and nothing else; the content ends
+        // with the newline that precedes it.
+        lines.pop();
+    }
+    // A block whose closing delimiter sits on the line right after the opening
+    // one has no content *lines* at all, so it is the empty string rather than a
+    // lone newline.
+    let trailing_newline = closer_alone && !lines.is_empty();
+    let mut value = String::new();
+    for (n, l) in lines.iter().enumerate() {
+        if n > 0 {
+            value.push('\n');
+        }
+        let stripped = if l.len() >= indent { &l[indent..] } else { "" };
+        value.push_str(stripped.trim_end_matches([' ', '\t']));
+    }
+    if trailing_newline {
+        value.push('\n');
+    }
+    Ok((unescape_block(&value), body_end + 3 - start, newlines))
+}
+
+/// Process the escapes in a text block's already-stripped value.
+///
+/// Two exist only here: `\<line-terminator>` joins the line to the next with no
+/// newline, and `\s` is a space that survives the trailing-whitespace stripping
+/// (which has already happened by the time this runs, which is the point).
+fn unescape_block(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\n') => {}
+            Some('s') => out.push(' '),
+            Some(e) => out.push(unescape(e)),
+            None => out.push('\\'),
+        }
+    }
+    out
 }

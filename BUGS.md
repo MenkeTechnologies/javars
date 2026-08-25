@@ -195,6 +195,16 @@ at the bottom, and are summarized in the section right after this one.
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
   `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
+- **Text blocks** (`"""…"""`), with the whole of JLS 3.10.6: the opening
+  delimiter must be followed by a line terminator, incidental leading
+  whitespace is stripped by the minimum indentation over the non-blank lines
+  *and* the closing delimiter's own line when it sits alone, trailing
+  whitespace goes from every line, and escapes are processed **last** — so a
+  `\n` written in the source is a newline in the value but is not a line the
+  stripping sees. The two escapes that exist only here are supported: `\`
+  before a line terminator joins the lines, and `\s` is a space that survives
+  the stripping. A block whose closing delimiter sits on the line right after
+  the opening one is the empty string, not a lone newline.
 - **`sealed` / `non-sealed` types and their `permits` clause.** Parsed and
   erased. The restriction is a *compile-time* one: `javac` has already rejected
   every implementation outside the `permits` list, and each permitted subtype
