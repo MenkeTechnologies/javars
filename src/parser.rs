@@ -786,6 +786,7 @@ fn record_members(
                                 expr: Box::new(Expr::Var(other.to_string())),
                                 class: name.to_string(),
                                 binding: None,
+                                components: Vec::new(),
                             }),
                         },
                         then: vec![Stmt::new(line, StmtKind::Return(Some(Expr::Bool(false))))],
@@ -2318,6 +2319,17 @@ impl Parser {
                     j += 1;
                 }
             }
+            // `case Pt(int x, int y)` — a record pattern, told apart by the
+            // `(` that no constant label can have here.
+            if matches!(self.toks[j].kind, Tok::LParen) {
+                self.pos = j;
+                let (binding, components) = self.pattern_tail()?;
+                return Ok(Expr::TypePattern {
+                    class,
+                    binding,
+                    components,
+                });
+            }
             if let Tok::Ident(binding) = &self.toks[j].kind {
                 // `when` is a contextual keyword: `case Foo when …` is a guarded
                 // *constant* label, not a pattern binding named `when`.
@@ -2327,6 +2339,7 @@ impl Parser {
                     return Ok(Expr::TypePattern {
                         class,
                         binding: Some(binding),
+                        components: Vec::new(),
                     });
                 }
             }
@@ -2334,6 +2347,55 @@ impl Parser {
         // Below the ternary, so the label's terminator (`:` or `->`) is not
         // swallowed.
         self.binary(0)
+    }
+
+    /// What follows a pattern's type: a binding name, a record pattern's
+    /// component list, or neither.
+    ///
+    /// `(` opens a **record pattern**, whose components are themselves patterns
+    /// — `Pt(int x, int y)`, and nested — so this recurses. Java 21 dropped the
+    /// named record pattern, so a component list is never followed by a
+    /// binding. An identifier is a plain type pattern's binding, and anything
+    /// else is a bare type test with neither.
+    fn pattern_tail(&mut self) -> Result<(Option<String>, Vec<Expr>), String> {
+        if self.is(&Tok::LParen) {
+            self.advance();
+            let mut components = Vec::new();
+            if !self.is(&Tok::RParen) {
+                loop {
+                    components.push(self.component_pattern()?);
+                    if self.is(&Tok::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RParen)?;
+            return Ok((None, components));
+        }
+        let binding = match self.peek() {
+            Tok::Ident(_) => Some(self.ident()?),
+            _ => None,
+        };
+        Ok((binding, Vec::new()))
+    }
+
+    /// One component of a record pattern: `int x`, `var v`, `String s`, or a
+    /// nested `Pt(int a, int b)`.
+    ///
+    /// A component's type is always written out (there is no bare binding), so
+    /// this reads the type and then defers to [`Parser::pattern_tail`] for the
+    /// rest — which is what makes the nesting fall out rather than needing its
+    /// own case.
+    fn component_pattern(&mut self) -> Result<Expr, String> {
+        let class = self.type_name()?;
+        let (binding, components) = self.pattern_tail()?;
+        Ok(Expr::TypePattern {
+            class,
+            binding,
+            components,
+        })
     }
 
     /// A `when <expr>` guard following a `case` label list, if there is one.
@@ -2393,14 +2455,12 @@ impl Parser {
                 // operator, delimiter and keyword the grammar allows after a
                 // relational operand is a different token — so the lookahead
                 // needs no further disambiguation.
-                let binding = match self.peek() {
-                    Tok::Ident(_) => Some(self.ident()?),
-                    _ => None,
-                };
+                let (binding, components) = self.pattern_tail()?;
                 lhs = Expr::InstanceOf {
                     expr: Box::new(lhs),
                     class,
                     binding,
+                    components,
                 };
                 continue;
             }

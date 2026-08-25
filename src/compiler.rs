@@ -162,6 +162,10 @@ struct ClassInfo {
     /// True when this is an `enum` — the flag that makes a bare `Color` a type
     /// reference rather than a variable, even for `enum Empty { }`.
     is_enum: bool,
+    /// True when this is a `record`. A record pattern reads its components
+    /// through their accessors, which only a record has, so the lowering asks
+    /// here before deriving the component list from the fields.
+    is_record: bool,
     /// An `enum`'s constant names in declaration order. Index is the constant's
     /// `ordinal()`.
     enum_constants: Vec<String>,
@@ -794,6 +798,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 supertypes,
                 is_interface: cl.is_interface,
                 is_enum: cl.is_enum,
+                is_record: cl.is_record,
                 enum_constants: cl.enum_constants.iter().map(|c| c.name.clone()).collect(),
                 fields,
                 field_types,
@@ -4749,19 +4754,13 @@ impl Compiler {
         enum_disc: Option<&String>,
         line: u32,
     ) -> Result<(), String> {
-        if let Expr::TypePattern { class, binding } = label {
-            self.emit_get(disc_t, line);
-            if let Some(name) = binding {
-                let ty = class.clone();
-                self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
-                self.emit_set(name, line);
-                self.emit_get(name, line);
-            }
-            let c = self.b.add_constant(Value::str(class.clone()));
-            self.b.emit(Op::LoadConst(c), line);
-            self.b
-                .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
-            return Ok(());
+        if let Expr::TypePattern {
+            class,
+            binding,
+            components,
+        } = label
+        {
+            return self.emit_pattern_test(disc_t, class, binding, components, line);
         }
         self.emit_get(disc_t, line);
         match (enum_disc, label) {
@@ -4770,6 +4769,125 @@ impl Compiler {
         }
         self.b.emit(Op::NumEq, line);
         Ok(())
+    }
+
+    /// Emit a pattern's test against the value in the temp `subject`, leaving a
+    /// boolean on the stack.
+    ///
+    /// A plain type pattern binds unconditionally and tests with `instanceof`:
+    /// Java's flow scoping is a compile-time rule, so `javac` has already
+    /// rejected every program that reads the binding where the pattern did not
+    /// match, and a conditional store would cost a branch to protect a value no
+    /// valid program can observe.
+    ///
+    /// A **record** pattern cannot do that. Its components are read through the
+    /// record's accessors, which a value of the wrong class does not have — so
+    /// the reads are guarded by the type test, and each nested component pattern
+    /// is itself a test that can fail. The shape is
+    /// `type-test && c1-matches && c2-matches && …`, with every failure landing
+    /// on one `false`.
+    fn emit_pattern_test(
+        &mut self,
+        subject: &str,
+        class: &str,
+        binding: &Option<String>,
+        components: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        // A component pattern whose type is a primitive or `var` always
+        // matches: the accessor's type is fixed by the record's declaration, so
+        // `javac` has already checked it and there is nothing to test at
+        // runtime. It binds and answers `true`.
+        if components.is_empty() && (class == "var" || !is_reference_type(class)) {
+            if let Some(name) = binding {
+                let ty = class.to_string();
+                self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
+                self.emit_get(subject, line);
+                self.emit_set(name, line);
+            }
+            self.b.emit(Op::LoadTrue, line);
+            return Ok(());
+        }
+        if let Some(name) = binding {
+            let ty = class.to_string();
+            self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
+            self.emit_get(subject, line);
+            self.emit_set(name, line);
+        }
+        self.emit_get(subject, line);
+        let class_c = self.b.add_constant(Value::str(class.to_string()));
+        self.b.emit(Op::LoadConst(class_c), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), line);
+        if components.is_empty() {
+            return Ok(());
+        }
+        let names = self.record_component_names(class).ok_or_else(|| {
+            format!(
+                "javars: `{class}` is not a record, so it has no component pattern (line {line})"
+            )
+        })?;
+        if names.len() != components.len() {
+            return Err(format!(
+                "javars: record pattern for `{class}` has {} component(s), but `{class}` declares {} (line {line})",
+                components.len(),
+                names.len()
+            ));
+        }
+        // The accessor calls are built as ordinary method calls on the subject,
+        // so the subject has to be a *declared* local of the record's type for
+        // the dispatch to resolve it. Declaring it here is also what types the
+        // call's result.
+        self.declare_local(subject, class, NumType::Other);
+        let mut misses = vec![self.b.emit(Op::JumpIfFalse(0), line)];
+        for (comp, accessor) in components.iter().zip(names) {
+            let Expr::TypePattern {
+                class: cty,
+                binding: cbind,
+                components: nested,
+            } = comp
+            else {
+                return Err(format!(
+                    "javars: a record pattern's components must themselves be patterns (line {line})"
+                ));
+            };
+            // Read the component through its accessor, into a temp the nested
+            // pattern can test and re-read.
+            let slot = self.temp();
+            self.expr(&Expr::MethodCall {
+                recv: Box::new(Expr::Var(subject.to_string())),
+                method: accessor.clone(),
+                args: Vec::new(),
+                line,
+            })?;
+            self.declare_local(&slot, cty, numtype_of_ty(cty).unwrap_or(NumType::Other));
+            self.emit_set(&slot, line);
+            self.emit_pattern_test(&slot, cty, cbind, nested, line)?;
+            misses.push(self.b.emit(Op::JumpIfFalse(0), line));
+        }
+        self.b.emit(Op::LoadTrue, line);
+        let to_end = self.b.emit(Op::Jump(0), line);
+        let at_false = self.b.current_pos();
+        for j in misses {
+            self.b.patch_jump(j, at_false);
+        }
+        self.b.emit(Op::LoadFalse, line);
+        let end = self.b.current_pos();
+        self.b.patch_jump(to_end, end);
+        Ok(())
+    }
+
+    /// A record's component accessor names, in component order, or `None` for a
+    /// class that is not a record.
+    ///
+    /// Taken from the class's instance fields, which for a record *are* its
+    /// components in declaration order — the parser lowers each component to a
+    /// field before anything else can add one, and Java forbids a record any
+    /// other instance field.
+    fn record_component_names(&self, class: &str) -> Option<Vec<String>> {
+        let info = self.classes.get(class)?;
+        info.is_record
+            .then(|| info.fields.iter().map(|f| f.name.clone()).collect())
     }
 
     /// Lower `break;` / `break label;`. An unlabeled break targets the innermost
@@ -5259,24 +5377,14 @@ impl Compiler {
                 expr,
                 class,
                 binding,
+                components,
             } => {
+                // The subject is evaluated once into a temp, because a record
+                // pattern reads it again for each component accessor.
+                let subject = self.temp();
                 self.expr(expr)?;
-                // A type pattern binds its variable to the tested value. The
-                // store is unconditional, which is safe because `javac` has
-                // already rejected every program that reads the binding where
-                // the pattern did not match — Java's flow scoping is a
-                // *compile-time* rule, so there is nothing left to enforce at
-                // runtime. Storing also leaves the value on no stack of its
-                // own, so it is read back for the test itself.
-                if let Some(name) = binding {
-                    let ty = class.clone();
-                    self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
-                    self.emit_set(name, 0);
-                    self.emit_get(name, 0);
-                }
-                let class_c = self.b.add_constant(Value::str(class.clone()));
-                self.b.emit(Op::LoadConst(class_c), 0);
-                self.b.emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), 0);
+                self.emit_set(&subject, 0);
+                self.emit_pattern_test(&subject, class, binding, components, 0)?;
             }
             Expr::Unary { op, rhs } => {
                 // `~` is answered natively for every operand shape, so a boxed

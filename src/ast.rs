@@ -559,6 +559,10 @@ pub enum Expr {
     TypePattern {
         class: String,
         binding: Option<String>,
+        /// A *record* pattern's component sub-patterns, in component order
+        /// (`case Pt(int x, int y)`). Empty for a plain type pattern. Each
+        /// element is itself a `TypePattern`, so the form nests.
+        components: Vec<Expr>,
     },
     /// `expr instanceof ClassName` — true when `expr` is a non-null instance of
     /// `ClassName` or a subclass.
@@ -570,6 +574,9 @@ pub enum Expr {
         expr: Box<Expr>,
         class: String,
         binding: Option<String>,
+        /// A record pattern's component sub-patterns — the same shape
+        /// [`Expr::TypePattern`] carries, for `o instanceof Pt(int x, int y)`.
+        components: Vec<Expr>,
     },
     /// A lambda expression: `() -> e`, `x -> e`, `(a, b) -> { … }`. Compiled to
     /// a heap closure that captures the enclosing scope **by value**, because a

@@ -247,6 +247,15 @@ at the bottom, and are summarized in the section right after this one.
   the subject it tests is the `switch`'s own discriminant, which the label has
   no way to name. `when` stays a contextual keyword: `int when = 5;` still
   parses.
+- **Record patterns**, in both `instanceof` and `switch`, nested to any depth
+  (`o instanceof Line(Pt(int ax, int ay), Pt b)`), with `var` components and
+  `when` guards. A record pattern reads its components through the record's
+  accessors, which a value of the wrong class does not have — so unlike a plain
+  type pattern its bindings are guarded by the type test, and each nested
+  component pattern is itself a test that can fail. A component whose type is a
+  primitive or `var` always matches, `javac` having already checked it against
+  the accessor's declared type. The component list comes from the record's
+  fields, which *are* its components in declaration order.
 - **`instanceof` type patterns.** `o instanceof String s` tests and binds in
   one step, and the binding carries the pattern's type — so `s.length()`
   resolves as a `String` method and `l / 3` on an `o instanceof Long l` is
