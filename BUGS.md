@@ -195,6 +195,15 @@ at the bottom, and are summarized in the section right after this one.
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
   `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
+- **`instanceof` type patterns.** `o instanceof String s` tests and binds in
+  one step, and the binding carries the pattern's type — so `s.length()`
+  resolves as a `String` method and `l / 3` on an `o instanceof Long l` is
+  integral division. `List<?>`/`Map<?,?>` type arguments are erased the way
+  every other type position's are. The binding is stored unconditionally rather
+  than only on the matching branch: Java's flow scoping is a *compile-time*
+  rule, and `javac` has already rejected every program that reads the binding
+  where the pattern did not match, so there is nothing left to enforce at
+  runtime.
 - **Standard-library essentials.** `Math.abs`/`max`/`min`/`pow`/`sqrt`/`floor`/
   `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees`/`rint`/
   `copySign`/`ulp`/`nextUp`/`nextDown`/`nextAfter`/`fma` (with

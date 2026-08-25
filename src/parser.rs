@@ -640,6 +640,7 @@ fn record_members(
                             rhs: Box::new(Expr::InstanceOf {
                                 expr: Box::new(Expr::Var(other.to_string())),
                                 class: name.to_string(),
+                                binding: None,
                             }),
                         },
                         then: vec![Stmt::new(line, StmtKind::Return(Some(Expr::Bool(false))))],
@@ -2162,9 +2163,24 @@ impl Parser {
             {
                 self.advance();
                 let class = self.ident()?;
+                // `o instanceof List<?>` — the type argument is erased, so it is
+                // parsed and discarded exactly as every other type position's is.
+                self.skip_generics();
+                // A *type pattern* names a variable after the type
+                // (`o instanceof String s`), which Java binds to the tested
+                // value wherever the pattern definitely matched. An identifier
+                // is the only thing that can follow the type here — every
+                // operator, delimiter and keyword the grammar allows after a
+                // relational operand is a different token — so the lookahead
+                // needs no further disambiguation.
+                let binding = match self.peek() {
+                    Tok::Ident(_) => Some(self.ident()?),
+                    _ => None,
+                };
                 lhs = Expr::InstanceOf {
                     expr: Box::new(lhs),
                     class,
+                    binding,
                 };
                 continue;
             }

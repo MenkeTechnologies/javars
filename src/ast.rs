@@ -545,9 +545,14 @@ pub enum Expr {
     This,
     /// `expr instanceof ClassName` — true when `expr` is a non-null instance of
     /// `ClassName` or a subclass.
+    ///
+    /// `binding` is the name of a *type pattern*'s variable
+    /// (`o instanceof String s`), which Java brings into scope wherever the
+    /// pattern definitely matched. It is `None` for the plain form.
     InstanceOf {
         expr: Box<Expr>,
         class: String,
+        binding: Option<String>,
     },
     /// A lambda expression: `() -> e`, `x -> e`, `(a, b) -> { … }`. Compiled to
     /// a heap closure that captures the enclosing scope **by value**, because a

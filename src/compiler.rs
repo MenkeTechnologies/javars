@@ -5161,8 +5161,25 @@ impl Compiler {
                 }
             }
             Expr::NewObject { class, args, line } => self.new_object(class, args, *line)?,
-            Expr::InstanceOf { expr, class } => {
+            Expr::InstanceOf {
+                expr,
+                class,
+                binding,
+            } => {
                 self.expr(expr)?;
+                // A type pattern binds its variable to the tested value. The
+                // store is unconditional, which is safe because `javac` has
+                // already rejected every program that reads the binding where
+                // the pattern did not match — Java's flow scoping is a
+                // *compile-time* rule, so there is nothing left to enforce at
+                // runtime. Storing also leaves the value on no stack of its
+                // own, so it is read back for the test itself.
+                if let Some(name) = binding {
+                    let ty = class.clone();
+                    self.declare_local(name, &ty, numtype_of_ty(&ty).unwrap_or(NumType::Other));
+                    self.emit_set(name, 0);
+                    self.emit_get(name, 0);
+                }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), 0);
                 self.b.emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), 0);
