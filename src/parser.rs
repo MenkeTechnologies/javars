@@ -2738,6 +2738,18 @@ impl Parser {
             if self.is(&Tok::Dot) {
                 let line = self.line();
                 self.advance();
+                // `outer.new Inner(…)` — a *qualified* class instance creation.
+                // javars flattens nested types into one namespace, so `Inner`
+                // names the same class a bare `new Inner(…)` does and the
+                // qualifier is dropped. An inner class that reads the outer
+                // *instance*'s fields is unmodeled either way (see BUGS.md); the
+                // qualifier only ever said which instance, and there is none to
+                // say. A side-effecting qualifier is evaluated by Java and not
+                // here, which is the observable part of dropping it.
+                if self.is(&Tok::New) {
+                    e = self.new_expr()?;
+                    continue;
+                }
                 // An *explicit* generic method type argument
                 // (`Optional.<String>empty()`, `Collections.<Integer>emptyList()`)
                 // sits between the dot and the method name. Java erases it, and
@@ -2944,7 +2956,16 @@ impl Parser {
     fn new_expr(&mut self) -> Result<Expr, String> {
         let line = self.line();
         self.eat(&Tok::New)?;
-        let ty = self.simple_type_name()?;
+        let mut ty = self.simple_type_name()?;
+        // `new Outer.Nested()` — javars flattens nested types into one namespace
+        // keyed by the *simple* name, so the qualifier names the same class the
+        // bare `new Nested()` does and is dropped. A lowercase qualifier is a
+        // package (`new java.util.ArrayList<>()`), which `simple_type_name` has
+        // already consumed.
+        while self.is(&Tok::Dot) && matches!(&self.toks[self.pos + 1].kind, Tok::Ident(_)) {
+            self.advance();
+            ty = self.ident()?;
+        }
         // Diamond / explicit type arguments (`new Box<>()`, `new Box<Integer>()`)
         // — erased.
         self.skip_generics();
@@ -3002,9 +3023,52 @@ impl Parser {
             self.uses_exceptions = true;
         }
         let args = self.call_args()?;
+        // `new I() { … }` — an anonymous class. When its body declares exactly
+        // one method it *is* a lambda: the interface has one abstract method,
+        // the body supplies it, and the enclosing locals it reads are captured
+        // the same way. Desugaring to one reuses that whole path — including the
+        // capture machinery, which is the part an anonymous class most needs.
+        if self.is(&Tok::LBrace) {
+            return self.anonymous_class(&ty, line);
+        }
         Ok(Expr::NewObject {
             class: ty,
             args,
+            line,
+        })
+    }
+
+    /// Desugar an anonymous class body into the lambda it abbreviates.
+    ///
+    /// Only the single-method form is modeled, which is the form an anonymous
+    /// class is written in: the interface it implements has one abstract method
+    /// and the body supplies it. A body that declares a field, a constructor, or
+    /// a second method is a real class with state, and is refused by name rather
+    /// than silently losing the members javars would not carry.
+    fn anonymous_class(&mut self, ty: &str, line: u32) -> Result<Expr, String> {
+        self.eat(&Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+            match self.try_any_method(ty)? {
+                Some((m, _)) => methods.push(m),
+                None => {
+                    return Err(format!(
+                        "javars: an anonymous `{ty}` may declare only methods (line {line})"
+                    ))
+                }
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        let [m] = <[Method; 1]>::try_from(methods).map_err(|ms| {
+            format!(
+                "javars: an anonymous `{ty}` is modeled only when its body declares exactly one                  method; this one declares {} (line {line})",
+                ms.len()
+            )
+        })?;
+        self.uses_functional = true;
+        Ok(Expr::Lambda {
+            params: m.params.iter().map(|p| p.name.clone()).collect(),
+            body: LambdaBody::Block(m.body),
             line,
         })
     }

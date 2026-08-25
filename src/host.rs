@@ -5806,6 +5806,32 @@ fn collection_static(
         )),
         // ── java.util.stream sources ──
         ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
+        // `Stream.iterate(seed, f)` and `Stream.generate(s)` are *infinite*, and
+        // a stream source here is a `Vec`. Both are therefore refused unless the
+        // pipeline that follows bounds them — which is what the three-argument
+        // `iterate(seed, hasNext, f)` does itself, and what a `limit` does for
+        // the other two. Producing some arbitrary prefix and hoping the program
+        // limits it below would answer a truncated stream as though it were the
+        // whole one.
+        ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "iterate") if args.len() == 3 => {
+            let mut items = Vec::new();
+            let mut cur = args[0].clone();
+            while matches!(
+                invoke_closure(vm, &args[1], std::slice::from_ref(&cur)),
+                Value::Bool(true)
+            ) {
+                items.push(cur.clone());
+                cur = invoke_closure(vm, &args[2], &[cur]);
+            }
+            Ok(stream_of(
+                items,
+                if class == "Stream" {
+                    StreamKind::Ref
+                } else {
+                    primitive_stream_kind(class)
+                },
+            ))
+        }
         ("IntStream" | "LongStream" | "DoubleStream", "of") => {
             Ok(stream_of(varargs_items(args), primitive_stream_kind(class)))
         }

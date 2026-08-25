@@ -226,6 +226,21 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **Anonymous classes, in their single-method form.** `new Runnable() { public
+  void run() { … } }` desugars to the lambda it abbreviates — the interface has
+  one abstract method, the body supplies it, and the enclosing locals it reads
+  are captured the same way, which is the part an anonymous class most needs. A
+  body that declares a field, a constructor, or a *second* method is a real
+  class with state; it is refused by name rather than silently losing the
+  members javars would not carry.
+- **Nested types named through their enclosers.** `new Outer.Nested()`,
+  `Outer.Nested.aStatic()`, and `outer.new Inner()` all parse. javars flattens
+  nested types into one namespace keyed by the simple name, so the qualifier
+  names the same class the bare form does and is dropped — which for
+  `outer.new Inner()` means a side-effecting qualifier is evaluated by Java and
+  not here. A nested class also sees its encloser's `static` fields by their
+  bare name, which no ancestry walk finds: a nested class is not a subclass of
+  the class it sits in, so the enclosers are read off the binary name.
 - **`Comparator`'s combinators.** `naturalOrder`, `reverseOrder`, `comparing`,
   `comparingInt`/`comparingLong`/`comparingDouble`, `reversed`,
   `thenComparing`, `thenComparingInt`/`Long`/`Double`. They are written in Java
@@ -248,6 +263,11 @@ at the bottom, and are summarized in the section right after this one.
   `rangeClosed`. Intermediate: `filter`, `map`, `flatMap`, `peek`, `limit`,
   `skip`, `distinct`, `sorted` (natural or with a comparator), `mapToInt`/
   `mapToLong`/`mapToDouble`/`mapToObj`/`boxed`/`asLongStream`/`asDoubleStream`.
+  `Stream.iterate(seed, hasNext, next)` is supported and the *infinite* forms
+  (`iterate(seed, next)`, `generate(s)`) are not: a stream source here is a
+  materialized sequence, and producing some arbitrary prefix in the hope that a
+  later `limit` bounds it would answer a truncated stream as though it were the
+  whole one.
   Terminal: `toList`, `toArray`, `collect`, `count`, `forEach`, `sum`,
   `average`, `min`, `max`, `reduce` (both arities), `anyMatch`, `allMatch`,
   `noneMatch`, `findFirst`, `findAny`. Collectors: `toList`, `toSet`,

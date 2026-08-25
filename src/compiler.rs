@@ -769,6 +769,29 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 static_fields.insert(f.name.clone(), (anc_name.clone(), f.ty.clone()));
             }
         }
+        // A *nested* class sees its encloser's `static` fields by their bare
+        // name, which no ancestry walk finds — a nested class is not a subclass
+        // of the class it sits in. The binary name is what records the nesting
+        // (`Outer$Nested`), so the enclosers are read off it, outermost first so
+        // a nearer one wins. Its own declarations still win over all of them,
+        // which is why this runs before the loop above would have to be undone —
+        // it does not, because `insert` here happens first.
+        let mut enclosing_statics: HashMap<String, (String, String)> = HashMap::new();
+        let mut prefix = cl.binary.as_str();
+        while let Some((outer, _)) = prefix.rsplit_once('$') {
+            let simple = outer.rsplit('$').next().unwrap_or(outer);
+            if let Some(oc) = by_name.get(simple) {
+                for f in &oc.static_fields {
+                    enclosing_statics
+                        .entry(f.name.clone())
+                        .or_insert_with(|| (simple.to_string(), f.ty.clone()));
+                }
+            }
+            prefix = outer;
+        }
+        for (name, owner) in enclosing_statics {
+            static_fields.entry(name).or_insert(owner);
+        }
         // Keyed by (name, param_types) so type-overloads coexist while an
         // override (same name + same param types) replaces the inherited entry.
         let mut methods: HashMap<(String, Vec<String>), MethodMeta> = HashMap::new();
@@ -1152,8 +1175,19 @@ impl Compiler {
     /// when the receiver is a value rather than a type name. A declared variable
     /// of the same name always wins.
     fn user_class_ref(&self, recv: &Expr) -> Option<String> {
-        let Expr::Var(name) = recv else {
-            return None;
+        let name = match recv {
+            Expr::Var(name) => name,
+            // `Outer.Nested.f()` — a nested type named through its enclosers.
+            // javars flattens nested types into one namespace keyed by the
+            // simple name, so the chain names the class its last segment does,
+            // provided every earlier segment names a class too (which is what
+            // separates it from `someValue.field.f()`).
+            Expr::Field { recv: outer, name } => {
+                return self
+                    .user_class_ref(outer)
+                    .and_then(|_| self.classes.contains_key(name).then(|| name.clone()));
+            }
+            _ => return None,
         };
         if self.is_declared_var(name) || self.bare_var_type(name).is_some() {
             return None;
@@ -5852,14 +5886,18 @@ impl Compiler {
         // through to the host, where they are reference identity and
         // `getClass().getName() + "@" + hex`. A class that declares either wins,
         // which is what keeps a `record`'s and an `enum`'s own versions in play.
-        // `hashCode` is deliberately *not* in that set: a `record`'s is derived
-        // from its components, and answering an identity hash there would be a
-        // silently wrong number instead of the compile error it is today.
+        // `hashCode` is in that set too, now that a `record` synthesizes its own
+        // (which therefore wins here). It was excluded while records had none,
+        // because an identity hash for a value type would have been a silently
+        // wrong number rather than the compile error it was; for a plain class
+        // the identity hash IS `Object`'s specified answer.
         if let Some(rc) = self.expr_class(recv) {
             let arg_tys: Vec<Option<String>> =
                 args.iter().map(|a| self.expr_java_type(a)).collect();
-            let inherited = matches!((method, args.len()), ("equals", 1) | ("toString", 0))
-                && self.resolve_instance_call(&rc, method, &arg_tys).is_none();
+            let inherited = matches!(
+                (method, args.len()),
+                ("equals", 1) | ("toString", 0) | ("hashCode", 0)
+            ) && self.resolve_instance_call(&rc, method, &arg_tys).is_none();
             if !inherited {
                 return self.dispatch_instance_method(recv, &rc, method, args, line);
             }
