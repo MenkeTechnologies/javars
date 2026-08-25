@@ -208,7 +208,7 @@ pub const REFERENCE: &[Entry] = &[
         "record",
         "Contextual Keywords",
         "record Name(T c1, U c2) { [compact constructor] [members] }",
-        "Declares a record. The parser synthesizes the canonical constructor, one accessor per component, `toString()` in Java's `Name[c1=v1, c2=v2]` form, and a component-wise `equals(Object)` guarded by an `instanceof` test. `hashCode()` is not derived — calling it is an unsupported-method error.",
+        "Declares a record. The parser synthesizes the canonical constructor, one accessor per component, `toString()` in Java's `Name[c1=v1, c2=v2]` form, a component-wise `equals(Object)` guarded by an `instanceof` test, and `hashCode()` as the `31 * h + componentHash` fold — each component through its own wrapper's `hashCode(x)`, so the widths stay apart. Declaring any of them yourself wins over the derived one.",
         "record Point(int x, int y) { }\n// new Point(1, 2) prints as Point[x=1, y=2]",
     ),
     (
