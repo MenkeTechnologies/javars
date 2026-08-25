@@ -3699,21 +3699,41 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower `while (cond) { … }` **rotated**: the test is emitted twice — once
+    /// ahead of the body as an entry guard, once after it as a *conditional*
+    /// backward branch — instead of once at the top with an unconditional
+    /// `Jump` back to it.
+    ///
+    /// The shape is what decides whether the loop ever leaves the interpreter.
+    /// fusevm's tracing JIT closes a trace only on a conditional backward
+    /// branch; recorded from a top-test loop it reaches an unconditional `Jump`
+    /// and declines, which is why `java --tiers` reported
+    /// `trace-eligible=true traced=false` for every `for` and `while` javars
+    /// emitted while `do { … } while (…)` — the one form that already ended in
+    /// a conditional branch — reported `traced=true`.
+    ///
+    /// Evaluation order and count are unchanged: a top-test loop runs the test
+    /// `n + 1` times for `n` iterations, and so does this (one entry test, then
+    /// one after each body run). Rotation costs one static copy of the
+    /// condition's code and saves one jump per iteration.
     fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> Result<(), String> {
         let label = self.pending_label.take();
-        let top = self.b.current_pos();
         self.expr(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
+        let top = self.b.current_pos();
         self.scopes.push(BreakScope::loop_scope(label));
         for s in body {
             self.stmt(s)?;
         }
-        // `continue` re-tests the condition — target it at the loop top.
+        // `continue` re-tests the condition — which is now the bottom copy of
+        // it, emitted just below.
+        let test = self.b.current_pos();
         let l = self.scopes.pop().unwrap();
         for op in &l.continue_ops {
-            self.b.patch_jump(*op, top);
+            self.b.patch_jump(*op, test);
         }
-        self.b.emit(Op::Jump(top), 0);
+        self.expr(cond)?;
+        self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
         self.b.patch_jump(jf, end);
         for op in l.break_ops {
@@ -3747,6 +3767,12 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower the C-style `for (init; cond; update)`, rotated for the reason
+    /// [`Compiler::while_stmt`] gives. `continue` still runs the update clause,
+    /// which now sits immediately before the bottom copy of the test.
+    ///
+    /// `for (;;)` has no test to branch on, so its back edge stays
+    /// unconditional — and with it, its ineligibility for a trace.
     fn for_stmt(
         &mut self,
         init: &[Stmt],
@@ -3758,7 +3784,6 @@ impl Compiler {
         for s in init {
             self.stmt(s)?;
         }
-        let top = self.b.current_pos();
         let jf = match cond {
             Some(c) => {
                 self.expr(c)?;
@@ -3766,19 +3791,28 @@ impl Compiler {
             }
             None => None,
         };
+        let top = self.b.current_pos();
         // `continue` runs the update clause, then re-tests — target it at the
         // step label emitted after the body.
         self.scopes.push(BreakScope::loop_scope(label));
         for s in body {
             self.stmt(s)?;
         }
-        // step label: the continue target is the update clause (or the loop-top
-        // re-test when there is no update).
+        // step label: the continue target is the update clause (or, when there
+        // is no update, the bottom re-test that follows it).
         let step = self.b.current_pos();
         for s in update {
             self.stmt(s)?;
         }
-        self.b.emit(Op::Jump(top), 0);
+        match cond {
+            Some(c) => {
+                self.expr(c)?;
+                self.b.emit(Op::JumpIfTrue(top), 0);
+            }
+            None => {
+                self.b.emit(Op::Jump(top), 0);
+            }
+        }
         let end = self.b.current_pos();
         if let Some(jf) = jf {
             self.b.patch_jump(jf, end);
@@ -4155,13 +4189,15 @@ impl Compiler {
         self.b.emit(Op::LoadInt(0), line);
         self.emit_set(&idx_t, line);
 
-        // `i < arr.length`
-        let top = self.b.current_pos();
+        // `i < arr.length`, as an entry guard — the loop is rotated for the
+        // reason [`Compiler::while_stmt`] gives, so the same test is emitted
+        // again at the bottom as the conditional backward branch.
         self.emit_get(&idx_t, line);
         self.emit_get(&arr_t, line);
         self.emit_field_get("length", line);
         self.b.emit(Op::NumLt, line);
         let jf = self.b.emit(Op::JumpIfFalse(0), line);
+        let top = self.b.current_pos();
 
         // The loop variable is rebound from `arr[i]` at the top of every
         // iteration, before the body runs.
@@ -4180,7 +4216,11 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), line);
         self.b.emit(Op::Add, line);
         self.emit_set(&idx_t, line);
-        self.b.emit(Op::Jump(top), line);
+        self.emit_get(&idx_t, line);
+        self.emit_get(&arr_t, line);
+        self.emit_field_get("length", line);
+        self.b.emit(Op::NumLt, line);
+        self.b.emit(Op::JumpIfTrue(top), line);
 
         let end = self.b.current_pos();
         self.b.patch_jump(jf, end);

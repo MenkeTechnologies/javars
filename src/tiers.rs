@@ -278,23 +278,30 @@ mod tests {
         assert!(report.reaches_native(), "{report}");
     }
 
-    /// A counted loop in a function counts in frame slots, so its body holds
-    /// nothing the tiers refuse and fusevm's recorder accepts the sequence. It
-    /// still installs no trace: the loop is emitted in the unrotated shape — a
-    /// forward `JumpIfFalse` exit closed by an unconditional backward `Jump` —
-    /// which the trace compiler records and then declines. This pins the gap
-    /// the report exists to expose; if loop lowering is rotated later, this
-    /// test is the one that says so.
+    /// A counted `for` written in Java reaches a compiled trace.
+    ///
+    /// This used to assert the opposite, and its comment said so: the loop was
+    /// lowered with a forward `JumpIfFalse` exit closed by an unconditional
+    /// backward `Jump`, which the trace compiler records and then declines, so
+    /// the hottest shape a Java program has stayed in the interpreter however
+    /// hot it got. [`crate::compiler::Compiler::while_stmt`] now emits every
+    /// `for`, `while`, and enhanced `for` rotated — the test duplicated as an
+    /// entry guard and a conditional backward branch — which is the shape
+    /// [`a_rotated_slot_loop_reaches_a_compiled_trace`] proves fusevm accepts.
+    ///
+    /// Keeping it as an assertion rather than deleting it is the point: rotate
+    /// the lowering back, or emit a loop body holding an op the tiers refuse,
+    /// and this fails.
     #[test]
-    fn a_counted_loop_is_trace_eligible_but_installs_no_trace() {
+    fn a_counted_loop_reaches_a_compiled_trace() {
         let report = report(PROGRAM).expect("runs");
         let counted = report.chunks[0]
             .loops
             .iter()
             .find(|l| l.trace_eligible)
             .unwrap_or_else(|| panic!("a trace-eligible loop: {report}"));
-        assert!(!counted.traced, "{report}");
+        assert!(counted.traced, "{report}");
         assert!(!counted.blacklisted, "{report}");
-        assert!(!report.reaches_native(), "{report}");
+        assert!(report.reaches_native(), "{report}");
     }
 }
