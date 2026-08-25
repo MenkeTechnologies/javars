@@ -7258,8 +7258,11 @@ fn builder_call_java_type(recv_ty: &str, method: &str, argc: usize) -> Option<&'
 fn is_width_overloaded(class: &str, method: &str, argc: usize) -> bool {
     class == "Math"
         && match method {
-            "addExact" | "subtractExact" | "multiplyExact" => argc == 2,
-            "toIntExact" => argc == 1,
+            "addExact" | "subtractExact" | "multiplyExact" | "divideExact" | "floorDivExact"
+            | "ceilDivExact" => argc == 2,
+            "toIntExact" | "incrementExact" | "decrementExact" | "negateExact" | "absExact" => {
+                argc == 1
+            }
             "clamp" => argc == 3,
             _ => false,
         }

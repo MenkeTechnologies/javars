@@ -4787,6 +4787,54 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 Err(_) => Err(Fault::java("ArithmeticException", "integer overflow")),
             }
         }
+        // The unary members of the family. Each is one of the binary ones with a
+        // constant operand — Java specifies them that way and their overflow
+        // messages agree — except `absExact`, whose message names the constant
+        // it cannot represent.
+        ("Math", "incrementExact", 2) => exact_arith(args[0].jint(), 1, args[1].jint(), Exact::Add),
+        ("Math", "decrementExact", 2) => exact_arith(args[0].jint(), 1, args[1].jint(), Exact::Sub),
+        ("Math", "negateExact", 2) => exact_arith(0, args[0].jint(), args[1].jint(), Exact::Sub),
+        ("Math", "absExact", 2) => {
+            let (v, width) = (args[0].jint(), args[1].jint());
+            let min = if width == width::LONG {
+                i64::MIN
+            } else {
+                i64::from(i32::MIN)
+            };
+            if v == min {
+                let name = if width == width::LONG {
+                    "Long.MIN_VALUE"
+                } else {
+                    "Integer.MIN_VALUE"
+                };
+                return Err(Fault::java(
+                    "ArithmeticException",
+                    format!("Overflow to represent absolute value of {name}"),
+                ));
+            }
+            Ok(Value::Int(v.abs()))
+        }
+        // The three exact divisions. Each rounds differently and all three
+        // overflow in exactly one place — `MIN_VALUE / -1`, whose quotient is
+        // one past the width — while a zero divisor is `/ by zero` first.
+        ("Math", "divideExact", 3) => exact_divide(
+            args[0].jint(),
+            args[1].jint(),
+            args[2].jint(),
+            Rounding::Truncate,
+        ),
+        ("Math", "floorDivExact", 3) => exact_divide(
+            args[0].jint(),
+            args[1].jint(),
+            args[2].jint(),
+            Rounding::Floor,
+        ),
+        ("Math", "ceilDivExact", 3) => exact_divide(
+            args[0].jint(),
+            args[1].jint(),
+            args[2].jint(),
+            Rounding::Ceil,
+        ),
         ("Math", "clamp", 4) => math_clamp(&args[0], &args[1], &args[2], args[3].jint()),
         ("Math", "signum", 1) => Ok(Value::float(match args[0].jfloat() {
             f if f > 0.0 => 1.0,
@@ -5219,6 +5267,68 @@ fn exact_arith(a: i64, b: i64, width: i64, op: Exact) -> Result<Value, Fault> {
     match i32::try_from(r) {
         Ok(n) => Ok(Value::Int(n.into())),
         Err(_) => Err(Fault::java("ArithmeticException", "integer overflow")),
+    }
+}
+
+/// Which way [`exact_divide`] rounds an inexact quotient.
+enum Rounding {
+    /// Toward zero — `Math.divideExact`, the `/` operator's own rounding.
+    Truncate,
+    /// Toward negative infinity — `Math.floorDivExact`.
+    Floor,
+    /// Toward positive infinity — `Math.ceilDivExact`.
+    Ceil,
+}
+
+/// `Math.divideExact` / `floorDivExact` / `ceilDivExact` at the width the
+/// compiler resolved.
+///
+/// All three overflow in exactly one place, `MIN_VALUE / -1`, whose quotient is
+/// one past the width in every rounding — and a zero divisor is `/ by zero`
+/// before that, which is the order openjdk 26.0.2 reports them in.
+fn exact_divide(a: i64, b: i64, width: i64, round: Rounding) -> Result<Value, Fault> {
+    if b == 0 {
+        return Err(Fault::java("ArithmeticException", "/ by zero"));
+    }
+    let overflow = || {
+        Fault::java(
+            "ArithmeticException",
+            if width == width::LONG {
+                "long overflow"
+            } else {
+                "integer overflow"
+            },
+        )
+    };
+    let q = match round {
+        Rounding::Truncate => a.checked_div(b),
+        Rounding::Floor => Some(floor_div(a, b)?),
+        // Ceiling is the floor plus one whenever the division was inexact,
+        // whatever the signs: `ceilDiv(7, 2)` is 4 (floor 3) and
+        // `ceilDiv(-7, 2)` is -3 (floor -4). Reusing `floor_div` keeps the one
+        // correction step in a single place.
+        Rounding::Ceil => floor_div(a, b)
+            .map(|f| {
+                if a.wrapping_rem(b) != 0 {
+                    f.wrapping_add(1)
+                } else {
+                    f
+                }
+            })
+            .map(Some)?,
+    };
+    let q = q.ok_or_else(overflow)?;
+    if width == width::LONG {
+        // `checked_div` already refused `i64::MIN / -1`; the two rounding arms
+        // reach it through `wrapping` arithmetic, so they are checked here.
+        if a == i64::MIN && b == -1 {
+            return Err(overflow());
+        }
+        return Ok(Value::Int(q));
+    }
+    match i32::try_from(q) {
+        Ok(n) => Ok(Value::Int(n.into())),
+        Err(_) => Err(overflow()),
     }
 }
 

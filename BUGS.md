@@ -199,8 +199,11 @@ at the bottom, and are summarized in the section right after this one.
   `ceil`/`round`/`signum`/`floorDiv`/`floorMod`/`toRadians`/`toDegrees`/`rint`/
   `copySign`/`ulp`/`nextUp`/`nextDown`/`nextAfter`/`fma` (with
   Java's int-vs-double overload result typing) and the `Math.PI`/`Math.E`
-  constants; `Math.addExact`/`subtractExact`/`multiplyExact`/`toIntExact` and
-  `Math.clamp`, each resolved to the overload the arguments' static types select
+  constants; the whole exact-arithmetic family —
+  `addExact`/`subtractExact`/`multiplyExact`/`divideExact`/`floorDivExact`/
+  `ceilDivExact`/`incrementExact`/`decrementExact`/`negateExact`/`absExact`/
+  `toIntExact` — and `Math.clamp`, each resolved to the overload the arguments'
+  static types select
   — so `Math.addExact(2000000000, 2000000000)` is `ArithmeticException: integer
   overflow` where `Math.addExact(2000000000L, 2000000000L)` is 4000000000, and
   `Math.clamp(0.1f, 0f, 3f)` renders as a `float`. A call whose argument types
@@ -1043,11 +1046,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math`'s remaining
-  exact-arithmetic statics (`divideExact`, `floorDivExact`, `ceilDivExact`,
-  `incrementExact`, `decrementExact`, `negateExact`, `absExact`, `powExact` and
-  the `unsigned` pair) and `StringBuilder.append(char[], int, int)` are on the
-  same footing: a call is a compile error naming the method. `System` carries
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math.powExact` and
+  the `unsignedMultiplyExact`/`unsignedPowExact` pair, and
+  `StringBuilder.append(char[], int, int)`, are on the same footing: a call is a
+  compile error naming the method. `System` carries
   only its two streams: `System.exit(3)` is
   ``javars: only `System.out`/`System.err` are supported, not `System.exit` ``,
   which also means a program cannot choose its exit status — 0 for a clean run
