@@ -390,6 +390,23 @@ struct FinallyScope {
 
 struct Compiler {
     b: ChunkBuilder,
+    /// Every `static final String` whose initializer is a constant expression,
+    /// by field name — Java's *constant variables* (JLS 4.12.4).
+    ///
+    /// Java folds a use of one at compile time, so `CONST + ""` is the interned
+    /// literal `"ab"` rather than a string built at run time. Keyed by the bare
+    /// name because that is how a constant is written inside its own class,
+    /// which is where nearly every use of one is.
+    string_constants: HashMap<String, String>,
+    /// Every Java `String` literal already in the constant pool, by text.
+    ///
+    /// Java *interns* string literals: two occurrences of `"ab"` in a program
+    /// denote one object, which is why `"ab" == "ab"` is `true`. javars gives a
+    /// `String` its identity through its `Arc`, and `Op::LoadConst` hands back a
+    /// clone of the pooled value — so one pool entry per distinct text is
+    /// exactly one interned object per distinct text, and the interning falls
+    /// out of the pooling rather than needing a runtime table.
+    literals: HashMap<String, u16>,
     /// The stack of enclosing breakable constructs (loops and `switch`es),
     /// innermost last. `break`/`continue` backpatch through it.
     scopes: Vec<BreakScope>,
@@ -555,8 +572,35 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             .iter()
             .any(|m| m.name == "toString" && m.param_tys.is_empty() && !m.is_abstract)
     });
+    // Java's *constant variables*: a `static final String` whose initializer is
+    // a constant expression. Collected before any body is lowered, because a use
+    // can precede the declaration and folding has to see it either way.
+    let mut string_constants: HashMap<String, String> = HashMap::new();
+    for cl in &prog.classes {
+        for f in &cl.static_fields {
+            if !(f.is_final && f.ty == "String") {
+                continue;
+            }
+            // The parser moves a `static` field's initializer into the class's
+            // static-init sequence, so the literal is found there rather than on
+            // the declaration — as the assignment that seeds the cell.
+            let text = cl.static_init.iter().find_map(|st| match &st.kind {
+                StmtKind::Assign {
+                    name,
+                    op: AssignOp::Assign,
+                    value: Expr::Str(text),
+                } if *name == f.name => Some(text.clone()),
+                _ => None,
+            });
+            if let Some(text) = text {
+                string_constants.insert(f.name.clone(), text);
+            }
+        }
+    }
     let mut c = Compiler {
         b: ChunkBuilder::new(),
+        literals: HashMap::new(),
+        string_constants,
         scopes: Vec::new(),
         pending_label: None,
         switch_counter: 0,
@@ -2845,6 +2889,64 @@ impl Compiler {
         Ok(())
     }
 
+    /// The text of a compile-time constant `String` expression, or `None` when
+    /// the expression is not one.
+    ///
+    /// Java's constant expressions (JLS 15.29) are literals and operations over
+    /// them, and a concatenation of two is folded by the compiler into a single
+    /// interned literal. Only the shapes that can appear in a *string*
+    /// concatenation are folded here — a literal of any kind, and `+` over two
+    /// of them — because that is the whole of what makes the difference
+    /// observable: `("a" + "b") == "ab"` is `true` in Java and would be `false`
+    /// against a concatenation built at run time.
+    ///
+    /// A `final` local or field initialized to a literal is a constant in Java
+    /// too; javars does not track that, so `f + "b"` concatenates at run time
+    /// and compares by identity. That is a `false` where Java answers `true`,
+    /// and it is noted in BUGS.md rather than guessed at here.
+    fn const_string(&self, e: &Expr) -> Option<String> {
+        Some(match e {
+            Expr::Str(s) => s.clone(),
+            // A `static final String CONST = "ab"` is a constant *variable*, so
+            // Java folds its uses. `Expr::Field` covers the qualified spelling
+            // (`T.CONST`), whose field name is the same key.
+            Expr::Var(name) => self.string_constants.get(name)?.clone(),
+            Expr::Field { name, .. } => self.string_constants.get(name)?.clone(),
+            Expr::Int(n) | Expr::Long(n) => n.to_string(),
+            Expr::Bool(b) => b.to_string(),
+            Expr::Char(c) => c.to_string(),
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            } if self.is_string_concat(lhs, rhs) => {
+                format!("{}{}", self.const_string(lhs)?, self.const_string(rhs)?)
+            }
+            _ => return None,
+        })
+    }
+
+    /// The constant-pool index of a Java `String` literal, adding it only the
+    /// first time that text appears.
+    ///
+    /// This is Java's string interning, done where it costs nothing: one pool
+    /// entry per distinct text means every `Op::LoadConst` of that literal hands
+    /// back a clone of one `Arc`, and `==` — which compares those pointers —
+    /// answers `true` for two occurrences of the same literal, as Java's does.
+    ///
+    /// Only *Java* literals come through here. The compiler's own constants
+    /// (class names, method names, format tags) keep using `add_constant`
+    /// directly: they never reach a user `==`, and pooling them beside the
+    /// literals would let an internal string share a literal's identity.
+    fn string_literal(&mut self, text: &str) -> u16 {
+        if let Some(&c) = self.literals.get(text) {
+            return c;
+        }
+        let c = self.b.add_constant(Value::str(text.to_string()));
+        self.literals.insert(text.to_string(), c);
+        c
+    }
+
     /// Emit Java's *boxing* or *unboxing* conversion (JLS 5.1.7 / 5.1.8) for the
     /// value already on top of the stack, when the target type calls for one.
     ///
@@ -4767,7 +4869,17 @@ impl Compiler {
             (Some(class), Expr::Var(c)) => self.emit_global_get(&enum_global(class, c), line),
             _ => self.expr(label)?,
         }
-        self.b.emit(Op::NumEq, line);
+        // Java's `switch` on a `String` selects with `equals`, not with `==`, so
+        // a `String` label compares by text. The label's own shape decides it:
+        // a string literal there means the selector is a `String`, whatever
+        // javars could infer about the selector's type. Without this a
+        // discriminant built at run time matched no label at all, `NumEq` on two
+        // strings having become an identity test.
+        if matches!(label, Expr::Str(_)) {
+            self.b.emit(Op::StrEq, line);
+        } else {
+            self.b.emit(Op::NumEq, line);
+        }
         Ok(())
     }
 
@@ -5258,7 +5370,7 @@ impl Compiler {
                 self.b.emit(Op::LoadConst(c), 0);
             }
             Expr::Str(s) => {
-                let c = self.b.add_constant(Value::str(s.clone()));
+                let c = self.string_literal(s);
                 self.b.emit(Op::LoadConst(c), 0);
             }
             // A `char` runs as its code point; the static type is what turns it
@@ -6792,6 +6904,19 @@ impl Compiler {
         // — the operand's `toString()` for an object, the one-character String
         // for a `char`. Arithmetic `+` (which is what `'a' + 1` is) must not.
         if op == BinOp::Add && self.is_string_concat(lhs, rhs) {
+            // A concatenation of compile-time constants IS a constant, and Java
+            // folds it in the compiler — which is why `("a" + "b") == "ab"` is
+            // `true` there: both sides end up the same interned literal. Folding
+            // it here is what keeps that true once `==` compares identities.
+            if let Some(folded) = self.const_string(&Expr::Binary {
+                op,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(rhs.clone()),
+            }) {
+                let c = self.string_literal(&folded);
+                self.b.emit(Op::LoadConst(c), 0);
+                return Ok(());
+            }
             self.emit_stringified(lhs)?;
             self.emit_stringified(rhs)?;
         } else {

@@ -602,6 +602,10 @@ fn record_members(
             ty: c.ty.clone(),
             name: c.name.clone(),
             init: None,
+            // A record's component field IS final in Java, but it holds a
+            // constructor argument rather than a constant expression, so it is
+            // never a *constant variable* and folding must not reach it.
+            is_final: false,
             line,
         });
     }
@@ -870,12 +874,14 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         ty: "String".to_string(),
         name: ENUM_NAME.to_string(),
         init: None,
+        is_final: false,
         line,
     });
     fields.push(FieldDecl {
         ty: "int".to_string(),
         name: ENUM_ORDINAL.to_string(),
         init: None,
+        is_final: false,
         line,
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
@@ -1090,11 +1096,15 @@ impl Parser {
     fn try_fields(&mut self) -> Result<Option<(Vec<FieldDecl>, bool)>, String> {
         let save = self.pos;
         let mut saw_static = false;
+        let mut saw_final = false;
         while matches!(self.peek(), Tok::Public | Tok::Static)
             || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "private" || w == "protected" || w == "volatile" || w == "transient")
         {
             if matches!(self.peek(), Tok::Static) {
                 saw_static = true;
+            }
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                saw_final = true;
             }
             self.advance();
         }
@@ -1127,6 +1137,7 @@ impl Parser {
                 ty,
                 name,
                 init,
+                is_final: saw_final,
                 line,
             });
             if self.is(&Tok::Comma) {

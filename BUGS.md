@@ -1283,30 +1283,33 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   widens both to `7.0`/`9.0`. This is the same erasure limit as the
   `s.get() / 2` entry above. Every source javars can type — a literal, a local,
   a field, an array element, a declared-return method — converts.
-- **`==` on objects is reference identity; on strings it is identity only for
-  the ones that have one.** Object and array handles (`Value::Obj`) are
-  identity-comparable, so `x == y`, `x == z` after `z = x`, and
-  `obj.field == null` all behave like Java's reference `==`.
+- **`==` on objects and on strings is reference identity.** Object and array
+  handles (`Value::Obj`) are identity-comparable, so `x == y`, `x == z` after
+  `z = x`, and `obj.field == null` all behave like Java's reference `==`.
 
-  `new String(…)` allocates a `String` with an identity of its own — the same
-  kind of box a wrapper class gets, carrying the class `String`, which no
-  compiler-side autoboxing produces — so `new String("ab") == "ab"` is `false`,
-  `new String("ab") == new String("ab")` is `false`, and an aliasing assignment
-  keeps `==` `true`. `intern()` answers the canonical value, so
-  `new String("ab").intern() == "ab"` is `true`. Everything that reads a
-  `String` reads through the box: its methods, `compareTo` and the natural
-  order a sort uses, `equals` and `hashCode`, collection membership and map
-  keys, rendering and `String.format`, `instanceof` and `getClass`. A `switch`
-  on a `String` unboxes its discriminant, because Java's `switch` compares with
-  `equals` rather than with `==`.
+  A `String`'s identity is the `Arc` that [`fusevm::Value::Str`] already
+  carries. Nothing wraps it and nothing is allocated for it — the identity was
+  in the representation from the start, unread. `Op::LoadConst` hands back a
+  clone of the pooled value, and the compiler pools one entry per distinct
+  literal text (`Compiler::string_literal`), so Java's *interning* of string
+  literals falls out of the pooling: `"ab" == "ab"` is `true`. Everything built
+  at run time — a concatenation, a `substring`, a `String.valueOf`,
+  `new String(…)` — allocates its own and is `==` to nothing else.
 
-  Every *other* `String` compares by value where Java compares identity, and
-  that is where the model stops: a `String` javars did not see constructed —
-  one produced by a runtime concatenation, `substring`, or `String.valueOf` —
-  has no handle, so `(s1 + s2) == "ab"` is `true` where Java answers `false`.
-  Giving those an identity means giving every `String` a handle, which is a
-  different change from this one: it would put an allocation on every
-  concatenation and a dereference on every read.
+  The JDK's "returns this string if unchanged" contract is honoured, because
+  `==` can now see it: `"ab".trim()`, `.strip()`, `.substring(0)`,
+  `.toLowerCase()`, `.replace('x','y')`, `.concat("")`, `.repeat(1)` and
+  `.toString()` all answer the receiver itself, and `String.valueOf(aString)`
+  does too. `intern()` answers the pool's object, seeded from the chunk's
+  literals before the run. A `switch` on a `String` selects by *text*, because
+  Java's `switch` uses `equals` rather than `==`.
+
+  A concatenation of compile-time constants is folded to one interned literal,
+  as `javac` folds it — including a `static final String` *constant variable*
+  (JLS 4.12.4), so `("a" + "b") == "ab"` and `(CONST + "") == "ab"` are both
+  `true`. What is **not** folded is a `final` *local* initialized with a
+  literal, which Java also treats as a constant variable: javars concatenates it
+  at run time, so `f + "b" == "ab"` is `false` where Java answers `true`.
 - **A boxed primitive is a real reference, in a *statically typed* position
   only.** `Integer`, `Long`, `Short`, `Byte`, `Character`, `Float` and `Double`
   each allocate a heap object with the `java.lang` class they name, cached over

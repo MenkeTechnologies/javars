@@ -109,6 +109,11 @@ fn run_chunk(
     host::set_binary_names(binaries);
     host::set_exceptions_enabled(exceptions);
     host::set_argv(argv.to_vec());
+    // Java interns string literals; javars gives a `String` its identity through
+    // its `Arc`, so the canonical object for a text that appears as a literal
+    // has to be that literal's. The constant pool is the only place they live,
+    // and it is read once here rather than at every `intern()` call.
+    host::intern_literals(&chunk);
     let mut vm = VM::new(chunk);
     host::install(&mut vm);
     vm.set_numeric_hook(std::sync::Arc::new(host::numeric_hook));

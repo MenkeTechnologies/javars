@@ -70,8 +70,10 @@ pure frontend over the shared engine. Highlights:
   slot, a cast, a generic, an `equals` argument, a collection element or key —
   so `((Object) 1000L).getClass().getName()` is `java.lang.Long` and a `Map`
   keyed on `1`, `1.0` and `1L` holds the three entries Java's holds.
-  `new String(…)` gets an identity the same way, so `new String("ab") == "ab"`
-  is `false` and `.intern()` brings it back. Every arithmetic, rendering and hashing surface unboxes them, so the
+  A `String`'s identity is the `Arc` it already carries, so `==` on two of them
+  is the reference comparison Java's is — `"ab" == "ab"` is `true` (one pooled
+  literal per distinct text) while `(s1 + s2) == "ab"` is `false`, at no
+  allocation and no indirection. Every arithmetic, rendering and hashing surface unboxes them, so the
   box is visible only where Java makes it visible.
 - **Verified against OpenJDK** — the example programs and the test corpus are
   diffed byte-for-byte against a reference `java`; the tests freeze that output

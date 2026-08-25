@@ -327,11 +327,10 @@ pub const JBOX: u16 = 747;
 ///
 /// Java's `String` is a reference type, so `new String("ab") == "ab"` is
 /// `false`: the constructor is specified to produce a *fresh* object, which is
-/// the only reason the expression is ever written. javars models an ordinary
-/// `String` as [`Value::Str`], which has no identity to distinguish, so this
-/// one allocates the same kind of box a wrapper class gets — carrying the class
-/// `String`, which no compiler-side autoboxing produces, so nothing else can
-/// create one by accident.
+/// the only reason the expression is ever written. A `String`'s identity here
+/// is its `Arc`, so this re-allocates the text — every other path that
+/// *produces* a string already allocates, and this is the one path that would
+/// otherwise pass an existing object through.
 pub const JNEW_STRING: u16 = 749;
 
 /// Unbox a wrapper back to its primitive; the identity function on a value that
@@ -791,6 +790,13 @@ thread_local! {
     /// is `false`, so the cache is not an optimization here — it is the
     /// observable behaviour.
     static BOX_CACHE: RefCell<HashMap<(usize, i64), u32>> = RefCell::new(HashMap::new());
+    /// Java's string pool: text -> the interned `String` for it.
+    ///
+    /// Seeded from the chunk's constants by [`intern_literals`], so the canonical
+    /// object for a text that appears as a literal *is* that literal — which is
+    /// what makes `("a" + b).intern() == "ab"` `true`. A text with no literal
+    /// interns the first value offered for it.
+    static INTERNED: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
     /// Every live box: handle -> (wrapper class, the primitive it wraps).
     ///
     /// Separate from `HEAP` on purpose — see [`HostObj::Boxed`]. Indexed by the
@@ -898,6 +904,39 @@ impl JavaNumeric for Value {
     }
 }
 
+/// Seed the string pool with the chunk's `String` literals. Call after
+/// [`heap_reset`] and before running.
+///
+/// `intern()` has to answer the *literal's* object for a text that has one, and
+/// the literals live in the constant pool rather than anywhere the host can
+/// reach at call time — so the pool is walked once here. Reading a text that
+/// never appears as a literal is not an error: the first value offered for it
+/// becomes canonical, which is what the JDK does too.
+pub fn intern_literals(chunk: &fusevm::Chunk) {
+    INTERNED.with(|table| {
+        let mut table = table.borrow_mut();
+        for c in &chunk.constants {
+            if let Value::Str(text) = c {
+                table
+                    .entry(text.as_str().to_string())
+                    .or_insert_with(|| c.clone());
+            }
+        }
+    });
+}
+
+/// `s.intern()` — the canonical `String` for `s`'s text.
+fn intern(v: &Value) -> Value {
+    let text = java_str(v);
+    INTERNED.with(|table| {
+        table
+            .borrow_mut()
+            .entry(text)
+            .or_insert_with(|| v.clone())
+            .clone()
+    })
+}
+
 /// Install the program arguments `main`'s `String[]` parameter will see. Call
 /// before running the chunk.
 pub fn set_argv(argv: Vec<String>) {
@@ -913,6 +952,7 @@ pub fn heap_reset() {
     // objects occupy, and `Integer.valueOf(1)` would answer someone else's list.
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
+    INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
@@ -1428,8 +1468,9 @@ fn b_box(vm: &mut VM, argc: u8) -> Value {
 /// [`JNEW_STRING`] — a `String` with a fresh identity.
 fn b_new_string(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let text = args.first().map(deboxed).unwrap_or(Value::Undef);
-    Value::Obj(alloc_box("String", text))
+    // `to_string` rather than a clone: a clone would share the argument's `Arc`
+    // and the constructor's whole job is not to.
+    Value::str(args.first().map(java_str).unwrap_or_default())
 }
 
 /// [`JUNBOX`] — the primitive inside a wrapper, or the value unchanged.
@@ -4379,6 +4420,19 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         };
     }
     match string_method(&s, &method, &args) {
+        // `intern()` answers the pool's object for the text, which is a
+        // *different* object from the receiver whenever the receiver was built
+        // at run time — the one string method whose whole purpose is to change
+        // which object you hold.
+        Ok(v) if method == "intern" => intern(&v),
+        // Every other `String` method that would answer text equal to the
+        // receiver's answers the receiver itself. That is the JDK's own
+        // contract, stated method by method — `trim`, `strip`, `substring`,
+        // `toLowerCase`, `replace`, `concat`, `toString` all say "this string if
+        // unchanged" — and it is observable now that `==` compares identities:
+        // `"ab".trim() == "ab"` is `true` in Java. One rule covers them because
+        // the condition the JDK states is the same one each time.
+        Ok(Value::Str(text)) if text.as_str() == s.as_ref() => recv,
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
@@ -4798,7 +4852,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("hashCode", 0) => Ok(Value::Int(
             java_hash(&Value::str(s.to_string())).unwrap_or(0).into(),
         )),
-        // Interning is unobservable here: javars compares strings by value.
+        // Both answer the receiver's text; the caller turns that into the
+        // receiver itself for `toString` and into the pool's object for
+        // `intern`.
         ("intern", 0) | ("toString", 0) => Ok(Value::str(s.to_string())),
         ("contentEquals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
         // `x.getClass()` evaluates to the runtime class's *binary name*
@@ -4966,6 +5022,10 @@ fn rendering_static(vm: &mut VM, class: &str, method: &str, args: &[Value]) -> O
     Some(match (class, method, args.len()) {
         // `String.valueOf(char[])` concatenates the characters rather than
         // rendering the array, which is why the array case comes first.
+        // `String.valueOf(Object)` is specified as `obj.toString()`, and a
+        // `String`'s `toString()` is `this` — so it answers the very same
+        // object, which `==` can now see.
+        ("String", "valueOf", 1) if matches!(args[0], Value::Str(_)) => args[0].clone(),
         ("String", "valueOf", 1) => Value::str(match array_items(&args[0]) {
             Some(items) => items.iter().map(|v| java_str_vm(vm, v)).collect::<String>(),
             None => java_str_vm(vm, &args[0]),
@@ -5462,6 +5522,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `copyValueOf(char[])` is `valueOf(char[])` — the JDK's own
         // implementation is one call to the other — so it takes the same arm
         // rather than a second reading of the array.
+        // See the `valueOf` note in `static_method_vm`. `copyValueOf` is
+        // *not* here: it is documented to copy, and its argument is a `char[]`
+        // rather than a `String` in every legal call.
+        ("String", "valueOf", 1) if matches!(args[0], Value::Str(_)) => Ok(args[0].clone()),
         ("String", "valueOf" | "copyValueOf", 1) => Ok(Value::str(match array_items(&args[0]) {
             Some(items) => items.iter().map(java_str).collect::<String>(),
             None => java_str(&args[0]),
@@ -8063,6 +8127,20 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
         match op {
             NumOp::Eq => return Ok(Value::bool(ref_eq(a, b))),
             NumOp::Ne => return Ok(Value::bool(!ref_eq(a, b))),
+            _ => {}
+        }
+    }
+    // Two `String`s compare as *references*, which is what Java's `==` does on
+    // them. The reference is the `Arc`: a literal is one pool entry per distinct
+    // text (see `Compiler::string_literal`), so two occurrences share a pointer
+    // and `"ab" == "ab"` is `true`, while every string built at run time —
+    // a concatenation, a `substring`, a `String.valueOf` — allocates its own and
+    // is `==` to nothing else. No heap box and no extra allocation: the
+    // identity was already there in the representation, unread.
+    if let (Value::Str(x), Value::Str(y)) = (a, b) {
+        match op {
+            NumOp::Eq => return Ok(Value::bool(std::sync::Arc::ptr_eq(x, y))),
+            NumOp::Ne => return Ok(Value::bool(!std::sync::Arc::ptr_eq(x, y))),
             _ => {}
         }
     }

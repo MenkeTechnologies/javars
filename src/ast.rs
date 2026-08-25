@@ -159,6 +159,13 @@ pub fn enum_body_class(enum_name: &str, constant: &str) -> String {
 pub struct FieldDecl {
     pub ty: String,
     pub name: String,
+    /// True when the declaration carried `final`.
+    ///
+    /// A `static final String` initialized with a constant expression is a
+    /// *constant variable* (JLS 4.12.4): Java folds its uses at compile time, so
+    /// `CONST + ""` is the interned literal `"ab"` rather than a string built at
+    /// run time — which `==` can tell apart.
+    pub is_final: bool,
     /// Field initializer expression, run (with default values first) before the
     /// constructor body — Java's instance-initialization order.
     pub init: Option<Expr>,
