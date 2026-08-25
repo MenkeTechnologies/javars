@@ -205,11 +205,25 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
     (
         "Comparator",
         "int compare(Object a, Object b)",
+        // `thenComparing` is overloaded in Java on `Comparator` *and* on a key
+        // extractor, and the two are told apart by the target type — which
+        // javars has no pass for. They are told apart here by *arity* instead,
+        // which is exact: a comparator takes two arguments and a key extractor
+        // one, and `Comparator.isKeyExtractor` reads the count off the lambda.
+        // The four `comparingXxx` statics differ only in the width they promise,
+        // which javars does not track, so they share one body.
         "default Comparator reversed() { return (a, b) -> this.compare(b, a); } \
-         default Comparator thenComparing(Comparator other) { return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return other.compare(a, b); }; } \
+         default Comparator thenComparing(Object other) { Comparator c = Comparator.asComparator(other); return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return c.compare(a, b); }; } \
+         default Comparator thenComparingInt(Function key) { return this.thenComparing(key); } \
+         default Comparator thenComparingLong(Function key) { return this.thenComparing(key); } \
+         default Comparator thenComparingDouble(Function key) { return this.thenComparing(key); } \
+         static Comparator asComparator(Object x) { if (Comparator.isKeyExtractor(x)) { Function k = (Function) x; return (a, b) -> k.apply(a).compareTo(k.apply(b)); } return (Comparator) x; } \
          static Comparator naturalOrder() { return (a, b) -> a.compareTo(b); } \
          static Comparator reverseOrder() { return (a, b) -> b.compareTo(a); } \
-         static Comparator comparing(Function key) { return (a, b) -> key.apply(a).compareTo(key.apply(b)); }",
+         static Comparator comparing(Function key) { return (a, b) -> key.apply(a).compareTo(key.apply(b)); } \
+         static Comparator comparingInt(Function key) { return Comparator.comparing(key); } \
+         static Comparator comparingLong(Function key) { return Comparator.comparing(key); } \
+         static Comparator comparingDouble(Function key) { return Comparator.comparing(key); }",
     ),
     ("IntSupplier", "int getAsInt()", ""),
     (

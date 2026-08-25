@@ -5686,14 +5686,22 @@ impl Compiler {
                     self.emit_exc_check(line);
                     return Ok(());
                 }
+                if !is_static_class(&class) {
+                    return Err(format!(
+                        "javars: class `{class}` has no static method `{method}` taking {} argument(s) (line {line})",
+                        args.len()
+                    ));
+                }
+            } else if !is_static_class(&class) {
                 return Err(format!(
-                    "javars: class `{class}` has no static method `{method}` taking {} argument(s) (line {line})",
-                    args.len()
+                    "javars: class `{class}` has no static method `{method}` (line {line})"
                 ));
             }
-            return Err(format!(
-                "javars: class `{class}` has no static method `{method}` (line {line})"
-            ));
+            // A class the *host* also models falls through to its static table
+            // rather than erroring here. That is what lets a prelude type — a
+            // functional interface whose defaults are written in Java — reach a
+            // static only the host can answer: `Comparator.isKeyExtractor`
+            // reads a lambda's parameter count, which no Java body can.
         }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
@@ -7430,6 +7438,7 @@ fn is_static_class(name: &str) -> bool {
             | "LongStream"
             | "DoubleStream"
             | "Collectors"
+            | "Comparator"
             | "Objects"
     )
 }

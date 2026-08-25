@@ -2918,6 +2918,15 @@ impl Parser {
                     let args = self.call_args()?;
                     return Ok(Expr::Call { name, args, line });
                 }
+                // Naming a functional interface pulls in the prelude that
+                // declares it — and it can be named in an *expression* as well
+                // as in a type position: `Comparator.naturalOrder()` writes it
+                // as a static-call receiver and nowhere else, which is why
+                // `Comparator` was ``cannot find symbol`` for a program that
+                // used nothing but its statics.
+                if crate::prelude::is_functional(&name) {
+                    self.uses_functional = true;
+                }
                 // A trailing `.` (method/field access) is consumed by the
                 // postfix layer above; a bare identifier is a variable read.
                 Ok(Expr::Var(name))

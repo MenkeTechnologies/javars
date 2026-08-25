@@ -5796,6 +5796,14 @@ fn collection_static(
                 index: KeyIndex::default(),
             })))
         }
+        // Whether `x` is a *key extractor* rather than a comparator, read off
+        // the lambda's declared parameter count. `Comparator.thenComparing` is
+        // overloaded on the two in Java and told apart by the target type,
+        // which javars has no pass for; the arity is exact and is what the
+        // prelude's `asComparator` branches on.
+        ("Comparator", "isKeyExtractor") if args.len() == 1 => Ok(Value::bool(
+            closure_meta(&args[0]).is_some_and(|(_, params, _)| params == 1),
+        )),
         // ── java.util.stream sources ──
         ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
         ("IntStream" | "LongStream" | "DoubleStream", "of") => {
@@ -5904,17 +5912,21 @@ fn collection_static(
             items.reverse();
             write_list(&args[0], items).map(|()| Value::Undef)
         }
-        ("Collections", "max") | ("Collections", "min") if args.len() == 1 => {
+        // `max`/`min` take an optional comparator, which may be a user closure
+        // — so the pick goes through the same stable sort the stream terminals
+        // use rather than through `Iterator::max_by`, which cannot call back
+        // into the VM.
+        ("Collections", "max") | ("Collections", "min") if matches!(args.len(), 1 | 2) => {
             let items = sequence_items(&args[0]).unwrap_or_default();
-            let pick = if method == "max" {
-                items.iter().max_by(|a, b| natural_cmp(a, b))
-            } else {
-                items.iter().min_by(|a, b| natural_cmp(a, b))
-            };
-            match pick {
-                Some(v) => Ok(v.clone()),
-                None => Err(Fault::java("NoSuchElementException", String::new())),
+            if items.is_empty() {
+                return Some(Err(Fault::java("NoSuchElementException", String::new())));
             }
+            let sorted = sort_values(vm, items, args.get(1));
+            Ok(if method == "max" {
+                sorted.last().cloned().unwrap_or(Value::Undef)
+            } else {
+                sorted.first().cloned().unwrap_or(Value::Undef)
+            })
         }
         _ => return None,
     })

@@ -226,6 +226,23 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **`Comparator`'s combinators.** `naturalOrder`, `reverseOrder`, `comparing`,
+  `comparingInt`/`comparingLong`/`comparingDouble`, `reversed`,
+  `thenComparing`, `thenComparingInt`/`Long`/`Double`. They are written in Java
+  in the prelude, the way the other functional interfaces' defaults are.
+
+  `thenComparing` is overloaded in Java on a `Comparator` *and* on a key
+  extractor, told apart by the target type — which javars has no pass for. They
+  are told apart by **arity** instead, which is exact: a comparator takes two
+  arguments and a key extractor one. `Comparator.isKeyExtractor` reads the count
+  off the lambda, and is the one thing on that interface no Java body could
+  answer. Reaching it needed the compiler to fall through to the host's static
+  table when a *host-modeled* class does not declare a static itself, rather
+  than erroring — which is also what would let any other prelude type carry a
+  host-answered static.
+
+  The four `comparingXxx` statics differ only in the width they promise, which
+  javars does not track, so they share one body.
 - **`java.util.stream`.** Sources: `Collection.stream()`, `Stream.of`,
   `Arrays.stream`, `IntStream`/`LongStream`/`DoubleStream`'s `of`/`range`/
   `rangeClosed`. Intermediate: `filter`, `map`, `flatMap`, `peek`, `limit`,
