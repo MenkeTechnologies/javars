@@ -548,6 +548,47 @@ fn component_eq(ty: &str, mine: Expr, theirs: Expr, line: u32) -> Expr {
     }
 }
 
+/// How a `record`'s derived `hashCode` hashes one component.
+///
+/// Each primitive goes through its own wrapper's `hashCode(x)` static, because
+/// the widths disagree: `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are
+/// different numbers, and `Long.hashCode` folds its two halves where
+/// `Integer.hashCode` is the value. A reference component contributes its own
+/// `hashCode()`, or 0 when it is `null` — which is what makes
+/// `new S(null).hashCode()` 0 rather than a `NullPointerException`.
+fn component_hash(ty: &str, value: Expr, line: u32) -> Expr {
+    let wrapper = match ty {
+        "int" | "short" | "byte" => "Integer",
+        "long" => "Long",
+        "float" => "Float",
+        "double" => "Double",
+        "boolean" => "Boolean",
+        "char" => "Character",
+        _ => {
+            return Expr::Ternary {
+                cond: Box::new(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(value.clone()),
+                    rhs: Box::new(Expr::Var("null".to_string())),
+                }),
+                then: Box::new(Expr::Int(0)),
+                els: Box::new(Expr::MethodCall {
+                    recv: Box::new(value),
+                    method: "hashCode".to_string(),
+                    args: Vec::new(),
+                    line,
+                }),
+            }
+        }
+    };
+    Expr::MethodCall {
+        recv: Box::new(Expr::Var(wrapper.to_string())),
+        method: "hashCode".to_string(),
+        args: vec![value],
+        line,
+    }
+}
+
 fn record_members(
     line: u32,
     name: &str,
@@ -643,6 +684,63 @@ fn record_members(
             params: Vec::new(),
             ret: "String".to_string(),
             body: vec![Stmt::new(line, StmtKind::Return(Some(text)))],
+            is_abstract: false,
+            line,
+        });
+    }
+    // `hashCode()` — the `31 * h + componentHash` fold, seeded at 0.
+    //
+    // The JLS leaves a record's hash *unspecified* beyond "derived from the
+    // components", so this reproduces what openjdk 26.0.2's `ObjectMethods`
+    // bootstrap computes rather than inventing one: a program that prints a
+    // record's hash, or that depends on two records landing in the same
+    // `HashMap` bucket, would otherwise disagree with the reference for no
+    // reason a user could see.
+    if !methods
+        .iter()
+        .any(|m| m.name == "hashCode" && m.params.is_empty())
+    {
+        let acc = "#h";
+        let mut body = vec![Stmt::new(
+            line,
+            StmtKind::Local {
+                ty: "int".to_string(),
+                name: acc.to_string(),
+                init: Some(Expr::Int(0)),
+            },
+        )];
+        for c in components {
+            let mine = Expr::Field {
+                recv: Box::new(Expr::This),
+                name: c.name.clone(),
+            };
+            body.push(Stmt::new(
+                line,
+                StmtKind::Assign {
+                    name: acc.to_string(),
+                    op: AssignOp::Assign,
+                    value: Expr::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Binary {
+                            op: BinOp::Mul,
+                            lhs: Box::new(Expr::Int(31)),
+                            rhs: Box::new(Expr::Var(acc.to_string())),
+                        }),
+                        rhs: Box::new(component_hash(&c.ty, mine, line)),
+                    },
+                },
+            ));
+        }
+        body.push(Stmt::new(
+            line,
+            StmtKind::Return(Some(Expr::Var(acc.to_string()))),
+        ));
+        methods.push(Method {
+            name: "hashCode".to_string(),
+            owner: name.to_string(),
+            params: Vec::new(),
+            ret: "int".to_string(),
+            body,
             is_abstract: false,
             line,
         });

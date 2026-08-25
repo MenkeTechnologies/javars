@@ -1817,6 +1817,66 @@ fn user_equals(vm: &VM, v: &Value) -> Option<(u32, usize)> {
 /// [`run_tostring`] stops: the enclosing frame is unwinding and a body's side
 /// effects must not run twice. One raised *by* the body leaves `PENDING` set for
 /// the calling builtin to surface, and the verdict is discarded with it.
+/// The hash one element contributes when a *user* `hashCode()` body decides it.
+///
+/// Run before the heap borrow, for the same reason [`eq_plan`] resolves the
+/// element comparisons there: the body reads its own fields and may allocate, so
+/// it cannot run under an outstanding borrow of the slab. `None` means no body
+/// is reachable and [`element_hash`] answers, which is the path every program
+/// that declares no `hashCode` — and every collection of `String`s and boxed
+/// primitives — takes.
+fn user_element_hash(vm: &mut VM, v: &Value) -> Option<i32> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    let class = instance_class(v)?;
+    let entry = member_entry(vm, &class, HASHCODE_SUFFIX)?;
+    if PENDING.with(|p| p.borrow().is_some()) {
+        return None;
+    }
+    let stack_base = vm.stack.len();
+    vm.stack.push(Value::Obj(*id));
+    match run_sub(vm, entry, stack_base) {
+        Value::Int(h) => Some(h as i32),
+        _ => None,
+    }
+}
+
+/// A collection's own `hashCode`, computed before the heap borrow so a user
+/// element body can run.
+///
+/// `None` for a receiver that is not a collection, or a call that is not
+/// `hashCode()`, which leaves the borrowed section to answer as before.
+fn collection_hash(vm: &mut VM, recv: &Value, method: &str, argc: usize) -> Option<Value> {
+    if method != "hashCode" || argc != 0 {
+        return None;
+    }
+    let each = |vm: &mut VM, e: &Value| user_element_hash(vm, e).unwrap_or_else(|| element_hash(e));
+    if let Some(entries) = map_entries(recv) {
+        let mut h = 0i32;
+        for (k, v) in &entries {
+            let (kh, vh) = (each(vm, k), each(vm, v));
+            h = h.wrapping_add(kh ^ vh);
+        }
+        return Some(Value::Int(h.into()));
+    }
+    let items = sequence_items(recv)?;
+    // A set's hash is the order-independent sum; a list's is the `31 * h + e`
+    // fold. `value_class` is what tells them apart, and it is the same question
+    // `render_sequence` asks to choose between `[…]` and `{…}`.
+    let is_set = value_class(recv).is_some_and(|c| c.contains("Set"));
+    let mut h = if is_set { 0i32 } else { 1i32 };
+    for e in &items {
+        let eh = each(vm, e);
+        h = if is_set {
+            h.wrapping_add(eh)
+        } else {
+            h.wrapping_mul(31).wrapping_add(eh)
+        };
+    }
+    Some(Value::Int(h.into()))
+}
+
 fn run_equals(vm: &mut VM, entry: usize, id: u32, other: &Value) -> bool {
     if PENDING.with(|p| p.borrow().is_some()) {
         return false;
@@ -3193,6 +3253,11 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // another collection), so it runs before any borrow is taken.
     if method == "toString" && args.is_empty() {
         return Value::str(java_str_vm(vm, recv));
+    }
+    // `hashCode` reads each element's, which may be a user body — same
+    // constraint, same treatment.
+    if let Some(h) = collection_hash(vm, recv, method, args.len()) {
+        return h;
     }
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.

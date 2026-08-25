@@ -195,6 +195,21 @@ at the bottom, and are summarized in the section right after this one.
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
   `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
+- **A `record`'s derived `hashCode`, and a user `hashCode()` a collection
+  reads.** A record now supplies `hashCode()` alongside its accessors,
+  `toString` and `equals`, as the `31 * h + componentHash` fold seeded at 0 —
+  each component going through its own wrapper's `hashCode(x)`, because
+  `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers and
+  `Long.hashCode` folds its two halves. The JLS leaves a record's hash
+  unspecified beyond "derived from the components", so this reproduces what
+  openjdk 26.0.2's `ObjectMethods` bootstrap computes rather than inventing an
+  algorithm a program could see disagree.
+
+  A collection's own `hashCode` runs a user element's body where one is
+  declared. Like the element *comparisons*, it has to run before the heap borrow
+  the collection call takes — the body reads its own fields and may allocate —
+  so it is resolved up front, and a collection of `String`s and boxed primitives
+  pays nothing for it.
 - **Text blocks** (`"""…"""`), with the whole of JLS 3.10.6: the opening
   delimiter must be followed by a line terminator, incidental leading
   whitespace is stripped by the minimum indentation over the non-blank lines
@@ -1060,14 +1075,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `l.sort(null)` — because the host's natural order knows numbers and strings
   and answered "equal" for everything else, so a `List` of a user `Comparable`
   came back in insertion order.
-- **`hashCode()` on a user class**, including a `record`'s derived one. A record
-  supplies its accessors, `toString`, and `equals`; calling `hashCode()` is a
-  compile error ("class `Pt` has no method `hashCode`") rather than a wrong
-  number. That is the point of the omission: a record's hash is derived from its
-  *components*, so falling back to an identity hash would answer a plausible
-  wrong number where the error is honest. `Object.hashCode()` itself *is*
-  supplied (on `new Object()`, and on any receiver javars types dynamically),
-  because there the specified answer is the identity hash and nothing else.
 - **Class literals** (`C.class`, `int.class`). `x.getClass()` works — it
   evaluates to the runtime class name, over which `getName`/`getSimpleName`
   answer — but there is no way to name a class without an instance, so
@@ -1078,11 +1085,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
   library surface — no boxed-type methods beyond the listed statics, no
-  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. A `hashCode` a
-  collection computes reads each element's, and a class that declares its own
-  `hashCode` body still does not have that body run (see the `hashCode` entry
-  below), so a collection of such instances hashes by identity where Java hashes
-  by value. `Math.powExact` and
+  `Iterator`/`entrySet`/`Deque`/`Queue`/`Optional`, no I/O. `Math.powExact` and
   the `unsignedMultiplyExact`/`unsignedPowExact` pair, and
   `StringBuilder.append(char[], int, int)`, are on the same footing: a call is a
   compile error naming the method. `System` carries
