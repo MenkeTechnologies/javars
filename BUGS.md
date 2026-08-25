@@ -226,6 +226,32 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **`java.util.stream`.** Sources: `Collection.stream()`, `Stream.of`,
+  `Arrays.stream`, `IntStream`/`LongStream`/`DoubleStream`'s `of`/`range`/
+  `rangeClosed`. Intermediate: `filter`, `map`, `flatMap`, `peek`, `limit`,
+  `skip`, `distinct`, `sorted` (natural or with a comparator), `mapToInt`/
+  `mapToLong`/`mapToDouble`/`mapToObj`/`boxed`/`asLongStream`/`asDoubleStream`.
+  Terminal: `toList`, `toArray`, `collect`, `count`, `forEach`, `sum`,
+  `average`, `min`, `max`, `reduce` (both arities), `anyMatch`, `allMatch`,
+  `noneMatch`, `findFirst`, `findAny`. Collectors: `toList`, `toSet`,
+  `joining` (all three arities), `counting`, `toMap`, `groupingBy`.
+
+  Nothing is evaluated until a terminal runs, and the short-circuiting ones stop
+  the source — so `l.stream().peek(p).limit(2).toList()` calls `p` twice, not
+  once per element, and `anyMatch` stops at the first hit. `distinct` and
+  `sorted` are *stateful barriers*: neither can answer for an element without
+  having seen every element before it, so the pipeline is evaluated in segments
+  split at them, which is why a `peek` before a `sorted` does run for every
+  element. The stream's *shape* is tracked, because it decides what the
+  terminals answer: `IntStream.max()` is an `OptionalInt` and
+  `DoubleStream.max()` an `OptionalDouble` where `Stream.max(cmp)` is a plain
+  `Optional`. `Arrays.stream(a)` reads its shape off the elements, the element
+  type being erased at run time — exact for every array a program can build.
+
+  A stream is single-use in Java; javars does not enforce that, and an
+  intermediate operation appends to a *copy* of the pipeline, so a program that
+  (illegally) reuses one sees the pipeline it built rather than one a later
+  stage extended underneath it.
 - **`java.util.Optional`.** `of`/`ofNullable`/`empty`, and
   `isPresent`/`isEmpty`/`get`/`orElse`/`orElseGet`/`orElseThrow`/`map`/`filter`/
   `ifPresent`/`ifPresentOrElse`/`equals`/`hashCode`/`toString`. It is a *value*
@@ -1144,7 +1170,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Objects.equals` (the one `Objects` member, because a `record`'s derived
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
-  library surface — no `entrySet`/`Deque`/`Queue`, no streams, no I/O. An iterator over a `Set` is not fail-fast, because a `Set` carries no
+  library surface — no `entrySet`/`Deque`/`Queue`, no I/O. A stream is evaluated
+  in one thread whatever `parallel()` would ask for, which is observable only
+  through a side-effecting pipeline's *ordering* — Java makes no ordering
+  promise for one either. An iterator over a `Set` is not fail-fast, because a `Set` carries no
   modification counter for it to check; Java's raises
   `ConcurrentModificationException` there too. `Math.powExact` and the
   `unsignedMultiplyExact`/`unsignedPowExact` pair are on the same footing: a

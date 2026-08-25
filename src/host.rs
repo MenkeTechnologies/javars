@@ -556,7 +556,30 @@ enum HostObj {
     /// `true`) but still a reference: two `Optional.of("x")` are distinct
     /// objects, so `==` between them is `false`. Both fall out of the heap
     /// object — `equals` compares the contents, `==` the handles.
-    Optional(Option<Value>),
+    ///
+    /// `class` is `Optional` or one of the three primitive specializations
+    /// (`OptionalInt`, `OptionalLong`, `OptionalDouble`), which differ in their
+    /// rendering (`OptionalDouble[4.0]`) and in the name of their accessor
+    /// (`getAsDouble` rather than `get`).
+    Optional {
+        class: &'static str,
+        value: Option<Value>,
+    },
+    /// A `java.util.stream.Stream` — a source and the pipeline built over it.
+    ///
+    /// Nothing is evaluated until a terminal operation runs, which is what Java
+    /// specifies and what a program can *see*: `l.stream().peek(p).limit(2)`
+    /// calls `p` twice, not once per source element.
+    Stream {
+        source: Vec<Value>,
+        stages: Vec<Stage>,
+        kind: StreamKind,
+    },
+    /// A `java.util.stream.Collector`, as the recipe `collect` will run.
+    Collector {
+        kind: &'static str,
+        args: Vec<Value>,
+    },
     /// A marker: the payload lives in [`BOXES`], not here.
     ///
     /// Both halves — the class and the primitive — are read from surfaces that
@@ -567,6 +590,61 @@ enum HostObj {
     /// owns a handle no other object can be given, which is what makes `==` on
     /// two of them mean anything.
     Boxed,
+}
+
+/// One stage of a stream pipeline, in the order the program wrote them.
+///
+/// `Distinct` and `Sorted` are *stateful barriers*: neither can answer for an
+/// element without having seen every element before it, so the pipeline is
+/// evaluated in segments split at them — which is what Java's own
+/// implementation does, and why `peek` before a `sorted` runs for every element
+/// while `peek` before a `limit` does not.
+#[derive(Clone)]
+enum Stage {
+    /// `filter(p)` — keep the elements `p` accepts.
+    Filter(Value),
+    /// `map(f)` / `mapToInt(f)` / `mapToObj(f)` — one element in, one out.
+    Map(Value),
+    /// `flatMap(f)` — one element in, the elements of the stream `f` answers out.
+    FlatMap(Value),
+    /// `peek(f)` — run `f` for its effect and pass the element through.
+    Peek(Value),
+    /// `limit(n)` — pass at most `n` elements, then end the pipeline.
+    Limit(i64),
+    /// `skip(n)` — drop the first `n`.
+    Skip(i64),
+    /// `distinct()` — a barrier.
+    Distinct,
+    /// `sorted()` / `sorted(cmp)` — a barrier.
+    Sorted(Option<Value>),
+}
+
+/// Which of the four stream shapes a pipeline is, which decides what its
+/// terminals answer: `IntStream.max()` is an `OptionalInt` and
+/// `DoubleStream.max()` an `OptionalDouble`, where `Stream.max(cmp)` is a plain
+/// `Optional`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// `Stream<T>`.
+    Ref,
+    /// `IntStream`.
+    Int,
+    /// `LongStream`.
+    Long,
+    /// `DoubleStream`.
+    Double,
+}
+
+impl StreamKind {
+    /// The `Optional` class this shape's `min`/`max`/`findFirst` answers.
+    fn optional_class(self) -> &'static str {
+        match self {
+            StreamKind::Ref => "Optional",
+            StreamKind::Int => "OptionalInt",
+            StreamKind::Long => "OptionalLong",
+            StreamKind::Double => "OptionalDouble",
+        }
+    }
 }
 
 /// The eight wrapper classes, indexed by the code the compiler passes [`JBOX`].
@@ -1190,7 +1268,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // line above (which does carry `RandomAccess`; a set does not).
         "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
         "Iterator$of" => &["Iterator"],
-        "Optional" => &["Serializable"],
+        "Optional" | "OptionalInt" | "OptionalLong" | "OptionalDouble" => &["Serializable"],
+        "Stream$of" => &["BaseStream"],
+        "Collector$of" => &["Collector"],
         // `Map.of` reaches `AbstractMap` — unlike `Set.of`, which stops at
         // `AbstractCollection` — and is not `Cloneable`. Measured against the
         // JDK rather than copied from the line above.
@@ -3269,7 +3349,9 @@ fn value_class(v: &Value) -> Option<String> {
                     // Not a name a program can write, like the other internal
                     // shapes — it exists so an iterator carries supertypes.
                     HostObj::Iterator { .. } => "Iterator$of".to_string(),
-                    HostObj::Optional(_) => "Optional".to_string(),
+                    HostObj::Optional { class, .. } => (*class).to_string(),
+                    HostObj::Stream { .. } => "Stream$of".to_string(),
+                    HostObj::Collector { .. } => "Collector$of".to_string(),
                     HostObj::Array(_) => "[]".to_string(),
                     // `Arrays.asList` and `List.of` are `List`s that are not
                     // `ArrayList`s, and a `subList` view is a third answer
@@ -3470,6 +3552,13 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     if let Some(h) = collection_hash(vm, recv, method, args.len()) {
         return h;
     }
+    // `stream()` on a collection — a *second* heap object, like the iterator
+    // below, and built from the elements as they stand.
+    if method == "stream" && args.is_empty() {
+        if let Some(items) = sequence_items(recv) {
+            return stream_of(items, StreamKind::Ref);
+        }
+    }
     // An iterator names a *second* heap object, so both its construction and
     // its own methods run outside the exclusive borrow below.
     if method == "iterator" && args.is_empty() {
@@ -3631,20 +3720,500 @@ fn list_mods(id: usize) -> Option<u64> {
     })
 }
 
-/// Allocate a `java.util.Optional`.
+/// Allocate a plain `java.util.Optional`.
 fn optional(v: Option<Value>) -> Value {
-    Value::Obj(heap_alloc(HostObj::Optional(v)))
+    optional_of("Optional", v)
 }
 
-/// The contents of an `Optional` handle: `Some(Some(v))` when present,
-/// `Some(None)` when empty, `None` when the value is not an `Optional` at all.
-fn as_optional(v: &Value) -> Option<Option<Value>> {
+/// Allocate an `Optional` of the given class — one of `Optional`,
+/// `OptionalInt`, `OptionalLong`, `OptionalDouble`.
+fn optional_of(class: &'static str, value: Option<Value>) -> Value {
+    Value::Obj(heap_alloc(HostObj::Optional { class, value }))
+}
+
+/// The class and contents of an `Optional` handle, or `None` when the value is
+/// not an `Optional` at all.
+fn as_optional_full(v: &Value) -> Option<(&'static str, Option<Value>)> {
     let Value::Obj(id) = v else {
         return None;
     };
     HEAP.with(|h| match h.borrow().get(*id as usize) {
-        Some(HostObj::Optional(inner)) => Some(inner.clone()),
+        Some(HostObj::Optional { class, value }) => Some((*class, value.clone())),
         _ => None,
+    })
+}
+
+/// The source and pipeline of a `Stream` handle, or `None` for anything else.
+fn as_stream(v: &Value) -> Option<(Vec<Value>, Vec<Stage>, StreamKind)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Stream {
+            source,
+            stages,
+            kind,
+        }) => Some((source.clone(), stages.clone(), *kind)),
+        _ => None,
+    })
+}
+
+/// Allocate a stream over `source`.
+fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
+    Value::Obj(heap_alloc(HostObj::Stream {
+        source,
+        stages: Vec::new(),
+        kind,
+    }))
+}
+
+/// Allocate the stream `recv` becomes with `stage` appended.
+///
+/// A stream is single-use in Java and javars does not enforce that, so appending
+/// to a *copy* rather than mutating in place is the safe reading: a program that
+/// (illegally) reuses one sees the pipeline it built, not one a later stage
+/// extended underneath it.
+fn stream_with(recv: &Value, kind: StreamKind, stage: Option<Stage>) -> Option<Value> {
+    let (source, mut stages, _) = as_stream(recv)?;
+    if let Some(stage) = stage {
+        stages.push(stage);
+    }
+    Some(Value::Obj(heap_alloc(HostObj::Stream {
+        source,
+        stages,
+        kind,
+    })))
+}
+
+/// Push one element through `stages`, calling `sink` for each element that
+/// reaches the end. Answers `false` when the pipeline has been cancelled — by a
+/// `limit` filling up, or by a short-circuiting terminal.
+///
+/// `counters` is one slot per stage, so a `limit` or a `skip` keeps its own
+/// count across elements. It is split alongside `stages` so each stage reads its
+/// own slot and never another's.
+fn stream_push(
+    vm: &mut VM,
+    v: Value,
+    stages: &[Stage],
+    counters: &mut [i64],
+    sink: &mut dyn FnMut(&mut VM, Value) -> bool,
+) -> bool {
+    let (Some(stage), rest) = (stages.first(), &stages[stages.len().min(1)..]) else {
+        return sink(vm, v);
+    };
+    let (count, rest_counts) = counters.split_first_mut().expect("one counter per stage");
+    match stage {
+        Stage::Filter(p) => {
+            if matches!(
+                invoke_closure(vm, p, std::slice::from_ref(&v)),
+                Value::Bool(true)
+            ) {
+                stream_push(vm, v, rest, rest_counts, sink)
+            } else {
+                true
+            }
+        }
+        Stage::Map(f) => {
+            let mapped = invoke_closure(vm, f, &[v]);
+            stream_push(vm, mapped, rest, rest_counts, sink)
+        }
+        Stage::FlatMap(f) => {
+            let inner = invoke_closure(vm, f, &[v]);
+            // The mapper answers a stream (or, tolerantly, a collection): its
+            // elements are pushed on in place of the one that produced them.
+            let elems = match as_stream(&inner) {
+                Some((src, st, _)) => {
+                    let mut out = Vec::new();
+                    let mut cs = vec![0i64; st.len()];
+                    for e in src {
+                        if !stream_push(vm, e, &st, &mut cs, &mut |_vm, x| {
+                            out.push(x);
+                            true
+                        }) {
+                            break;
+                        }
+                    }
+                    out
+                }
+                None => sequence_items(&inner).unwrap_or_default(),
+            };
+            for e in elems {
+                if !stream_push(vm, e, rest, rest_counts, sink) {
+                    return false;
+                }
+            }
+            true
+        }
+        Stage::Peek(f) => {
+            invoke_closure(vm, f, std::slice::from_ref(&v));
+            stream_push(vm, v, rest, rest_counts, sink)
+        }
+        Stage::Skip(n) => {
+            *count += 1;
+            if *count <= *n {
+                true
+            } else {
+                stream_push(vm, v, rest, rest_counts, sink)
+            }
+        }
+        // A full `limit` ends the pipeline rather than merely dropping the
+        // element — which is what makes `peek(p).limit(2)` call `p` twice.
+        Stage::Limit(n) => {
+            if *count >= *n {
+                return false;
+            }
+            *count += 1;
+            let go = stream_push(vm, v, rest, rest_counts, sink);
+            go && *count < *n
+        }
+        Stage::Distinct | Stage::Sorted(_) => {
+            unreachable!("a barrier is split off before the element-wise walk")
+        }
+    }
+}
+
+/// Run `source` through `stages`, calling `sink` for each surviving element
+/// until it answers `false` or the source is exhausted.
+///
+/// A stateful barrier — `distinct` or `sorted` — cannot answer for an element
+/// without having seen every element before it, so the pipeline is evaluated in
+/// segments split at the first one. That is Java's own shape, and it is why a
+/// `peek` before a `sorted` runs for every element while a `peek` before a
+/// `limit` does not.
+fn stream_drive(
+    vm: &mut VM,
+    source: Vec<Value>,
+    stages: &[Stage],
+    sink: &mut dyn FnMut(&mut VM, Value) -> bool,
+) {
+    if let Some(i) = stages
+        .iter()
+        .position(|s| matches!(s, Stage::Distinct | Stage::Sorted(_)))
+    {
+        let mut buf = Vec::new();
+        stream_drive(vm, source, &stages[..i], &mut |_vm, v| {
+            buf.push(v);
+            true
+        });
+        let buf = match &stages[i] {
+            Stage::Distinct => {
+                let mut seen: Vec<Value> = Vec::new();
+                for v in buf {
+                    if !seen.iter().any(|x| value_eq(x, &v)) {
+                        seen.push(v);
+                    }
+                }
+                seen
+            }
+            Stage::Sorted(cmp) => sort_values(vm, buf, cmp.as_ref()),
+            _ => unreachable!("the position above found a barrier"),
+        };
+        return stream_drive(vm, buf, &stages[i + 1..], sink);
+    }
+    let mut counters = vec![0i64; stages.len()];
+    for v in source {
+        if !stream_push(vm, v, stages, &mut counters, sink) {
+            break;
+        }
+    }
+}
+
+/// Sort by a comparator closure, or by the natural order when there is none.
+///
+/// A stable insertion sort driven by the comparator, because a user comparator
+/// re-enters the VM and `slice::sort_by` cannot call back into it.
+fn sort_values(vm: &mut VM, items: Vec<Value>, cmp: Option<&Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(items.len());
+    for v in items {
+        let mut at = out.len();
+        while at > 0 {
+            let ord = match cmp {
+                Some(c) => invoke_closure(vm, c, &[out[at - 1].clone(), v.clone()]).jint(),
+                None => natural_cmp(&out[at - 1], &v) as i64,
+            };
+            if ord <= 0 {
+                break;
+            }
+            at -= 1;
+        }
+        out.insert(at, v);
+    }
+    out
+}
+
+/// Every element a pipeline yields.
+fn stream_collect(vm: &mut VM, source: Vec<Value>, stages: &[Stage]) -> Vec<Value> {
+    let mut out = Vec::new();
+    stream_drive(vm, source, stages, &mut |_vm, v| {
+        out.push(v);
+        true
+    });
+    out
+}
+
+/// `java.util.stream.Stream`'s methods — the intermediate operations, which
+/// answer a new stream, and the terminals, which run the pipeline.
+///
+/// `None` for any other receiver. Every terminal drives the pipeline exactly
+/// once and the short-circuiting ones stop the source, which is what a `peek`
+/// before a `limit` or a `findFirst` observes.
+fn stream_method(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    let (source, stages, kind) = as_stream(recv)?;
+    let stage = |st: Stage| Ok(stream_with(recv, kind, Some(st)).expect("receiver is a stream"));
+    let retyped = |k: StreamKind| Ok(stream_with(recv, k, None).expect("receiver is a stream"));
+    let all = |vm: &mut VM| stream_collect(vm, source.clone(), &stages);
+    Some(match (method, args.len()) {
+        // ── intermediate ──
+        ("filter", 1) => stage(Stage::Filter(args[0].clone())),
+        ("map", 1) => stage(Stage::Map(args[0].clone())),
+        ("flatMap", 1) => stage(Stage::FlatMap(args[0].clone())),
+        ("peek", 1) => stage(Stage::Peek(args[0].clone())),
+        ("limit", 1) => stage(Stage::Limit(args[0].jint())),
+        ("skip", 1) => stage(Stage::Skip(args[0].jint())),
+        ("distinct", 0) => stage(Stage::Distinct),
+        ("sorted", 0) => stage(Stage::Sorted(None)),
+        ("sorted", 1) => stage(Stage::Sorted(Some(args[0].clone()))),
+        // The mapping operations that also change the stream's *shape*, which
+        // is what decides whether `max()` answers an `OptionalInt` or an
+        // `OptionalDouble`.
+        ("mapToInt", 1) => {
+            Ok(
+                stream_with(recv, StreamKind::Int, Some(Stage::Map(args[0].clone())))
+                    .expect("receiver is a stream"),
+            )
+        }
+        ("mapToLong", 1) => {
+            Ok(
+                stream_with(recv, StreamKind::Long, Some(Stage::Map(args[0].clone())))
+                    .expect("receiver is a stream"),
+            )
+        }
+        ("mapToDouble", 1) => {
+            Ok(
+                stream_with(recv, StreamKind::Double, Some(Stage::Map(args[0].clone())))
+                    .expect("receiver is a stream"),
+            )
+        }
+        ("mapToObj", 1) => {
+            Ok(
+                stream_with(recv, StreamKind::Ref, Some(Stage::Map(args[0].clone())))
+                    .expect("receiver is a stream"),
+            )
+        }
+        ("boxed", 0) => retyped(StreamKind::Ref),
+        ("asLongStream", 0) => retyped(StreamKind::Long),
+        ("asDoubleStream", 0) => retyped(StreamKind::Double),
+        // ── terminal ──
+        ("toList", 0) => Ok(list_value(all(vm), Fixity::Immutable)),
+        ("toArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(all(vm))))),
+        ("count", 0) => Ok(Value::Int(all(vm).len() as i64)),
+        ("forEach" | "forEachOrdered", 1) => {
+            let f = args[0].clone();
+            stream_drive(vm, source, &stages, &mut |vm, v| {
+                invoke_closure(vm, &f, &[v]);
+                true
+            });
+            Ok(Value::Undef)
+        }
+        ("sum", 0) => {
+            let items = all(vm);
+            Ok(if kind == StreamKind::Double {
+                Value::float(items.iter().map(|v| v.jfloat()).sum())
+            } else {
+                Value::Int(items.iter().map(|v| v.jint()).sum())
+            })
+        }
+        // `average` answers an `OptionalDouble` whatever the stream's width,
+        // and an empty one for an empty stream rather than a NaN.
+        ("average", 0) => {
+            let items = all(vm);
+            Ok(optional_of(
+                "OptionalDouble",
+                (!items.is_empty()).then(|| {
+                    Value::float(items.iter().map(|v| v.jfloat()).sum::<f64>() / items.len() as f64)
+                }),
+            ))
+        }
+        ("min" | "max", 0 | 1) => {
+            let items = all(vm);
+            let cmp = args.first().cloned();
+            let sorted = sort_values(vm, items, cmp.as_ref());
+            let pick = if method == "min" {
+                sorted.first()
+            } else {
+                sorted.last()
+            };
+            Ok(optional_of(kind.optional_class(), pick.cloned()))
+        }
+        ("findFirst" | "findAny", 0) => {
+            let mut found = None;
+            stream_drive(vm, source, &stages, &mut |_vm, v| {
+                found = Some(v);
+                false
+            });
+            Ok(optional_of(kind.optional_class(), found))
+        }
+        ("anyMatch" | "allMatch" | "noneMatch", 1) => {
+            // One walk answers all three: `allMatch` looks for a counterexample
+            // and the other two for an example, so each stops at the first hit.
+            let want = method != "allMatch";
+            let p = args[0].clone();
+            let mut hit = false;
+            stream_drive(vm, source, &stages, &mut |vm, v| {
+                let ok = matches!(invoke_closure(vm, &p, &[v]), Value::Bool(true));
+                if ok == want {
+                    hit = true;
+                    return false;
+                }
+                true
+            });
+            Ok(Value::bool(match method {
+                "anyMatch" => hit,
+                "noneMatch" => !hit,
+                _ => !hit,
+            }))
+        }
+        ("reduce", 1) => {
+            let items = all(vm);
+            let f = args[0].clone();
+            let mut acc: Option<Value> = None;
+            for v in items {
+                acc = Some(match acc {
+                    Some(a) => invoke_closure(vm, &f, &[a, v]),
+                    None => v,
+                });
+            }
+            Ok(optional_of(kind.optional_class(), acc))
+        }
+        ("reduce", 2) => {
+            let items = all(vm);
+            let f = args[1].clone();
+            let mut acc = args[0].clone();
+            for v in items {
+                acc = invoke_closure(vm, &f, &[acc, v]);
+            }
+            Ok(acc)
+        }
+        ("collect", 1) => {
+            let items = all(vm);
+            collect_with(vm, items, &args[0])
+        }
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Stream method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
+}
+
+/// The stream shape a primitive stream class names.
+fn primitive_stream_kind(class: &str) -> StreamKind {
+    match class {
+        "LongStream" => StreamKind::Long,
+        "DoubleStream" => StreamKind::Double,
+        _ => StreamKind::Int,
+    }
+}
+
+/// Allocate a `Collectors.*` recipe.
+fn collector(kind: &'static str, args: Vec<Value>) -> Value {
+    Value::Obj(heap_alloc(HostObj::Collector { kind, args }))
+}
+
+/// Allocate a `List` holding `items`.
+fn list_value(items: Vec<Value>, fixed: Fixity) -> Value {
+    Value::Obj(heap_alloc(HostObj::List {
+        items,
+        fixed,
+        mods: 0,
+    }))
+}
+
+/// Run a `Collectors.*` recipe over the elements a pipeline yielded.
+fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Value, Fault> {
+    let Value::Obj(id) = collector else {
+        return Err(Fault::internal(
+            "javars: `collect` takes a `Collectors.*` collector".to_string(),
+        ));
+    };
+    let (kind, cargs) = HEAP
+        .with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Collector { kind, args }) => Some((*kind, args.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Fault::internal("javars: `collect` takes a `Collectors.*` collector".to_string())
+        })?;
+    Ok(match kind {
+        "toList" => list_value(items, Fixity::Mutable),
+        "toSet" => {
+            let mut out: Vec<Value> = Vec::new();
+            for v in items {
+                if !out.iter().any(|x| value_eq(x, &v)) {
+                    out.push(v);
+                }
+            }
+            Value::Obj(heap_alloc(HostObj::Set {
+                items: out,
+                order: Order::Hash,
+                fixed: Fixity::Mutable,
+                index: KeyIndex::default(),
+            }))
+        }
+        "counting" => Value::Int(items.len() as i64),
+        "joining" => {
+            let sep = cargs.first().map(java_str).unwrap_or_default();
+            let pre = cargs.get(1).map(java_str).unwrap_or_default();
+            let suf = cargs.get(2).map(java_str).unwrap_or_default();
+            let body: Vec<String> = items.iter().map(java_str).collect();
+            Value::str(format!("{pre}{}{suf}", body.join(&sep)))
+        }
+        // `toMap(k, v)` and `groupingBy(k)` both key by a mapper's answer; they
+        // differ in what they put under a repeated key — the later value, and a
+        // list of every value.
+        "toMap" | "groupingBy" => {
+            let mut entries: Vec<(Value, Value)> = Vec::new();
+            for v in items {
+                let key = invoke_closure(vm, &cargs[0], std::slice::from_ref(&v));
+                let val = if kind == "toMap" {
+                    invoke_closure(vm, &cargs[1], std::slice::from_ref(&v))
+                } else {
+                    v
+                };
+                match entries.iter_mut().find(|(k, _)| value_eq(k, &key)) {
+                    Some((_, slot)) if kind == "toMap" => *slot = val,
+                    Some((_, slot)) => {
+                        let mut group = sequence_items(slot).unwrap_or_default();
+                        group.push(val);
+                        *slot = list_value(group, Fixity::Mutable);
+                    }
+                    None => entries.push((
+                        key,
+                        if kind == "toMap" {
+                            val
+                        } else {
+                            list_value(vec![val], Fixity::Mutable)
+                        },
+                    )),
+                }
+            }
+            Value::Obj(heap_alloc(HostObj::Map {
+                entries,
+                order: Order::Hash,
+                fixed: Fixity::Mutable,
+                index: KeyIndex::default(),
+            }))
+        }
+        other => {
+            return Err(Fault::internal(format!(
+                "javars: unsupported collector `Collectors.{other}`"
+            )))
+        }
     })
 }
 
@@ -3659,12 +4228,16 @@ fn optional_method(
     method: &str,
     args: &[Value],
 ) -> Option<Result<Value, Fault>> {
-    let inner = as_optional(recv)?;
+    let (class, inner) = as_optional_full(recv)?;
     let empty = || Fault::java("NoSuchElementException", "No value present");
     Some(match (method, args.len()) {
         ("isPresent", 0) => Ok(Value::bool(inner.is_some())),
         ("isEmpty", 0) => Ok(Value::bool(inner.is_none())),
-        ("get", 0) | ("orElseThrow", 0) => inner.ok_or_else(empty),
+        // The primitive specializations spell the accessor for their own width;
+        // the class already knows which, so one arm serves all four.
+        ("get" | "orElseThrow" | "getAsInt" | "getAsLong" | "getAsDouble", 0) => {
+            inner.ok_or_else(empty)
+        }
         ("orElse", 1) => Ok(inner.unwrap_or_else(|| args[0].clone())),
         ("orElseGet", 1) => Ok(match inner {
             Some(v) => v,
@@ -3703,9 +4276,9 @@ fn optional_method(
             Ok(Value::Undef)
         }
         // A value, so `equals` compares contents where `==` compares handles.
-        ("equals", 1) => Ok(Value::bool(match (inner, as_optional(&args[0])) {
-            (Some(x), Some(Some(y))) => value_eq(&x, &y),
-            (None, Some(None)) => true,
+        ("equals", 1) => Ok(Value::bool(match (inner, as_optional_full(&args[0])) {
+            (Some(x), Some((other, Some(y)))) => other == class && value_eq(&x, &y),
+            (None, Some((other, None))) => other == class,
             _ => false,
         })),
         ("hashCode", 0) => Ok(Value::Int(match inner {
@@ -4416,6 +4989,14 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             vm.stack.push(a);
         }
         return b_closure_call(vm, n as u8 + 1);
+    }
+    // A `Stream` receiver. Every stage and every terminal runs user closures, so
+    // it takes the VM and sits with the other handle shapes.
+    if let Some(r) = stream_method(vm, &recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
     }
     // An `Optional` receiver. Its `map`/`filter`/`ifPresent`/`orElseGet` run a
     // user closure, so it takes the VM and sits with the other handle shapes
@@ -5214,6 +5795,50 @@ fn collection_static(
                 fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             })))
+        }
+        // ── java.util.stream sources ──
+        ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
+        ("IntStream" | "LongStream" | "DoubleStream", "of") => {
+            Ok(stream_of(varargs_items(args), primitive_stream_kind(class)))
+        }
+        // `range` is half-open and `rangeClosed` is not, which is the whole
+        // difference between them.
+        ("IntStream" | "LongStream", "range" | "rangeClosed") if args.len() == 2 => {
+            let (lo, hi) = (args[0].jint(), args[1].jint());
+            let hi = if method == "rangeClosed" { hi + 1 } else { hi };
+            Ok(stream_of(
+                (lo..hi).map(Value::Int).collect(),
+                primitive_stream_kind(class),
+            ))
+        }
+        // `Arrays.stream(a)` answers an `IntStream` for an `int[]` and a
+        // `Stream<T>` for a reference array. The element *type* is erased at
+        // run time, so the shape is read off the elements — which is exact for
+        // every array a program can build, an `int[]` holding `Value::Int` and
+        // a `double[]` holding `Value::Float`.
+        ("Arrays", "stream") if args.len() == 1 => {
+            let items = array_items(&args[0]).unwrap_or_default();
+            let kind = if items.iter().any(|v| matches!(v, Value::Float(_))) {
+                StreamKind::Double
+            } else if !items.is_empty() && items.iter().all(|v| matches!(v, Value::Int(_))) {
+                StreamKind::Int
+            } else {
+                StreamKind::Ref
+            };
+            Ok(stream_of(items, kind))
+        }
+        // ── java.util.stream.Collectors ──
+        ("Collectors", "toList" | "toUnmodifiableList") if args.is_empty() => {
+            Ok(collector("toList", Vec::new()))
+        }
+        ("Collectors", "toSet" | "toUnmodifiableSet") if args.is_empty() => {
+            Ok(collector("toSet", Vec::new()))
+        }
+        ("Collectors", "counting") if args.is_empty() => Ok(collector("counting", Vec::new())),
+        ("Collectors", "joining") if args.len() <= 3 => Ok(collector("joining", args.to_vec())),
+        ("Collectors", "toMap") if args.len() == 2 => Ok(collector("toMap", args.to_vec())),
+        ("Collectors", "groupingBy") if args.len() == 1 => {
+            Ok(collector("groupingBy", args.to_vec()))
         }
         // `java.util.Optional`'s factories. `of` rejects `null` — that is the
         // whole distinction from `ofNullable`, and accepting it would make an
@@ -7814,11 +8439,14 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
-            // `Optional[x]` / `Optional.empty` — the JDK's own rendering.
-            Some(HostObj::Optional(inner)) => match inner {
-                Some(v) => format!("Optional[{}]", java_str(v)),
-                None => "Optional.empty".to_string(),
+            // `Optional[x]` / `Optional.empty` — the JDK's own rendering, and
+            // the same shape for the three primitive specializations.
+            Some(HostObj::Optional { class, value }) => match value {
+                Some(v) => format!("{class}[{}]", java_str(v)),
+                None => format!("{class}.empty"),
             },
+            Some(HostObj::Stream { .. }) => format!("<stream>@{id:x}"),
+            Some(HostObj::Collector { .. }) => format!("<collector>@{id:x}"),
             None => format!("(obj:{id})"),
         }
     })
@@ -8864,6 +9492,8 @@ mod cast_target_tables {
             "Set$immutable",
             "Map$immutable",
             "Iterator$of",
+            "Stream$of",
+            "Collector$of",
         ] {
             assert!(
                 !is_checkable_cast_target(internal),

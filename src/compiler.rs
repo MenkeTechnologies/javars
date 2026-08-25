@@ -7425,6 +7425,11 @@ fn is_static_class(name: &str) -> bool {
             | "Set"
             | "Map"
             | "Optional"
+            | "Stream"
+            | "IntStream"
+            | "LongStream"
+            | "DoubleStream"
+            | "Collectors"
             | "Objects"
     )
 }
@@ -7799,7 +7804,13 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Math", "floor")
         | ("Math", "ceil")
         | ("Math", "round")
-        | ("Arrays", "toString") => 1,
+        | ("Arrays", "toString")
+        // `String::valueOf` is the commonest mapper in a stream pipeline. Its
+        // overloads all take one argument, so the arity is unambiguous even
+        // though the type is not — which is what `javac` needs the target type
+        // for and javars does not, being dynamically typed underneath.
+        | ("String", "valueOf")
+ => 1,
         ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,
         _ => return None,
     })

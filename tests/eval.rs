@@ -3320,14 +3320,19 @@ fn an_undeclared_name_is_a_compile_error_not_a_null() {
     // A bare name nothing declares used to read an unset cell and evaluate to
     // `null`, so `undefinedVar` printed `null` and `undefinedVar + 1` printed
     // `null1` — a typo becoming output. It is also what made an unmodeled class
-    // a *runtime* failure: `IntStream.range(0, 3)` reported
-    // `NullPointerException: Cannot invoke "String.range()"`, which is neither
+    // a *runtime* failure: an unmodeled class reported
+    // `NullPointerException: Cannot invoke "String.now()"`, which is neither
     // Java's answer nor the honest "javars does not model this" error.
+    //
+    // The unmodeled-class case was written as `IntStream.range(0, 3).sum()`.
+    // `IntStream` is modeled now, so that spelling stopped testing anything and
+    // `LocalDate` takes its place — a class javars still does not model, which
+    // is what the case is about.
     for src in [
         "System.out.println(undefinedVar);",
         "int y = undefinedVar + 1; System.out.println(y);",
         "System.out.println(Foo.bar());",
-        "System.out.println(IntStream.range(0, 3).sum());",
+        "System.out.println(LocalDate.now());",
     ] {
         let (_, err, ok) = run_streams(&wrap(src));
         assert!(!ok, "must not run: {src}");
