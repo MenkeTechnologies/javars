@@ -313,6 +313,24 @@ pub const JF32_ROUND: u16 = 743;
 /// empty string when the receiver is not statically an array.
 pub const JBINARY_CLASS: u16 = 744;
 
+/// Box a primitive into its `java.lang` wrapper. Stack `[value, class]`
+/// (`class` on top, an index into [`BOX_CLASSES`]); `argc == 2`.
+///
+/// Emitted wherever Java performs a *boxing conversion* — assigning an `int`
+/// expression to an `Integer`, `Integer.valueOf(x)`, a cast to a wrapper type.
+/// The result is a heap handle, so `==` on two of them is reference identity,
+/// which is what the language says it is.
+pub const JBOX: u16 = 747;
+
+/// Unbox a wrapper back to its primitive; the identity function on a value that
+/// is not boxed. Stack `[value]`; `argc == 1`.
+///
+/// Emitted wherever Java performs an *unboxing conversion* — assigning an
+/// `Integer` expression to an `int`, passing one to a primitive parameter — so
+/// that a later `==` between two such variables compares numbers rather than
+/// the handles they were copied from.
+pub const JUNBOX: u16 = 748;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -458,6 +476,60 @@ enum HostObj {
         /// methods are unobservable.
         buffer: bool,
     },
+    /// A boxed primitive — `java.lang.Integer` and its seven siblings.
+    ///
+    /// Java's wrapper types are *reference* types, and `==` on two of them is
+    /// reference identity, not value equality. A bare [`Value::Int`] cannot
+    /// carry an identity, so `Integer a = 128, b = 128; a == b` answered `true`
+    /// where Java answers `false`. Putting the box on the heap gives it the
+    /// identity the language says it has, and gives it a *class* besides:
+    /// `Integer.valueOf(1).equals(Long.valueOf(1))` is `false` in Java and one
+    /// `Value::Int` could not tell the two apart.
+    ///
+    /// `v` is the primitive it wraps — `Value::Int` for the five integral
+    /// classes, `Value::Float` for `Float`/`Double`, `Value::Bool` for
+    /// `Boolean`. Every numeric surface unboxes it (see [`unboxed`]), so the
+    /// box is observable only where Java makes it observable: `==`, `equals`,
+    /// `hashCode`, and `getClass`.
+    /// A marker: the payload lives in [`BOXES`], not here.
+    ///
+    /// Both halves — the class and the primitive — are read from surfaces that
+    /// already hold a borrow of this heap: a boxed element inside a `List` is
+    /// compared while the list itself is borrowed, so reading the box out of
+    /// `HEAP` would be a re-entrant borrow and panic. A separate `RefCell`
+    /// cannot collide with this one. The slot is still allocated here so a box
+    /// owns a handle no other object can be given, which is what makes `==` on
+    /// two of them mean anything.
+    Boxed,
+}
+
+/// The eight wrapper classes, indexed by the code the compiler passes [`JBOX`].
+///
+/// The order is fixed: `JBOX`'s first argument is an index into this table, so
+/// reordering it would silently rebox every literal as a different class.
+/// `Boolean` is deliberately absent. Its cache covers `true` and `false` both,
+/// so every autoboxed `Boolean` pair Java can produce is already the same
+/// object and `==` on them is always `true` — boxing it would buy no fidelity
+/// while putting a heap handle where the VM tests truth, which is not a numeric
+/// surface and so would not unbox.
+pub const BOX_CLASSES: [&str; 7] = [
+    "Integer",
+    "Long",
+    "Short",
+    "Byte",
+    "Character",
+    "Float",
+    "Double",
+];
+
+/// The index into [`BOX_CLASSES`] a wrapper class name boxes as, or `None` for
+/// a name that is not a wrapper. The compiler and the host share this so a
+/// spelling can never mean one class on one side and another on the other.
+pub fn box_class_code(name: &str) -> Option<i64> {
+    BOX_CLASSES
+        .iter()
+        .position(|c| *c == name)
+        .map(|i| i as i64)
 }
 
 /// A hashable stand-in for the [`Value`]s a `Map` key or a `Set` element can
@@ -489,7 +561,14 @@ fn index_key(v: &Value) -> Option<IndexKey> {
         Value::Int(n) => IndexKey::Int(*n),
         Value::Str(s) => IndexKey::Str(s.as_str().to_string()),
         Value::Bool(b) => IndexKey::Bool(*b),
-        Value::Obj(id) => IndexKey::Obj(*id),
+        // A box buckets with the primitive it wraps, not with its handle, so
+        // `map.put(Integer.valueOf(1), x)` and `map.get(1)` meet. The bucket is
+        // an accelerator — every candidate is still confirmed with `value_eq`,
+        // which is where the class check lives — so sharing one is free.
+        Value::Obj(id) => match unboxed(v) {
+            Some(inner) => return index_key(&inner),
+            None => IndexKey::Obj(*id),
+        },
         Value::Undef => IndexKey::Null,
         // `value_eq` compares an integral and a floating value numerically, so
         // a `Float` has to land in the same bucket the equal `Int` does. That
@@ -643,6 +722,109 @@ thread_local! {
     /// The program arguments `main`'s `String[]` parameter is bound to — what
     /// the CLI collected after the file name. Set by [`set_argv`] before the run.
     static ARGV: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The wrapper caches the JLS mandates: `(class index, value) -> handle`.
+    ///
+    /// JLS 5.1.7 requires `valueOf` to return the *same* object for every
+    /// `boolean`, every `char` in `0..=127`, and every `byte`, `short`, `int`
+    /// and `long` in `-128..=127`. That requirement is the whole reason
+    /// `Integer a = 127, b = 127; a == b` is `true` while the same pair at 128
+    /// is `false`, so the cache is not an optimization here — it is the
+    /// observable behaviour.
+    static BOX_CACHE: RefCell<HashMap<(usize, i64), u32>> = RefCell::new(HashMap::new());
+    /// Every live box: handle -> (wrapper class, the primitive it wraps).
+    ///
+    /// Separate from `HEAP` on purpose — see [`HostObj::Boxed`].
+    static BOXES: RefCell<HashMap<u32, (&'static str, Value)>> = RefCell::new(HashMap::new());
+}
+
+/// Box `v` as the wrapper class at index `code` in [`BOX_CLASSES`], returning
+/// the handle.
+///
+/// Values in the JLS-mandated cache range share one handle; everything else
+/// gets a fresh one, which is exactly the identity Java gives it.
+fn box_value(code: usize, v: Value) -> Value {
+    let class = BOX_CLASSES[code];
+    // Only the integral classes, `Character` and `Boolean` have a cache, and
+    // only over the range the JLS names. `Float`/`Double` have none at all —
+    // `Double d1 = 1.0, d2 = 1.0; d1 == d2` is `false` for every value.
+    let cached = match class {
+        "Integer" | "Long" | "Short" | "Byte" => match &v {
+            Value::Int(n) if (-128..=127).contains(n) => Some(*n),
+            _ => None,
+        },
+        "Character" => match &v {
+            Value::Int(n) if (0..=127).contains(n) => Some(*n),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(key) = cached else {
+        return Value::Obj(alloc_box(class, v));
+    };
+    if let Some(id) = BOX_CACHE.with(|c| c.borrow().get(&(code, key)).copied()) {
+        return Value::Obj(id);
+    }
+    let id = alloc_box(class, v);
+    BOX_CACHE.with(|c| c.borrow_mut().insert((code, key), id));
+    Value::Obj(id)
+}
+
+/// Give a box a heap handle of its own and record its payload in [`BOXES`].
+fn alloc_box(class: &'static str, v: Value) -> u32 {
+    let id = heap_alloc(HostObj::Boxed);
+    BOXES.with(|b| b.borrow_mut().insert(id, (class, v)));
+    id
+}
+
+/// The primitive inside a boxed wrapper, or `None` for anything else.
+///
+/// Every numeric, rendering, hashing and equality surface calls this first, so
+/// a box that reaches one behaves as the primitive it wraps. That is what makes
+/// the model safe to introduce incrementally: a site that has not been taught
+/// about boxes answers exactly as it did before rather than answering wrongly.
+fn unboxed(v: &Value) -> Option<Value> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    BOXES.with(|b| b.borrow().get(id).map(|(_, v)| v.clone()))
+}
+
+/// The wrapper class of a boxed value, or `None` for anything else.
+fn box_class(v: &Value) -> Option<&'static str> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    BOXES.with(|b| b.borrow().get(id).map(|(c, _)| *c))
+}
+
+/// `v` with any box removed — the identity function on everything else.
+fn deboxed(v: &Value) -> Value {
+    unboxed(v).unwrap_or_else(|| v.clone())
+}
+
+/// `to_int` / `to_float` **through any box**.
+///
+/// fusevm's own converters see a boxed wrapper as the heap handle it is and
+/// answer 0, silently: `arr[anInteger]` indexed element 0 and
+/// `String.format("%d", anInteger)` printed 0. Every host builtin that wants a
+/// number out of a value therefore asks here instead. On an unboxed value the
+/// answer is fusevm's exactly, so converting a call site cannot change what it
+/// already answered — which is why the conversion could be mechanical.
+trait JavaNumeric {
+    /// The value as an `i64`, unboxing a wrapper first.
+    fn jint(&self) -> i64;
+    /// The value as an `f64`, unboxing a wrapper first.
+    fn jfloat(&self) -> f64;
+}
+
+impl JavaNumeric for Value {
+    fn jint(&self) -> i64 {
+        Value::to_int(&deboxed(self))
+    }
+
+    fn jfloat(&self) -> f64 {
+        Value::to_float(&deboxed(self))
+    }
 }
 
 /// Install the program arguments `main`'s `String[]` parameter will see. Call
@@ -655,6 +837,11 @@ pub fn set_argv(argv: Vec<String>) {
 /// start of each program run so a fresh program never sees a prior run's handles.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
+    // The wrapper cache holds heap handles, so it has to go with the heap it
+    // indexes into: a surviving entry would name a slot the next program's own
+    // objects occupy, and `Integer.valueOf(1)` would answer someone else's list.
+    BOX_CACHE.with(|c| c.borrow_mut().clear());
+    BOXES.with(|b| b.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
@@ -820,7 +1007,11 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
     match class {
         // java.lang
         "String" => &["CharSequence", "Comparable", "Serializable"],
-        "Integer" | "Double" => &["Number", "Comparable"],
+        // The six `Number` wrappers. Only `Integer` and `Double` were listed
+        // while those were the only two classes a bare `Value::Int`/`Float`
+        // could answer as; a boxed value now names its own class, so
+        // `Long.valueOf(1) instanceof Number` has a class to walk from.
+        "Integer" | "Double" | "Long" | "Short" | "Byte" | "Float" => &["Number", "Comparable"],
         "Number" => &["Serializable"],
         "Boolean" | "Character" => &["Comparable", "Serializable"],
         "Enum" => &["Comparable", "Serializable"],
@@ -970,6 +1161,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JF32_ARITH, b_f32_arith);
     vm.register_builtin(JF32_ROUND, b_f32_round);
     vm.register_builtin(JBINARY_CLASS, b_binary_class);
+    vm.register_builtin(JBOX, b_box);
+    vm.register_builtin(JUNBOX, b_unbox);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
     vm.register_builtin(JSTRINGIFY, b_stringify);
@@ -1056,7 +1249,7 @@ fn b_exc_depth(vm: &mut VM, argc: u8) -> Value {
 /// loop.
 fn b_exc_cut(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let depth = args.first().map(|v| v.to_int()).unwrap_or(0).max(0) as usize;
+    let depth = args.first().map(|v| v.jint()).unwrap_or(0).max(0) as usize;
     if depth <= vm.stack.len() {
         vm.stack.truncate(depth);
     }
@@ -1135,6 +1328,43 @@ fn b_classof(vm: &mut VM, argc: u8) -> Value {
 /// runtime class of every shape the value model has, and [`binary_name`] maps
 /// that to the JDK's own spelling — including the private classes `List.of`
 /// and `Arrays.asList` return. Only `getClass()` was not asking them.
+/// [`JBOX`] — box a primitive into the wrapper class named by the code on top
+/// of the stack.
+fn b_box(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let code = args
+        .get(1)
+        .map(as_i64)
+        .unwrap_or(0)
+        .clamp(0, BOX_CLASSES.len() as i64 - 1) as usize;
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    // `null` is not boxed. Java's boxing conversion applies to a *primitive*,
+    // and the one place a null can reach a boxing site is an already-reference
+    // expression the compiler could not type; boxing it would turn `null` into
+    // an object and make `x == null` false.
+    if matches!(v, Value::Undef) {
+        return v;
+    }
+    box_value(code, v)
+}
+
+/// [`JUNBOX`] — the primitive inside a wrapper, or the value unchanged.
+fn b_unbox(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    deboxed(&v)
+}
+
+/// Java `==` on two heap references: the same handle.
+///
+/// Reached from [`numeric_hook`], which routes a pair of handles here before it
+/// considers them as numbers. That ordering is the whole model: two boxed
+/// wrappers holding 128 are *numerically* equal and Java still answers `false`,
+/// because `==` on two references compares the references.
+fn ref_eq(a: &Value, b: &Value) -> bool {
+    matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y)
+}
+
 fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let array_type = args.get(1).map(|h| h.as_str_cow().into_owned());
@@ -1238,9 +1468,9 @@ fn descriptor_primitive(d: &str) -> Option<&'static str> {
 
 /// [`JMAKE_CLOSURE`] — snapshot the captures and register the closure.
 fn b_make_closure(vm: &mut VM, _argc: u8) -> Value {
-    let ncap = vm.stack.pop().unwrap_or(Value::Undef).to_int() as usize;
-    let params = vm.stack.pop().unwrap_or(Value::Undef).to_int() as u8;
-    let name_idx = vm.stack.pop().unwrap_or(Value::Undef).to_int() as u16;
+    let ncap = vm.stack.pop().unwrap_or(Value::Undef).jint() as usize;
+    let params = vm.stack.pop().unwrap_or(Value::Undef).jint() as u8;
+    let name_idx = vm.stack.pop().unwrap_or(Value::Undef).jint() as u16;
     let mut captures = Vec::with_capacity(ncap);
     for _ in 0..ncap {
         captures.push(vm.stack.pop().unwrap_or(Value::Undef));
@@ -1332,6 +1562,12 @@ fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
 /// heap object, whose Java hash is an identity hash javars cannot reproduce (and
 /// whose iteration order is therefore not reproducible in Java either).
 fn java_hash(v: &Value) -> Option<i32> {
+    // A wrapper hashes as its primitive. The two arms below already split
+    // `Integer` from `Long` by magnitude, which is exact: an `Integer` can hold
+    // nothing outside `i32`, so a value that does is necessarily a `Long`.
+    if let Some(inner) = unboxed(v) {
+        return java_hash(&inner);
+    }
     Some(match v {
         // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
         // counts UTF-16 code units; javars counts scalars, the same
@@ -1411,6 +1647,16 @@ fn present_order(items: &[Value], order: Order) -> Vec<usize> {
 /// same simplification javars's `==` already makes — a user `equals` override is
 /// not called).
 fn value_eq(a: &Value, b: &Value) -> bool {
+    // `equals` between two wrappers is class-sensitive: `Integer.valueOf(1)
+    // .equals(Long.valueOf(1))` is `false` in Java, and telling those two apart
+    // is what the box's class tag is for. A box against a *bare* value is
+    // compared numerically, because a bare `Value::Int` carries no class to
+    // disagree with — it is whichever wrapper the context autoboxed it into.
+    match (box_class(a), box_class(b)) {
+        (Some(x), Some(y)) if x != y => return false,
+        (Some(_), _) | (_, Some(_)) => return value_eq(&deboxed(a), &deboxed(b)),
+        _ => {}
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => x == y,
@@ -1428,10 +1674,8 @@ fn value_eq(a: &Value, b: &Value) -> bool {
                 // `list.contains(Double.NaN)` can ever answer true. The total
                 // order [`float_compare`] already implements is the same
                 // predicate, so the two cannot drift.
-                (Value::Float(_), Value::Float(_)) => {
-                    float_compare(a.to_float(), b.to_float()) == 0
-                }
-                _ => a.to_float() == b.to_float(),
+                (Value::Float(_), Value::Float(_)) => float_compare(a.jfloat(), b.jfloat()) == 0,
+                _ => a.jfloat() == b.jfloat(),
             }
         }
         _ => false,
@@ -1763,7 +2007,7 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (_, Value::Undef) => Ordering::Greater,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => float_compare(a.to_float(), b.to_float()).cmp(&0),
+        _ => float_compare(a.jfloat(), b.jfloat()).cmp(&0),
     }
 }
 
@@ -2069,7 +2313,7 @@ fn builder_method(
             // is observable through `capacity()`; the second is not, because
             // javars stores the text in a `String` that is already trimmed.
             ("ensureCapacity", 1) => {
-                let want = args[0].to_int();
+                let want = args[0].jint();
                 if want > 0 {
                     *cap = sb_grow(*cap, want as usize);
                 }
@@ -2086,7 +2330,7 @@ fn builder_method(
                 Ok(this)
             }
             ("appendCodePoint", 1) => {
-                let cp = args[0].to_int();
+                let cp = args[0].jint();
                 match u32::try_from(cp).ok().and_then(char::from_u32) {
                     Some(c) => {
                         s.push(c);
@@ -2101,25 +2345,25 @@ fn builder_method(
                 }
             }
             ("repeat", 2) => {
-                let n = args[1].to_int().max(0) as usize;
+                let n = args[1].jint().max(0) as usize;
                 s.push_str(&rendered[0].repeat(n));
                 *count = len + rendered[0].chars().count() * n;
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("charAt", 1) => {
-                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                let at = sb_char_offset(s, args[0].jint(), len)?;
                 Ok(Value::Int(s[at..].chars().next().map_or(0, |c| c as i64)))
             }
             ("setCharAt", 2) => {
-                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                let at = sb_char_offset(s, args[0].jint(), len)?;
                 let old = s[at..].chars().next().map_or(0, char::len_utf8);
                 s.replace_range(at..at + old, &rendered[1]);
                 *count = len - 1 + rendered[1].chars().count();
                 Ok(Value::Undef)
             }
             ("deleteCharAt", 1) => {
-                let at = sb_char_offset(s, args[0].to_int(), len)?;
+                let at = sb_char_offset(s, args[0].jint(), len)?;
                 let old = s[at..].chars().next().map_or(0, char::len_utf8);
                 s.replace_range(at..at + old, "");
                 *count = len - 1;
@@ -2129,16 +2373,16 @@ fn builder_method(
             // range check, which is why `delete(2, 100)` truncates rather than
             // throwing while `substring(1, 9)` throws.
             ("delete", 2) => {
-                let start = args[0].to_int();
-                let end = args[1].to_int().min(len as i64);
+                let start = args[0].jint();
+                let end = args[1].jint().min(len as i64);
                 let (a, b) = sb_range(s, start, end, len)?;
                 s.replace_range(a..b, "");
                 *count = len - (end - start) as usize;
                 Ok(this)
             }
             ("replace", 3) => {
-                let start = args[0].to_int();
-                let end = args[1].to_int().min(len as i64);
+                let start = args[0].jint();
+                let end = args[1].jint().min(len as i64);
                 let (a, b) = sb_range(s, start, end, len)?;
                 s.replace_range(a..b, &rendered[2]);
                 *count = len - (end - start) as usize + rendered[2].chars().count();
@@ -2146,18 +2390,18 @@ fn builder_method(
                 Ok(this)
             }
             ("substring", 1) => {
-                let (a, b) = sb_range(s, args[0].to_int(), len as i64, len)?;
+                let (a, b) = sb_range(s, args[0].jint(), len as i64, len)?;
                 Ok(Value::str(s[a..b].to_string()))
             }
             ("substring", 2) | ("subSequence", 2) => {
-                let (a, b) = sb_range(s, args[0].to_int(), args[1].to_int(), len)?;
+                let (a, b) = sb_range(s, args[0].jint(), args[1].jint(), len)?;
                 Ok(Value::str(s[a..b].to_string()))
             }
             // `insert`'s bounds failure names the *builder's* length as the
             // range end, which is what `checkOffset` reports:
             // `Range [9, 3) out of bounds for length 3`.
             ("insert", 2) => {
-                let at = args[0].to_int();
+                let at = args[0].jint();
                 if at < 0 || at as usize > len {
                     return Err(sb_range_fault(at, len as i64, len));
                 }
@@ -2174,7 +2418,7 @@ fn builder_method(
                 Ok(this)
             }
             ("setLength", 1) => {
-                let n = args[0].to_int();
+                let n = args[0].jint();
                 if n < 0 {
                     return Err(Fault::java(
                         "StringIndexOutOfBoundsException",
@@ -2196,7 +2440,7 @@ fn builder_method(
             }
             ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &rendered[0]))),
             ("indexOf", 2) => {
-                let from = args[1].to_int().clamp(0, len as i64) as usize;
+                let from = args[1].jint().clamp(0, len as i64) as usize;
                 let byte = sb_byte_of(s, len, from);
                 Ok(Value::Int(match char_index_of(&s[byte..], &rendered[0]) {
                     -1 => -1,
@@ -2207,7 +2451,7 @@ fn builder_method(
             ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
                 s,
                 &rendered[0],
-                args[1].to_int(),
+                args[1].jint(),
             ))),
             // `compareTo(StringBuilder)` is `String.compareTo` on the contents
             // (Java 11+); `equals` is NOT — it stays reference identity, which
@@ -2386,7 +2630,7 @@ fn pop_fixed<const N: usize>(vm: &mut VM, argc: u8) -> [Value; N] {
 /// (stack `[size, default]`).
 fn b_array_new(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let size = args.first().map(|v| v.to_int()).unwrap_or(0);
+    let size = args.first().map(|v| v.jint()).unwrap_or(0);
     let default = args.get(1).cloned().unwrap_or(Value::Undef);
     if size < 0 {
         return raise(
@@ -2406,7 +2650,7 @@ fn b_array_new_multi(vm: &mut VM, argc: u8) -> Value {
     let mut args = pop_args(vm, argc);
     // Last arg is the leaf default; the rest are the dimension sizes.
     let default = args.pop().unwrap_or(Value::Undef);
-    let sizes: Vec<i64> = args.iter().map(|v| v.to_int()).collect();
+    let sizes: Vec<i64> = args.iter().map(|v| v.jint()).collect();
     if let Some(&n) = sizes.iter().find(|&&s| s < 0) {
         return raise(vm, Fault::java("NegativeArraySizeException", n.to_string()));
     }
@@ -2448,7 +2692,7 @@ fn b_array_lit(vm: &mut VM, argc: u8) -> Value {
 fn b_array_get(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let arr = args.first().cloned().unwrap_or(Value::Undef);
-    let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+    let idx = args.get(1).map(|v| v.jint()).unwrap_or(0);
     let id = match arr {
         Value::Obj(id) => id,
         _ => return raise(vm, Fault::java("NullPointerException", NULL_ARRAY_LOAD)),
@@ -2489,7 +2733,7 @@ const NULL_ARRAY_LENGTH: &str = "Cannot read the array length because the array 
 fn b_array_set(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let arr = args.first().cloned().unwrap_or(Value::Undef);
-    let idx = args.get(1).map(|v| v.to_int()).unwrap_or(0);
+    let idx = args.get(1).map(|v| v.jint()).unwrap_or(0);
     let val = args.get(2).cloned().unwrap_or(Value::Undef);
     let id = match arr {
         Value::Obj(id) => id,
@@ -2647,6 +2891,9 @@ fn value_class(v: &Value) -> Option<String> {
             return HEAP.with(|h| {
                 Some(match h.borrow().get(*id as usize)? {
                     HostObj::Instance { class, .. } => class.clone(),
+                    // The whole point of the box: `Integer` and `Long` are
+                    // different classes for a value one `Value::Int` holds.
+                    HostObj::Boxed => box_class(v)?.to_string(),
                     HostObj::Array(_) => "[]".to_string(),
                     // `Arrays.asList` and `List.of` are `List`s that are not
                     // `ArrayList`s, and a `subList` view is a third answer
@@ -2794,7 +3041,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // `subList` allocates a view over the receiver, so it needs the receiver's
     // handle — which `list_method` (working on a plain `&mut Vec`) never sees.
     if method == "subList" && args.len() == 2 {
-        return match make_sublist(id, args[0].to_int(), args[1].to_int()) {
+        return match make_sublist(id, args[0].jint(), args[1].jint()) {
             Ok(v) => v,
             Err(f) => raise(vm, f),
         };
@@ -3179,7 +3426,7 @@ fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Valu
                 } else if j >= hi {
                     true
                 } else {
-                    invoke_closure(vm, cmp, &[items[j].clone(), items[i].clone()]).to_int() >= 0
+                    invoke_closure(vm, cmp, &[items[j].clone(), items[i].clone()]).jint() >= 0
                 };
                 if take_left {
                     *slot = items[i].clone();
@@ -3245,7 +3492,7 @@ fn list_method(
         }
         ("add", 2) => {
             structural()?;
-            let at = args[0].to_int();
+            let at = args[0].jint();
             if at < 0 || at as usize > items.len() {
                 return Err(Fault::java(
                     "IndexOutOfBoundsException",
@@ -3256,12 +3503,12 @@ fn list_method(
             Value::Undef
         }
         ("get", 1) => {
-            let i = bounds(args[0].to_int(), items.len())?;
+            let i = bounds(args[0].jint(), items.len())?;
             items[i].clone()
         }
         ("set", 2) => {
             replace()?;
-            let i = bounds(args[0].to_int(), items.len())?;
+            let i = bounds(args[0].jint(), items.len())?;
             std::mem::replace(&mut items[i], args[1].clone())
         }
         // `List.remove(int)` removes by index — the overload Java picks for an
@@ -3271,7 +3518,7 @@ fn list_method(
         // because a boxed `Integer` and an `int` are one value here.
         ("remove", 1) => {
             structural()?;
-            let i = bounds(args[0].to_int(), items.len())?;
+            let i = bounds(args[0].jint(), items.len())?;
             items.remove(i)
         }
         // `List.remove(Object)` — removes the first element equal to the
@@ -3645,6 +3892,26 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     if let Some(v) = boxed_method(&recv, &method, args.len()) {
         return v;
     }
+    // The same, for a receiver that is a *wrapper handle*. The three methods
+    // whose answer depends on the wrapper's class are answered here; everything
+    // else re-enters with the primitive, so the tables above serve a boxed
+    // receiver exactly as they serve a bare one.
+    if unboxed(&recv).is_some() {
+        match (method.as_str(), args.len()) {
+            ("equals", 1) => return Value::bool(value_eq(&recv, &args[0])),
+            ("hashCode", 0) => {
+                return java_hash(&recv).map_or(Value::Undef, |h| Value::Int(h.into()))
+            }
+            _ => {}
+        }
+        let inner = deboxed(&recv);
+        vm.stack.push(inner);
+        for a in args {
+            vm.stack.push(a);
+        }
+        vm.stack.push(Value::str(method));
+        return b_str_dispatch(vm, argc);
+    }
     // Borrowed, not copied. `into_owned` cloned the whole receiver on every
     // single `String` method call, so `s.charAt(i)` over an n-character string
     // moved n bytes per call and n² across the loop — 40k characters meant
@@ -3745,11 +4012,11 @@ fn boxed_method(recv: &Value, method: &str, argc: usize) -> Option<Value> {
     // and `(byte) intValue()`, so both derive from this one.
     let int_value = match recv {
         Value::Float(f) => *f as i32,
-        other => other.to_int() as i32,
+        other => other.jint() as i32,
     };
     let long_value = match recv {
         Value::Float(f) => *f as i64,
-        other => other.to_int(),
+        other => other.jint(),
     };
     Some(match method {
         // `String.hashCode` is a different function and the `String` table
@@ -3760,8 +4027,8 @@ fn boxed_method(recv: &Value, method: &str, argc: usize) -> Option<Value> {
         "shortValue" => Value::Int((int_value as i16).into()),
         "byteValue" => Value::Int((int_value as i8).into()),
         "longValue" => Value::Int(long_value),
-        "doubleValue" => Value::float(recv.to_float()),
-        "floatValue" => Value::float(recv.to_float() as f32 as f64),
+        "doubleValue" => Value::float(recv.jfloat()),
+        "floatValue" => Value::float(recv.jfloat() as f32 as f64),
         "booleanValue" if matches!(recv, Value::Bool(_)) => recv.clone(),
         // A `char` is carried as its code point (or as the one-character
         // `String` a rendered one becomes), so unboxing it is identity — the
@@ -4018,7 +4285,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // is 100, not "c1". The compiler converts it back to a String wherever
         // Java's string conversion applies.
         ("charAt", 1) => {
-            let i = args[0].to_int();
+            let i = args[0].jint();
             match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
                 Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(
@@ -4027,8 +4294,8 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
                 )),
             }
         }
-        ("substring", 1) => substring(s, args[0].to_int(), char_len()),
-        ("substring", 2) => substring(s, args[0].to_int(), args[1].to_int()),
+        ("substring", 1) => substring(s, args[0].jint(), char_len()),
+        ("substring", 2) => substring(s, args[0].jint(), args[1].jint()),
         ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &args[0].as_str_cow()))),
         // `indexOf(t, from)` starts the search at `from`; the result is still an
         // index into the whole string.
@@ -4038,7 +4305,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             // string's length for the empty one — `"abc".indexOf("", 9)` is 3,
             // not 9. Clamping only the negative end returned the unclamped
             // `from` back through the empty-needle hit.
-            let from = args[1].to_int().clamp(0, char_len()) as usize;
+            let from = args[1].jint().clamp(0, char_len()) as usize;
             let tail: String = s.chars().skip(from).collect();
             let hit = char_index_of(&tail, &args[0].as_str_cow());
             Ok(Value::Int(if hit < 0 { -1 } else { hit + from as i64 }))
@@ -4051,10 +4318,10 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
             s,
             &args[0].as_str_cow(),
-            args[1].to_int(),
+            args[1].jint(),
         ))),
         ("codePointAt", 1) => {
-            let i = args[0].to_int();
+            let i = args[0].jint();
             match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
                 Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(
@@ -4101,7 +4368,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("split", 1) | ("split", 2) => {
             let compiled = crate::regex::compile(&args[0].as_str_cow());
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
-            let limit = args.get(1).map_or(0, Value::to_int);
+            let limit = args.get(1).map_or(0, JavaNumeric::jint);
             let parts = pat.split(s, limit).map_err(engine_fault)?;
             Ok(Value::Obj(heap_alloc(HostObj::Array(
                 parts.into_iter().map(Value::str).collect(),
@@ -4136,7 +4403,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // the start. An offset outside the string is `false`, not a fault —
         // Java bounds-checks it rather than throwing.
         ("startsWith", 2) => {
-            let off = args[1].to_int();
+            let off = args[1].jint();
             let len = char_count(s);
             Ok(Value::bool(usize::try_from(off).is_ok_and(|o| {
                 o <= len && s[char_byte_of(s, o)..].starts_with(args[0].as_str_cow().as_ref())
@@ -4148,7 +4415,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             s.replace(args[0].as_str_cow().as_ref(), &args[1].as_str_cow()),
         )),
         ("repeat", 1) => {
-            let n = args[0].to_int();
+            let n = args[0].jint();
             if n < 0 {
                 Err(Fault::java(
                     "IllegalArgumentException",
@@ -4407,7 +4674,9 @@ fn write_list(target: &Value, items: Vec<Value>) -> Result<(), Fault> {
 /// positive infinity). `Integer.parseInt`/`Long.parseLong` reject malformed
 /// input the way `javac`-compiled code would throw `NumberFormatException`.
 fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
-    let both_int = |a: &Value, b: &Value| matches!(a, Value::Int(_)) && matches!(b, Value::Int(_));
+    let both_int = |a: &Value, b: &Value| {
+        matches!(deboxed(a), Value::Int(_)) && matches!(deboxed(b), Value::Int(_))
+    };
     match (class, method, args.len()) {
         // ── java.lang.Math ──
         // `wrapping_abs`, not `abs`: Rust's `abs` panics on `i64::MIN`, so
@@ -4419,37 +4688,34 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `emit_wrap32`; this is the 64-bit one, which had no guard at all.
         ("Math", "abs", 1) => Ok(match &args[0] {
             Value::Int(n) => Value::Int(n.wrapping_abs()),
-            other => Value::float(other.to_float().abs()),
+            other => Value::float(other.jfloat().abs()),
         }),
         ("Math", "max", 2) => Ok(if both_int(&args[0], &args[1]) {
-            Value::Int(args[0].to_int().max(args[1].to_int()))
+            Value::Int(args[0].jint().max(args[1].jint()))
         } else {
-            Value::float(max_double(args[0].to_float(), args[1].to_float()))
+            Value::float(max_double(args[0].jfloat(), args[1].jfloat()))
         }),
         ("Math", "min", 2) => Ok(if both_int(&args[0], &args[1]) {
-            Value::Int(args[0].to_int().min(args[1].to_int()))
+            Value::Int(args[0].jint().min(args[1].jint()))
         } else {
-            Value::float(min_double(args[0].to_float(), args[1].to_float()))
+            Value::float(min_double(args[0].jfloat(), args[1].jfloat()))
         }),
-        ("Math", "pow", 2) => Ok(Value::float(pow_double(
-            args[0].to_float(),
-            args[1].to_float(),
-        ))),
-        ("Math", "sqrt", 1) => Ok(Value::float(args[0].to_float().sqrt())),
-        ("Math", "floor", 1) => Ok(Value::float(args[0].to_float().floor())),
-        ("Math", "ceil", 1) => Ok(Value::float(args[0].to_float().ceil())),
-        ("Math", "round", 1) => Ok(Value::Int(round_double(args[0].to_float()))),
+        ("Math", "pow", 2) => Ok(Value::float(pow_double(args[0].jfloat(), args[1].jfloat()))),
+        ("Math", "sqrt", 1) => Ok(Value::float(args[0].jfloat().sqrt())),
+        ("Math", "floor", 1) => Ok(Value::float(args[0].jfloat().floor())),
+        ("Math", "ceil", 1) => Ok(Value::float(args[0].jfloat().ceil())),
+        ("Math", "round", 1) => Ok(Value::Int(round_double(args[0].jfloat()))),
         // `Math.floorDiv`/`floorMod` round toward negative infinity, unlike `/`
         // and `%` which truncate toward zero: `floorDiv(-7, 2)` is -4.
-        ("Math", "floorDiv", 2) => floor_div(args[0].to_int(), args[1].to_int()).map(Value::Int),
+        ("Math", "floorDiv", 2) => floor_div(args[0].jint(), args[1].jint()).map(Value::Int),
         ("Math", "floorMod", 2) => {
-            let (a, b) = (args[0].to_int(), args[1].to_int());
+            let (a, b) = (args[0].jint(), args[1].jint());
             // Wrapping for the same reason `floor_div` wraps: with
             // `Long.MIN_VALUE` and -1 the quotient is `Long.MIN_VALUE` and
             // `q * b` overflows, which panicked and aborted. Java answers 0.
             floor_div(a, b).map(|q| Value::Int(a.wrapping_sub(q.wrapping_mul(b))))
         }
-        ("Math", "signum", 1) => Ok(Value::float(match args[0].to_float() {
+        ("Math", "signum", 1) => Ok(Value::float(match args[0].jfloat() {
             f if f > 0.0 => 1.0,
             f if f < 0.0 => -1.0,
             f => f,
@@ -4462,8 +4728,8 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // every one of them (`sin` 14/180, `cbrt` 25/180, `tan` 5/10). An
         // unregistered method is a clear error; a silently different last digit
         // is not, so they stay out until a StrictMath port can answer exactly.
-        ("Math", "toRadians", 1) => Ok(Value::float(args[0].to_float().to_radians())),
-        ("Math", "toDegrees", 1) => Ok(Value::float(args[0].to_float().to_degrees())),
+        ("Math", "toRadians", 1) => Ok(Value::float(args[0].jfloat().to_radians())),
+        ("Math", "toDegrees", 1) => Ok(Value::float(args[0].jfloat().to_degrees())),
         // The exactly-specified `double` statics, as opposed to the
         // transcendentals just above. Each is an IEEE operation or a walk over
         // the bit pattern, so there is one right answer and Rust gives it:
@@ -4472,25 +4738,20 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // and `ulp`/`nextUp`/`nextDown`/`nextAfter` step the representable
         // neighbours. They were unregistered — an error at the call site — for
         // want of a reason rather than for one.
-        ("Math", "rint", 1) => Ok(Value::float(args[0].to_float().round_ties_even())),
-        ("Math", "copySign", 2) => Ok(Value::float(
-            args[0].to_float().copysign(args[1].to_float()),
-        )),
+        ("Math", "rint", 1) => Ok(Value::float(args[0].jfloat().round_ties_even())),
+        ("Math", "copySign", 2) => Ok(Value::float(args[0].jfloat().copysign(args[1].jfloat()))),
         ("Math", "fma", 3) => Ok(Value::float(
-            args[0]
-                .to_float()
-                .mul_add(args[1].to_float(), args[2].to_float()),
+            args[0].jfloat().mul_add(args[1].jfloat(), args[2].jfloat()),
         )),
-        ("Math", "ulp", 1) => Ok(Value::float(double_ulp(args[0].to_float()))),
-        ("Math", "nextUp", 1) => Ok(Value::float(next_after(args[0].to_float(), f64::INFINITY))),
+        ("Math", "ulp", 1) => Ok(Value::float(double_ulp(args[0].jfloat()))),
+        ("Math", "nextUp", 1) => Ok(Value::float(next_after(args[0].jfloat(), f64::INFINITY))),
         ("Math", "nextDown", 1) => Ok(Value::float(next_after(
-            args[0].to_float(),
+            args[0].jfloat(),
             f64::NEG_INFINITY,
         ))),
-        ("Math", "nextAfter", 2) => Ok(Value::float(next_after(
-            args[0].to_float(),
-            args[1].to_float(),
-        ))),
+        ("Math", "nextAfter", 2) => {
+            Ok(Value::float(next_after(args[0].jfloat(), args[1].jfloat())))
+        }
 
         // ── java.lang.Integer / Long ──
         // A null argument is rejected before the text is looked at; without the
@@ -4501,7 +4762,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Long", "parseLong", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
         ("Integer", "parseInt", 1) => parse_int_radix(&args[0].as_str_cow(), 10, true),
         ("Integer", "parseInt", 2) => {
-            let radix = args[1].to_int();
+            let radix = args[1].jint();
             parse_int_radix(&args[0].as_str_cow(), radix, true)
         }
         ("Long", "parseLong", 1) => parse_int_radix(&args[0].as_str_cow(), 10, false),
@@ -4511,38 +4772,38 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Integer", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, true),
             Value::Undef => Err(null_number_fault()),
-            other => Ok(Value::Int(other.to_int())),
+            other => Ok(Value::Int(other.jint())),
         },
         // `Integer.toString(int)` / `Integer.toString(int, radix)`.
-        ("Integer", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
+        ("Integer", "toString", 1) => Ok(Value::str(args[0].jint().to_string())),
         ("Integer", "toString", 2) => Ok(Value::str(int_to_radix_string(
-            args[0].to_int(),
-            args[1].to_int(),
+            args[0].jint(),
+            args[1].jint(),
         ))),
         // The unsigned radix renderings read the value as a *bit pattern* at its
         // declared width — `Integer.toHexString(-1)` is "ffffffff" and
         // `Long.toHexString(-1L)` is sixteen f's.
         ("Integer", "toBinaryString", 1) => {
-            Ok(Value::str(format!("{:b}", args[0].to_int() as i32 as u32)))
+            Ok(Value::str(format!("{:b}", args[0].jint() as i32 as u32)))
         }
         ("Integer", "toHexString", 1) => {
-            Ok(Value::str(format!("{:x}", args[0].to_int() as i32 as u32)))
+            Ok(Value::str(format!("{:x}", args[0].jint() as i32 as u32)))
         }
         ("Integer", "toOctalString", 1) => {
-            Ok(Value::str(format!("{:o}", args[0].to_int() as i32 as u32)))
+            Ok(Value::str(format!("{:o}", args[0].jint() as i32 as u32)))
         }
-        ("Long", "toBinaryString", 1) => Ok(Value::str(format!("{:b}", args[0].to_int() as u64))),
-        ("Long", "toHexString", 1) => Ok(Value::str(format!("{:x}", args[0].to_int() as u64))),
-        ("Long", "toOctalString", 1) => Ok(Value::str(format!("{:o}", args[0].to_int() as u64))),
-        ("Integer" | "Long", "compare", 2) => Ok(Value::Int(cmp_to_int(
-            args[0].to_int().cmp(&args[1].to_int()),
-        ))),
-        ("Integer" | "Long", "max", 2) => Ok(Value::Int(args[0].to_int().max(args[1].to_int()))),
-        ("Integer" | "Long", "min", 2) => Ok(Value::Int(args[0].to_int().min(args[1].to_int()))),
+        ("Long", "toBinaryString", 1) => Ok(Value::str(format!("{:b}", args[0].jint() as u64))),
+        ("Long", "toHexString", 1) => Ok(Value::str(format!("{:x}", args[0].jint() as u64))),
+        ("Long", "toOctalString", 1) => Ok(Value::str(format!("{:o}", args[0].jint() as u64))),
+        ("Integer" | "Long", "compare", 2) => {
+            Ok(Value::Int(cmp_to_int(args[0].jint().cmp(&args[1].jint()))))
+        }
+        ("Integer" | "Long", "max", 2) => Ok(Value::Int(args[0].jint().max(args[1].jint()))),
+        ("Integer" | "Long", "min", 2) => Ok(Value::Int(args[0].jint().min(args[1].jint()))),
         ("Integer" | "Long", "sum", 2) => {
-            Ok(Value::Int(args[0].to_int().wrapping_add(args[1].to_int())))
+            Ok(Value::Int(args[0].jint().wrapping_add(args[1].jint())))
         }
-        ("Integer" | "Long", "signum", 1) => Ok(Value::Int(args[0].to_int().signum())),
+        ("Integer" | "Long", "signum", 1) => Ok(Value::Int(args[0].jint().signum())),
         // `Xxx.hashCode(x)` is the static spelling of the boxed instance
         // method, and each box folds a different width: `Integer` is the value,
         // `Long` folds its halves, `Double` folds `doubleToLongBits`, and
@@ -4550,21 +4811,21 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // 1069547520 where `Double.hashCode(1.5)` is 1073217536.
         ("Integer" | "Long" | "Double" | "Boolean" | "Character", "hashCode", 1) => {
             let v = match class {
-                "Double" => Value::float(args[0].to_float()),
+                "Double" => Value::float(args[0].jfloat()),
                 "Boolean" => Value::bool(matches!(args[0], Value::Bool(true))),
                 "Character" => Value::Int(i64::from(char_arg(&args[0]) as u32)),
-                _ => Value::Int(args[0].to_int()),
+                _ => Value::Int(args[0].jint()),
             };
             Ok(Value::Int(java_hash(&v).unwrap_or(0).into()))
         }
         ("Float", "hashCode", 1) => Ok(Value::Int(
-            ((args[0].to_float() as f32).to_bits() as i32).into(),
+            ((args[0].jfloat() as f32).to_bits() as i32).into(),
         )),
-        ("Long", "toString", 1) => Ok(Value::str(args[0].to_int().to_string())),
+        ("Long", "toString", 1) => Ok(Value::str(args[0].jint().to_string())),
         ("Long", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, false),
             Value::Undef => Err(null_number_fault()),
-            other => Ok(Value::Int(other.to_int())),
+            other => Ok(Value::Int(other.jint())),
         },
 
         // ── java.lang.Double ──
@@ -4584,12 +4845,12 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 .map(Value::float)
                 .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
-        ("Double", "toString", 1) => Ok(Value::str(format_double(args[0].to_float()))),
+        ("Double", "toString", 1) => Ok(Value::str(format_double(args[0].jfloat()))),
 
         // ── java.lang.Float ──
         // Every one of these answers at 32-bit precision, which is the whole
         // reason they are not aliases of the `Double` arm above.
-        ("Float", "toString", 1) => Ok(Value::str(format_float(args[0].to_float() as f32))),
+        ("Float", "toString", 1) => Ok(Value::str(format_float(args[0].jfloat() as f32))),
         ("Float", "parseFloat", 1) | ("Float", "valueOf", 1) => {
             let s = args[0].as_str_cow();
             parse_java_double(&s)
@@ -4597,17 +4858,17 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
         ("Float", "compare", 2) => Ok(Value::Int(float_compare(
-            f64::from(args[0].to_float() as f32),
-            f64::from(args[1].to_float() as f32),
+            f64::from(args[0].jfloat() as f32),
+            f64::from(args[1].jfloat() as f32),
         ))),
-        ("Float", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
-        ("Float", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
+        ("Float", "isNaN", 1) => Ok(Value::bool(args[0].jfloat().is_nan())),
+        ("Float", "isInfinite", 1) => Ok(Value::bool(args[0].jfloat().is_infinite())),
         ("Double", "compare", 2) => Ok(Value::Int(float_compare(
-            args[0].to_float(),
-            args[1].to_float(),
+            args[0].jfloat(),
+            args[1].jfloat(),
         ))),
-        ("Double", "isNaN", 1) => Ok(Value::bool(args[0].to_float().is_nan())),
-        ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].to_float().is_infinite())),
+        ("Double", "isNaN", 1) => Ok(Value::bool(args[0].jfloat().is_nan())),
+        ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].jfloat().is_infinite())),
 
         // ── java.lang.Character ──
         // The argument is a `char` code point (`char_arg` also accepts the
@@ -4722,7 +4983,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // the allocation's own `NegativeArraySizeException`.
         ("Arrays", "copyOf", 2) => {
             let items = array_items(&args[0]).unwrap_or_default();
-            let len = args[1].to_int();
+            let len = args[1].jint();
             if len < 0 {
                 return Err(Fault::java("NegativeArraySizeException", len.to_string()));
             }
@@ -4733,7 +4994,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         }
         ("Arrays", "copyOfRange", 3) => {
             let items = array_items(&args[0]).unwrap_or_default();
-            let (from, to) = (args[1].to_int(), args[2].to_int());
+            let (from, to) = (args[1].jint(), args[2].jint());
             // `Arrays.copyOfRange` checks the range itself and reports it with
             // the two endpoints alone; a `from` outside the source is left to
             // the `System.arraycopy` underneath, whose message names the
@@ -5207,7 +5468,10 @@ fn one_to_one_case<I: Iterator<Item = char>>(c: char, map: fn(char) -> I) -> i64
 }
 
 fn char_arg(v: &Value) -> char {
-    match v {
+    // Through a `Character` box too: `Character.isLetter(aCharacter)` reads the
+    // wrapper as its code point, and the handle would otherwise render as text
+    // whose first character is a digit of the id.
+    match &deboxed(v) {
         Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{0}'),
         other => other.as_str_cow().chars().next().unwrap_or('\u{0}'),
     }
@@ -5801,7 +6065,7 @@ fn format_conversion(
     };
     match conv {
         'd' => {
-            let n = arg.to_int();
+            let n = arg.jint();
             Ok(num(
                 if n < 0 {
                     "-".to_string()
@@ -5812,7 +6076,7 @@ fn format_conversion(
             ))
         }
         'f' => {
-            let x = arg.to_float();
+            let x = arg.jfloat();
             // `#` on a fixed conversion forces the decimal point to appear even
             // at precision 0: `%#.0f` of 1.0 is `1.`.
             let mut body = fixed_half_up(x, prec.unwrap_or(6));
@@ -5882,7 +6146,7 @@ fn format_conversion(
         // Java's `%e` always writes a two-digit exponent with an explicit sign
         // (`1.234568e+03`), where Rust's `{:e}` writes `1.234568e3`.
         'e' | 'E' => {
-            let x = arg.to_float();
+            let x = arg.jfloat();
             // `sci_notation` carries a negative sign; the split rendering wants
             // the magnitude, so it is stripped and re-supplied as the prefix.
             let s = sci_notation(x, prec.unwrap_or(6));
@@ -5897,7 +6161,7 @@ fn format_conversion(
         // `%g` picks fixed or scientific by the value's magnitude; Java's
         // precision counts *significant* digits and defaults to 6.
         'g' | 'G' => {
-            let x = arg.to_float();
+            let x = arg.jfloat();
             let p = prec.unwrap_or(6).max(1);
             let s = if x != 0.0 && (x.abs() < 1e-4 || x.abs() >= 10f64.powi(p as i32)) {
                 sci_notation(x, p - 1)
@@ -6158,7 +6422,7 @@ fn java_bool(v: &Value) -> bool {
 /// holds the value, which is `int` for everything an `int` can hold — the same
 /// default [`boxed_class`] applies.
 fn radix_bits(arg: &Value, tag: &str) -> u64 {
-    let n = arg.to_int();
+    let n = arg.jint();
     match tag {
         "byte" | "Byte" => n as u8 as u64,
         "short" | "Short" => n as u16 as u64,
@@ -6586,6 +6850,22 @@ fn run_tostring(vm: &mut VM, entry: usize, id: u32) -> String {
 /// hash is the handle (deterministic within a run) rather than a JVM identity
 /// hash.
 fn obj_default_str(id: u32) -> String {
+    // A wrapper renders as the primitive it holds, and two of the eight need
+    // their class to do it: a `char` rides `Value::Int`, so `Character` has to
+    // turn the code point back into the character, and `Float.toString` is the
+    // 32-bit rendering (`0.1f` prints `0.1`, not the `double` widening's
+    // `0.10000000149011612`). Computed before the heap borrow below so the
+    // formatting helpers are free to touch the heap themselves.
+    let handle = Value::Obj(id);
+    if let (Some(class), Some(v)) = (box_class(&handle), unboxed(&handle)) {
+        return match class {
+            "Character" => char::from_u32(as_i64(&v) as u32)
+                .map(String::from)
+                .unwrap_or_default(),
+            "Float" => java_str(&float_to_string(&v)),
+            _ => java_str(&v),
+        };
+    }
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
@@ -6622,6 +6902,7 @@ fn obj_default_str(id: u32) -> String {
             // which is not reproducible (and not stable across JVM runs), so
             // javars prints a fixed marker instead. See `BUGS.md`.
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
+            Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             None => format!("(obj:{id})"),
         }
     })
@@ -6929,7 +7210,12 @@ fn format_ieee(f: f64, plain: String, sci: String) -> String {
 /// silent. Requiring both operands to be numbers up front makes the two paths
 /// disjoint by construction instead of by ordering.
 fn is_java_number(v: &Value) -> bool {
+    // A boxed wrapper is a number too: every arithmetic and relational operator
+    // Java allows on one unboxes it first (JLS 5.1.8), so the hook must reach
+    // `java_numeric` for it rather than falling into the `String` arms and
+    // concatenating.
     matches!(v, Value::Int(_) | Value::Float(_))
+        || unboxed(v).is_some_and(|inner| matches!(inner, Value::Int(_) | Value::Float(_)))
 }
 
 /// One binary operation on two Java primitive numbers — the pairs fusevm hands
@@ -7030,10 +7316,22 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     // `Neg` is unary — fusevm passes `Undef` as the second operand, so it can
     // never satisfy the two-number gate below and is answered first.
     if op == NumOp::Neg && is_java_number(a) {
-        return java_numeric(op, a, &Value::Int(0));
+        return java_numeric(op, &deboxed(a), &Value::Int(0));
+    }
+    // `==`/`!=` between two heap references is reference identity — before the
+    // numeric gate below, because two boxed wrappers are numbers as well as
+    // references and Java compares them as references. A mixed box/primitive
+    // pair is *not* caught here and falls through to the numeric path, which is
+    // Java's rule too: `anInteger == anInt` unboxes (JLS 15.21.1).
+    if matches!((a, b), (Value::Obj(_), Value::Obj(_))) {
+        match op {
+            NumOp::Eq => return Ok(Value::bool(ref_eq(a, b))),
+            NumOp::Ne => return Ok(Value::bool(!ref_eq(a, b))),
+            _ => {}
+        }
     }
     if is_java_number(a) && is_java_number(b) {
-        return java_numeric(op, a, b);
+        return java_numeric(op, &deboxed(a), &deboxed(b));
     }
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
@@ -7175,9 +7473,9 @@ fn b_f32(vm: &mut VM, _argc: u8) -> Value {
 /// [`JF32_ARITH`] — one arithmetic operation at 32-bit width.
 fn b_f32_arith(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let a = args.first().map(Value::to_float).unwrap_or(0.0) as f32;
-    let b = args.get(1).map(Value::to_float).unwrap_or(0.0) as f32;
-    let r = match args.get(2).map(Value::to_int).unwrap_or(f32_op::ADD) {
+    let a = args.first().map(JavaNumeric::jfloat).unwrap_or(0.0) as f32;
+    let b = args.get(1).map(JavaNumeric::jfloat).unwrap_or(0.0) as f32;
+    let r = match args.get(2).map(JavaNumeric::jint).unwrap_or(f32_op::ADD) {
         f32_op::SUB => a - b,
         f32_op::MUL => a * b,
         f32_op::DIV => a / b,
@@ -7190,12 +7488,16 @@ fn b_f32_arith(vm: &mut VM, argc: u8) -> Value {
 /// [`JF32_ROUND`] — `Math.round(float)`, answering an `int`.
 fn b_f32_round(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    Value::Int(round_float(v.to_float() as f32).into())
+    Value::Int(round_float(v.jfloat() as f32).into())
 }
 
 /// [`JF32_STR`] — `Float.toString`, or element-wise over a `float[]`.
 fn b_f32_str(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
+    // A boxed `Float` is rendered from the primitive it wraps; without this the
+    // `Value::Obj` arm below would see a handle that is not an array and hand
+    // the box straight back, which renders through `Double`'s rules instead.
+    let v = unboxed(&v).unwrap_or(v);
     match &v {
         Value::Obj(_) => match array_items(&v) {
             Some(items) => Value::Obj(heap_alloc(HostObj::Array(
@@ -7520,7 +7822,7 @@ fn jdk_name(n: &str) -> String {
 /// truncates toward zero first, and a `char` (a one-character string) yields its
 /// code point.
 fn cast_to_i64(v: &Value) -> i64 {
-    match v {
+    match unboxed(v).as_ref().unwrap_or(v) {
         Value::Float(f) => *f as i64,
         other => as_i64(other),
     }
@@ -7529,6 +7831,11 @@ fn cast_to_i64(v: &Value) -> i64 {
 /// Coerce a value to `i64`. A one-character string is a `char`, and its code
 /// point is its numeric value — `(int) 'a'` is 97.
 fn as_i64(v: &Value) -> i64 {
+    // A wrapper is its primitive everywhere a number is wanted; the box exists
+    // for `==`, `equals`, `hashCode` and `getClass` and nothing else.
+    if let Some(inner) = unboxed(v) {
+        return as_i64(&inner);
+    }
     match v {
         Value::Int(i) => *i,
         Value::Float(f) => *f as i64,
@@ -7546,6 +7853,9 @@ fn as_i64(v: &Value) -> i64 {
 
 /// Coerce a value to `f64` for the floating division path.
 fn as_f64(v: &Value) -> f64 {
+    if let Some(inner) = unboxed(v) {
+        return as_f64(&inner);
+    }
     match v {
         Value::Int(i) => *i as f64,
         Value::Float(f) => *f,

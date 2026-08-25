@@ -1658,7 +1658,7 @@ pub const REFERENCE: &[Entry] = &[
         "ClassCastException",
         "Throwables",
         "class ClassCastException extends RuntimeException",
-        "Declared and catchable, but never raised: a *reference* cast is a no-op here — the host heap already carries each object's class and javars does not box primitives, so there is no representation to change and nothing to check. Primitive casts are real conversions and cannot fail.",
+        "Raised by a *checked* reference cast whose target the value's runtime class does not satisfy, with Java's own detail message. The cast changes no representation — the host heap already carries each object's class — so verifying one is all it does. Primitive casts are real conversions and cannot fail.",
         "catch (ClassCastException e) { System.out.println(e); }",
     ),
     (

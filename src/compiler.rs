@@ -90,9 +90,13 @@ enum NumType {
 /// for `var` and unknown types, whose category is inferred from an initializer.
 fn numtype_of_ty(ty: &str) -> Option<NumType> {
     match ty {
-        "int" | "long" | "short" | "byte" | "char" | "Character" => Some(NumType::Int),
-        "float" | "double" => Some(NumType::Float),
-        "boolean" | "String" => Some(NumType::Other),
+        // The wrappers answer as the primitives they box, because every
+        // arithmetic operator unboxes them first: `Integer a = f(); a / 2` is
+        // integral division in Java however opaque `f` is.
+        "int" | "long" | "short" | "byte" | "char" | "Character" | "Integer" | "Long" | "Short"
+        | "Byte" => Some(NumType::Int),
+        "float" | "double" | "Float" | "Double" => Some(NumType::Float),
+        "boolean" | "String" | "Boolean" => Some(NumType::Other),
         _ => None,
     }
 }
@@ -2490,7 +2494,10 @@ impl Compiler {
     /// binary operation, so they qualify; `long` (64-bit) and an unknown type do
     /// not.
     fn is_int_width(ty: Option<&str>) -> bool {
-        matches!(ty, Some("int" | "short" | "byte" | "char" | "Character"))
+        matches!(
+            ty.map(unwrapped_ty),
+            Some("int" | "short" | "byte" | "char")
+        )
     }
 
     /// True when `e`'s static Java type is `char`. A `char` runs as its code
@@ -2514,7 +2521,13 @@ impl Compiler {
     /// precision — this is the flag that says where to narrow it and where to
     /// print it as a `float` rather than as a `double`.
     fn is_float32_expr(&self, e: &Expr) -> bool {
-        matches!(self.expr_java_type(e).as_deref(), Some("float" | "float[]"))
+        // `Float` too: its box holds the 32-bit value, so `Float x = 0.1f, y =
+        // 0.1f; x + y` is the `float` addition (0.2), not the `double` one
+        // (0.20000000298023224) the widened operands would give.
+        matches!(
+            self.expr_java_type(e).as_deref().map(unwrapped_ty),
+            Some("float" | "float[]")
+        )
     }
 
     /// Emit one arithmetic operation at 32-bit `float` width, with both operands
@@ -2653,7 +2666,13 @@ impl Compiler {
             _ => return None,
         };
         let src = self.expr_java_type(e)?;
-        matches!(src.as_str(), "int" | "long" | "short" | "byte" | "char").then_some(t)
+        // A wrapper widens as the primitive it boxes: `double d = anInteger;` is
+        // an unboxing conversion followed by a widening one (JLS 5.2).
+        matches!(
+            unwrapped_ty(&src),
+            "int" | "long" | "short" | "byte" | "char"
+        )
+        .then_some(t)
     }
 
     /// Emit the widening primitive conversion for the value already on top of
@@ -2672,6 +2691,72 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
         } else {
             self.b.emit(Op::TruncFloat, line);
+        }
+    }
+
+    /// Lower `e` and unbox the result when its static type is a wrapper class.
+    ///
+    /// For the operators that do **not** reach [`crate::host::numeric_hook`] —
+    /// `&`, `|`, `^`, the shifts, and `~`, which fusevm answers natively for
+    /// every operand shape. A boxed operand there is a heap handle, and the
+    /// native op reads it as 0: `Integer x = 1000, y = 6; x | y` answered 0.
+    /// Arithmetic and the comparisons need no such call, because a pair the
+    /// native op declines is delegated to the hook, which unboxes.
+    fn expr_unboxed(&mut self, e: &Expr) -> Result<(), String> {
+        self.expr(e)?;
+        if self
+            .expr_java_type(e)
+            .is_some_and(|t| crate::host::box_class_code(&t).is_some())
+        {
+            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
+        }
+        Ok(())
+    }
+
+    /// Emit Java's *boxing* or *unboxing* conversion (JLS 5.1.7 / 5.1.8) for the
+    /// value already on top of the stack, when the target type calls for one.
+    ///
+    /// This sits in [`Compiler::expr_targeted`] because that is the one place
+    /// javars lowers a value into a slot of a declared type — a local, a field,
+    /// an array element, a method argument, a `return`, a conditional branch.
+    /// Java's boxing conversions happen in exactly those *assignment contexts*,
+    /// so putting the rule here covers them all rather than at six call sites
+    /// that could drift.
+    ///
+    /// A source whose type javars cannot pin down converts neither way. That is
+    /// deliberate: an unboxed value in a wrapper-typed slot behaves as it always
+    /// did, whereas boxing a value that is already a reference would turn
+    /// `Integer b = a;` — an aliasing assignment Java performs no conversion for
+    /// — into a fresh object, and `a == b` would answer `false` where Java says
+    /// `true`.
+    fn emit_boxing_conversion(&mut self, target: &str, e: &Expr) {
+        let Some(code) = crate::host::box_class_code(target) else {
+            return;
+        };
+        if self
+            .expr_java_type(e)
+            .is_some_and(|src| !is_reference_type(&src))
+        {
+            self.b.emit(Op::LoadInt(code), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
+        }
+    }
+
+    /// The reverse of [`Compiler::emit_boxing_conversion`]: a wrapper flowing
+    /// into a primitive slot.
+    ///
+    /// Without it the handle would sit in an `int` variable, and `==` between
+    /// two such variables would compare the handles they were copied from
+    /// rather than the numbers they hold.
+    fn emit_unboxing_conversion(&mut self, target: &str, e: &Expr) {
+        if is_reference_type(target) {
+            return;
+        }
+        if self
+            .expr_java_type(e)
+            .is_some_and(|src| crate::host::box_class_code(&src).is_some())
+        {
+            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
         }
     }
 
@@ -3123,8 +3208,18 @@ impl Compiler {
             }
             let widen = self.widen_target(target, e);
             self.expr(e)?;
+            // Unboxing runs *before* any widening and boxing *after* it, which
+            // is the order Java converts in: `double d = anInteger` unboxes to
+            // an `int` and then widens (JLS 5.2), and widening a handle would
+            // read it as 0.
+            if let Some(t) = target {
+                self.emit_unboxing_conversion(t, e);
+            }
             if let Some(w) = widen {
                 self.emit_widen(w, 0);
+            }
+            if let Some(t) = target {
+                self.emit_boxing_conversion(t, e);
             }
             return Ok(());
         }
@@ -4904,7 +4999,14 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::JINSTANCEOF, 2), 0);
             }
             Expr::Unary { op, rhs } => {
-                self.expr(rhs)?;
+                // `~` is answered natively for every operand shape, so a boxed
+                // operand would be read as the handle rather than the number.
+                // `-` and `!` are safe unboxed: `Negate` delegates to the hook,
+                // and `Boolean` is not a boxed class.
+                match op {
+                    UnOp::BitNot => self.expr_unboxed(rhs)?,
+                    _ => self.expr(rhs)?,
+                }
                 match op {
                     UnOp::Neg => {
                         self.b.emit(Op::Negate, 0);
@@ -5184,6 +5286,17 @@ impl Compiler {
                         .all(|a| Self::is_int_width(self.expr_java_type(a).as_deref()))
                 {
                     self.emit_wrap32(line);
+                }
+                // `Integer.valueOf(x)` and its siblings are Java's *explicit*
+                // boxing conversion, cache and all — which is what makes
+                // `Integer.valueOf(127) == Integer.valueOf(127)` `true` and the
+                // same pair at 128 `false`. The host dispatch answers the
+                // primitive; the box goes on here, where the class is known.
+                if method == "valueOf" && args.len() == 1 {
+                    if let Some(code) = crate::host::box_class_code(class) {
+                        self.b.emit(Op::LoadInt(code), line);
+                        self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                    }
                 }
                 return Ok(());
             }
@@ -6261,10 +6374,10 @@ impl Compiler {
     /// *non-short-circuiting* logical operators, and the result has to stay a
     /// boolean rather than the 0/1 an integer op would leave.
     fn bitwise(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
-        let boolean = self.expr_java_type(lhs).as_deref() == Some("boolean")
-            || self.expr_java_type(rhs).as_deref() == Some("boolean");
-        self.expr(lhs)?;
-        self.expr(rhs)?;
+        let is_bool = |t: Option<String>| t.as_deref().map(unwrapped_ty) == Some("boolean");
+        let boolean = is_bool(self.expr_java_type(lhs)) || is_bool(self.expr_java_type(rhs));
+        self.expr_unboxed(lhs)?;
+        self.expr_unboxed(rhs)?;
         let vop = match (op, boolean) {
             (BinOp::BitAnd, true) => Op::LogAnd,
             (BinOp::BitOr, true) => Op::LogOr,
@@ -6287,9 +6400,9 @@ impl Compiler {
     /// an `int` result is narrowed afterwards. `>>>` zero-fills at the operand's
     /// width, which no fusevm op carries, so it routes through the host.
     fn shift(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
-        let long = self.expr_java_type(lhs).as_deref() == Some("long");
-        self.expr(lhs)?;
-        self.expr(rhs)?;
+        let long = self.expr_java_type(lhs).as_deref().map(unwrapped_ty) == Some("long");
+        self.expr_unboxed(lhs)?;
+        self.expr_unboxed(rhs)?;
         self.b.emit(Op::LoadInt(if long { 63 } else { 31 }), 0);
         self.b.emit(Op::BitAnd, 0);
         if op == BinOp::Ushr {
@@ -6314,9 +6427,11 @@ impl Compiler {
     /// javars already represents identically is emitted as the operand alone, so
     /// the common `(int) i` stays native. A *reference* cast has no runtime
     /// effect here: the host heap already carries each object's class and
-    /// javars does not box primitives, so it changes no representation — but it
-    /// is still *checked*, and a cast the runtime class does not satisfy throws
-    /// `ClassCastException` the way Java's does.
+    /// a value already in reference form carries its own, so it changes no
+    /// representation — but it is still *checked*, and a cast the runtime class
+    /// does not satisfy throws `ClassCastException` the way Java's does. A cast
+    /// to a wrapper class whose operand is a *primitive* is not that at all: it
+    /// is Java's explicit boxing conversion, and is emitted as one.
     fn cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
         let src = self.expr_java_type(e);
         let identity = matches!(
@@ -6331,6 +6446,18 @@ impl Compiler {
             "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
         );
         if !primitive {
+            // `(Integer) 5` is a *boxing* conversion, not a checked downcast:
+            // the operand is a primitive, so there is no class to verify and the
+            // cast's whole effect is to produce the wrapper. `(Integer) someObj`
+            // still checks, because there the operand is already a reference.
+            if let Some(code) = crate::host::box_class_code(ty) {
+                if src.as_deref().is_some_and(|t| !is_reference_type(t)) {
+                    self.expr(e)?;
+                    self.b.emit(Op::LoadInt(code), line);
+                    self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                    return Ok(());
+                }
+            }
             return self.reference_cast(ty, e, line);
         }
         if identity {
@@ -6547,15 +6674,38 @@ fn mangle_static(owner: &str, name: &str, param_tys: &[String]) -> String {
 /// `int` < `long` < `float` < `double`); `None` for non-numeric types. Used by
 /// overload resolution to score widening conversions.
 fn numeric_rank(ty: &str) -> Option<u32> {
-    Some(match ty {
+    Some(match unwrapped_ty(ty) {
         "byte" => 1,
-        "short" | "char" | "Character" => 2,
+        "short" | "char" => 2,
         "int" => 3,
         "long" => 4,
         "float" => 5,
         "double" => 6,
         _ => return None,
     })
+}
+
+/// The primitive a type name denotes: a wrapper class answers as the primitive
+/// it boxes, and every other name answers as itself.
+///
+/// Java's binary numeric promotion, its shift-distance mask, and its
+/// `&`/`|`/`^` overloading are all defined on the *primitive* — a wrapper
+/// operand is unboxed first (JLS 5.6.2) — so every predicate that asks "how
+/// wide is this operand" asks through here. Without it `Long l; l << 33` masked
+/// the distance to 5 bits instead of 6 and `Boolean b; b & false` compiled to
+/// the integer `&`.
+fn unwrapped_ty(ty: &str) -> &str {
+    match ty {
+        "Integer" => "int",
+        "Long" => "long",
+        "Short" => "short",
+        "Byte" => "byte",
+        "Character" => "char",
+        "Float" => "float",
+        "Double" => "double",
+        "Boolean" => "boolean",
+        other => other,
+    }
 }
 
 /// The type name for a numeric rank, promoted to at least `int` (Java's binary
@@ -6773,7 +6923,19 @@ fn boxed_call_java_type(method: &str, argc: usize) -> Option<&'static str> {
 /// 32-bit `int` wrap decision.
 fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
     Some(match (class, method) {
-        ("Integer", "parseInt") | ("Integer", "valueOf") => "int",
+        ("Integer", "parseInt") => "int",
+        // The wrapper `valueOf`s answer a *reference*, and saying so is what
+        // makes `Integer.valueOf(128) == Integer.valueOf(128)` compare handles
+        // (`false`, as in Java) rather than the numbers behind them. Their
+        // numeric category is still integral — `numtype_of_ty` maps a wrapper
+        // to the primitive it boxes — so `Integer.valueOf(7) / 2` still
+        // truncates.
+        ("Integer", "valueOf") => "Integer",
+        ("Long", "valueOf") => "Long",
+        ("Short", "valueOf") => "Short",
+        ("Byte", "valueOf") => "Byte",
+        ("Character", "valueOf") => "Character",
+        ("Double", "valueOf") => "Double",
         // `Long.parseLong` and `Math.round` are 64-bit results in Java, so they
         // must NOT be treated as `int` — that is exactly the case where the
         // wrap would be wrong.
@@ -6788,7 +6950,8 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
             "pow" | "sqrt" | "floor" | "ceil" | "rint" | "copySign" | "ulp" | "nextUp" | "nextDown"
             | "nextAfter" | "fma",
         ) => "double",
-        ("Float", "parseFloat") | ("Float", "valueOf") => "float",
+        ("Float", "parseFloat") => "float",
+        ("Float", "valueOf") => "Float",
         ("Float", "toString") => "String",
         ("Float", "compare") => "int",
         ("Float", "isNaN") | ("Float", "isInfinite") => "boolean",
@@ -6816,7 +6979,8 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
 fn static_call_numtype(class: &str, method: &str) -> Option<NumType> {
     match (class, method) {
         ("Integer", "parseInt") | ("Integer", "valueOf") => Some(NumType::Int),
-        ("Long", "parseLong") => Some(NumType::Int),
+        ("Long", "parseLong") | ("Long", "valueOf") => Some(NumType::Int),
+        ("Short", "valueOf") | ("Byte", "valueOf") | ("Character", "valueOf") => Some(NumType::Int),
         ("Math", "round") => Some(NumType::Int),
         _ => None,
     }

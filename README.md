@@ -62,6 +62,12 @@ pure frontend over the shared engine. Highlights:
 - **Java `+` overloading** — a strict numeric hook supplies string
   concatenation (`"x=" + x`) for the mixed operands the VM's native arithmetic
   does not compute, while all-numeric arithmetic stays on the JIT fast path.
+- **Real boxed wrappers** — `Integer`, `Long`, `Short`, `Byte`, `Character`,
+  `Float` and `Double` are heap objects with the class and the JLS cache Java
+  gives them, so `Integer a = 127, b = 127; a == b` is `true` and the same pair
+  at 128 is `false`, while `Integer a = 1000; Integer b = a; a == b` stays
+  `true`. Every arithmetic, rendering and hashing surface unboxes them, so the
+  box is visible only where Java makes it visible.
 - **Verified against OpenJDK** — the example programs and the test corpus are
   diffed byte-for-byte against a reference `java`; the tests freeze that output
   so CI needs no JDK installed.

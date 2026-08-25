@@ -1203,35 +1203,43 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `x == z` after `z = x`, and `obj.field == null` all behave like Java's reference
   `==`. String `==`, however, compares by *value* (Java's is identity) — this
   matches the far more common intent and avoids surprising `"ab" == "a"+"b"`.
-- **`==` between two boxed integers ignores the `Integer` cache.** javars boxes
-  no primitive, so an `Integer` is the same `Value::Int` an `int` is and `==`
-  compares the numbers. Java compares *references*, and caches only
-  `-128..=127`, which is why `Integer a = 127, b = 127; a == b` is `true` there
-  and `Integer a = 128, b = 128; a == b` is `false` — javars answers `true` for
-  both. `Long`/`Short`/`Byte`/`Character` cache the same range and read the same
-  way; `Double`/`Float` cache nothing, so Java is `false` for every pair of them
-  while javars is `true` when the values are equal.
+- **A boxed primitive is a real reference, in a *statically typed* position
+  only.** `Integer`, `Long`, `Short`, `Byte`, `Character`, `Float` and `Double`
+  each allocate a heap object with the `java.lang` class they name, cached over
+  the range JLS 5.1.7 mandates (`-128..=127`, `0..=127` for `Character`, nothing
+  for the two floating classes). So `Integer a = 127, b = 127; a == b` is `true`
+  and the same pair at 128 is `false`; `Integer a = 1000; Integer b = a; a == b`
+  is `true`, the two names denoting one box; `Integer.valueOf(1).equals(
+  Long.valueOf(1))` is `false`; and `((Object) aLong).getClass().getName()` is
+  `java.lang.Long`.
 
-  The same one kind-per-family model decides `equals` between an integral and a
-  floating value, and there it goes the other way — javars calls them equal
-  where Java does not. `Integer.valueOf(1).equals(Double.valueOf(1.0))` is
-  `false` in Java (different classes), so a `HashMap` keyed on `1` and on `1.0`
-  holds two entries; javars compares the numbers, so the second `put` replaces
-  the first and the map holds one. `Integer` against `Long` reads the same way.
-  The collection key index takes this as given rather than working around it:
-  a value's index bucket is derived so that anything `value_eq` calls equal
-  lands in one bucket, and the cases where that correspondence is not provable
-  (a `Float` key, a magnitude past 2^53 where several `long`s round to one
-  `double`) fall back to the linear scan the index replaced.
+  The box is emitted where Java performs a *boxing conversion* and javars can
+  see the types: assigning a primitive expression into a slot declared with a
+  wrapper type (a local, a field, an array element, a parameter, a `return`, a
+  conditional branch), an explicit `X.valueOf(x)`, and a cast `(Integer) x`. It
+  is removed again at the matching unboxing conversion. An expression javars
+  cannot type statically converts neither way — which is deliberate, because
+  boxing a value that is already a reference would break the aliasing above.
 
-  Reproducing the boundary alone would be worse than the current answer, not
-  better: the model has no object to be identical *to*, so
-  `Integer a = 1000; Integer b = a; a == b` — which is `true` in Java, the two
-  names denoting one box — would become `false` the moment `==` started
-  answering "equal and inside the cache". A faithful answer needs boxing to
-  allocate a heap object with an identity, which is a change to how every
-  integral value crosses into an erased position rather than a change to `==`.
-  `.equals` is exact for all of them.
+  **`Boolean` is deliberately not boxed.** Its cache covers `true` and `false`
+  both, so every autoboxed pair Java can produce is already the same object and
+  `==` on them is always `true` — the box would buy no fidelity while putting a
+  heap handle where the VM tests truth, which is not a numeric surface and so
+  would not unbox.
+
+  What is still unboxed is every position javars cannot type: a value crossing
+  into an **erased** one — a collection element, a `Map` key, an `Object`-typed
+  slot — is stored as the bare primitive. So `List<Integer> l; l.add(128);
+  l.get(0) == l.get(1)` is `true` where Java says `false`, and one kind per
+  family still decides `equals` there: `Integer.valueOf(1).equals(
+  Double.valueOf(1.0))` is `false` in Java (different classes), so a `HashMap`
+  keyed on `1` and on `1.0` holds two entries where javars holds one. The
+  collection key index takes that as given rather than working around it: a
+  value's index bucket is derived so anything `value_eq` calls equal lands in
+  one bucket, and the cases where the correspondence is not provable (a `Float`
+  key, a magnitude past 2^53 where several `long`s round to one `double`) fall
+  back to the linear scan the index replaced. `.equals` between two *typed*
+  wrappers is exact, because both carry their class.
 - **What `instanceof` still cannot decide is what the value model does not
   record.** The type test is exact for every shape javars names (see the
   `instanceof` entry under "Implemented"); three answers are left, and each is a
@@ -1286,16 +1294,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `java.util.HashMap$Values`. The control flow is right and only the class in the
   message is wrong; naming it exactly needs the view to be a shape of its own,
   which is the same change that would make it alias.
-- **A boxed `Character` is a one-character String.** The `char` *type* is a real
-  16-bit integral value (see the "`char` arithmetic" entry under "Implemented"),
-  but javars boxes no primitive, so a `char` entering an erased position — a
-  `List<Character>` element, a `Map<Character, …>` key — is stored as its
-  one-character String instead of as a `Character` object. That is what makes
+- **A `Character` in an *erased* position is a one-character String.** The
+  `char` *type* is a real 16-bit integral value (see the "`char` arithmetic"
+  entry under "Implemented"), and a `Character`-typed slot now holds a real box
+  (see the boxing entry above) — but a `char` entering a position javars cannot
+  type, a `List<Character>` element or a `Map<Character, …>` key, is stored as
+  its one-character String instead. That is what makes
   `System.out.println(list)` print `[p, q]` like Java's. The visible difference
-  is `==` on two boxed values: Java compares `Character` *references* (and
-  caches the ASCII range, so `Character.valueOf('a') == Character.valueOf('a')`
-  is true), javars compares the strings by value — the same String-`==` model
-  above.
+  is `==` between two such values: Java compares `Character` references, javars
+  compares the strings by value — the same String-`==` model above.
 - **`java Foo.java` is `javac Foo.java && java Foo`, not the JDK's source-file
   mode.** The two entry points select a different class to run. JDK 21's
   source-file launcher runs the FIRST top-level class in the file; `java -cp . T`
