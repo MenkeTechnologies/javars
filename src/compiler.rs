@@ -5386,7 +5386,18 @@ impl Compiler {
                 // references — so both arguments cross into a reference position
                 // and autobox there, exactly as `x.equals(y)`'s does.
                 // `Objects.equals(aLong, 1000)` is `false` in Java.
-                let box_args = class == "Objects" && method == "equals" && args.len() == 2;
+                let box_args = (class == "Objects" && method == "equals" && args.len() == 2)
+                    // The collection factories build *elements*, so their
+                    // arguments autobox exactly as `list.add(x)`'s does — which
+                    // is what keeps `List.of(128, 128).get(0) == get(1)` the
+                    // `false` Java answers and `Map.of(1, …, 1.0, …, 1L, …)` at
+                    // three entries. `Arrays.fill` is deliberately not here: its
+                    // second argument is an *array element*, and an `int[]` slot
+                    // holds the primitive.
+                    || matches!(
+                        (class.as_str(), method),
+                        ("List", "of") | ("Set", "of") | ("Map", "of") | ("Arrays", "asList")
+                    );
                 for (i, a) in args.iter().enumerate() {
                     let floats = match &text_slots {
                         Some(slots) => i > 0 && slots.contains(&(i - 1)),

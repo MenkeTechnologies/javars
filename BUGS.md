@@ -1252,10 +1252,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   (`Compiler::list_index_arg`). A `char` element is still javars's
   one-character String — see the `Character` entry below.
 
+  The collection *factories* — `List.of`, `Set.of`, `Map.of`, `Arrays.asList` —
+  box their arguments for the same reason, so `List.of(128, 128).get(0) ==
+  get(1)` is `false` and `Map.of(1, …, 1.0, …, 1L, …)` holds three entries.
+  `Arrays.fill` deliberately does not: its second argument is an *array
+  element*, and an `int[]` slot holds the primitive.
+
   What is left is every position javars cannot type at all: an expression whose
   static type erasure has thrown away converts neither way, so a value that
-  reached a collection from one — a static factory's argument (`List.of(128,
-  128)`), an element copied out of another erased container — is stored as the
+  reached a collection from one — an element copied out of another erased
+  container, a value returned by a method javars cannot type — is stored as the
   bare primitive and compares by value. Mixing the two is safe rather than
   merely tolerable: `value_eq` compares a box against a bare value by unboxing,
   so a lookup finds a key however it got there; it is only *two* boxes that
