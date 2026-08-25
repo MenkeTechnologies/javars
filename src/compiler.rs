@@ -7424,6 +7424,7 @@ fn is_static_class(name: &str) -> bool {
             | "List"
             | "Set"
             | "Map"
+            | "Optional"
             | "Objects"
     )
 }

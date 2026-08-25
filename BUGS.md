@@ -226,6 +226,16 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
+- **`java.util.Optional`.** `of`/`ofNullable`/`empty`, and
+  `isPresent`/`isEmpty`/`get`/`orElse`/`orElseGet`/`orElseThrow`/`map`/`filter`/
+  `ifPresent`/`ifPresentOrElse`/`equals`/`hashCode`/`toString`. It is a *value*
+  for `equals` and a *reference* for `==` — `Optional.of("x").equals(
+  Optional.of("x"))` is `true` while `==` between them is `false` — which falls
+  out of it being a heap object. `of(null)` is a `NullPointerException` and an
+  empty `get()`/`orElseThrow()` is `NoSuchElementException: No value present`,
+  both the JDK's.
+- **An explicit generic method type argument** (`Optional.<String>empty()`)
+  parses and is erased, like every other type-argument group.
 - **`Iterator` over a `List` or a `Set`.** `hasNext`, `next` and `remove`,
   reading the source *live* rather than from a snapshot — which is what makes
   `remove()` write through to the collection and, for a `List`, makes a
@@ -1134,8 +1144,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Objects.equals` (the one `Objects` member, because a `record`'s derived
   `equals` is specified in terms of it), the `String` instance methods, and the
   `java.util` collections are the whole
-  library surface — no `entrySet`/`Deque`/`Queue`/`Optional`, no streams, no
-  I/O. An iterator over a `Set` is not fail-fast, because a `Set` carries no
+  library surface — no `entrySet`/`Deque`/`Queue`, no streams, no I/O. An iterator over a `Set` is not fail-fast, because a `Set` carries no
   modification counter for it to check; Java's raises
   `ConcurrentModificationException` there too. `Math.powExact` and the
   `unsignedMultiplyExact`/`unsignedPowExact` pair are on the same footing: a

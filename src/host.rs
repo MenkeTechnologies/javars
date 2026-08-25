@@ -550,6 +550,13 @@ enum HostObj {
         /// the note in `iterator_method`.
         exp_mods: u64,
     },
+    /// A `java.util.Optional` — present with a value, or empty.
+    ///
+    /// A *value* in Java (`Optional.of("x").equals(Optional.of("x"))` is
+    /// `true`) but still a reference: two `Optional.of("x")` are distinct
+    /// objects, so `==` between them is `false`. Both fall out of the heap
+    /// object — `equals` compares the contents, `==` the handles.
+    Optional(Option<Value>),
     /// A marker: the payload lives in [`BOXES`], not here.
     ///
     /// Both halves — the class and the primitive — are read from surfaces that
@@ -1183,6 +1190,7 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // line above (which does carry `RandomAccess`; a set does not).
         "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
         "Iterator$of" => &["Iterator"],
+        "Optional" => &["Serializable"],
         // `Map.of` reaches `AbstractMap` — unlike `Set.of`, which stops at
         // `AbstractCollection` — and is not `Cloneable`. Measured against the
         // JDK rather than copied from the line above.
@@ -3261,6 +3269,7 @@ fn value_class(v: &Value) -> Option<String> {
                     // Not a name a program can write, like the other internal
                     // shapes — it exists so an iterator carries supertypes.
                     HostObj::Iterator { .. } => "Iterator$of".to_string(),
+                    HostObj::Optional(_) => "Optional".to_string(),
                     HostObj::Array(_) => "[]".to_string(),
                     // `Arrays.asList` and `List.of` are `List`s that are not
                     // `ArrayList`s, and a `subList` view is a third answer
@@ -3619,6 +3628,95 @@ fn list_mods(id: usize) -> Option<u64> {
     HEAP.with(|h| match h.borrow().get(id) {
         Some(HostObj::List { mods, .. }) => Some(*mods),
         _ => None,
+    })
+}
+
+/// Allocate a `java.util.Optional`.
+fn optional(v: Option<Value>) -> Value {
+    Value::Obj(heap_alloc(HostObj::Optional(v)))
+}
+
+/// The contents of an `Optional` handle: `Some(Some(v))` when present,
+/// `Some(None)` when empty, `None` when the value is not an `Optional` at all.
+fn as_optional(v: &Value) -> Option<Option<Value>> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Optional(inner)) => Some(inner.clone()),
+        _ => None,
+    })
+}
+
+/// `java.util.Optional`'s instance methods.
+///
+/// `None` for any other receiver, which leaves the call to the dispatch that
+/// follows. The contents are read out before anything runs, because `map`,
+/// `filter` and `ifPresent` invoke a user closure that can allocate.
+fn optional_method(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    let inner = as_optional(recv)?;
+    let empty = || Fault::java("NoSuchElementException", "No value present");
+    Some(match (method, args.len()) {
+        ("isPresent", 0) => Ok(Value::bool(inner.is_some())),
+        ("isEmpty", 0) => Ok(Value::bool(inner.is_none())),
+        ("get", 0) | ("orElseThrow", 0) => inner.ok_or_else(empty),
+        ("orElse", 1) => Ok(inner.unwrap_or_else(|| args[0].clone())),
+        ("orElseGet", 1) => Ok(match inner {
+            Some(v) => v,
+            None => invoke_closure(vm, &args[0], &[]),
+        }),
+        ("map", 1) => Ok(match inner {
+            // `map` answers an empty `Optional` when the mapper answers `null`,
+            // which is what distinguishes it from a plain transformation.
+            Some(v) => {
+                let mapped = invoke_closure(vm, &args[0], &[v]);
+                optional((!matches!(mapped, Value::Undef)).then_some(mapped))
+            }
+            None => optional(None),
+        }),
+        ("filter", 1) => Ok(match inner {
+            Some(v) => {
+                let keep = matches!(
+                    invoke_closure(vm, &args[0], std::slice::from_ref(&v)),
+                    Value::Bool(true)
+                );
+                optional(keep.then_some(v))
+            }
+            None => optional(None),
+        }),
+        ("ifPresent", 1) => {
+            if let Some(v) = inner {
+                invoke_closure(vm, &args[0], &[v]);
+            }
+            Ok(Value::Undef)
+        }
+        ("ifPresentOrElse", 2) => {
+            match inner {
+                Some(v) => invoke_closure(vm, &args[0], &[v]),
+                None => invoke_closure(vm, &args[1], &[]),
+            };
+            Ok(Value::Undef)
+        }
+        // A value, so `equals` compares contents where `==` compares handles.
+        ("equals", 1) => Ok(Value::bool(match (inner, as_optional(&args[0])) {
+            (Some(x), Some(Some(y))) => value_eq(&x, &y),
+            (None, Some(None)) => true,
+            _ => false,
+        })),
+        ("hashCode", 0) => Ok(Value::Int(match inner {
+            Some(v) => element_hash(&v).into(),
+            None => 0,
+        })),
+        ("toString", 0) => Ok(Value::str(java_str(recv))),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Optional method `{method}` with {} argument(s)",
+            args.len()
+        ))),
     })
 }
 
@@ -4318,6 +4416,15 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             vm.stack.push(a);
         }
         return b_closure_call(vm, n as u8 + 1);
+    }
+    // An `Optional` receiver. Its `map`/`filter`/`ifPresent`/`orElseGet` run a
+    // user closure, so it takes the VM and sits with the other handle shapes
+    // rather than in the borrow-free tables below.
+    if let Some(r) = optional_method(vm, &recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
     }
     // An `Iterator` receiver. It is not a collection, so without this it fell
     // through to the `String` table and `it.hasNext()` was
@@ -5108,6 +5215,19 @@ fn collection_static(
                 index: KeyIndex::default(),
             })))
         }
+        // `java.util.Optional`'s factories. `of` rejects `null` — that is the
+        // whole distinction from `ofNullable`, and accepting it would make an
+        // `Optional` that claims to be present and is not.
+        ("Optional", "of") if args.len() == 1 => {
+            if matches!(args[0], Value::Undef) {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            Ok(optional(Some(args[0].clone())))
+        }
+        ("Optional", "ofNullable") if args.len() == 1 => Ok(optional(
+            (!matches!(args[0], Value::Undef)).then(|| args[0].clone()),
+        )),
+        ("Optional", "empty") if args.is_empty() => Ok(optional(None)),
         // `Map.of(k1, v1, k2, v2, …)` — an immutable map, rejecting a repeated
         // key rather than letting the later pair win, and rejecting a `null`
         // key outright. Both are what `java.util.ImmutableCollections` does, and
@@ -7694,6 +7814,11 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
+            // `Optional[x]` / `Optional.empty` — the JDK's own rendering.
+            Some(HostObj::Optional(inner)) => match inner {
+                Some(v) => format!("Optional[{}]", java_str(v)),
+                None => "Optional.empty".to_string(),
+            },
             None => format!("(obj:{id})"),
         }
     })

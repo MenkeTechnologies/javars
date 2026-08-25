@@ -2738,6 +2738,12 @@ impl Parser {
             if self.is(&Tok::Dot) {
                 let line = self.line();
                 self.advance();
+                // An *explicit* generic method type argument
+                // (`Optional.<String>empty()`, `Collections.<Integer>emptyList()`)
+                // sits between the dot and the method name. Java erases it, and
+                // it is the only thing that can appear there, so it is skipped
+                // like every other type-argument group.
+                self.skip_generics();
                 let member = self.ident()?;
                 if self.is(&Tok::LParen) {
                     let args = self.call_args()?;
