@@ -1222,6 +1222,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   heap handle where the VM tests truth, which is not a numeric surface and so
   would not unbox.
 
+  A primitive crossing into **any** reference position boxes, not just a
+  wrapper-typed one: `Object o = 1000L` and `(Object) 1000L` produce a `Long`,
+  a generic slot (`Box<Long>`'s `E`) produces one, and an `Object[]` element
+  produces one — so `((Object) aLong).getClass().getName()` is
+  `java.lang.Long` rather than the `java.lang.Integer` a bare `Value::Int`
+  reads as. The argument of `x.equals(y)` and both arguments of
+  `Objects.equals` box for the same reason: `equals` compares references, so
+  `Integer.valueOf(1000).equals(1000L)` is `false`, which needs the argument to
+  carry the `Long` class it autoboxes into.
+
   A primitive entering a **collection** element or key position is boxed too,
   which is what keeps a `Map` keyed on `1`, `1.0` and `1L` at the three entries
   Java's holds rather than the one a single numeric kind collapses them to, and
@@ -1298,11 +1308,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   which is the same change that would make it alias.
 - **A `Character` in a collection is a one-character String.** The `char`
   *type* is a real 16-bit integral value (see the "`char` arithmetic" entry
-  under "Implemented"), and a `Character`-typed slot holds a real box (see the
-  boxing entry above) — but a `char` entering a collection element or key
-  position is stored as its one-character String instead, deliberately: that is
-  what makes the rendering below work, and it is the one primitive whose boxed
-  form is excluded from the collection boxing above. That is what makes
+  under "Implemented"), and a `char` crossing into a statically-typed reference
+  slot — a `Character` variable, an `Object` one, a cast — now boxes as a real
+  `Character` (see the boxing entry above), so `((Object) 'x').getClass()` is
+  `java.lang.Character`. A `char` entering a **collection** element or key
+  position is still stored as its one-character String, deliberately: that is
+  what makes the rendering below work, and it is the one position where the two
+  models still differ. That is what makes
   `System.out.println(list)` print `[p, q]` like Java's. The visible difference
   is `==` between two such values: Java compares `Character` references, javars
   compares the strings by value — the same String-`==` model above.

@@ -2799,15 +2799,15 @@ impl Compiler {
         })
     }
 
-    /// The wrapper `e` is boxed into when it enters a collection element or key
-    /// position, or `None` when it enters unchanged.
+    /// The wrapper class `e` autoboxes into when it crosses into a reference
+    /// position, or `None` when it crosses unchanged.
     ///
-    /// `char` and `boolean` are absent on purpose. A `char` in an erased
-    /// position is javars's one-character String (see BUGS.md), which is what
-    /// makes `System.out.println(aCharacterList)` print `[p, q]`; `boolean` is
-    /// not a boxed class here at all. An expression javars cannot type is left
-    /// alone, so it compares by value exactly as it did before.
-    fn collection_box_code(&self, e: &Expr) -> Option<i64> {
+    /// `char` and `boolean` are absent on purpose. A `char` in a collection is
+    /// javars's one-character String (see BUGS.md), which is what makes
+    /// `System.out.println(aCharacterList)` print `[p, q]`; `boolean` is not a
+    /// boxed class here at all. An expression javars cannot type is left alone,
+    /// so it compares by value exactly as it did before.
+    fn autobox_code(&self, e: &Expr) -> Option<i64> {
         let ty = self.expr_java_type(e)?;
         let wrapper = match ty.as_str() {
             "int" => "Integer",
@@ -2857,16 +2857,33 @@ impl Compiler {
     /// — into a fresh object, and `a == b` would answer `false` where Java says
     /// `true`.
     fn emit_boxing_conversion(&mut self, target: &str, e: &Expr) {
-        let Some(code) = crate::host::box_class_code(target) else {
-            return;
+        // A wrapper-typed target names the class outright. Every *other*
+        // reference target — `Object`, `Number`, `Comparable`, an erased type
+        // variable — takes the class Java autoboxes the source primitive into
+        // (JLS 5.2: a boxing conversion followed by a widening reference one),
+        // which is what makes `((Object) aLong).getClass()` answer
+        // `java.lang.Long` rather than the `Integer` one `Value::Int` reads as.
+        let code = match crate::host::box_class_code(target) {
+            Some(code) => {
+                if self
+                    .expr_java_type(e)
+                    .is_some_and(|src| is_reference_type(&src))
+                {
+                    return;
+                }
+                code
+            }
+            // `char` and `boolean` are absent from `autobox_code` for the
+            // reasons it gives, and a `char` bound to a reference slot has
+            // already been converted to its one-character String above.
+            None if is_reference_type(target) => match self.autobox_code(e) {
+                Some(code) => code,
+                None => return,
+            },
+            None => return,
         };
-        if self
-            .expr_java_type(e)
-            .is_some_and(|src| !is_reference_type(&src))
-        {
-            self.b.emit(Op::LoadInt(code), 0);
-            self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
-        }
+        self.b.emit(Op::LoadInt(code), 0);
+        self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
     }
 
     /// The reverse of [`Compiler::emit_boxing_conversion`]: a wrapper flowing
@@ -3324,14 +3341,26 @@ impl Compiler {
         if !matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             // A `char` bound to a reference-typed slot (`Object o = 'x';`, an
             // `Object` parameter, an `Object`-returning method) is *boxed* in
-            // Java, so it renders as a character from then on — javars models
-            // the box as the one-character String. `Character` is excluded
-            // because javars keeps it as the primitive, which is what makes
-            // `Character c = 'x'; c + 1` the 121 Java's unboxing gives.
-            if target.is_some_and(|t| is_reference_type(t) && t != "Character")
-                && self.is_char_expr(e)
-            {
-                return self.emit_char_string(e);
+            // Java. It boxes here too — as a real `Character`, which is what
+            // makes `((Object) 'x').getClass()` answer `java.lang.Character` and
+            // `o instanceof Character` `true`. A `Character` box renders as its
+            // character, so it prints exactly as the one-character String this
+            // used to produce; a *collection* element still takes that String
+            // (see the note at `JCOLL_DISPATCH`), which is the one place the two
+            // models still differ.
+            // The *primitive* `char` only: a `Character`-typed expression is
+            // already a reference, and boxing it again would make
+            // `Character c = 'z'; Object o = c; o == c` `false` where Java —
+            // which performs no conversion on that assignment — says `true`.
+            if let Some(t) = target {
+                if is_reference_type(t) && self.expr_java_type(e).as_deref() == Some("char") {
+                    self.expr(e)?;
+                    let code = crate::host::box_class_code("Character")
+                        .expect("`Character` is a boxed class");
+                    self.b.emit(Op::LoadInt(code), 0);
+                    self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
+                    return Ok(());
+                }
             }
             // `double[] a = {1, 2};` — the untyped literal takes its element
             // type from the declaration, and every element is assigned into a
@@ -5353,6 +5382,11 @@ impl Compiler {
                         _ => Some(Vec::new()),
                     })
                     .flatten();
+                // `Objects.equals(a, b)` runs `a.equals(b)`, which compares
+                // references — so both arguments cross into a reference position
+                // and autobox there, exactly as `x.equals(y)`'s does.
+                // `Objects.equals(aLong, 1000)` is `false` in Java.
+                let box_args = class == "Objects" && method == "equals" && args.len() == 2;
                 for (i, a) in args.iter().enumerate() {
                     let floats = match &text_slots {
                         Some(slots) => i > 0 && slots.contains(&(i - 1)),
@@ -5362,6 +5396,12 @@ impl Compiler {
                         self.emit_converted_arg(a, floats)?;
                     } else {
                         self.expr(a)?;
+                    }
+                    if box_args {
+                        if let Some(code) = self.autobox_code(a) {
+                            self.b.emit(Op::LoadInt(code), line);
+                            self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                        }
                     }
                 }
                 // `java.util.Formatter` rejects a conversion whose argument is
@@ -5518,7 +5558,7 @@ impl Compiler {
                     continue;
                 }
                 self.emit_char_string(a)?;
-                if let Some(code) = self.collection_box_code(a) {
+                if let Some(code) = self.autobox_code(a) {
                     self.b.emit(Op::LoadInt(code), line);
                     self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
                 }
@@ -5637,14 +5677,17 @@ impl Compiler {
                 c.emit_raising_builtin(crate::host::JSTR_DISPATCH, args.len() as u8 + 2, line);
             }
         };
+        // `x.equals(y)` compares *references*, so `y` crosses into a reference
+        // position and is autoboxed there. Java's answer depends on it:
+        // `Integer.valueOf(1000).equals(1000L)` is `false` because the argument
+        // boxes to a `Long`, and a bare `Value::Int` has no class to disagree
+        // with. Only `equals` gets this — every other erased call reads its
+        // argument as a number, where a box would be an allocation for nothing.
+        let box_arg = method == "equals" && args.len() == 1;
         if targets.is_empty() {
             self.expr(recv)?;
             for a in args {
-                if raw_args {
-                    self.expr(a)?;
-                } else {
-                    self.emit_char_string(a)?;
-                }
+                self.emit_erased_arg(a, raw_args, box_arg)?;
             }
             fallback(self);
             return Ok(());
@@ -5657,11 +5700,7 @@ impl Compiler {
             .iter()
             .map(|a| {
                 let t = self.temp();
-                if raw_args {
-                    self.expr(a)?;
-                } else {
-                    self.emit_char_string(a)?;
-                }
+                self.emit_erased_arg(a, raw_args, box_arg)?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -5699,6 +5738,37 @@ impl Compiler {
         let end = self.b.current_pos();
         for j in end_jumps {
             self.b.patch_jump(j, end);
+        }
+        Ok(())
+    }
+
+    /// Lower one argument of an erased instance call.
+    ///
+    /// `raw` keeps a `char` as its code point (only `compareTo` on a `char`
+    /// receiver wants that); otherwise a `char` becomes the one-character String
+    /// the rest of the frontend uses. `boxed` additionally autoboxes a primitive
+    /// — see the note at [`Compiler::emit_erased_call`]'s `box_arg`.
+    fn emit_erased_arg(&mut self, a: &Expr, raw: bool, boxed: bool) -> Result<(), String> {
+        if raw {
+            return self.expr(a);
+        }
+        // A `char` argument to `equals` boxes as a `Character` rather than
+        // becoming the one-character String: `((Object) 'z').equals('z')` is
+        // `true` in Java, and a String argument would compare against the box's
+        // code point and answer `false`.
+        if boxed && self.expr_java_type(a).as_deref() == Some("char") {
+            self.expr(a)?;
+            let code = crate::host::box_class_code("Character").expect("`Character` is boxed");
+            self.b.emit(Op::LoadInt(code), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
+            return Ok(());
+        }
+        self.emit_char_string(a)?;
+        if boxed {
+            if let Some(code) = self.autobox_code(a) {
+                self.b.emit(Op::LoadInt(code), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
+            }
         }
         Ok(())
     }
@@ -6626,12 +6696,16 @@ impl Compiler {
             "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
         );
         if !primitive {
-            // `(Integer) 5` is a *boxing* conversion, not a checked downcast:
-            // the operand is a primitive, so there is no class to verify and the
-            // cast's whole effect is to produce the wrapper. `(Integer) someObj`
-            // still checks, because there the operand is already a reference.
-            if let Some(code) = crate::host::box_class_code(ty) {
-                if src.as_deref().is_some_and(|t| !is_reference_type(t)) {
+            // `(Integer) 5` and `(Object) 5L` are *boxing* conversions, not
+            // checked downcasts: the operand is a primitive, so there is no
+            // class to verify and the cast's whole effect is to produce the
+            // wrapper — the one the target names, or the one the operand
+            // autoboxes into when the target is `Object` or another supertype.
+            // `(Integer) someObj` still checks, because there the operand is
+            // already a reference.
+            if src.as_deref().is_some_and(|t| !is_reference_type(t)) {
+                let code = crate::host::box_class_code(ty).or_else(|| self.autobox_code(e));
+                if let Some(code) = code {
                     self.expr(e)?;
                     self.b.emit(Op::LoadInt(code), line);
                     self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
