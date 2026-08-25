@@ -733,8 +733,10 @@ thread_local! {
     static BOX_CACHE: RefCell<HashMap<(usize, i64), u32>> = RefCell::new(HashMap::new());
     /// Every live box: handle -> (wrapper class, the primitive it wraps).
     ///
-    /// Separate from `HEAP` on purpose — see [`HostObj::Boxed`].
-    static BOXES: RefCell<HashMap<u32, (&'static str, Value)>> = RefCell::new(HashMap::new());
+    /// Separate from `HEAP` on purpose — see [`HostObj::Boxed`]. Indexed by the
+    /// handle rather than hashed on it, because unboxing is on the path of every
+    /// arithmetic operation a wrapper takes part in and every erased read.
+    static BOXES: RefCell<Vec<Option<(&'static str, Value)>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Box `v` as the wrapper class at index `code` in [`BOX_CLASSES`], returning
@@ -772,7 +774,11 @@ fn box_value(code: usize, v: Value) -> Value {
 /// Give a box a heap handle of its own and record its payload in [`BOXES`].
 fn alloc_box(class: &'static str, v: Value) -> u32 {
     let id = heap_alloc(HostObj::Boxed);
-    BOXES.with(|b| b.borrow_mut().insert(id, (class, v)));
+    BOXES.with(|b| {
+        let mut b = b.borrow_mut();
+        b.resize(id as usize + 1, None);
+        b[id as usize] = Some((class, v));
+    });
     id
 }
 
@@ -786,7 +792,12 @@ fn unboxed(v: &Value) -> Option<Value> {
     let Value::Obj(id) = v else {
         return None;
     };
-    BOXES.with(|b| b.borrow().get(id).map(|(_, v)| v.clone()))
+    BOXES.with(|b| {
+        b.borrow()
+            .get(*id as usize)?
+            .as_ref()
+            .map(|(_, v)| v.clone())
+    })
 }
 
 /// The wrapper class of a boxed value, or `None` for anything else.
@@ -794,7 +805,7 @@ fn box_class(v: &Value) -> Option<&'static str> {
     let Value::Obj(id) = v else {
         return None;
     };
-    BOXES.with(|b| b.borrow().get(id).map(|(c, _)| *c))
+    BOXES.with(|b| b.borrow().get(*id as usize)?.as_ref().map(|(c, _)| *c))
 }
 
 /// `v` with any box removed — the identity function on everything else.

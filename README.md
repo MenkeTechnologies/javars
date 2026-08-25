@@ -66,7 +66,9 @@ pure frontend over the shared engine. Highlights:
   `Float` and `Double` are heap objects with the class and the JLS cache Java
   gives them, so `Integer a = 127, b = 127; a == b` is `true` and the same pair
   at 128 is `false`, while `Integer a = 1000; Integer b = a; a == b` stays
-  `true`. Every arithmetic, rendering and hashing surface unboxes them, so the
+  `true`. A primitive entering a collection element or key position is boxed
+  too, so a `Map` keyed on `1`, `1.0` and `1L` holds the three entries Java's
+  holds. Every arithmetic, rendering and hashing surface unboxes them, so the
   box is visible only where Java makes it visible.
 - **Verified against OpenJDK** — the example programs and the test corpus are
   diffed byte-for-byte against a reference `java`; the tests freeze that output

@@ -1227,19 +1227,26 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   heap handle where the VM tests truth, which is not a numeric surface and so
   would not unbox.
 
-  What is still unboxed is every position javars cannot type: a value crossing
-  into an **erased** one — a collection element, a `Map` key, an `Object`-typed
-  slot — is stored as the bare primitive. So `List<Integer> l; l.add(128);
-  l.get(0) == l.get(1)` is `true` where Java says `false`, and one kind per
-  family still decides `equals` there: `Integer.valueOf(1).equals(
-  Double.valueOf(1.0))` is `false` in Java (different classes), so a `HashMap`
-  keyed on `1` and on `1.0` holds two entries where javars holds one. The
-  collection key index takes that as given rather than working around it: a
-  value's index bucket is derived so anything `value_eq` calls equal lands in
-  one bucket, and the cases where the correspondence is not provable (a `Float`
-  key, a magnitude past 2^53 where several `long`s round to one `double`) fall
-  back to the linear scan the index replaced. `.equals` between two *typed*
-  wrappers is exact, because both carry their class.
+  A primitive entering a **collection** element or key position is boxed too,
+  which is what keeps a `Map` keyed on `1`, `1.0` and `1L` at the three entries
+  Java's holds rather than the one a single numeric kind collapses them to, and
+  makes `List<Integer> l; l.add(128); l.add(128); l.get(0) == l.get(1)` the
+  `false` Java answers. An *index* argument is not an element and stays the
+  `int` it is; the list methods that take one are a closed set
+  (`Compiler::list_index_arg`). A `char` element is still javars's
+  one-character String — see the `Character` entry below.
+
+  What is left is every position javars cannot type at all: an expression whose
+  static type erasure has thrown away converts neither way, so a value that
+  reached a collection from one — a static factory's argument (`List.of(128,
+  128)`), an element copied out of another erased container — is stored as the
+  bare primitive and compares by value. Mixing the two is safe rather than
+  merely tolerable: `value_eq` compares a box against a bare value by unboxing,
+  so a lookup finds a key however it got there; it is only *two* boxes that
+  compare by class. The collection key index is derived so anything `value_eq`
+  calls equal lands in one bucket, and the cases where the correspondence is not
+  provable (a `Float` key, a magnitude past 2^53 where several `long`s round to
+  one `double`) fall back to the linear scan the index replaced.
 - **What `instanceof` still cannot decide is what the value model does not
   record.** The type test is exact for every shape javars names (see the
   `instanceof` entry under "Implemented"); three answers are left, and each is a
@@ -1294,12 +1301,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `java.util.HashMap$Values`. The control flow is right and only the class in the
   message is wrong; naming it exactly needs the view to be a shape of its own,
   which is the same change that would make it alias.
-- **A `Character` in an *erased* position is a one-character String.** The
-  `char` *type* is a real 16-bit integral value (see the "`char` arithmetic"
-  entry under "Implemented"), and a `Character`-typed slot now holds a real box
-  (see the boxing entry above) — but a `char` entering a position javars cannot
-  type, a `List<Character>` element or a `Map<Character, …>` key, is stored as
-  its one-character String instead. That is what makes
+- **A `Character` in a collection is a one-character String.** The `char`
+  *type* is a real 16-bit integral value (see the "`char` arithmetic" entry
+  under "Implemented"), and a `Character`-typed slot holds a real box (see the
+  boxing entry above) — but a `char` entering a collection element or key
+  position is stored as its one-character String instead, deliberately: that is
+  what makes the rendering below work, and it is the one primitive whose boxed
+  form is excluded from the collection boxing above. That is what makes
   `System.out.println(list)` print `[p, q]` like Java's. The visible difference
   is `==` between two such values: Java compares `Character` references, javars
   compares the strings by value — the same String-`==` model above.
