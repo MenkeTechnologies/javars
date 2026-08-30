@@ -1278,8 +1278,22 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   Java and is the ordinal difference, so it is synthesized onto every enum
   alongside `name`/`ordinal`/`toString`/`equals`, which is also what makes
   `Collections.sort` of an enum list work.
-- **Sealed types, inner (non-`static`) classes,** and **anonymous classes** other
-  than the enum-constant body form.
+- **Sealed types** and **inner (non-`static`) classes.**
+- **An anonymous class past one method.** The single-method form of an
+  INTERFACE works — `new Greet() { public String name() { return "anon"; } }`
+  runs, and its inherited `default` methods dispatch to that override — which is
+  the shape a listener or a comparator is written in. Everything past it is
+  refused loudly, each with its own message:
+
+  | shape | javars |
+  | --- | --- |
+  | two or more methods | `an anonymous G is modeled only when its body declares exactly one` |
+  | any field beside the method | `an anonymous G may declare only methods` |
+  | extending an abstract CLASS | `no concrete implementation of a for A` |
+
+  This entry previously said anonymous classes were unimplemented outside the
+  enum-constant body form, which understated it: the one-method interface form
+  has been working and is now pinned in the frozen corpus.
 - **Assignment as an *expression*.** `n = 5` is a statement here, not a value, so
   the idioms that read the assigned value back — `if (f && (n = 5) > 0)`,
   `while ((c = next()) != -1)`, `a = b = 0` — stop at
