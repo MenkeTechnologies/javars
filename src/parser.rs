@@ -2755,6 +2755,17 @@ impl Parser {
                 // sits between the dot and the method name. Java erases it, and
                 // it is the only thing that can appear there, so it is skipped
                 // like every other type-argument group.
+                // `T.class` — the class literal. `class` is a keyword, so it
+                // never reaches `ident()`; without this arm the selector
+                // reported "expected an identifier but found Class".
+                if self.is(&Tok::Class) {
+                    self.advance();
+                    let name = class_lit_name(&e).ok_or_else(|| {
+                        format!("javars: `.class` needs a type name on line {line}")
+                    })?;
+                    e = Expr::ClassLit(name);
+                    continue;
+                }
                 self.skip_generics();
                 let member = self.ident()?;
                 if self.is(&Tok::LParen) {
@@ -3237,4 +3248,18 @@ fn binop(t: &Tok) -> Option<(BinOp, u8)> {
         Tok::Percent => (BinOp::Mod, 10),
         _ => return None,
     })
+}
+
+/// The type name a `.class` literal was written on, rebuilt from the expression
+/// the selector loop had already parsed.
+///
+/// `T.class` parses `T` as an identifier and `java.util.List.class` as a chain
+/// of field accesses, because nothing before the `class` token says a type is
+/// coming — so the name is recovered here rather than predicted.
+fn class_lit_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(n) => Some(n.clone()),
+        Expr::Field { recv, name } => Some(format!("{}.{}", class_lit_name(recv)?, name)),
+        _ => None,
+    }
 }

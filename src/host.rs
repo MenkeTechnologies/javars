@@ -9378,6 +9378,22 @@ const CHECKABLE_CAST_TARGETS: &[&str] = &[
 /// module-and-loader clause that follows it, so a `java.util` type named as
 /// though it were unpackaged would produce a message that is wrong in two
 /// places at once.
+/// The binary name for a class named in SOURCE, with no instance to read it
+/// off — what a `T.class` literal evaluates to.
+///
+/// Shares `jdk_name` with the runtime path, so a literal and
+/// `x.getClass().getName()` on the same type cannot disagree. A primitive is
+/// its own keyword: `int.class.getName()` is `int`, not `java.lang.Integer`.
+pub fn qualify_class_name(n: &str) -> String {
+    if matches!(
+        n,
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean" | "void"
+    ) {
+        return n.to_string();
+    }
+    crate::prelude::qualified_throwable(n).unwrap_or_else(|| jdk_name(n))
+}
+
 fn jdk_name(n: &str) -> String {
     match n {
         "String"

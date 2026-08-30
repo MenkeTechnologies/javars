@@ -409,6 +409,13 @@ pub enum AssignOp {
 /// A Java expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
+    /// `T.class` / `int.class` — a class literal.
+    ///
+    /// Held as the type NAME as written. javars has no `Class` object: a class
+    /// is its binary name, over which `getName`/`getSimpleName` answer, which is
+    /// what `x.getClass()` already evaluates to. So the literal resolves to the
+    /// same string, and the two spellings agree by construction.
+    ClassLit(String),
     Int(i64),
     /// An `L`-suffixed integer literal. Runs on the same 64-bit value as
     /// [`Expr::Int`]; the distinct node exists only so the static type is

@@ -1489,6 +1489,22 @@ impl Compiler {
     /// `String`, a class/interface name, an array type, `null`), or `None` when
     /// it cannot be determined statically. Drives overload resolution by argument
     /// type; an unknown type falls back to arity-only matching at the call site.
+    /// The binary name a `T.class` literal evaluates to.
+    ///
+    /// A class is its binary name here, so this has to agree with what
+    /// `x.getClass()` produces for an instance of the same type — a DECLARED
+    /// class answers from the nesting-aware `binary` the compiler already keeps
+    /// (`T$A` for a nested one), and everything else is left as written for the
+    /// host to qualify the way it qualifies a runtime class name. A primitive
+    /// (`int.class`) is its own keyword and stays as it is.
+    fn class_literal_name(&self, name: &str) -> String {
+        // A qualified spelling (`java.util.List.class`) is already the name.
+        if let Some(c) = self.classes.get(name) {
+            return c.binary.clone();
+        }
+        crate::host::qualify_class_name(name)
+    }
+
     fn expr_java_type(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(_) => Some("int".to_string()),
@@ -3078,6 +3094,9 @@ impl Compiler {
     /// Drives the truncating-vs-floating choice for `/`.
     fn expr_type(&self, e: &Expr) -> NumType {
         match e {
+            // A class literal is a reference value, so it has no numeric
+            // category — the same answer a String literal gets.
+            Expr::ClassLit(_) => NumType::Other,
             // A pattern label is a `switch` label, never a value; it has no
             // numeric category because it never reaches an operator.
             Expr::TypePattern { .. } => NumType::Other,
@@ -5382,6 +5401,14 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
+            // `T.class` — a class IS its binary name here, which is what
+            // `x.getClass()` already evaluates to, so the literal resolves to
+            // the same string at COMPILE time: the name is written in the
+            // source and needs no value to read it off.
+            Expr::ClassLit(name) => {
+                let c = self.string_literal(&self.class_literal_name(name));
+                self.b.emit(Op::LoadConst(c), 0);
+            }
             // A pattern label carries no subject of its own — the `switch`
             // supplies its discriminant — so it is lowered by
             // [`Compiler::emit_case_test`] and never reaches here.
@@ -7270,6 +7297,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
 
 fn expr_has_ffi(e: &Expr) -> bool {
     match e {
+        Expr::ClassLit(_) => false,
         Expr::TypePattern { .. } => false,
         Expr::Call { name, args, .. } => name == RUST_COMPILE || args.iter().any(expr_has_ffi),
         Expr::Unary { rhs, .. } => expr_has_ffi(rhs),

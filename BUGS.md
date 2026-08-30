@@ -1198,10 +1198,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `l.sort(null)` — because the host's natural order knows numbers and strings
   and answered "equal" for everything else, so a `List` of a user `Comparable`
   came back in insertion order.
-- **Class literals** (`C.class`, `int.class`). `x.getClass()` works — it
-  evaluates to the runtime class name, over which `getName`/`getSimpleName`
-  answer — but there is no way to name a class without an instance, so
-  `synchronized (C.class)` and `C.class.getName()` are parse errors.
+- ~~**Class literals** (`C.class`, `int.class`)~~ — implemented. A class is its
+  binary name here, which is what `x.getClass()` already evaluates to, so the
+  literal resolves to the same string at COMPILE time: the type is named in the
+  source, and nothing has to be evaluated to read it off. A declared class
+  answers from the nesting-aware name the compiler already keeps, so `A.class`
+  inside `T` is `T$A`; a JDK name is qualified through the same `jdk_name` the
+  runtime path uses, so a literal and `getClass().getName()` on one type cannot
+  disagree; and a primitive is its own keyword (`int.class.getName()` is `int`).
+  `synchronized (C.class)` follows from it. What is still missing is everything
+  a real `Class` object does BEYOND its name — no `isInstance`, `getSuperclass`,
+  `getDeclaredMethods` or reflection of any kind, because there is no object to
+  carry them.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
   `Objects.equals` (the one `Objects` member, because a `record`'s derived
