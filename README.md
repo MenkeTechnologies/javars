@@ -536,7 +536,7 @@ Next waves, in priority order:
    prerequisite. See [`BUGS.md`](BUGS.md) for which callback shapes can re-enter
    and which cannot.
 2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
-   class literals (`C.class`), `Iterator`/`entrySet`, and wider stdlib coverage
+   `Iterator`/`entrySet`, and wider stdlib coverage
    (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived
    `hashCode`).
 3. **Lazy class initialization** — javars runs every class's `static`
