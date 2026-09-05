@@ -4536,6 +4536,30 @@ fn invoke_closure(vm: &mut VM, clo: &Value, args: &[Value]) -> Value {
     b_closure_call(vm, args.len() as u8 + 1)
 }
 
+/// The `null` an immutable collection refuses to be *asked about*.
+///
+/// `ImmutableCollections` rejects a `null` query as well as a `null` element:
+/// `List.of(1, 2).contains(null)` throws rather than answering `false`, and so
+/// do `indexOf`/`lastIndexOf`, `Set.of(…).contains`, and `Map.of(…)`'s
+/// `get`/`getOrDefault`/`containsKey`/`containsValue`. javars answered
+/// `false`/`null` for all of them, which is the worse kind of divergence: a
+/// program that reaches the query at all takes a branch here that it cannot
+/// take on a JVM.
+///
+/// Only the *message* still differs, and only for some receiver sizes. Where the
+/// JDK reaches the query through `Objects.requireNonNull` — every `List.of`, and
+/// the `SetN`/`MapN` shapes — its message is `null` and matches this one exactly.
+/// Where it instead reaches an `o.equals(…)`/`pk.hashCode()` on the null itself
+/// (`Set12`, `Map1`, `MapN.get`), the JDK's helpful NPE names the internal frame
+/// variable — `Cannot invoke "Object.equals(Object)" because "o" is null` — which
+/// is the helpful-NPE text BUGS.md already records javars cannot reproduce.
+fn reject_null_probe(fixed: Fixity, v: &Value) -> Result<(), Fault> {
+    match fixed == Fixity::Immutable && matches!(v, Value::Undef) {
+        true => Err(Fault::java("NullPointerException", String::new())),
+        false => Ok(()),
+    }
+}
+
 /// `java.util.List` methods.
 fn list_method(
     items: &mut Vec<Value>,
@@ -4555,15 +4579,49 @@ fn list_method(
         Fixity::Immutable => Err(Fault::java("UnsupportedOperationException", String::new())),
         _ => Ok(()),
     };
+    // An out-of-range index does not name one exception: the JDK's three list
+    // shapes reach the bounds check through three different code paths, and each
+    // reports in its own words. javars modelled all three as the `ArrayList`
+    // one, so a program that caught `ArrayIndexOutOfBoundsException` around a
+    // `List.of(1, 2, 3).get(5)` did not catch here what it catches there.
+    // Measured on openjdk 21.0.12:
+    //
+    //   new ArrayList<>(…).get(5)  IndexOutOfBoundsException       Index 5 out of bounds for length 2
+    //   Arrays.asList(…).get(5)    ArrayIndexOutOfBoundsException  Index 5 out of bounds for length 2
+    //   List.of(1, 2).get(5)       IndexOutOfBoundsException       Index: 5 Size: 2
+    //   List.of(1, 2, 3).get(5)    ArrayIndexOutOfBoundsException  Index 5 out of bounds for length 3
+    //
+    // The split inside `List.of` is the same one that already decides its class
+    // name (`ImmutableCollections$List12` at one or two elements, `$ListN`
+    // otherwise, zero included): `List12` holds its elements in two fields and
+    // raises `outOfBounds` itself, while `ListN` and `Arrays$ArrayList` index a
+    // backing array and let the array's own check fire.
     let bounds = |i: i64, len: usize| -> Result<usize, Fault> {
         if i < 0 || i as usize >= len {
-            return Err(Fault::java(
-                "IndexOutOfBoundsException",
-                format!("Index {i} out of bounds for length {len}"),
-            ));
+            let (class, msg) = match fixed {
+                Fixity::Immutable if (1..=2).contains(&len) => (
+                    "IndexOutOfBoundsException",
+                    format!("Index: {i} Size: {len}"),
+                ),
+                Fixity::Immutable | Fixity::FixedSize => (
+                    "ArrayIndexOutOfBoundsException",
+                    format!("Index {i} out of bounds for length {len}"),
+                ),
+                Fixity::Mutable => (
+                    "IndexOutOfBoundsException",
+                    format!("Index {i} out of bounds for length {len}"),
+                ),
+            };
+            return Err(Fault::java(class, msg));
         }
         Ok(i as usize)
     };
+    if matches!(
+        (method, args.len()),
+        ("contains", 1) | ("indexOf", 1) | ("lastIndexOf", 1)
+    ) {
+        reject_null_probe(fixed, &args[0])?;
+    }
     let v = match (method, args.len()) {
         ("size", 0) => Value::Int(items.len() as i64),
         ("isEmpty", 0) => Value::bool(items.is_empty()),
@@ -4716,6 +4774,12 @@ fn map_method(
             None => entries.iter().position(|(x, _)| value_eq(x, k)),
         },
     };
+    if matches!(
+        (method, args.len()),
+        ("get", 1) | ("getOrDefault", 2) | ("containsKey", 1) | ("containsValue", 1)
+    ) {
+        reject_null_probe(fixed, &args[0])?;
+    }
     let out = match (method, args.len()) {
         ("size", 0) => NewColl::Value(Value::Int(entries.len() as i64)),
         ("isEmpty", 0) => NewColl::Value(Value::bool(entries.is_empty())),
@@ -4858,6 +4922,9 @@ fn set_method(
         Fixity::Mutable => Ok(()),
         _ => Err(Fault::java("UnsupportedOperationException", String::new())),
     };
+    if (method, args.len()) == ("contains", 1) {
+        reject_null_probe(fixed, &args[0])?;
+    }
     let v = match (method, args.len()) {
         ("size", 0) => Value::Int(items.len() as i64),
         ("isEmpty", 0) => Value::bool(items.is_empty()),
@@ -5754,6 +5821,23 @@ fn deep_to_string_vm(vm: &mut VM, v: &Value) -> String {
     }
 }
 
+/// `List.of`/`Set.of` refuse a `null` element, as `ImmutableCollections` does.
+///
+/// `Map.of` already rejected a `null` key or value; the two element factories
+/// did not, so `List.of(1, null)` built a two-element list and printed
+/// `[1, null]` where the JDK throws before the list exists. That is the
+/// permissive direction — a program the reference refuses to run answered here
+/// — and it is the one an `Optional`/null-check idiom leans on.
+///
+/// The JDK's `Objects.requireNonNull` carries no detail message, so neither does
+/// this: `e.getMessage()` is `null` on both sides.
+fn reject_null_element(items: &[Value]) -> Result<(), Fault> {
+    match items.iter().any(|v| matches!(v, Value::Undef)) {
+        true => Err(Fault::java("NullPointerException", String::new())),
+        false => Ok(()),
+    }
+}
+
 /// The `java.util` statics: `Arrays.asList`, `List.of`/`Set.of`,
 /// `Collections.sort`/`reverse`/`max`/`min`. `None` when `Class.method` is not
 /// one of them, so the ordinary stdlib statics are reached unchanged.
@@ -5773,7 +5857,13 @@ fn collection_static(
     Some(match (class, method) {
         // `Arrays.asList` is a fixed-size *view*: `set` works, `add` throws.
         ("Arrays", "asList") => list(varargs_items(args), Fixity::FixedSize),
-        ("List", "of") => list(varargs_items(args), Fixity::Immutable),
+        ("List", "of") => {
+            let items = varargs_items(args);
+            if let Err(f) = reject_null_element(&items) {
+                return Some(Err(f));
+            }
+            list(items, Fixity::Immutable)
+        }
         // `Set.of` is the one set-building factory that *rejects* a repeat
         // rather than dropping it — `Set.of(1, 1)` is an
         // `IllegalArgumentException` naming the element, not a one-element set.
@@ -5781,6 +5871,9 @@ fn collection_static(
         // that ran and answered.
         ("Set", "of") => {
             let items = varargs_items(args);
+            if let Err(f) = reject_null_element(&items) {
+                return Some(Err(f));
+            }
             let unique = distinct(vm, &items);
             if unique.len() != items.len() {
                 let dup = first_repeat(vm, &items).unwrap_or(Value::Undef);

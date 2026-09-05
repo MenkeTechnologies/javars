@@ -360,7 +360,15 @@ Implemented and checked against the reference `java`:
   `Collections.sort`/`reverse`/`max`/`min`. `Arrays.asList` is fixed-size and
   `List.of`/`Set.of` immutable, so a structural write to one throws
   `UnsupportedOperationException` as Java's does, and neither factory answers
-  `instanceof` as the mutable kind it is not. They are heap objects like arrays, so
+  `instanceof` as the mutable kind it is not. The `of` factories also refuse a
+  `null` — both one they are built from and one they are asked about, so
+  `List.of(1, null)` and `List.of(1, 2).contains(null)` each throw
+  `NullPointerException` rather than holding it or answering `false` — and an
+  out-of-range index reports through the shape the receiver has: an `ArrayList`
+  raises `IndexOutOfBoundsException`, an array-backed `Arrays.asList` or longer
+  `List.of` raises the `ArrayIndexOutOfBoundsException` subclass, and a one- or
+  two-element `List.of` raises `IndexOutOfBoundsException` with Java's other
+  wording (`Index: 5 Size: 2`). They are heap objects like arrays, so
   reference semantics hold; the enhanced `for` iterates them; `sort` and
   `forEach` take a lambda. A sort is a stable merge sort driven by the
   comparator; naming none (`Collections.sort(l)`, `l.sort(null)`) orders by the

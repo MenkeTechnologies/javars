@@ -4996,3 +4996,88 @@ fn string_builder_char_at_is_a_char_and_its_arithmetic_is_a_code_point() {
     assert!(ok, "stdout was {out:?}");
     assert_eq!(out, "e\n102\no\nhe\n");
 }
+
+// ── Round 8: the immutable-collection contract, which is three separate answers
+
+#[test]
+fn the_list_bounds_fault_names_the_class_the_receivers_shape_raises() {
+    // An out-of-range index is not one exception in Java: the three list shapes
+    // reach the bounds check through three different paths and each reports in
+    // its own words. javars raised the `ArrayList` one for all three, so a
+    // program that catches `ArrayIndexOutOfBoundsException` around a
+    // `List.of(1, 2, 3).get(5)` caught nothing here and caught it on a JVM.
+    //
+    // Captured from openjdk 21.0.12, and the same split the class name already
+    // takes: `List.of` is `ImmutableCollections$List12` at one or two elements
+    // (which raises `outOfBounds` itself) and `$ListN` otherwise (which indexes
+    // a backing array and lets the array's check fire), and `Arrays.asList` is
+    // an array view like `ListN`.
+    let (out, ok) = run(&wrap(
+        "try { new java.util.ArrayList<>(java.util.List.of(1, 2)).get(5); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { java.util.Arrays.asList(1, 2).get(5); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { java.util.List.of(1, 2).get(5); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { java.util.List.of(1, 2, 3).get(5); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { java.util.List.of().get(0); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }\
+         try { java.util.Arrays.asList(1, 2).set(5, 0); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage()); }",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "java.lang.IndexOutOfBoundsException: Index 5 out of bounds for length 2\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n\
+         java.lang.IndexOutOfBoundsException: Index: 5 Size: 2\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 3\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0\n\
+         java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2\n"
+    );
+}
+
+#[test]
+fn the_immutable_factories_reject_a_null_element_rather_than_holding_it() {
+    // `Map.of` already refused a null key or value; `List.of` and `Set.of` did
+    // not, so `List.of(1, null)` built a list and printed `[1, null]` where the
+    // JDK throws before the list exists. This is the permissive direction — a
+    // program the reference refuses to run answered here — and it is the
+    // direction a null-check idiom leans on. `Objects.requireNonNull` carries no
+    // detail message, so neither does this one.
+    let (out, ok) = run(&wrap(
+        "try { java.util.List.of(1, null); } catch (NullPointerException e) { System.out.println(\"list \" + e.getMessage()); }\
+         try { java.util.List.of(1, 2, null, 4); } catch (NullPointerException e) { System.out.println(\"listn \" + e.getMessage()); }\
+         try { java.util.Set.of(1, null); } catch (NullPointerException e) { System.out.println(\"set \" + e.getMessage()); }\
+         try { java.util.Map.of(\"a\", null); } catch (NullPointerException e) { System.out.println(\"map \" + e.getMessage()); }\
+         System.out.println(java.util.Arrays.asList(1, null));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    // `Arrays.asList` is a view over an array and holds a null happily — the
+    // rejection belongs to the `of` factories alone, so the last line is the
+    // control that keeps the guard from spreading to every list.
+    assert_eq!(
+        out,
+        "list null\nlistn null\nset null\nmap null\n[1, null]\n"
+    );
+}
+
+#[test]
+fn an_immutable_collection_refuses_a_null_query_instead_of_answering_false() {
+    // `ImmutableCollections` rejects a null it is *asked about*, not only one it
+    // is built from: `List.of(1, 2).contains(null)` throws where javars answered
+    // `false`. Answering is the worse divergence of the two — a program that
+    // reaches the query takes a branch here it cannot take on a JVM — and the
+    // mutable containers really do answer, which is why the guard reads the
+    // receiver's fixity rather than applying to every collection.
+    let (out, ok) = run(&wrap(
+        "try { java.util.List.of(1, 2).contains(null); } catch (NullPointerException e) { System.out.println(\"c \" + e.getMessage()); }\
+         try { java.util.List.of(1, 2).indexOf(null); } catch (NullPointerException e) { System.out.println(\"i \" + e.getMessage()); }\
+         try { java.util.List.of(1, 2).lastIndexOf(null); } catch (NullPointerException e) { System.out.println(\"l \" + e.getMessage()); }\
+         try { java.util.Set.of(1, 2, 3).contains(null); } catch (NullPointerException e) { System.out.println(\"s \" + e.getMessage()); }\
+         try { java.util.Map.of(\"a\", 1, \"b\", 2).containsKey(null); } catch (NullPointerException e) { System.out.println(\"k \" + e.getMessage()); }\
+         try { java.util.Map.of(\"a\", 1, \"b\", 2).containsValue(null); } catch (NullPointerException e) { System.out.println(\"v \" + e.getMessage()); }\
+         System.out.println(new java.util.ArrayList<>(java.util.List.of(1, 2)).contains(null));\
+         System.out.println(java.util.Arrays.asList(1, 2).indexOf(null));",
+    ));
+    assert!(ok, "stdout was {out:?}");
+    assert_eq!(
+        out,
+        "c null\ni null\nl null\ns null\nk null\nv null\nfalse\n-1\n"
+    );
+}

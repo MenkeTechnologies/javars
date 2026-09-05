@@ -1359,7 +1359,7 @@ pub const REFERENCE: &[Entry] = &[
         "get",
         "List Methods",
         "T get(int index)",
-        "The element at `index`; out of range raises `IndexOutOfBoundsException` carrying `Index i out of bounds for length n`.",
+        "The element at `index`. Out of range raises what the receiver's shape raises: an `ArrayList` gives `IndexOutOfBoundsException: Index i out of bounds for length n`, `Arrays.asList` and a `List.of` of three or more elements give `ArrayIndexOutOfBoundsException` with that same message, and a `List.of` of one or two gives `IndexOutOfBoundsException: Index: i Size: n`.",
         "System.out.println(xs.get(0));",
     ),
     (
@@ -1700,14 +1700,14 @@ pub const REFERENCE: &[Entry] = &[
         "IndexOutOfBoundsException",
         "Throwables",
         "class IndexOutOfBoundsException extends RuntimeException",
-        "Raised by the `List` accessors — `get`, `set`, `remove`, and the two-argument `add`. The first three carry `Index i out of bounds for length n`; `add(index, e)` carries Java's distinct `Index: i, Size: n` wording.",
+        "Raised by the `List` accessors — `get`, `set`, `remove`, and the two-argument `add`. On a mutable list the first three carry `Index i out of bounds for length n`; `add(index, e)` carries Java's distinct `Index: i, Size: n` wording, and a one-or-two-element `List.of` carries `Index: i Size: n`. An array-backed receiver (`Arrays.asList`, a longer `List.of`) raises the `ArrayIndexOutOfBoundsException` subclass instead.",
         "try { xs.get(99); } catch (IndexOutOfBoundsException e) { System.out.println(e.getMessage()); }",
     ),
     (
         "ArrayIndexOutOfBoundsException",
         "Throwables",
         "class ArrayIndexOutOfBoundsException extends IndexOutOfBoundsException",
-        "Raised by an out-of-range array read or write, carrying Java's exact `Index i out of bounds for length n`. The bounds check runs inside the heap borrow and the throwable is allocated after it is released, since raising allocates on the same heap.",
+        "Raised by an out-of-range array read or write, and by the `List` shapes that index a backing array (`Arrays.asList`, a `List.of` of three or more elements), carrying Java's exact `Index i out of bounds for length n`. The bounds check runs inside the heap borrow and the throwable is allocated after it is released, since raising allocates on the same heap.",
         "int[] a = new int[2];\ntry { System.out.println(a[5]); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }",
     ),
     (

@@ -1566,6 +1566,19 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   the entry point that ran them — and the same four programs are in the corpus a
   second time with `public class T` declared first, which both entry points
   agree on.
+
+  The count is twelve, not four. Replaying every record through
+  `java T.java` on `openjdk 21.0.12` — rather than reading the corpus for an
+  `enum` keyword — finds eight more that predate the check the same way, each
+  declaring a plain `class` first: the constructor-and-initializer-order records
+  (`class Par`, `class Bse`, `class Tel`, `class Up`, `class Blk`, `class
+  Seeded`) and the two `getClass()` ones (`class Named`, `class B`). All twelve
+  were re-verified through `javac T.java && java -cp . T`, the entry point that
+  captured them, and all twelve still produce exactly what they froze; what they
+  do not have is a `public class T`-first twin, which the four `enum` ones do.
+  The whole corpus was replayed against the same JDK at the same time: no record
+  diverges from the reference under the entry point it was captured through, and
+  no frozen expectation carries a pre-JDK-19 `Double.toString` rendering.
 - **`String.format` uses the root locale, always.** javars has no locale model:
   `%,d` groups with `,` and `%,.2f` separates with `.` whatever
   `Locale.getDefault()` is. The reference agrees on this machine (`en_US`) and
@@ -1694,6 +1707,30 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `"Object.hashCode()"`). All five need the compiler to hand the receiver's
   static type and the callee's erased signature to the raising site, which it
   does not do today.
+- **An immutable collection's `null` query throws with `requireNonNull`'s
+  message, not the JDK's helpful NPE, for three receiver shapes.**
+  `List.of(…)`/`Set.of(…)`/`Map.of(…)` reject a `null` they are *asked about* as
+  well as one they are built from — `List.of(1, 2).contains(null)` throws rather
+  than answering `false` — and javars now raises the same
+  `NullPointerException` at the same point. The message matches exactly wherever
+  the JDK itself reaches the query through `Objects.requireNonNull`, which is
+  every `List.of` receiver and the `SetN`/`MapN` shapes: both say `null`. Where
+  the JDK instead reaches an `equals`/`hashCode` call on the null itself, its
+  helpful NPE names the internal frame variable, and javars still says `null`.
+  Measured on `openjdk 21.0.12`:
+
+  | program | JDK 21 `getMessage()` | javars |
+  | --- | --- | --- |
+  | `Set.of(1, 2).contains(null)` | `Cannot invoke "Object.equals(Object)" because "o" is null` | `null` |
+  | `Map.of("a", 1).containsKey(null)` | `Cannot invoke "Object.equals(Object)" because "o" is null` | `null` |
+  | `Map.of("a", 1, "b", 2).get(null)` | `Cannot invoke "Object.hashCode()" because "pk" is null` | `null` |
+  | `Set.of(1, 2, 3).contains(null)` | `null` | `null` |
+  | `List.of(1, 2).contains(null)` | `null` | `null` |
+
+  This is the helpful-NPE gap above, reached through a collection: the text names
+  a slot in `java.util.ImmutableCollections`, and reproducing it would mean
+  hard-coding another JDK's internal frame variable names. The class and the
+  control flow are exact, which is what a `catch` observes.
 - **`Arrays.copyOfRange` with a `from` outside the source omits the message
   text.** Java's bounds check for that case happens inside `System.arraycopy`,
   whose message names the element type — `arraycopy: source index -1 out of

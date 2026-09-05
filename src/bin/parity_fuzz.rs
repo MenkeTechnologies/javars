@@ -84,7 +84,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// xorshift64*, seeded per program index so any case replays from its seed.
@@ -1702,6 +1703,61 @@ fn g_varargs(r: &mut Rng) -> String {
     }
 }
 
+/// The `List.of`/`Set.of`/`Map.of` contract, which is three answers and not one.
+///
+/// The `listop` and `listview` modes build collections and read them back; both
+/// stay on the *accepting* side of the factories, so the whole refusing side was
+/// unreachable and three separate divergences hid behind clean sweeps:
+///
+///   * An out-of-range index does not name one exception. `ArrayList` raises
+///     `IndexOutOfBoundsException`, `Arrays.asList` and a three-or-more-element
+///     `List.of` let a backing array raise `ArrayIndexOutOfBoundsException`, and
+///     a one-or-two-element `List.of` raises `IndexOutOfBoundsException` with a
+///     different wording again (`Index: 5 Size: 2`). Only a probe that prints
+///     `getClass().getName()` alongside `getMessage()` can see the difference —
+///     printing the message alone agrees on two of the four.
+///   * `List.of(1, null)` throws before the list exists.
+///   * `List.of(1, 2).contains(null)` throws rather than answering `false`, and
+///     so do `indexOf`/`lastIndexOf`, `Set.of.contains`, and `Map.of`'s
+///     `get`/`containsKey`/`containsValue`.
+///
+/// Every probe reports through `getClass().getName()`, because the three list
+/// shapes differ in the exception *class* well before they differ in its text,
+/// and a `RuntimeException` catch that printed only the message would call two
+/// of them equal. The receiver sizes are drawn to straddle the JDK's own
+/// `List12`/`ListN` and `Set12`/`SetN` and `Map1`/`MapN` boundaries, since that
+/// arity is what selects the reporting path.
+fn g_immutable(r: &mut Rng) -> String {
+    let idx = pick(r, &["3", "5", "-1", "-2", "9"]);
+    let report =
+        "catch (RuntimeException e) { System.out.println(e.getClass().getName() + \" \" + e.getMessage()); }";
+    match r.below(16) {
+        // bounds, one receiver shape per arm
+        0 => format!("try {{ new ArrayList<>(List.of(1, 2)).get({idx}); }} {report}"),
+        1 => format!("try {{ Arrays.asList(1, 2).get({idx}); }} {report}"),
+        2 => format!("try {{ List.of(1).get({idx}); }} {report}"),
+        3 => format!("try {{ List.of(1, 2).get({idx}); }} {report}"),
+        4 => format!("try {{ List.of(1, 2, 3).get({idx}); }} {report}"),
+        5 => format!("try {{ List.of(1, 2, 3, 4, 5).get({idx}); }} {report}"),
+        6 => format!("try {{ List.of().get({idx}); }} {report}"),
+        7 => format!("try {{ Arrays.asList(1, 2, 3).set({idx}, 0); }} {report}"),
+        // a structural refusal outranks a bad index on an immutable receiver
+        8 => format!("try {{ List.of(1, 2).set({idx}, 0); }} {report}"),
+        9 => format!("try {{ List.of(1, 2).remove({idx}); }} {report}"),
+        // a null the factory is built from
+        10 => "try { List.of(1, null); } catch (NullPointerException e) { System.out.println(\"npe \" + e.getMessage()); }".to_string(),
+        11 => "try { List.of(1, 2, null, 4); } catch (NullPointerException e) { System.out.println(\"npe \" + e.getMessage()); }".to_string(),
+        // a null the collection is asked about — the JDK's message here is its
+        // helpful-NPE text for a `Set12`/`Map1` receiver, which BUGS.md records
+        // javars cannot reproduce, so those arities stay out of the pool and
+        // the ones whose message is `requireNonNull`'s own stay in.
+        12 => format!("try {{ List.of(1, 2).contains(null); }} {report}"),
+        13 => format!("try {{ List.of(1, 2).indexOf(null); }} {report}"),
+        14 => format!("try {{ Set.of(1, 2, 3).contains(null); }} {report}"),
+        _ => format!("try {{ Map.of(\"a\", 1, \"b\", 2).containsKey(null); }} {report}"),
+    }
+}
+
 /// `List.subList` **views**, whose defining property is that they alias their
 /// backing list rather than copy it.
 ///
@@ -2384,6 +2440,7 @@ enum Mode {
     ListOp,
     Varargs,
     ListView,
+    Immutable,
     Super,
     InstanceOf,
     Render,
@@ -2438,6 +2495,7 @@ const CONCRETE: &[Mode] = &[
     Mode::ListOp,
     Mode::Varargs,
     Mode::ListView,
+    Mode::Immutable,
     Mode::Super,
     Mode::InstanceOf,
     Mode::Render,
@@ -2494,6 +2552,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ListOp => "listop",
         Mode::Varargs => "varargs",
         Mode::ListView => "listview",
+        Mode::Immutable => "immutable",
         Mode::Super => "super",
         Mode::InstanceOf => "instanceof",
         Mode::Render => "render",
@@ -2562,6 +2621,7 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::ListOp => g_listop(r),
         Mode::Varargs => g_varargs(r),
         Mode::ListView => g_listview(r),
+        Mode::Immutable => g_immutable(r),
         Mode::Super => g_super(r),
         Mode::InstanceOf => g_instanceof(r),
         Mode::Render => g_render(r),
@@ -2600,6 +2660,45 @@ struct RunOut {
 
 static TMP_CTR: AtomicU64 = AtomicU64::new(0);
 
+/// Environment variables that change what a `java` launcher does, cleared from
+/// every JVM this harness spawns -- the probes AND the measured runs alike.
+///
+/// `JAVA_HOME` is not read by a real `java` binary, but the first `java` on a
+/// developer `PATH` is routinely a version-manager shim that *is* a script and
+/// does read it. On this machine it names a JDK 17, whose `Double.toString`
+/// predates JDK 19's shortest-round-trip rewrite, so an inherited `JAVA_HOME`
+/// silently selects a JVM that answers `1.0e23` with `9.999999999999999E22`.
+/// [`require_modern_doubles`] catches that, but only because the probe runs
+/// under the same environment as the measured programs; clearing the variable
+/// removes the divergence at the source instead of detecting it after the fact.
+///
+/// The three `*OPTIONS` variables are read by the launcher itself and prepend
+/// arbitrary flags to every invocation. `JDK_JAVA_OPTIONS` is the dangerous one
+/// for a differential harness: it is honoured only by the *source-file*
+/// launcher -- exactly the entry point this harness uses and the frozen corpus
+/// replays -- so an ambient value alters the reference and nothing else, and
+/// javars, which reads no environment variable at all, cannot follow it.
+const JVM_ENV_TO_CLEAR: &[&str] = &[
+    "JAVA_HOME",
+    "JDK_JAVA_OPTIONS",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+];
+
+/// A `Command` for one side of the comparison, with [`JVM_ENV_TO_CLEAR`] removed.
+///
+/// Both sides are sanitized, not just the oracle: javars reads no environment
+/// variable, so clearing them costs nothing there and keeps the two processes
+/// running under one environment rather than two that differ in ways the report
+/// would not name.
+fn jvm_command(prog: &Path) -> Command {
+    let mut c = Command::new(prog);
+    for k in JVM_ENV_TO_CLEAR {
+        c.env_remove(k);
+    }
+    c
+}
+
 /// The options the reference `java` is launched with, and javars is not.
 ///
 /// An empty `user.language`/`user.country` is `Locale.ROOT` — the locale javars
@@ -2629,7 +2728,7 @@ fn run_prog(prog: &Path, opts: &[&str], src: &str, timeout: Duration) -> RunOut 
         };
     }
 
-    let mut child = match Command::new(prog)
+    let mut child = match jvm_command(prog)
         .args(opts)
         .arg(&path)
         .current_dir(&dir)
@@ -2695,6 +2794,119 @@ fn diverges(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) ->
     differs(&a, &b)
 }
 
+/// The literal spans of a probe, as `(start, end)` byte ranges of its source.
+///
+/// A run of digits that is not glued to an identifier, and the inside of a
+/// double-quoted string. Both are found by a single left-to-right walk that
+/// tracks whether it is inside a string or a character literal, so a `"5"` in a
+/// message and an escaped quote do not read as code.
+fn literal_spans(probe: &str) -> Vec<(usize, usize)> {
+    let b = probe.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i + 1;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if i <= b.len() {
+                    spans.push((start, i.min(b.len())));
+                }
+                i += 1;
+            }
+            // A character literal is skipped whole: its content is one code
+            // point and replacing it with `0` or `""` never compiles.
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                // Glued to an identifier on the left (`arg0`, `List12`) it is
+                // part of a name, not a number.
+                let name =
+                    start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_');
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                    i += 1;
+                }
+                // A suffix (`5L`, `1.0f`) or a trailing identifier character
+                // makes the span something other than a bare decimal.
+                let suffixed = i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_');
+                if !name && !suffixed {
+                    spans.push((start, i));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
+/// Reduce one probe's *literals* while it keeps diverging.
+///
+/// [`minimize`] deletes whole probes, which is the only reduction a packed
+/// program allows — but it stops at one probe, and that probe still carries the
+/// operands the generator happened to draw. A report that reads
+/// `List.of(47, 12, 99).get(-2)` says the same thing as `List.of(1, 1, 1).get(0)`
+/// and takes longer to read: the reader has to establish for himself that 47 and
+/// 99 are not load-bearing before he can see that the *arity* is. So each
+/// literal is tried against a smaller stand-in and kept only when the divergence
+/// survives, which turns the surviving operands into evidence — a `3` that
+/// resists shrinking to `0` and `1` is a `3` the divergence depends on.
+///
+/// Every candidate is checked against the same predicate the search uses, and
+/// the oracle's own success is part of it: a reduction that stops the reference
+/// from compiling makes both sides fail, and while that is not a *divergence* it
+/// would be one the moment javars accepted what javac refused. Requiring the
+/// oracle to still run keeps a syntactically broken reduction from being
+/// mistaken for a smaller reproducer.
+fn shrink_literals(probe: &str, ours: &Path, oracle: &Path, timeout: Duration) -> String {
+    let oracle_ran = run_prog(
+        oracle,
+        ORACLE_OPTS,
+        &build_program(&[probe.to_string()]),
+        timeout,
+    )
+    .ok;
+    let still_diverges = |cand: &str| -> bool {
+        let src = build_program(&[cand.to_string()]);
+        let a = run_prog(oracle, ORACLE_OPTS, &src, timeout);
+        if oracle_ran && !a.ok {
+            return false;
+        }
+        differs(&a, &run_prog(ours, OURS_OPTS, &src, timeout))
+    };
+    let mut cur = probe.to_string();
+    // Right to left, so an accepted replacement cannot shift the spans still to
+    // be tried.
+    let mut spans = literal_spans(&cur);
+    spans.reverse();
+    for (start, end) in spans {
+        if end > cur.len() || start > end {
+            continue;
+        }
+        let original = cur[start..end].to_string();
+        for smaller in ["", "0", "1"] {
+            if smaller == original {
+                break;
+            }
+            let mut cand = cur.clone();
+            cand.replace_range(start..end, smaller);
+            if still_diverges(&cand) {
+                cur = cand;
+                break;
+            }
+        }
+    }
+    cur
+}
+
 /// Bisect a diverging probe list down to a minimal still-diverging subset.
 fn minimize(probes: &[String], ours: &Path, oracle: &Path, timeout: Duration) -> Vec<String> {
     let mut cur = probes.to_vec();
@@ -2756,11 +2968,7 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("JAVA_ORACLE") {
         let p = PathBuf::from(p);
         match jdk_banner(&p) {
-            Some(v) => {
-                require_modern_doubles(&p, &v);
-                require_root_locale(&p, &v);
-                eprintln!("parity-fuzz: oracle {} ({v})", p.display());
-            }
+            Some(v) => announce_oracle(&p, &v),
             None => {
                 eprintln!(
                     "parity-fuzz: JAVA_ORACLE={} does not run — `--version` failed",
@@ -2781,9 +2989,7 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
             }
             match jdk_banner(&cand) {
                 Some(v) => {
-                    require_modern_doubles(&cand, &v);
-                    require_root_locale(&cand, &v);
-                    eprintln!("parity-fuzz: oracle {} ({v})", cand.display());
+                    announce_oracle(&cand, &v);
                     return cand;
                 }
                 None => rejected.push(cand.display().to_string()),
@@ -2797,10 +3003,35 @@ fn resolve_oracle(ours: &Path) -> PathBuf {
     std::process::exit(2);
 }
 
+/// Accept a candidate as the reference, after measuring it, and say so.
+///
+/// The report is unconditional rather than reserved for failures. Which JVM
+/// answered is the single fact that decides what every double-valued
+/// comparison in the run means, and a harness that prints it only when it
+/// rejects one leaves a *passing* sweep with no record of what it passed
+/// against — the log then cannot distinguish a clean run against JDK 21 from a
+/// clean run against a JVM whose renderings differ. The ambient `JAVA_HOME` is
+/// named for the same reason: it is the variable that misdirects a shim, and
+/// [`JVM_ENV_TO_CLEAR`] strips it, so the line records both what was present
+/// and that it did not reach the JVM.
+fn announce_oracle(prog: &Path, banner: &str) {
+    require_modern_doubles(prog, banner);
+    require_root_locale(prog, banner);
+    eprintln!("parity-fuzz: oracle {} ({banner})", prog.display());
+    eprintln!(
+        "parity-fuzz: oracle verified — 1.0e23 renders as 1.0E23 (JDK 19+ Double.toString), \
+         String.format is the root locale"
+    );
+    eprintln!(
+        "parity-fuzz: ambient JAVA_HOME={} (cleared from every spawn)",
+        std::env::var("JAVA_HOME").unwrap_or_else(|_| "<unset>".into())
+    );
+}
+
 /// The first line `prog --version` prints, if it exits 0 and prints one.
 /// `None` for anything that is not a working launcher.
 fn jdk_banner(prog: &Path) -> Option<String> {
-    let out = Command::new(prog).arg("--version").output().ok()?;
+    let out = jvm_command(prog).arg("--version").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2821,11 +3052,7 @@ fn renders_modern_doubles(prog: &Path) -> Option<bool> {
         "public class D { public static void main(String[] a) { System.out.println(1.0e23); } }\n",
     )
     .ok()?;
-    let out = Command::new(prog)
-        .arg(&path)
-        .current_dir(&dir)
-        .output()
-        .ok();
+    let out = jvm_command(prog).arg(&path).current_dir(&dir).output().ok();
     let _ = std::fs::remove_dir_all(&dir);
     let out = out?;
     Some(String::from_utf8_lossy(&out.stdout).trim() == "1.0E23")
@@ -2847,7 +3074,7 @@ fn formats_in_root_locale(prog: &Path) -> Option<bool> {
         "public class L { public static void main(String[] a) { System.out.print(String.format(\"%,d|%.2f\", 1234567, 3.5)); } }\n",
     )
     .ok()?;
-    let out = Command::new(prog)
+    let out = jvm_command(prog)
         .args(ORACLE_OPTS)
         .arg(&path)
         .current_dir(&dir)
@@ -2895,6 +3122,7 @@ struct Args {
     mode: Mode,
     timeout: Duration,
     verbose: bool,
+    jobs: usize,
 }
 
 fn parse_args() -> Args {
@@ -2906,6 +3134,13 @@ fn parse_args() -> Args {
         mode: Mode::All,
         timeout: Duration::from_secs(60),
         verbose: false,
+        // One seed per core by default. A sweep is not compute-bound — nearly
+        // all of its wall time is two process launches per program waiting on
+        // each other — so the serial loop left the machine idle: 24 programs
+        // took 2:35.82 at 28% CPU on this one. The floor is 1, not 0, since
+        // `--jobs 0` would otherwise spawn no worker and report a clean sweep
+        // over zero programs.
+        jobs: std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -2921,6 +3156,7 @@ fn parse_args() -> Args {
             "--once" => a.once = true,
             "--verbose" | "-v" => a.verbose = true,
             "--timeout" => a.timeout = Duration::from_secs(next(&mut i).parse().unwrap_or(60)),
+            "--jobs" | "-j" => a.jobs = next(&mut i).parse().unwrap_or(a.jobs).max(1),
             "--mode" => {
                 let m = next(&mut i);
                 match parse_mode(&m) {
@@ -2932,7 +3168,7 @@ fn parse_args() -> Args {
                 }
             }
             "--help" | "-h" => {
-                println!("parity-fuzz [--iters N] [--probes N] [--seed N] [--once] [--mode M] [--timeout SECS] [-v]");
+                println!("parity-fuzz [--iters N] [--probes N] [--seed N] [--once] [--mode M] [--timeout SECS] [--jobs N] [-v]");
                 println!(
                     "modes: all {}",
                     CONCRETE
@@ -2971,55 +3207,95 @@ fn main() {
 
     let iters = if args.once { 1 } else { args.iters };
     let base = args.seed.unwrap_or(0x5EED);
-    let mut failures = 0usize;
-    let mut probes_run = 0usize;
-    let mut skipped = 0usize;
 
-    for k in 0..iters {
-        let seed = if args.once {
-            base
-        } else {
-            base.wrapping_add(k as u64)
-        };
-        let probes = gen_probes(seed, args.mode, args.probes);
-        let src = build_program(&probes);
-        let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
-        // A program the reference toolchain itself did not run is no evidence
-        // about javars. Comparing anyway would let a probe the JDK rejects be
-        // counted as agreement (both sides "fail"), which silently inflates a
-        // clean sweep — so it is skipped and reported under its own count.
-        if !a.ok || a.stdout.is_empty() {
-            skipped += 1;
-            eprintln!("seed {seed}: SKIPPED — reference `java` did not produce output");
-            // A skip is a claim about the *generator*, not about javars, so the
-            // program has to be inspectable — otherwise a mode that emits Java
-            // the JDK rejects would quietly shrink the verified count instead of
-            // being fixed.
-            if args.verbose {
-                eprintln!("{src}");
-            }
-            continue;
+    // One program per worker at a time, handed out from a shared cursor rather
+    // than sliced up front: a program that diverges pays for minimization and
+    // literal shrinking on top of its two launches, so a fixed split would
+    // leave every other worker idle behind the one that found something.
+    let next_index = AtomicUsize::new(0);
+    let failures = AtomicUsize::new(0);
+    let probes_run = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
+    // Divergence reports are several lines each and interleaving two of them
+    // would make both unreadable, so a report is assembled whole and printed
+    // under the lock.
+    let report = Mutex::new(());
+    let jobs = args.jobs.min(iters.max(1));
+    eprintln!("parity-fuzz: {jobs} job(s)");
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let k = next_index.fetch_add(1, Ordering::Relaxed);
+                if k >= iters {
+                    return;
+                }
+                let seed = if args.once {
+                    base
+                } else {
+                    base.wrapping_add(k as u64)
+                };
+                let probes = gen_probes(seed, args.mode, args.probes);
+                let src = build_program(&probes);
+                let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
+                // A program the reference toolchain itself did not run is no
+                // evidence about javars. Comparing anyway would let a probe the
+                // JDK rejects be counted as agreement (both sides "fail"), which
+                // silently inflates a clean sweep — so it is skipped and
+                // reported under its own count.
+                if !a.ok || a.stdout.is_empty() {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    let _g = report.lock().unwrap_or_else(|e| e.into_inner());
+                    eprintln!("seed {seed}: SKIPPED — reference `java` did not produce output");
+                    // A skip is a claim about the *generator*, not about javars,
+                    // so the program has to be inspectable — otherwise a mode
+                    // that emits Java the JDK rejects would quietly shrink the
+                    // verified count instead of being fixed.
+                    if args.verbose {
+                        eprintln!("{src}");
+                    }
+                    continue;
+                }
+                probes_run.fetch_add(probes.len(), Ordering::Relaxed);
+                let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
+                if !differs(&a, &b) {
+                    if args.verbose {
+                        let _g = report.lock().unwrap_or_else(|e| e.into_inner());
+                        eprintln!("seed {seed}: ok ({} probes)", probes.len());
+                    }
+                    continue;
+                }
+                failures.fetch_add(1, Ordering::Relaxed);
+                let mut minimal = minimize(&probes, &ours, &oracle, args.timeout);
+                // Literal reduction only pays once the probe list is down to
+                // one: with several probes left the divergence could move
+                // between them and each candidate costs two JDK launches.
+                if minimal.len() == 1 {
+                    minimal[0] = shrink_literals(&minimal[0], &ours, &oracle, args.timeout);
+                }
+                let src = build_program(&minimal);
+                let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
+                let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
+                let mut out =
+                    format!("=== DIVERGENCE seed {seed} (replay: --seed {seed} --once) ===\n");
+                for probe in &minimal {
+                    out.push_str(&format!("  {probe}\n"));
+                }
+                out.push_str(&format!(
+                    "  oracle: ok={} out={}\n",
+                    a.ok,
+                    render(&a.stdout)
+                ));
+                out.push_str(&format!("  ours  : ok={} out={}", b.ok, render(&b.stdout)));
+                let _g = report.lock().unwrap_or_else(|e| e.into_inner());
+                println!("{out}");
+            });
         }
-        probes_run += probes.len();
-        let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
-        if !differs(&a, &b) {
-            if args.verbose {
-                eprintln!("seed {seed}: ok ({} probes)", probes.len());
-            }
-            continue;
-        }
-        failures += 1;
-        let minimal = minimize(&probes, &ours, &oracle, args.timeout);
-        let src = build_program(&minimal);
-        let a = run_prog(&oracle, ORACLE_OPTS, &src, args.timeout);
-        let b = run_prog(&ours, OURS_OPTS, &src, args.timeout);
-        println!("=== DIVERGENCE seed {seed} (replay: --seed {seed} --once) ===");
-        for probe in &minimal {
-            println!("  {probe}");
-        }
-        println!("  oracle: ok={} out={}", a.ok, render(&a.stdout));
-        println!("  ours  : ok={} out={}", b.ok, render(&b.stdout));
-    }
+    });
+
+    let failures = failures.into_inner();
+    let probes_run = probes_run.into_inner();
+    let skipped = skipped.into_inner();
 
     eprintln!(
         "parity-fuzz: {} program(s) ({skipped} skipped), {probes_run} verified probe(s), {failures} divergence(s)",
@@ -3039,6 +3315,62 @@ fn main() {
 /// counted a *skip* — which reads in the summary exactly like coverage that
 /// passed. These tests pin the group accounting that replaced it, so the pools
 /// cannot drift back into generating a program the oracle refuses to run.
+/// [`literal_spans`] finds the operands a report should shrink, and nothing else.
+///
+/// The walk decides what a run of digits *is* from its neighbours, and every
+/// wrong answer costs a JDK launch on a candidate that cannot compile — or worse,
+/// silently rewrites a name and reports a reproducer that does not reproduce.
+/// These pin the four judgements it makes.
+#[cfg(test)]
+mod literal_spans_tests {
+    use super::literal_spans;
+
+    fn found(probe: &str) -> Vec<&str> {
+        literal_spans(probe)
+            .into_iter()
+            .map(|(a, b)| &probe[a..b])
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_decimal_is_a_literal_and_a_digit_inside_a_name_is_not() {
+        // `List12` and `arg0` are names. Rewriting the `12` in `List12` to `0`
+        // produces `List0`, which does not compile and burns two JDK launches
+        // per candidate to discover it.
+        assert_eq!(found("List.of(1, 2).get(5);"), ["1", "2", "5"]);
+        assert_eq!(found("x = List12 + arg0;"), Vec::<&str>::new());
+        assert_eq!(found("a1b2c3"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_suffixed_or_fractional_literal_is_left_whole_or_left_alone() {
+        // `5L` and `1.0f` carry a type in their suffix; replacing the digits
+        // alone would leave a bare `L`/`f`. A `1.0` with no suffix is one span,
+        // not two — shrinking `1` and `0` independently would emit `.0` and `1.`.
+        assert_eq!(found("long v = 5L; float f = 1.0f;"), Vec::<&str>::new());
+        assert_eq!(found("double d = 1.0;"), ["1.0"]);
+    }
+
+    #[test]
+    fn digits_inside_a_string_are_the_strings_content_not_the_programs() {
+        // The span is the *inside* of the quotes, so the replacement stays a
+        // valid string literal. The digits within it are not separate spans;
+        // reporting them too would rewrite `"a5"` to `"a"5""`.
+        assert_eq!(found("System.out.println(\"idx 5\" + 7);"), ["idx 5", "7"]);
+        assert_eq!(found("s = \"\";"), [""]);
+    }
+
+    #[test]
+    fn a_char_literal_and_an_escaped_quote_do_not_open_a_string() {
+        // `'\"'` and `\"\\\"\"` each contain a quote that does not start one. A
+        // walk that took either as an opener would treat the rest of the probe
+        // as string content and find no spans at all in it.
+        assert_eq!(found("c = '\"'; n = 4;"), ["4"]);
+        assert_eq!(found("s = \"a\\\"b\"; n = 4;"), ["a\\\"b", "4"]);
+        assert_eq!(found("c = '5'; n = 4;"), ["4"]);
+    }
+}
+
 #[cfg(test)]
 mod regex_pairing {
     use super::*;
