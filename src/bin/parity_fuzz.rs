@@ -3048,7 +3048,28 @@ fn jvm_command(prog: &Path) -> Command {
 /// probe would report a divergence that says nothing about javars. This does not
 /// hide the locale gap: a javars program cannot select a locale at all, so there
 /// is no javars behaviour on the other side of the pin to measure.
-const ORACLE_OPTS: &[&str] = &["-Duser.language=", "-Duser.country="];
+///
+/// `-XX:-OmitStackTraceInFastThrow` is the same kind of pin, for the same kind
+/// of reason. HotSpot replaces a *repeatedly* thrown implicit exception --
+/// `ArrayIndexOutOfBoundsException`, `NullPointerException`, and the rest of the
+/// set the JIT generates -- with a preallocated instance carrying no stack trace
+/// and **no message**, once the throwing site is hot enough. So a probe that
+/// prints `e.getMessage()` reports the real text early in a run and `null` later
+/// in it, at a threshold that depends on how often the JIT reached that site.
+/// Measured on openjdk 21.0.12.1: `List.of(1, 2, 3, 4, 5).get(-2)` in a loop
+/// answers `Index -2 out of bounds for length 5` on iteration 0 and `null` on
+/// iteration 199,999; with the flag it answers the message at both. That made a
+/// sweep report a divergence for a program javars ran correctly, and made the
+/// same program pass when run alone. It is a JIT timing artifact rather than
+/// language behaviour, javars has no equivalent optimization to reproduce, and
+/// the flag only restores the message the exception is specified to carry -- so
+/// pinning it removes noise from the oracle without excusing anything on the
+/// javars side.
+const ORACLE_OPTS: &[&str] = &[
+    "-Duser.language=",
+    "-Duser.country=",
+    "-XX:-OmitStackTraceInFastThrow",
+];
 
 /// javars takes no options before the source file.
 const OURS_OPTS: &[&str] = &[];
