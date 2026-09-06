@@ -5,6 +5,7 @@
 //! operators and punctuation used by declarations, expressions, and the
 //! C-style control statements. Line/block/`//`-doc comments are skipped.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// A lexical token with its 1-based source line (for error reporting).
@@ -140,8 +141,7 @@ impl fmt::Display for Tok {
 
 /// Lex `src` into a token vector terminated by `Tok::Eof`.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
-    let translated = translate_unicode_escapes(src)?;
-    lex_translated(&translated)
+    lex_translated(&translate_unicode_escapes(src)?)
 }
 
 /// JLS 3.3: replace every eligible `\uXXXX` in the source with the character it
@@ -168,9 +168,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 /// A lone surrogate (`\ud83d`) names no Unicode scalar. javars stores a `String`
 /// as scalars — the same model `length` and `charAt` already use — so there is
 /// no value to produce, and this refuses rather than inventing one.
-fn translate_unicode_escapes(src: &str) -> Result<String, String> {
+///
+/// A source with no `\u` in it at all is the overwhelmingly common case, and it
+/// borrows: returning an owned `String` here copied the whole file on every
+/// `lex`, which `parse` and `compile` each pay for again.
+fn translate_unicode_escapes(src: &str) -> Result<Cow<'_, str>, String> {
     if !src.contains("\\u") {
-        return Ok(src.to_string());
+        return Ok(Cow::Borrowed(src));
     }
     let cs: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -216,7 +220,7 @@ fn translate_unicode_escapes(src: &str) -> Result<String, String> {
         out.push(ch);
         i += 4;
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
