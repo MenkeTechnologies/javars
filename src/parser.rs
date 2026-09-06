@@ -20,6 +20,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         uses_exceptions: false,
         uses_functional: false,
         switch_expr_depth: 0,
+        type_params: Vec::new(),
     };
     p.program()
 }
@@ -59,6 +60,20 @@ struct Parser {
     /// which is Java's contextual rule (a variable or method named `yield`
     /// predates the keyword and must keep working).
     switch_expr_depth: usize,
+    /// The type-parameter names in scope at the cursor — a `class Box<T>`'s and
+    /// the enclosing method's, pushed at the declaration and popped after its
+    /// body.
+    ///
+    /// Java erases these, and javars erases them too, but erasing by *dropping
+    /// the name* leaves the raw text behind — so in a program where a type
+    /// variable and a class share a name, `T get()` was read as returning the
+    /// class. The parity harness writes exactly that shape (`public class T`
+    /// holding `interface Gen<T> { T get(); }`), and it made `g.get().length()`
+    /// the hard error ``class `T` has no method `length` ``. A name in this set
+    /// erases to `Object` instead, which is what Java's own erasure produces
+    /// for an unbounded parameter and which leaves the call to dispatch on the
+    /// receiver at run time.
+    type_params: Vec<String>,
 }
 
 impl Parser {
@@ -176,8 +191,9 @@ impl Parser {
             None => name.clone(),
         };
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
-        // `<K, V>` — erased (parsed and discarded).
-        self.skip_generics();
+        // `<K, V>` — erased, but the names stay in scope for the body so a
+        // parameter that shadows a class name is not read as that class.
+        let class_generics = self.declare_generics();
         // A record's header carries its components: `record Point(int x, int y)`.
         let components = if is_record {
             self.eat(&Tok::LParen)?;
@@ -313,6 +329,7 @@ impl Parser {
                 &mut inst_methods,
             );
         }
+        self.undeclare_generics(class_generics);
         classes.push(Class {
             name,
             binary,
@@ -981,6 +998,50 @@ impl Parser {
     /// Skip a generic type-parameter/argument group `< ... >` when the cursor is
     /// on `<`, matching nested `<`/`>` (Java erases these at runtime, so javars
     /// parses and discards them). A no-op when the cursor is not on `<`.
+    /// Parse a *declaration's* `<…>` and record the parameter names it binds,
+    /// where [`Parser::skip_generics`] parses a *use's* type arguments and keeps
+    /// nothing. Returns how many names were pushed, for the caller to pop once
+    /// the declaration's body is parsed.
+    ///
+    /// The names are the identifiers at nesting depth 1 that open the list or
+    /// follow a top-level comma — `<T>`, `<K, V>`, `<T extends Comparable<T>>`.
+    fn declare_generics(&mut self) -> usize {
+        if !self.is(&Tok::Lt) {
+            return 0;
+        }
+        let start = self.pos;
+        self.skip_generics();
+        let mut names = Vec::new();
+        let mut depth = 0i32;
+        let mut expect_name = false;
+        for t in &self.toks[start..self.pos] {
+            match &t.kind {
+                Tok::Lt => {
+                    depth += 1;
+                    expect_name = depth == 1;
+                }
+                k if k.generic_closers() > 0 => {
+                    depth -= k.generic_closers();
+                    expect_name = false;
+                }
+                Tok::Comma if depth == 1 => expect_name = true,
+                Tok::Ident(w) if expect_name && depth == 1 => {
+                    names.push(w.clone());
+                    expect_name = false;
+                }
+                _ => expect_name = false,
+            }
+        }
+        let n = names.len();
+        self.type_params.extend(names);
+        n
+    }
+
+    /// Drop the `n` most recently declared type-parameter names.
+    fn undeclare_generics(&mut self, n: usize) {
+        self.type_params.truncate(self.type_params.len() - n);
+    }
+
     fn skip_generics(&mut self) {
         if !self.is(&Tok::Lt) {
             return;
@@ -1168,12 +1229,14 @@ impl Parser {
             }
             self.advance();
         }
-        // Optional generic method type parameters `<T> T id(T x)` — erased.
-        self.skip_generics();
+        // Optional generic method type parameters `<T> T id(T x)` — erased, with
+        // the names kept in scope for the signature and body.
+        let method_generics = self.declare_generics();
         // A return type is required, so peeking a non-type here means this is not
         // a method (it is a field or constructor).
         if !self.at_type() {
             self.pos = save;
+            self.undeclare_generics(method_generics);
             return Ok(None);
         }
         let line = self.line();
@@ -1186,6 +1249,7 @@ impl Parser {
             }
             _ => {
                 self.pos = save;
+                self.undeclare_generics(method_generics);
                 return Ok(None);
             }
         };
@@ -1202,6 +1266,7 @@ impl Parser {
             self.eat(&Tok::LBrace)?;
             (self.block()?, false)
         };
+        self.undeclare_generics(method_generics);
         Ok(Some((
             Method {
                 name,
@@ -1330,6 +1395,11 @@ impl Parser {
     /// Trailing `[]` pairs are folded into the returned name (e.g. `int[]`).
     fn type_name(&mut self) -> Result<String, String> {
         let mut ty = self.simple_type_name()?;
+        // A name bound as a type parameter erases to `Object`, not to itself —
+        // see [`Parser::type_params`].
+        if self.type_params.iter().any(|p| *p == ty) {
+            ty = "Object".to_string();
+        }
         // Naming a functional interface pulls in the prelude that declares it,
         // even when the program never writes a lambda literal (a method
         // parameter of type `Runnable` is enough).
@@ -3096,6 +3166,21 @@ impl Parser {
                 ms.len()
             )
         })?;
+        // One method is still not enough on its own. `new Object() { public
+        // String toString() { … } }` declares exactly one — and `Object` has no
+        // abstract method for it to supply, so what the body overrides is an
+        // *inherited* body, which is a real class and not a lambda. Desugaring
+        // it made `System.out.println(o)` print `<lambda>@e` where Java prints
+        // what the override returns: a silent wrong answer rather than a
+        // refusal, which is the one outcome this frontend does not ship. The
+        // same holds for `equals`/`hashCode`, and for those three names under
+        // any supertype.
+        if ty == "Object" || matches!(m.name.as_str(), "toString" | "equals" | "hashCode") {
+            return Err(format!(
+                "javars: an anonymous `{ty}` whose body overrides `{}` is a class with inherited state, not the single abstract method javars models an anonymous class by (line {line})",
+                m.name
+            ));
+        }
         self.uses_functional = true;
         Ok(Expr::Lambda {
             params: m.params.iter().map(|p| p.name.clone()).collect(),
