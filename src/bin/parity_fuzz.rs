@@ -2203,6 +2203,29 @@ const SUPPORT: &str = concat!(
     "    static String vkind(Object... xs) { return \"obj\" + xs.length; }\n",
     "    static String vtag(String tag, int... xs) { return tag + \":\" + xs.length + \":\" + Arrays.toString(xs); }\n",
     "    static String vnull(Object... xs) { return xs == null ? \"nullarray\" : \"len\" + xs.length; }\n",
+    // The nested members the `nested` mode names. They sit *inside* `T`, which
+    // is the whole point: `Nst` and `T.Nst` are two spellings of one type, and a
+    // parser that steps over a lowercase package qualifier only accepts the
+    // first and rejects the second.
+    //
+    // `Greeter` carries a `default` and a `static` member so that the probes
+    // reach both without declaring a class to implement it — `of` returns the
+    // lambda, and `greet`/`shout` are inherited bodies rather than the
+    // abstract `name`.
+    "    static class Nst {\n",
+    "        final int x, y;\n",
+    "        Nst(int x, int y) { this.x = x; this.y = y; }\n",
+    "        int sum() { return x + y; }\n",
+    "        public boolean equals(Object o) { return o instanceof Nst p && p.x == x && p.y == y; }\n",
+    "        public int hashCode() { return x * 31 + y; }\n",
+    "        public String toString() { return \"(\" + x + \",\" + y + \")\"; }\n",
+    "    }\n",
+    "    interface Greeter {\n",
+    "        String name();\n",
+    "        default String greet() { return \"Hello, \" + name(); }\n",
+    "        default String shout() { return greet().toUpperCase() + \"!\"; }\n",
+    "        static Greeter of(String n) { return () -> n; }\n",
+    "    }\n",
 );
 
 /// The types the probes construct: the `AutoCloseable` the resource probes open
@@ -2445,6 +2468,12 @@ enum Mode {
     InstanceOf,
     Render,
     Equals,
+    Bits,
+    Objects,
+    Deque,
+    Mutate,
+    Chars,
+    Nested,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2500,7 +2529,305 @@ const CONCRETE: &[Mode] = &[
     Mode::InstanceOf,
     Mode::Render,
     Mode::Equals,
+    Mode::Bits,
+    Mode::Objects,
+    Mode::Deque,
+    Mode::Mutate,
+    Mode::Chars,
+    Mode::Nested,
 ];
+
+/// The `Integer`/`Long` bit-twiddling statics, at the boundaries where the two
+/// widths disagree.
+///
+/// No probe in this generator named one before this mode: `bitCount`,
+/// `rotateLeft`, `highestOneBit`, `numberOfLeadingZeros` and `reverseBytes` had
+/// zero occurrences across the whole corpus, so a 24,480-probe sweep could not
+/// see them. The operand pool is deliberately all edges — 0, -1, both MIN/MAX
+/// values, a lone bit and a byte-asymmetric pattern — because every one of these
+/// methods is exact everywhere else and only interesting at a boundary.
+///
+/// `sum`/`max`/`min` ride along for the same reason: they are the arms where an
+/// `Integer` call must narrow to 32 bits and a `Long` call must not, and
+/// sharing one 64-bit implementation between them is invisible until an operand
+/// reaches `Integer.MAX_VALUE`.
+fn g_bits(r: &mut Rng) -> String {
+    let i = pick(
+        r,
+        &[
+            "0",
+            "-1",
+            "1",
+            "100",
+            "0x12345678",
+            "Integer.MIN_VALUE",
+            "Integer.MAX_VALUE",
+            "-2147483648",
+        ],
+    );
+    let j = pick(
+        r,
+        &[
+            "0L",
+            "-1L",
+            "1L",
+            "255L",
+            "Long.MIN_VALUE",
+            "Long.MAX_VALUE",
+            "4294967296L",
+        ],
+    );
+    let d = pick(r, &["0", "1", "8", "31", "32", "33", "-1", "63", "64"]);
+    let unary = pick(
+        r,
+        &[
+            "bitCount",
+            "reverse",
+            "reverseBytes",
+            "highestOneBit",
+            "lowestOneBit",
+            "numberOfLeadingZeros",
+            "numberOfTrailingZeros",
+            "signum",
+        ],
+    );
+    match r.below(8) {
+        0 => format!("System.out.println(Integer.{unary}({i}));"),
+        1 => format!("System.out.println(Long.{unary}({j}));"),
+        2 => format!("System.out.println(Integer.rotateLeft({i}, {d}) + \" \" + Integer.rotateRight({i}, {d}));"),
+        3 => format!("System.out.println(Long.rotateLeft({j}, {d}) + \" \" + Long.rotateRight({j}, {d}));"),
+        // The width test: `Integer.sum` wraps at 32 bits, `Long.sum` at 64.
+        4 => format!("System.out.println(Integer.sum({i}, {d}) + \" \" + Long.sum({j}, {d}));"),
+        5 => format!("System.out.println(Integer.max({i}, {d}) + \" \" + Integer.min({i}, {d}) + \" \" + Integer.compare({i}, {d}));"),
+        6 => format!("System.out.println(Integer.toBinaryString(Integer.{unary}({i})) + \"|\" + Integer.toHexString({i}));"),
+        // A method reference to a bit static, which is also the shape
+        // `reduce`/`merge` is written with.
+        _ => format!(
+            "{{ java.util.function.IntBinaryOperator f = Integer::sum; System.out.println(f.applyAsInt({i}, {d})); }}"
+        ),
+    }
+}
+
+/// `java.util.Objects` — the class whose whole purpose is answering for a
+/// `null` where the instance method throws.
+///
+/// `Objects.` appeared zero times in the generator before this mode. Half the
+/// pool is `null` on purpose: `Objects.hashCode(null)` is 0,
+/// `Objects.toString(null)` is the four-character string, and
+/// `Objects.hash()` is 1 rather than 0 — three answers a plausible
+/// implementation gets wrong in three different directions.
+fn g_objects(r: &mut Rng) -> String {
+    let v = pick(
+        r,
+        &["null", "\"a\"", "5", "1.5", "'c'", "true", "List.of(1, 2)"],
+    );
+    let w = pick(r, &["null", "\"a\"", "5", "\"b\""]);
+    let report =
+        "catch (RuntimeException e) { System.out.println(e.getClass().getName() + \" \" + e.getMessage()); }";
+    // `requireNonNull` and `requireNonNullElse` return their type variable, so
+    // a bare `null` argument leaves `T` to be inferred from the *enclosing*
+    // `println` — and `println(char[])` and `println(String)` both match, which
+    // `javac` reports as "reference to println is ambiguous". The whole program
+    // then fails to compile and the harness counts it a skip: that is what
+    // dropped 218 of 300 `--mode objects` programs. Naming `Object` pins `T`
+    // without changing the value or the exception being probed. The other arms
+    // need no cast — their results are already `int`, `String` or `boolean`.
+    let vo = if *v == "null" { "(Object) null" } else { *v };
+    let wo = if *w == "null" { "(Object) null" } else { *w };
+    match r.below(10) {
+        0 => format!("System.out.println(Objects.hashCode({v}));"),
+        1 => format!("System.out.println(Objects.toString({v}));"),
+        2 => format!("System.out.println(Objects.toString({v}, \"dflt\"));"),
+        3 => format!("System.out.println(Objects.isNull({v}) + \" \" + Objects.nonNull({v}));"),
+        4 => format!("System.out.println(Objects.equals({v}, {w}));"),
+        5 => format!("System.out.println(Objects.hash({v}, {w}));"),
+        // `Objects.hash()` seeds at 1 and folds, so the empty call is not 0.
+        6 => {
+            "System.out.println(Objects.hash() + \" \" + Objects.hash((Object) null));".to_string()
+        }
+        7 => format!("try {{ System.out.println(Objects.requireNonNull({vo})); }} {report}"),
+        8 => format!(
+            "try {{ System.out.println(Objects.requireNonNull({vo}, \"was null\")); }} {report}"
+        ),
+        _ => {
+            format!(
+                "try {{ System.out.println(Objects.requireNonNullElse({vo}, {wo})); }} {report}"
+            )
+        }
+    }
+}
+
+/// `Deque`/`Queue` — the head-and-tail collection, and the three families of
+/// empty-receiver behaviour a program can tell apart.
+///
+/// `ArrayDeque`, `addFirst`, `pollLast` and `peekFirst` all had zero
+/// occurrences before this mode. The empty receiver is half the pool because
+/// that is the only place `getFirst` (throws), `peekFirst` (null) and
+/// `pollFirst` (null, and removes) stop agreeing.
+fn g_deque(r: &mut Rng) -> String {
+    let seed = pick(
+        r,
+        &[
+            "new ArrayDeque<>()",
+            "new ArrayDeque<>(List.of(1, 2, 3))",
+            "new LinkedList<>()",
+            "new LinkedList<>(List.of(7, 8))",
+        ],
+    );
+    let v = pick(r, &["9", "0", "-4"]);
+    let init = format!("Deque<Integer> q = {seed};");
+    let report =
+        "catch (RuntimeException e) { System.out.println(e.getClass().getName() + \" \" + e.getMessage()); }";
+    match r.below(12) {
+        // `push` is `addFirst`, so a stack built with it reads back reversed.
+        0 => format!("{{ {init} q.push({v}); q.push(1); System.out.println(q); }}"),
+        1 => format!("{{ {init} q.addLast({v}); q.addFirst(1); System.out.println(q + \" \" + q.size()); }}"),
+        2 => format!("{{ {init} q.offer({v}); q.offerFirst(1); q.offerLast(2); System.out.println(q); }}"),
+        // The null-answering readers on whatever the seed left.
+        3 => format!("{{ {init} System.out.println(q.peek() + \" \" + q.peekFirst() + \" \" + q.peekLast()); }}"),
+        4 => format!("{{ {init} System.out.println(q.poll() + \" \" + q + \" \" + q.pollLast() + \" \" + q); }}"),
+        5 => format!("{{ {init} System.out.println(q.pollFirst() + \" \" + q.pollLast() + \" \" + q.isEmpty()); }}"),
+        // The throwing readers, which is where an empty seed matters.
+        6 => format!("{{ {init} try {{ System.out.println(q.getFirst() + \" \" + q.getLast()); }} {report} }}"),
+        7 => format!("{{ {init} try {{ System.out.println(q.element()); }} {report} }}"),
+        8 => format!("{{ {init} try {{ System.out.println(q.pop() + \" \" + q); }} {report} }}"),
+        9 => format!("{{ {init} try {{ System.out.println(q.removeFirst() + \" \" + q.removeLast()); }} {report} }}"),
+        // A deque is still a collection: iteration order is head to tail.
+        10 => format!("{{ {init} q.addLast({v}); int t = 0; for (int x : q) t = t * 10 + x; System.out.println(t + \" \" + q.contains({v})); }}"),
+        _ => format!("{{ {init} q.addFirst({v}); System.out.println(q.toString() + \" \" + q.size() + \" \" + q.isEmpty()); }}"),
+    }
+}
+
+/// `removeIf` and `replaceAll` — the two `Collection` mutators that run a user
+/// lambda per element, across all three list fixities and both set shapes.
+///
+/// Neither appeared before this mode (the seven `replaceAll` hits in the
+/// generator were `String.replaceAll`, the regex one). The three receivers
+/// answer differently and a `catch` can see it: `List.of` throws before it
+/// looks at the argument, `Arrays.asList` runs the predicate and throws only if
+/// something must actually go, and an `ArrayList` does the work — so a probe
+/// that only used a mutable receiver would miss two thirds of the behaviour.
+fn g_mutate(r: &mut Rng) -> String {
+    let recv = pick(
+        r,
+        &[
+            "new ArrayList<>(List.of(1, 2, 3, 4))",
+            "new ArrayList<Integer>()",
+            "Arrays.asList(1, 2, 3)",
+            "List.of(1, 2, 3)",
+        ],
+    );
+    let pred = pick(
+        r,
+        &["x -> x % 2 == 0", "x -> false", "x -> true", "x -> x > 2"],
+    );
+    let op = pick(r, &["x -> x * 2", "x -> x", "x -> -x"]);
+    let set = pick(
+        r,
+        &[
+            "new HashSet<>(List.of(1, 2, 3))",
+            "new LinkedHashSet<>(List.of(1, 2, 3))",
+            "new TreeSet<>(List.of(3, 1, 2))",
+            "Set.of(1, 2)",
+        ],
+    );
+    let report =
+        "catch (RuntimeException e) { System.out.println(e.getClass().getName() + \" \" + e.getMessage()); }";
+    match r.below(10) {
+        0 => format!("{{ List<Integer> l = {recv}; try {{ System.out.println(l.removeIf({pred}) + \" \" + l); }} {report} }}"),
+        1 => format!("{{ List<Integer> l = {recv}; try {{ l.replaceAll({op}); System.out.println(l); }} {report} }}"),
+        // A null argument: the immutable receiver refuses before it sees it.
+        2 => format!("{{ List<Integer> l = {recv}; try {{ l.removeIf(null); }} {report} }}"),
+        3 => format!("{{ List<Integer> l = {recv}; try {{ l.replaceAll(null); }} {report} }}"),
+        4 => format!("{{ Set<Integer> s = {set}; try {{ System.out.println(s.removeIf({pred}) + \" \" + s); }} {report} }}"),
+        // A `removeIf` that removed something is a structural modification, so
+        // an outstanding view goes stale; one that removed nothing does not.
+        5 => format!("{{ List<Integer> l = new ArrayList<>(List.of(1, 2, 3)); List<Integer> v = l.subList(0, 2); l.removeIf({pred}); try {{ System.out.println(v); }} {report} }}"),
+        // `replaceAll` bumps the modification count whether or not anything
+        // changed, so the same view is stale after `x -> x`.
+        6 => format!("{{ List<Integer> l = new ArrayList<>(List.of(1, 2, 3)); List<Integer> v = l.subList(0, 2); l.replaceAll({op}); try {{ System.out.println(v); }} {report} }}"),
+        7 => format!("{{ List<Integer> l = {recv}; try {{ System.out.println(l.removeIf({pred}) + \" \" + l.removeIf({pred})); }} {report} }}"),
+        // A `subList` view: the elements it removes are the parent's, and the
+        // parent must show it. `keySet()`/`values()` are deliberately NOT
+        // probed here — BUGS.md records them as copies rather than views, so a
+        // `removeIf` through one would fail for a reason this mode is not
+        // about and would sit permanently red.
+        8 => format!("{{ List<Integer> l = new ArrayList<>(List.of(1, 2, 3, 4)); List<Integer> v = l.subList(1, 4); System.out.println(v.removeIf({pred}) + \" \" + v + \" \" + l); }}"),
+        _ => format!("{{ List<Integer> l = {recv}; try {{ l.replaceAll({op}); System.out.println(l.removeIf({pred}) + \" \" + l); }} {report} }}"),
+    }
+}
+
+/// `String.chars`/`codePoints`/`lines` — the three views of a string that are
+/// streams rather than strings.
+///
+/// All three had zero coverage. `lines()` is the interesting one: it splits on
+/// *terminators*, so a trailing newline ends the last line rather than starting
+/// an empty one, and a lone `\r` terminates as well as `\r\n` does — three
+/// rules an implementation built on a `split` gets wrong.
+fn g_chars(r: &mut Rng) -> String {
+    let s = pick(
+        r,
+        &[
+            "\"abc\"",
+            "\"\"",
+            "\"a\"",
+            "\"AaZz09\"",
+            "\"  x \"",
+            "\"\\u00e9\"",
+        ],
+    );
+    let lined = pick(
+        r,
+        &[
+            "\"a\\nb\"",
+            "\"a\\nb\\n\"",
+            "\"\"",
+            "\"\\n\"",
+            "\"a\\n\\nb\"",
+            "\"a\\r\\nb\\rc\"",
+            "\"x\"",
+        ],
+    );
+    match r.below(9) {
+        0 => format!("System.out.println({s}.chars().sum() + \" \" + {s}.chars().count());"),
+        1 => format!("System.out.println({s}.codePoints().sum() + \" \" + {s}.codePoints().count());"),
+        2 => format!("System.out.println({s}.chars().boxed().toList());"),
+        3 => format!("System.out.println({s}.chars().max().isPresent() + \" \" + {s}.chars().min().isPresent());"),
+        4 => format!("System.out.println({s}.chars().filter(c -> c > 'a').count());"),
+        5 => format!("System.out.println({s}.chars().map(c -> c - 32).boxed().toList());"),
+        6 => format!("System.out.println({lined}.lines().count());"),
+        7 => format!("System.out.println({lined}.lines().toList());"),
+        _ => format!("System.out.println({lined}.lines().map(x -> \"[\" + x + \"]\").toList());"),
+    }
+}
+
+/// Nested types and the qualified names that reach them.
+///
+/// `T.Nst p = …` was a *parse* error before this mode: the type parser stepped
+/// over a lowercase package qualifier only, so an enclosing class in front of
+/// the type name ended the declaration. `static class` had zero occurrences in
+/// the generator, and neither did any qualified type name whose first segment is
+/// capitalised, which is why a saturated sweep never reached it.
+///
+/// The declarations live in `SUPPORT`/`SUPPORT_CLASS`; this mode only writes the
+/// uses, in both the simple and the qualified spelling, so the two must agree.
+fn g_nested(r: &mut Rng) -> String {
+    let a = pick(r, &["1", "0", "-3", "7"]);
+    let b = pick(r, &["2", "5", "-1"]);
+    match r.below(10) {
+        0 => format!("{{ Nst p = new Nst({a}, {b}); System.out.println(p + \" \" + p.sum()); }}"),
+        1 => format!("{{ T.Nst p = new T.Nst({a}, {b}); System.out.println(p + \" \" + p.sum()); }}"),
+        2 => format!("{{ T.Nst p = new Nst({a}, {b}); Nst q = new T.Nst({a}, {b}); System.out.println(p.equals(q) + \" \" + (p == q)); }}"),
+        3 => format!("{{ List<T.Nst> l = new ArrayList<>(); l.add(new Nst({a}, {b})); System.out.println(l); }}"),
+        4 => format!("{{ T.Nst p = new T.Nst({a}, {b}); System.out.println(p.getClass().getSimpleName()); }}"),
+        // The interface's `default` and `static` members, reached both ways.
+        5 => format!("{{ Greeter g = Greeter.of(\"n{a}\"); System.out.println(g.greet()); }}"),
+        6 => format!("{{ T.Greeter g = () -> \"q{a}\"; System.out.println(g.greet() + \" \" + g.name()); }}"),
+        7 => format!("{{ Greeter g = () -> \"z\"; System.out.println(g.shout()); }}"),
+        8 => format!("{{ T.Nst p = new T.Nst({a}, {b}); Greeter g = () -> p.toString(); System.out.println(g.greet()); }}"),
+        _ => format!("{{ T.Nst[] ps = {{ new Nst({a}, {b}), new T.Nst({b}, {a}) }}; System.out.println(Arrays.toString(ps)); }}"),
+    }
+}
 
 fn mode_name(m: Mode) -> &'static str {
     match m {
@@ -2557,6 +2884,12 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::InstanceOf => "instanceof",
         Mode::Render => "render",
         Mode::Equals => "equals",
+        Mode::Bits => "bits",
+        Mode::Objects => "objects",
+        Mode::Deque => "deque",
+        Mode::Mutate => "mutate",
+        Mode::Chars => "chars",
+        Mode::Nested => "nested",
     }
 }
 
@@ -2626,6 +2959,12 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::InstanceOf => g_instanceof(r),
         Mode::Render => g_render(r),
         Mode::Equals => g_equals(r),
+        Mode::Bits => g_bits(r),
+        Mode::Objects => g_objects(r),
+        Mode::Deque => g_deque(r),
+        Mode::Mutate => g_mutate(r),
+        Mode::Chars => g_chars(r),
+        Mode::Nested => g_nested(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
