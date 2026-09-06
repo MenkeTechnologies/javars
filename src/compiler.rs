@@ -2810,6 +2810,24 @@ impl Compiler {
     /// *refuses* the call when it cannot type an argument rather than picking
     /// one and being silently wrong at exactly the values these methods exist
     /// to catch.
+    /// The value a grown copy of `arr` pads with, from `arr`'s **static** type:
+    /// a primitive array's element default. `None` for a reference array (whose
+    /// default is the `null` the host already falls back to) and for an
+    /// expression javars could not type.
+    ///
+    /// See the call site in the static-dispatch lowering for why this cannot be
+    /// answered at run time.
+    fn array_element_default(&self, arr: &Expr) -> Option<Value> {
+        let ty = self.expr_java_type(arr)?;
+        let elem = ty.strip_suffix("[]")?;
+        Some(match elem {
+            "int" | "long" | "short" | "byte" | "char" => Value::Int(0),
+            "double" | "float" => Value::float(0.0),
+            "boolean" => Value::bool(false),
+            _ => return None,
+        })
+    }
+
     fn overload_width(
         &self,
         class: &str,
@@ -3719,6 +3737,29 @@ impl Compiler {
             return Err(format!(
                 "javars: class `{name}` has no member `{method}` a method reference can name (line {line})"
             ));
+        }
+        // `ArrayList::new`, `StringBuilder::new`, `String::new` — a constructor
+        // reference to a *modeled stdlib* type rather than a declared one. Every
+        // one of these was a hard error before: `ArrayList` is not in
+        // [`is_static_class`], so the reference fell out of this resolver
+        // entirely and was reported as an unresolvable receiver, and `String` is,
+        // so it reached the end and was reported as unmodeled. Both spellings
+        // are ordinary Java — `Collectors.toCollection(ArrayList::new)` and
+        // `map.computeIfAbsent(k, ArrayList::new)` are how the idiom is written.
+        //
+        // javars does not target-type a method reference, so the constructor
+        // this can name is the **no-argument** one. That is the constructor
+        // every `Supplier`-shaped use means; the capacity-taking overload is
+        // only reachable through a functional type javars would have to infer.
+        if method == "new" && has_no_arg_constructor(name) {
+            return Ok(Some(lambda(
+                Vec::new(),
+                Expr::NewObject {
+                    class: name.to_string(),
+                    args: Vec::new(),
+                    line,
+                },
+            )));
         }
         if !is_static_class(name) {
             return Ok(None);
@@ -5874,15 +5915,32 @@ impl Compiler {
                 if let Some(code) = widened {
                     self.b.emit(Op::LoadInt(code), line);
                 }
+                // `Arrays.copyOf`/`copyOfRange` pad a grown copy with the
+                // *element type's* default, and the element type is erased at
+                // run time — the host reads it off element 0, which an **empty**
+                // source does not have. So `Arrays.copyOf(new int[0], 2)`
+                // answered `[null, null]` where Java answers `[0, 0]`, and
+                // likewise for every other primitive element type. The source's
+                // static type is known here and nowhere else, so the pad goes to
+                // the host as one more operand — the same route `overload_width`
+                // takes above.
+                let pad = (class == "Arrays" && matches!(method, "copyOf" | "copyOfRange"))
+                    .then(|| args.first().and_then(|a| self.array_element_default(a)))
+                    .flatten();
+                if let Some(v) = pad.clone() {
+                    let c = self.b.add_constant(v);
+                    self.b.emit(Op::LoadConst(c), line);
+                }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
                 let method_c = self.b.add_constant(Value::str(method.to_string()));
                 self.b.emit(Op::LoadConst(method_c), line);
                 // argc counts the args plus the class-name and method-name
-                // strings, plus the width operand when there is one.
+                // strings, plus the width operand and the array pad when there
+                // is one of each.
                 self.emit_raising_builtin(
                     crate::host::JSTATIC_DISPATCH,
-                    args.len() as u8 + 2 + u8::from(widened.is_some()),
+                    args.len() as u8 + 2 + u8::from(widened.is_some()) + u8::from(pad.is_some()),
                     line,
                 );
                 // The `Math` overloads that overflow at `int` width:
@@ -7841,6 +7899,14 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
 
 /// True when `ty` names a collection *implementation* — the types `new` can
 /// construct. The interfaces (`List`, `Map`, `Set`) are declaration-only.
+/// The modeled stdlib types whose no-argument constructor a `T::new` reference
+/// can name. The collection implementations plus the three other types Java
+/// programs default-construct.
+fn has_no_arg_constructor(ty: &str) -> bool {
+    is_concrete_collection(ty)
+        || matches!(ty, "String" | "StringBuilder" | "StringBuffer" | "Object")
+}
+
 fn is_concrete_collection(ty: &str) -> bool {
     matches!(
         ty,

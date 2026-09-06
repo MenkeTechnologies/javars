@@ -1973,17 +1973,92 @@ fn map_hash(entries: &[(Value, Value)]) -> i64 {
 /// whose `hashCode` is the JVM identity hash. A key with no modeled hash keeps
 /// insertion order.
 fn hash_order(keys: &[Value]) -> Vec<usize> {
-    let n = keys.len();
+    let cap = hash_capacity(keys.len());
+    let mut idx: Vec<usize> = (0..keys.len()).collect();
+    idx.sort_by_key(|&i| hash_bucket(&keys[i], cap));
+    idx
+}
+
+/// The table size a `HashMap`/`HashSet` holding `n` entries has: the default 16,
+/// doubled while the load factor would exceed 0.75.
+fn hash_capacity(n: usize) -> usize {
     let mut cap = 16usize;
     while n > cap * 3 / 4 {
         cap *= 2;
     }
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by_key(|&i| {
-        let h = java_hash(&keys[i]).unwrap_or(0) as u32;
-        ((cap as u32 - 1) & (h ^ (h >> 16))) as usize
+    cap
+}
+
+/// Which bin `key` lands in for a table of `cap` — Java's
+/// `(capacity - 1) & (h ^ (h >>> 16))`.
+fn hash_bucket(key: &Value, cap: usize) -> usize {
+    let h = java_hash(key).unwrap_or(0) as u32;
+    ((cap as u32 - 1) & (h ^ (h >> 16))) as usize
+}
+
+/// Move the entry for `key` to the head of its hash bin.
+///
+/// `HashMap.put` links a new node at the *tail* of its bin, but
+/// `computeIfAbsent`, `compute` and `merge` all reach their insert through
+/// `newNode(hash, key, value, first)`, which links it at the *head*. So a key
+/// added by one of those three iterates *before* every key it collides with,
+/// where the same key added by `put` iterates after them. Measured on openjdk
+/// 21.0.12.1, inserting `three` into a `HashMap` already holding `one` and
+/// `two` (`three` shares `two`'s bin):
+///
+///   put / putIfAbsent / putAll           {one=1, two=2, three=3}
+///   computeIfAbsent / compute / merge    {one=1, three=3, two=2}
+///
+/// javars stores a map as one entry vector and derives the hash order from it
+/// by a stable sort on bin index, so a bin's chain *is* that vector's order
+/// restricted to the bin — which makes the JDK's head-insert a move of the new
+/// entry to just before the first entry it collides with. The relative order
+/// then survives a resize, as it does in Java, because a split preserves it.
+///
+/// Only a hash map has bins; an insertion-ordered or sorted map derives nothing
+/// from the vector's order and is left alone.
+fn hash_bucket_head_insert(recv: &Value, key: &Value) {
+    if map_order(recv) != Order::Hash {
+        return;
+    }
+    let Some(entries) = map_entries(recv) else {
+        return;
+    };
+    let Some(at) = entries.iter().rposition(|(k, _)| value_eq(k, key)) else {
+        return;
+    };
+    let cap = hash_capacity(entries.len());
+    let bin = hash_bucket(&entries[at].0, cap);
+    let Some(first) = entries.iter().position(|(k, _)| hash_bucket(k, cap) == bin) else {
+        return;
+    };
+    if first >= at {
+        return;
+    }
+    let mut out = entries;
+    let moved = out.remove(at);
+    out.insert(first, moved);
+    write_map_entries(recv, out);
+}
+
+/// Replace a map's entry vector wholesale and stale its key index, which the
+/// next lookup rebuilds. The one caller is [`hash_bucket_head_insert`], which
+/// reorders rather than adds.
+fn write_map_entries(recv: &Value, entries: Vec<(Value, Value)>) {
+    let Value::Obj(id) = recv else {
+        return;
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::Map {
+            entries: dst,
+            index,
+            ..
+        }) = h.borrow_mut().get_mut(*id as usize)
+        {
+            *dst = entries;
+            index.invalidate();
+        }
     });
-    idx
 }
 
 /// The order `items` are presented in under `order`, as indices into `items`.
@@ -2721,6 +2796,24 @@ fn builder_method(
     // Arguments render before the heap borrow: a rendering may run a user
     // `toString()`, which re-enters the VM and can allocate.
     let rendered: Vec<String> = args.iter().map(|a| sb_arg_str(vm, a)).collect();
+    // `chars`/`codePoints` name a *second* heap object, so they are answered
+    // before the exclusive borrow below is taken — allocating under it panics
+    // the interpreter, which is why these two used to refuse outright and
+    // `sb.chars().count()` was a hard error where Java answers `sb.length()`.
+    // The values are the `String` arm's: javars stores a builder's text as
+    // Unicode scalars, exactly as it stores a string's.
+    if matches!((method, args.len()), ("chars", 0) | ("codePoints", 0)) {
+        let text = HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Builder { s, len, .. }) => Some(s.chars().take(*len).collect::<Vec<_>>()),
+            _ => None,
+        })?;
+        return Some(Ok(stream_of(
+            text.into_iter()
+                .map(|c| Value::Int(i64::from(c as u32)))
+                .collect(),
+            StreamKind::Int,
+        )));
+    }
     Some(HEAP.with(|h| {
         let mut heap = h.borrow_mut();
         let Some(HostObj::Builder {
@@ -2924,9 +3017,6 @@ fn builder_method(
             // (Java 11+); `equals` is NOT — it stays reference identity, which
             // is why it is left to `object_method`.
             ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &rendered[0], false))),
-            ("chars", 0) | ("codePoints", 0) => Err(Fault::internal(format!(
-                "javars: unsupported StringBuilder method `{method}` with 0 argument(s)"
-            ))),
             _ => Err(Fault::internal(format!(
                 "javars: unsupported StringBuilder method `{method}` with {} argument(s)",
                 args.len()
@@ -3636,6 +3726,162 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 }
             }
             return Value::bool(removed);
+        }
+        // The six `Map` methods that are *compound*: each is defined in the JDK
+        // as a short sequence of `get`/`put`/`remove`/`containsKey`, and four of
+        // them run a user function in the middle of it. javars had none of them,
+        // so `map.computeIfAbsent(k, f)` — the ordinary way to fill a
+        // multimap — was a hard `unsupported Map method` refusal.
+        //
+        // They are written here as that same sequence of primitive calls rather
+        // than as fresh arms inside [`map_method`], for two reasons. The
+        // primitives already carry the parts that are easy to get wrong and hard
+        // to see: the key-equality plan (a user `equals` wins over `value_eq`),
+        // the key index, and the rule that a re-`put` keeps an entry's original
+        // position while a new key appends. And the function has to run with no
+        // heap borrow held, which is why they sit up here beside `sort` and
+        // `removeIf` rather than below the borrow.
+        //
+        // Two behaviours are NOT in the JDK's default bodies and are measured
+        // from openjdk 21.0.12.1 instead:
+        //
+        //   * An immutable receiver refuses *before* the function runs, and
+        //     refuses even when the default body would not have mutated —
+        //     `Map.of("a",1).computeIfAbsent("a", f)` is the UOE, not `1`, and
+        //     `Map.of(...).putAll(new HashMap<>())` is the UOE, not a no-op.
+        //     `ImmutableCollections` overrides each of these to throw outright.
+        //   * The function (and `merge`'s value) is null-checked up front, so a
+        //     null one is the NPE even when the body would never have called it.
+        ("compute", 2)
+        | ("computeIfAbsent", 2)
+        | ("computeIfPresent", 2)
+        | ("merge", 3)
+        | ("replace", 2)
+        | ("putAll", 1)
+            if map_entries(recv).is_some() =>
+        {
+            if map_fixity(recv) == Some(Fixity::Immutable) {
+                return raise(
+                    vm,
+                    Fault::java("UnsupportedOperationException", String::new()),
+                );
+            }
+            // `Objects.requireNonNull` on the function, and on `merge`'s value,
+            // before anything is read.
+            let null_checked: &[usize] = match method {
+                "compute" | "computeIfAbsent" | "computeIfPresent" => &[1],
+                "merge" => &[1, 2],
+                "putAll" => &[0],
+                _ => &[],
+            };
+            if null_checked
+                .iter()
+                .any(|&i| matches!(args[i], Value::Undef))
+            {
+                return raise(vm, Fault::java("NullPointerException", String::new()));
+            }
+            if method == "putAll" {
+                let Some(entries) = map_entries(&args[0]) else {
+                    return raise(vm, Fault::internal("javars: `putAll` needs a Map argument"));
+                };
+                let order = map_order(&args[0]);
+                let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                for i in present_order(&keys, order) {
+                    let (k, v) = entries[i].clone();
+                    coll_method(vm, recv, "put", &[k, v]);
+                    if PENDING.with(|p| p.borrow().is_some()) {
+                        return Value::Undef;
+                    }
+                }
+                return Value::Undef;
+            }
+            let key = args[0].clone();
+            let old = coll_method(vm, recv, "get", &[key.clone()]);
+            if PENDING.with(|p| p.borrow().is_some()) {
+                return Value::Undef;
+            }
+            let absent = matches!(old, Value::Undef);
+            // `replace` is the one arm with no function: it writes only over a
+            // key the map already has, and answers with the value it displaced.
+            if method == "replace" {
+                if absent {
+                    return Value::Undef;
+                }
+                coll_method(vm, recv, "put", &[key, args[1].clone()]);
+                return old;
+            }
+            // `computeIfAbsent` on a key that is already mapped never calls the
+            // function at all, and `computeIfPresent` on one that is not.
+            if (method == "computeIfAbsent" && !absent) || (method == "computeIfPresent" && absent)
+            {
+                return old;
+            }
+            let fresh = match method {
+                "computeIfAbsent" => invoke_closure(vm, &args[1], &[key.clone()]),
+                "computeIfPresent" | "compute" => {
+                    invoke_closure(vm, &args[1], &[key.clone(), old.clone()])
+                }
+                // `merge` seeds an absent key with the value rather than calling
+                // the function, and its function takes (old, value) — not the
+                // (key, value) pair the `compute` family passes.
+                _ if absent => args[1].clone(),
+                _ => invoke_closure(vm, &args[2], &[old.clone(), args[1].clone()]),
+            };
+            if PENDING.with(|p| p.borrow().is_some()) {
+                return Value::Undef;
+            }
+            if matches!(fresh, Value::Undef) {
+                // A null result removes the entry — except under
+                // `computeIfAbsent`, whose contract is to leave the map alone
+                // and answer null when the function declines to supply a value.
+                if method != "computeIfAbsent" && !absent {
+                    coll_method(vm, recv, "remove", &[key]);
+                }
+                return Value::Undef;
+            }
+            coll_method(vm, recv, "put", &[key.clone(), fresh.clone()]);
+            if PENDING.with(|p| p.borrow().is_some()) {
+                return Value::Undef;
+            }
+            // A key these three *add* goes to the head of its hash bin, not the
+            // tail `put` just gave it — see [`hash_bucket_head_insert`].
+            if absent {
+                hash_bucket_head_insert(recv, &key);
+            }
+            return fresh;
+        }
+        // `Map.replaceAll` — every value replaced in place by a `(key, value)`
+        // function. Its `List`/`Set` namesake is the arm above, which excludes a
+        // map receiver; a map's takes *two* parameters and moves no key, so each
+        // result is written back with a `put` over a key the map already has.
+        ("replaceAll", 1) if map_entries(recv).is_some() => {
+            if map_fixity(recv) == Some(Fixity::Immutable) {
+                return raise(
+                    vm,
+                    Fault::java("UnsupportedOperationException", String::new()),
+                );
+            }
+            if matches!(args[0], Value::Undef) {
+                return raise(vm, Fault::java("NullPointerException", String::new()));
+            }
+            let entries = map_entries(recv).unwrap_or_default();
+            let order = map_order(recv);
+            let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            // Iterated in the order the map *presents*, not the order it stores:
+            // the function is user code and can observe the sequence it is
+            // called in, which for a `HashMap` is the bin walk.
+            for i in present_order(&keys, order) {
+                let (k, v) = entries[i].clone();
+                let fresh = invoke_closure(vm, &args[0], &[k.clone(), v]);
+                if PENDING.with(|p| p.borrow().is_some()) {
+                    return Value::Undef;
+                }
+                coll_method(vm, recv, "put", &[k, fresh]);
+                if PENDING.with(|p| p.borrow().is_some()) {
+                    return Value::Undef;
+                }
+            }
+            return Value::Undef;
         }
         ("forEach", 1) => {
             // A `Map`'s consumer takes (key, value); a List/Set's takes one.
@@ -4594,6 +4840,21 @@ fn write_sequence(id: usize, items: Vec<Value>, structural: bool) -> Result<(), 
 }
 
 /// The presentation order of a `Map` handle.
+/// A map's [`Fixity`] — `Map.of(…)` is immutable, `new HashMap<>()` is not.
+///
+/// [`collection_fixity`] answers for a `List` or a `Set` only; a map reaches its
+/// refusals through [`map_method`]'s `shape` instead, which the compound
+/// methods in [`coll_method`] never see because they run before the borrow.
+fn map_fixity(v: &Value) -> Option<Fixity> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { fixed, .. }) => Some(*fixed),
+        _ => None,
+    })
+}
+
 fn map_order(v: &Value) -> Order {
     let Value::Obj(id) = v else {
         return Order::Insertion;
@@ -6907,18 +7168,18 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // a reversed range threw where javars silently answered an array.
         // `Arrays.copyOf` allocates before it copies, so a negative length is
         // the allocation's own `NegativeArraySizeException`.
-        ("Arrays", "copyOf", 2) => {
+        ("Arrays", "copyOf", 2 | 3) => {
             let items = array_items(&args[0]).unwrap_or_default();
             let len = args[1].jint();
             if len < 0 {
                 return Err(Fault::java("NegativeArraySizeException", len.to_string()));
             }
-            let pad = element_default(&items);
+            let pad = array_pad(&args[2..], &items);
             let mut out = items;
             out.resize(len as usize, pad);
             Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
         }
-        ("Arrays", "copyOfRange", 3) => {
+        ("Arrays", "copyOfRange", 3 | 4) => {
             let items = array_items(&args[0]).unwrap_or_default();
             let (from, to) = (args[1].jint(), args[2].jint());
             // `Arrays.copyOfRange` checks the range itself and reports it with
@@ -6936,7 +7197,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 return Err(Fault::java("ArrayIndexOutOfBoundsException", String::new()));
             }
             let (from, to) = (from as usize, to as usize);
-            let pad = element_default(&items);
+            let pad = array_pad(&args[3..], &items);
             let mut out: Vec<Value> = items
                 .get(from..to.min(items.len()))
                 .unwrap_or_default()
@@ -6945,15 +7206,32 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
         }
         // `Arrays.binarySearch` returns `-(insertion point) - 1` when absent,
-        // exactly as the JDK does.
+        // exactly as the JDK does — and when the key is present *more than
+        // once*, the index of whichever copy the JDK's own probe sequence lands
+        // on. That is not "any match": `Arrays.binarySearch(new int[]{3, 3}, 3)`
+        // is 0 and `binarySearch(new int[]{3, 3, 3, 3}, 3)` is 1, both fixed by
+        // the loop below. Rust's `slice::binary_search_by` makes no such promise
+        // and answered 1 and 3, so the two agreed only on arrays with no
+        // duplicate key. The loop is `java.util.Arrays.binarySearch0`
+        // transcribed, midpoint included (`(low + high) >>> 1`).
         ("Arrays", "binarySearch", 2) => {
             let items = array_items(&args[0]).unwrap_or_default();
-            Ok(Value::Int(
-                match items.binary_search_by(|p| natural_cmp(p, &args[1])) {
-                    Ok(i) => i as i64,
-                    Err(i) => -(i as i64) - 1,
-                },
-            ))
+            let key = &args[1];
+            let mut low: i64 = 0;
+            let mut high: i64 = items.len() as i64 - 1;
+            let mut found = None;
+            while low <= high {
+                let mid = ((low as u64 + high as u64) >> 1) as i64;
+                match natural_cmp(&items[mid as usize], key) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    std::cmp::Ordering::Greater => high = mid - 1,
+                    std::cmp::Ordering::Equal => {
+                        found = Some(mid);
+                        break;
+                    }
+                }
+            }
+            Ok(Value::Int(found.unwrap_or(-(low + 1))))
         }
         // `Arrays.hashCode(a)` — the JDK's documented `31 * result + e` fold,
         // seeded at 1, wrapping at 32 bits.
@@ -7444,6 +7722,17 @@ fn pow_double(a: f64, b: f64) -> f64 {
     if b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) {
         return f64::NAN;
     }
+    // fdlibm's `__ieee754_pow` — the algorithm the JDK's `StrictMath.pow`
+    // implements and `Math.pow` agrees with here — short-circuits an exponent of
+    // exactly -1 to `1/x` rather than routing it through the log/exp core. The
+    // two disagree in the last place: `Math.pow(0.49999999999999994, -1)` is
+    // 2.0000000000000004 (the reciprocal) and Rust's `powf` answers 2.0.
+    // Measured over a 90-point grid against openjdk 21.0.12.1, this is the only
+    // exponent where taking the shortcut changes an answer, and it changes it
+    // toward the reference.
+    if b == -1.0 {
+        return 1.0 / a;
+    }
     a.powf(b)
 }
 
@@ -7614,6 +7903,20 @@ fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault>
 /// at runtime, so it is read off element 0: a numeric array pads with its zero,
 /// a boolean array with `false`, and anything else (including an empty source)
 /// with `null`.
+/// The pad a grown array copy takes: the compiler's, when it could read the
+/// source's *static* element type and sent it as a trailing operand, and
+/// otherwise [`element_default`]'s guess from element 0.
+///
+/// The compiler's is the only answer available for an **empty** source, which
+/// has no element 0 to read — `Arrays.copyOf(new int[0], 2)` is `[0, 0]` in
+/// Java and was `[null, null]` here.
+fn array_pad(extra: &[Value], items: &[Value]) -> Value {
+    match extra.first() {
+        Some(v) => v.clone(),
+        None => element_default(items),
+    }
+}
+
 fn element_default(items: &[Value]) -> Value {
     match items.first() {
         Some(Value::Int(_)) => Value::Int(0),
