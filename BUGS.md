@@ -855,7 +855,9 @@ at the bottom, and are summarized in the section right after this one.
   function's first call rather than at composition.
 - **Method references.** `String::length` and `Integer::parseInt` (unbound
   receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
-  `this::method` (bound — the receiver is captured), `Point::new`, and
+  `this::method` (bound — the receiver is captured), `Point::new`,
+  `ArrayList::new`/`HashMap::new`/`StringBuilder::new`/`String::new`/
+  `Object::new` (the no-argument constructor of a modeled stdlib type), and
   `System.out::println`. Java infers the reference's arity from its *target*
   type; javars has no target-typing pass, so the arity comes from the referenced
   member's own declaration — which resolves every unambiguous form and rejects
@@ -1253,10 +1255,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   carry them.
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
-  `Objects.equals` (the one `Objects` member, because a `record`'s derived
-  `equals` is specified in terms of it), the `String` instance methods, and the
-  `java.util` collections are the whole
-  library surface — no `entrySet`/`Deque`/`Queue`, no I/O. A stream is evaluated
+  the `Objects` members, the `String` instance methods, and the `java.util`
+  collections are the whole
+  library surface — no `entrySet`, no I/O. A stream is evaluated
   in one thread whatever `parallel()` would ask for, which is observable only
   through a side-effecting pipeline's *ordering* — Java makes no ordering
   promise for one either. An iterator over a `Set` is not fail-fast, because a `Set` carries no
@@ -1275,8 +1276,20 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   sweep against OpenJDK 26 diverged in the last digit for every one of them
   (`sin` 14/180, `cbrt` 25/180, `tan` 5/10), so they are left out: an
   unregistered static is a clear error, a silently different last digit is not.
-  `sqrt`, `pow`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
-  `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
+  `sqrt`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
+  `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported.
+  `pow` is supported but sits with the transcendentals rather than with them: the
+  JDK reaches it through the same fdlibm log/exp core and Rust's `powf` does not
+  reproduce it bit-for-bit. A 90-point sweep against openjdk 21.0.12.1 diverges
+  in the last place twice — `Math.pow(2.0, -0.5)` is `0.7071067811865475` there
+  and `…76` here, and `Math.pow(1e-300, 1.0/3)` ends `…127E-100` there and
+  `…128E-100` here. fdlibm's exponent short-circuits are taken, so an exponent of
+  exactly -1 is the reciprocal rather than the core's answer (which is what makes
+  `Math.pow(0.49999999999999994, -1)` the reference's `2.0000000000000004` and
+  not `2.0`); closing the last two needs the core itself ported. `pow` is kept
+  rather than withdrawn because the whole `Exact`/rounding family that reaches
+  for it is exact, and because a program that writes `Math.pow(2, 10)` — the
+  overwhelmingly common shape — gets the exact answer,
   as are the `Math.PI`/`Math.E` constants — and so are `rint`, `copySign`,
   `ulp`, `nextUp`/`nextDown`/`nextAfter` and `fma`, which sit on the exact side
   of the same line: each is an IEEE operation or a walk over the bit pattern, so
@@ -1339,6 +1352,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   | two or more methods | `an anonymous G is modeled only when its body declares exactly one` |
   | any field beside the method | `an anonymous G may declare only methods` |
   | extending an abstract CLASS | `no concrete implementation of a for A` |
+  | overriding `toString`/`equals`/`hashCode`, or any `new Object() { … }` | `whose body overrides ... is a class with inherited state` |
+
+  That last row is the one that used to be a *wrong answer* rather than a
+  refusal. `new Object() { public String toString() { return "x"; } }` declares
+  exactly one method, so it took the lambda desugaring — and `Object` has no
+  abstract method for the body to supply, so `System.out.println(o)` rendered
+  `<lambda>@e` where Java prints `x`. What such a body overrides is an inherited
+  implementation, which is a class with state and not a functional method.
 
   This entry previously said anonymous classes were unimplemented outside the
   enum-constant body form, which understated it: the one-method interface form

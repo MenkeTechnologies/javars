@@ -5321,3 +5321,218 @@ fn remove_if_through_a_view_keeps_the_view_usable() {
     assert!(ok, "{out}");
     assert_eq!(out, "true [2] [1, 2, 4]\n[20, 30] [1, 20, 30, 4]\n");
 }
+
+#[test]
+fn a_maps_compound_methods_follow_the_jdk_default_bodies() {
+    // `compute`, `computeIfAbsent`, `computeIfPresent`, `merge`, `replace` and
+    // `putAll` are each a short sequence of `get`/`put`/`remove` in the JDK, and
+    // javars answers them as that same sequence. The arms that separate a right
+    // implementation from a plausible one are the *null* results: a function
+    // returning null removes the entry under `compute`/`computeIfPresent`/
+    // `merge` but leaves the map untouched under `computeIfAbsent`, and
+    // `computeIfAbsent` on a key already present never calls the function at
+    // all. Frozen against openjdk 21.0.12.1.
+    let (out, ok) = run(&wrap(
+        "java.util.Map<String, Integer> m = new java.util.LinkedHashMap<>();\
+         m.put(\"a\", 1); m.put(\"b\", 2);\
+         System.out.println(m.computeIfAbsent(\"a\", k -> 99) + \" \" + m.computeIfAbsent(\"c\", k -> 3));\
+         System.out.println(m.computeIfAbsent(\"d\", k -> null) + \" \" + m.containsKey(\"d\"));\
+         System.out.println(m.computeIfPresent(\"a\", (k, v) -> v + 10) + \" \" + m.computeIfPresent(\"zz\", (k, v) -> 1));\
+         System.out.println(m.computeIfPresent(\"b\", (k, v) -> null) + \" \" + m);\
+         System.out.println(m.compute(\"e\", (k, v) -> v == null ? 7 : v) + \" \" + m.compute(\"a\", (k, v) -> null) + \" \" + m);\
+         System.out.println(m.merge(\"f\", 5, (x, y) -> x + y) + \" \" + m.merge(\"f\", 5, (x, y) -> x + y));\
+         System.out.println(m.merge(\"f\", 5, (x, y) -> null) + \" \" + m);\
+         System.out.println(m.replace(\"c\", 30) + \" \" + m.replace(\"nope\", 30) + \" \" + m);\
+         m.replaceAll((k, v) -> v * 2);\
+         java.util.Map<String, Integer> n = new java.util.TreeMap<>();\
+         n.put(\"z\", 1); n.putAll(m); System.out.println(n);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "1 3\nnull false\n11 null\nnull {a=11, c=3}\n7 null {c=3, e=7}\n5 10\nnull {c=3, e=7}\n3 null {c=30, e=7}\n{c=60, e=14, z=1}\n"
+    );
+}
+
+#[test]
+fn a_key_added_by_compute_heads_its_hash_bin() {
+    // `HashMap.put` links a new node at the tail of its bin;
+    // `computeIfAbsent`/`compute`/`merge` reach the insert through
+    // `newNode(hash, key, value, first)`, which links it at the head. So the
+    // same three keys inserted two ways iterate in two different orders —
+    // `three` shares `two`'s bin. Measured on openjdk 21.0.12.1; a
+    // `LinkedHashMap` has no bins and must NOT move.
+    let (out, ok) = run(&wrap(
+        "java.util.Map<String, Integer> a = new java.util.HashMap<>();\
+         a.put(\"one\", 1); a.put(\"two\", 2); a.put(\"three\", 3);\
+         java.util.Map<String, Integer> b = new java.util.HashMap<>();\
+         b.put(\"one\", 1); b.put(\"two\", 2); b.computeIfAbsent(\"three\", k -> 3);\
+         java.util.Map<String, Integer> c = new java.util.HashMap<>();\
+         c.put(\"one\", 1); c.put(\"two\", 2); c.merge(\"three\", 3, (x, y) -> x);\
+         java.util.Map<String, Integer> d = new java.util.LinkedHashMap<>();\
+         d.put(\"one\", 1); d.put(\"two\", 2); d.computeIfAbsent(\"three\", k -> 3);\
+         System.out.println(a);\
+         System.out.println(b);\
+         System.out.println(c);\
+         System.out.println(d);\
+         System.out.println(a.equals(b));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "{one=1, two=2, three=3}\n{one=1, three=3, two=2}\n{one=1, three=3, two=2}\n{one=1, two=2, three=3}\ntrue\n"
+    );
+}
+
+#[test]
+fn a_constructor_reference_names_a_stdlib_types_no_arg_constructor() {
+    // `ArrayList::new` was an unresolvable receiver and `String::new` an
+    // unmodeled reference: only a *declared* class reached the constructor arm.
+    // Each supplier is called twice to pin that it constructs per call rather
+    // than capturing one object.
+    let (out, ok) = run("import java.util.*;\
+         public class T {\
+           interface Gen<E> { E get(); }\
+           public static void main(String[] args) {\
+             Gen<ArrayList<String>> a = ArrayList::new;\
+             List<String> l = a.get(); l.add(\"x\");\
+             System.out.println(l + \" \" + a.get());\
+             Gen<StringBuilder> b = StringBuilder::new;\
+             System.out.println(\"[\" + b.get().append(\"q\") + \"]\" + b.get().length());\
+             Gen<String> s = String::new;\
+             System.out.println(\"[\" + s.get() + \"]\" + s.get().isEmpty());\
+             Gen<TreeMap<String, Integer>> m = TreeMap::new;\
+             System.out.println(m.get());\
+             Gen<Object> o = Object::new;\
+             System.out.println(o.get() != null);\
+           }\
+         }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "[x] []\n[q]0\n[]true\n{}\ntrue\n");
+}
+
+#[test]
+fn a_type_parameter_shadowing_a_class_name_still_erases() {
+    // Erasing a type parameter by dropping its name leaves the raw text behind,
+    // so `T get()` inside `class T` was read as returning the class and
+    // `g.get().length()` was ``class `T` has no method `length` ``. The name is
+    // in scope as a type *variable*, so it erases to `Object` and the call
+    // dispatches on the receiver — while a class genuinely named `Box` used as a
+    // type outside any `<Box>` binding must keep resolving to the class.
+    let (out, ok) = run("public class T {\
+           interface Gen<T> { T get(); }\
+           static class Box { int v; Box(int v) { this.v = v; } int v() { return v; } }\
+           static <T> T id(T x) { return x; }\
+           static Box mk() { return new Box(7); }\
+           public static void main(String[] args) {\
+             Gen<String> g = () -> \"zz\";\
+             System.out.println(g.get().length());\
+             System.out.println(id(\"q\").length() + \" \" + id(5));\
+             Box b = mk();\
+             System.out.println(b.v() + \" \" + mk().v());\
+           }\
+         }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "2\n1 5\n7 7\n");
+}
+
+#[test]
+fn a_grown_copy_of_an_empty_array_pads_with_the_element_types_zero() {
+    // The pad is the *element type's* default, and the element type is erased at
+    // run time — reading it off element 0 works for every array except an empty
+    // one, which answered `[null, null]` where Java answers `[0, 0]`. The
+    // compiler knows the source's static type and sends the pad along, so a
+    // reference array still pads with `null`.
+    let (out, ok) = run(&wrap(
+        "System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOf(new int[] {}, 2)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOf(new double[] {}, 2)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOf(new boolean[] {}, 2)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOf(new String[] {}, 2)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOfRange(new long[] {}, 0, 2)));\
+         System.out.println(java.util.Arrays.toString(java.util.Arrays.copyOf(new int[] {5}, 3)));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[0, 0]\n[0.0, 0.0]\n[false, false]\n[null, null]\n[0, 0]\n[5, 0, 0]\n"
+    );
+}
+
+#[test]
+fn a_builders_chars_stream_reads_its_current_contents() {
+    // `chars`/`codePoints` allocate a second heap object, so they are answered
+    // before the builder's exclusive borrow is taken — under it the interpreter
+    // panics, which is why they used to refuse outright. `setLength` past the
+    // end pads with NUL, and those padding characters are elements of the
+    // stream (code point 0), which is what pins the count against the text.
+    let (out, ok) = run(&wrap(
+        "StringBuilder b = new StringBuilder();\
+         System.out.println(b.chars().count());\
+         StringBuilder c = new StringBuilder(\"aBc\");\
+         System.out.println(c.chars().count() + \" \" + c.chars().sum() + \" \" + c.codePoints().max().getAsInt());\
+         c.setLength(2); System.out.println(c.chars().count() + \" \" + c.chars().sum());\
+         c.setLength(4); System.out.println(c.chars().count() + \" \" + c.chars().sum());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "0\n3 262 99\n2 163\n4 163\n");
+}
+
+#[test]
+fn binary_search_lands_on_the_jdks_own_probe_when_the_key_repeats() {
+    // With no duplicate key any correct binary search agrees; with one, the
+    // index returned is whichever copy the probe sequence reaches, and the JDK's
+    // is fixed. Rust's `slice::binary_search_by` promises only *a* match and
+    // returned the last: `{3, 3}` answered 1 where Java answers 0, and
+    // `{3, 3, 3, 3}` answered 3 where Java answers 1. Frozen against openjdk
+    // 21.0.12.1, absent keys included (`-(insertion point) - 1`).
+    let (out, ok) = run(&wrap(
+        "int[] a = {3, 3};\
+         int[] b = {1, 3, 3, 3, 5};\
+         int[] c = {3, 3, 3, 3};\
+         long[] d = {1L, 2L, 3L, 4L, 5L, 6L, 7L};\
+         System.out.println(java.util.Arrays.binarySearch(a, 3) + \" \" + java.util.Arrays.binarySearch(c, 3));\
+         System.out.println(java.util.Arrays.binarySearch(b, 3) + \" \" + java.util.Arrays.binarySearch(b, 2) + \" \" + java.util.Arrays.binarySearch(b, 9) + \" \" + java.util.Arrays.binarySearch(b, 0));\
+         for (long k = 0; k <= 8; k++) System.out.print(java.util.Arrays.binarySearch(d, k) + \",\");\
+         System.out.println();",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "0 1\n2 -2 -6 -1\n-1,0,1,2,3,4,5,6,-8,\n");
+}
+
+#[test]
+fn pow_takes_fdlibms_reciprocal_shortcut_at_exponent_minus_one() {
+    // fdlibm short-circuits an exponent of exactly -1 to `1/x` instead of
+    // routing it through the log/exp core, and the two disagree in the last
+    // place. `Math.pow(0.49999999999999994, -1)` is the reciprocal,
+    // 2.0000000000000004, where Rust's `powf` answers 2.0.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Math.pow(0.49999999999999994, -1));\
+         System.out.println(Math.pow(3.0, -1) + \" \" + Math.pow(0.1, -1) + \" \" + Math.pow(-3.0, -1));\
+         System.out.println(Math.pow(0.0, -1) + \" \" + Math.pow(-0.0, -1) + \" \" + Math.pow(2.0, 10));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "2.0000000000000004\n0.3333333333333333 10.0 -0.3333333333333333\nInfinity -Infinity 1024.0\n"
+    );
+}
+
+#[test]
+fn an_anonymous_object_that_overrides_tostring_is_refused_not_desugared() {
+    // It declares exactly one method, so it took the lambda desugaring — and
+    // `Object` has no abstract method for the body to supply, so printing the
+    // value rendered `<lambda>@e` where Java prints what the override returns.
+    // A refusal is the correct answer for a shape javars does not model; a
+    // plausible-looking wrong one is not.
+    let (out, ok) = run(&wrap(
+        "Object o = new Object() { public String toString() { return \"anon\"; } };\
+         System.out.println(o);",
+    ));
+    assert!(!ok, "{out}");
+    let (out, ok) = run(&wrap(
+        "Runnable r = new Runnable() { public void run() { System.out.println(\"ran\"); } };\
+         r.run();",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "ran\n");
+}

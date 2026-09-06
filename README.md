@@ -357,7 +357,10 @@ Implemented and checked against the reference `java`:
   `try`/`finally` and `throw` all work inside a lambda body.
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
   `Point::area`, `obj::method`, `this::method`, `Point::new`,
-  `System.out::println`.
+  `System.out::println`. A constructor reference also names a modeled stdlib
+  type's no-argument constructor — `ArrayList::new`, `HashMap::new`,
+  `StringBuilder::new`, `String::new`, `Object::new` — which is the form a
+  `Supplier`-shaped use takes.
 - **`java.util` collections** — `List`/`ArrayList`/`LinkedList`,
   `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
@@ -396,7 +399,14 @@ Implemented and checked against the reference `java`:
   overrides `equals` and leaves `hashCode` alone is *not* found by a
   `HashSet`/`HashMap`, because it is not found by Java's either;
   [`BUGS.md`](BUGS.md) has the boundary. `Set.of` rejects a repeated element
-  with `IllegalArgumentException` rather than dropping it.
+  with `IllegalArgumentException` rather than dropping it. A `Map` also answers
+  the compound methods that are defined in terms of the primitive ones —
+  `compute`, `computeIfAbsent`, `computeIfPresent`, `merge`, `replace`,
+  `putAll`, and the two-parameter `replaceAll` — including the detail that
+  separates them from `put`: a key one of the first three *adds* to a `HashMap`
+  is linked at the **head** of its hash bin where `put` links it at the tail, so
+  the same map filled two ways iterates in two different orders, exactly as
+  Java's does.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
@@ -562,10 +572,11 @@ Next waves, in priority order:
    element; compile-time pipeline fusion is one way to build it, not a
    prerequisite. See [`BUGS.md`](BUGS.md) for which callback shapes can re-enter
    and which cannot.
-2. **`switch` patterns** (`case Integer i ->`, `case null`, `when` guards),
-   `Iterator`/`entrySet`, and wider stdlib coverage
-   (more `Math`/`Integer` statics, more `String` methods, a `record`'s derived
-   `hashCode`).
+2. **`Map.entrySet`** and the remaining collection views (`List.listIterator`),
+   plus wider stdlib coverage (a `record`'s derived `hashCode`,
+   `Collectors.toCollection`). The pattern forms this line used to list —
+   `case Integer i ->`, `case null`, `when` guards — and `Iterator` all run;
+   measured against the reference on openjdk 21.0.12.1.
 3. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 
