@@ -2287,6 +2287,18 @@ const SUPPORT_CLASS: &str = concat!(
     "interface Str1 { String of(String s); }\n",
     "interface Pred1 { boolean of(int a); }\n",
     "interface Sup0 { int of(); }\n",
+    // A *generic* supplier, for the `ctorref` and `anon` modes: a constructor
+    // reference needs a target type whose method returns the constructed type,
+    // and `Sup0` above is fixed to `int`.
+    "interface Gen<T> { T get(); }\n",
+    // An *instance* initializer block — a member-position `{ ... }`, which runs
+    // before the constructor body. `static { }` was generated; this was not.
+    "class Ini {\n",
+    "    int v;\n",
+    "    String seen = \"none\";\n",
+    "    { seen = \"init\"; v = 1; }\n",
+    "    Ini(int k) { v = v + k; }\n",
+    "}\n",
     "class Res implements AutoCloseable {\n",
     "    String n;\n",
     "    Res(String n) { this.n = n; System.out.println(\"open \" + n); }\n",
@@ -2474,6 +2486,16 @@ enum Mode {
     Mutate,
     Chars,
     Nested,
+    Builder,
+    MathFn,
+    MapFn,
+    CtorRef,
+    Optional,
+    Stream,
+    ArraysFn,
+    ParseFn,
+    TextBlock,
+    Anon,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2535,6 +2557,16 @@ const CONCRETE: &[Mode] = &[
     Mode::Mutate,
     Mode::Chars,
     Mode::Nested,
+    Mode::Builder,
+    Mode::MathFn,
+    Mode::MapFn,
+    Mode::CtorRef,
+    Mode::Optional,
+    Mode::Stream,
+    Mode::ArraysFn,
+    Mode::ParseFn,
+    Mode::TextBlock,
+    Mode::Anon,
 ];
 
 /// The `Integer`/`Long` bit-twiddling statics, at the boundaries where the two
@@ -2829,6 +2861,348 @@ fn g_nested(r: &mut Rng) -> String {
     }
 }
 
+/// `StringBuilder`/`StringBuffer`, which had **zero** coverage: the string
+/// `StringBuilder` did not appear once in this generator, so 28 registered
+/// methods and the whole mutable-string path were unreachable by any sweep.
+///
+/// The interesting arms are the ones where the builder is not a `String` in
+/// disguise: `setLength` truncates *or* zero-pads, `insert`/`delete` take index
+/// pairs whose out-of-range cases are `StringIndexOutOfBoundsException`, and
+/// `reverse` is in place, so the receiver a later arm reads is the reversed one.
+fn g_builder(r: &mut Rng) -> String {
+    let init = pick(
+        r,
+        &["\"\"", "\"abc\"", "\"a\"", "\"hello world\"", "\"  \""],
+    );
+    let piece = pick(
+        r,
+        &[
+            "\"x\"", "\"\"", "\"long\"", "'q'", "7", "-3", "2.5", "true", "9L",
+        ],
+    );
+    let i = pick(r, &["0", "1", "2", "5", "-1"]);
+    let j = pick(r, &["0", "1", "3", "9"]);
+    match r.below(16) {
+        0 => format!("{{ StringBuilder b = new StringBuilder({init}); b.append({piece}); System.out.println(b + \"|\" + b.length()); }}"),
+        1 => format!("{{ StringBuilder b = new StringBuilder({init}); System.out.println(b.append({piece}).append({piece}).append({init})); }}"),
+        2 => format!("{{ StringBuilder b = new StringBuilder({init}); System.out.println(b.reverse() + \"|\" + b); }}"),
+        3 => format!("{{ StringBuilder b = new StringBuilder({init}); System.out.println(b.isEmpty() + \" \" + b.length() + \" \" + b.toString().equals({init})); }}"),
+        4 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.charAt({i})); }} catch (RuntimeException e) {{ System.out.println(\"c:\" + e.getClass().getName()); }} }}"),
+        5 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.insert({i}, {piece})); }} catch (RuntimeException e) {{ System.out.println(\"i:\" + e.getClass().getName()); }} }}"),
+        6 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.deleteCharAt({i})); }} catch (RuntimeException e) {{ System.out.println(\"d:\" + e.getClass().getName()); }} }}"),
+        7 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.delete({i}, {j})); }} catch (RuntimeException e) {{ System.out.println(\"D:\" + e.getClass().getName()); }} }}"),
+        8 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.replace({i}, {j}, \"Z\")); }} catch (RuntimeException e) {{ System.out.println(\"r:\" + e.getClass().getName()); }} }}"),
+        9 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ b.setCharAt({i}, 'w'); System.out.println(b); }} catch (RuntimeException e) {{ System.out.println(\"s:\" + e.getClass().getName()); }} }}"),
+        10 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ b.setLength({j}); System.out.println(\"[\" + b + \"]\" + b.length()); }} catch (RuntimeException e) {{ System.out.println(\"L:\" + e.getClass().getName()); }} }}"),
+        11 => format!("{{ StringBuilder b = new StringBuilder({init}); try {{ System.out.println(b.substring({i}) + \"|\" + b.substring(0, {i})); }} catch (RuntimeException e) {{ System.out.println(\"S:\" + e.getClass().getName()); }} }}"),
+        12 => format!("{{ StringBuilder b = new StringBuilder({init}); System.out.println(b.indexOf(\"a\") + \" \" + b.lastIndexOf(\"a\") + \" \" + b.indexOf(\"zz\")); }}"),
+        13 => format!("{{ StringBuilder b = new StringBuilder({init}); System.out.println(b.compareTo(new StringBuilder({init})) + \" \" + b.compareTo(new StringBuilder(\"m\"))); }}"),
+        14 => format!("{{ StringBuffer b = new StringBuffer({init}); System.out.println(b.append({piece}) + \"|\" + b.length()); }}"),
+        _ => format!("{{ StringBuilder b = new StringBuilder(); for (int k = 0; k < 3; k++) b.append(k).append({piece}); System.out.println(b + \"|\" + b.chars().count()); }}"),
+    }
+}
+
+/// The 27 `Math` methods no probe named. Only `abs/max/min/floor/ceil/sqrt` were
+/// generated, so the exact-arithmetic family — every member of which is a
+/// no-op away from its boundary and an `ArithmeticException` at it — had no
+/// coverage at all, and neither did the rounding and float-neighbour methods
+/// whose whole content is their edge cases.
+///
+/// The operand pool is deliberately boundaries: both `MIN_VALUE`s, both
+/// `MAX_VALUE`s, the halfway ties `round` resolves upward, and the signed zeros
+/// that separate `signum`/`copySign` from a sign test.
+fn g_mathfn(r: &mut Rng) -> String {
+    let i = pick(
+        r,
+        &[
+            "0",
+            "1",
+            "-1",
+            "7",
+            "-7",
+            "Integer.MAX_VALUE",
+            "Integer.MIN_VALUE",
+            "2147483646",
+        ],
+    );
+    let j = pick(r, &["1", "-1", "2", "-2", "0", "Integer.MAX_VALUE"]);
+    let l = pick(
+        r,
+        &["0L", "1L", "-1L", "Long.MAX_VALUE", "Long.MIN_VALUE", "3L"],
+    );
+    let d = pick(
+        r,
+        &[
+            "0.0",
+            "-0.0",
+            "2.5",
+            "-2.5",
+            "3.5",
+            "0.49999999999999994",
+            "1.0",
+            "-1.5",
+            "1e300",
+            "Double.NaN",
+            "Double.MIN_VALUE",
+        ],
+    );
+    let e = pick(r, &["0.0", "1.0", "-1.0", "2.0", "0.5", "-0.0"]);
+    match r.below(14) {
+        0 => format!("System.out.println(Math.floorDiv({i}, {j} == 0 ? 1 : {j}) + \" \" + Math.floorMod({i}, {j} == 0 ? 1 : {j}));"),
+        1 => format!("System.out.println(Math.round({d}) + \" \" + Math.round((float) {d}) + \" \" + Math.rint({d}));"),
+        2 => format!("System.out.println(Math.pow({d}, {e}) + \" \" + Math.signum({d}) + \" \" + Math.copySign({d}, {e}));"),
+        3 => format!("System.out.println(Math.ulp({d}) + \" \" + Math.nextUp({d}) + \" \" + Math.nextDown({d}) + \" \" + Math.nextAfter({d}, {e}));"),
+        4 => format!("System.out.println(Math.fma({d}, {e}, 1.0) + \" \" + Math.toDegrees({d}) + \" \" + Math.toRadians({d}));"),
+        5 => format!("System.out.println(Math.clamp({i}, -5, 5) + \" \" + Math.clamp({d}, -1.0, 1.0));"),
+        6 => format!("try {{ System.out.println(Math.addExact({i}, {j})); }} catch (ArithmeticException ex) {{ System.out.println(\"ae:\" + ex.getMessage()); }}"),
+        7 => format!("try {{ System.out.println(Math.subtractExact({i}, {j}) + \" \" + Math.multiplyExact({i}, {j})); }} catch (ArithmeticException ex) {{ System.out.println(\"se:\" + ex.getMessage()); }}"),
+        8 => format!("try {{ System.out.println(Math.negateExact({i}) + \" \" + Math.absExact({i})); }} catch (ArithmeticException ex) {{ System.out.println(\"ne:\" + ex.getMessage()); }}"),
+        9 => format!("try {{ System.out.println(Math.incrementExact({i}) + \" \" + Math.decrementExact({i})); }} catch (ArithmeticException ex) {{ System.out.println(\"ie:\" + ex.getMessage()); }}"),
+        10 => format!("try {{ System.out.println(Math.toIntExact({l})); }} catch (ArithmeticException ex) {{ System.out.println(\"te:\" + ex.getMessage()); }}"),
+        11 => format!("try {{ System.out.println(Math.divideExact({i}, {j} == 0 ? 1 : {j}) + \" \" + Math.floorDivExact({i}, {j} == 0 ? 1 : {j})); }} catch (ArithmeticException ex) {{ System.out.println(\"de:\" + ex.getMessage()); }}"),
+        12 => format!("try {{ System.out.println(Math.addExact({l}, 1L) + \" \" + Math.multiplyExact({l}, 2L)); }} catch (ArithmeticException ex) {{ System.out.println(\"le:\" + ex.getMessage()); }}"),
+        _ => format!("try {{ System.out.println(Math.ceilDivExact({i}, {j} == 0 ? 1 : {j})); }} catch (ArithmeticException ex) {{ System.out.println(\"ce:\" + ex.getMessage()); }}"),
+    }
+}
+
+/// The compound `Map` methods — `compute`, `computeIfAbsent`,
+/// `computeIfPresent`, `merge`, `replace`, `putAll` and a map's two-parameter
+/// `replaceAll`. Every one was an `unsupported Map method` refusal before this
+/// round, and none appeared in the generator.
+///
+/// The `HashMap` arms are the point: a key that these three *add* is linked at
+/// the **head** of its hash bin where `put` links it at the tail, so a program
+/// that fills the same map by `put` and by `merge` iterates it in two different
+/// orders. Keys are drawn from a pool that collides under Java's spread
+/// function, because nothing else can see the difference.
+fn g_mapfn(r: &mut Rng) -> String {
+    let ctor = pick(r, &["HashMap", "LinkedHashMap", "TreeMap"]);
+    let k = pick(
+        r,
+        &[
+            "\"one\"",
+            "\"two\"",
+            "\"three\"",
+            "\"four\"",
+            "\"a\"",
+            "\"zz\"",
+        ],
+    );
+    let v = pick(r, &["1", "0", "-3", "42"]);
+    let f = pick(
+        r,
+        &[
+            "(x, y) -> x + y",
+            "(x, y) -> x * y",
+            "(x, y) -> y",
+            "(x, y) -> null",
+        ],
+    );
+    let seed = "m.put(\"one\", 1); m.put(\"two\", 2);";
+    match r.below(14) {
+        0 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.computeIfAbsent({k}, s -> s.length()) + \" \" + m); }}"),
+        1 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.computeIfAbsent({k}, s -> null) + \" \" + m + \" \" + m.containsKey({k})); }}"),
+        2 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.computeIfPresent({k}, (s, x) -> x + {v}) + \" \" + m); }}"),
+        3 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.computeIfPresent({k}, (s, x) -> null) + \" \" + m); }}"),
+        4 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.compute({k}, (s, x) -> x == null ? {v} : x + {v}) + \" \" + m); }}"),
+        5 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.compute({k}, (s, x) -> null) + \" \" + m); }}"),
+        6 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.merge({k}, {v}, {f}) + \" \" + m); }}"),
+        7 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} System.out.println(m.replace({k}, {v}) + \" \" + m); }}"),
+        8 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} Map<String,Integer> n = new {ctor}<>(); n.put({k}, {v}); n.put(\"three\", 3); m.putAll(n); System.out.println(m); }}"),
+        9 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} m.replaceAll((s, x) -> x * 10 + s.length()); System.out.println(m); }}"),
+        // The head-insert arms: the same three keys, filled two ways.
+        10 => format!("{{ Map<String,Integer> m = new {ctor}<>(); {seed} m.put(\"three\", 3); Map<String,Integer> n = new {ctor}<>(); n.put(\"one\", 1); n.put(\"two\", 2); n.merge(\"three\", 3, (x, y) -> x); System.out.println(m + \" \" + n + \" \" + m.equals(n)); }}"),
+        11 => format!("{{ Map<String,Integer> m = new {ctor}<>(); for (int q = 0; q < 20; q++) m.computeIfAbsent(\"k\" + q, s -> s.length()); System.out.println(m); }}"),
+        12 => format!("{{ Map<String,List<Integer>> m = new {ctor}<>(); for (String w : new String[] {{\"apple\", \"avocado\", \"banana\", \"cherry\"}}) m.computeIfAbsent(w.substring(0, 1), s -> new ArrayList<>()).add(w.length()); System.out.println(m); }}"),
+        // Every refusal an immutable map answers with, and the null-argument NPEs.
+        // The seed goes into `h`, not into `m`: `m` is the immutable map this
+        // arm exists to probe, and seeding it would throw *outside* the `try`
+        // and kill the whole program — which the harness counts as a skip, not
+        // as a failure, and a skipped program is coverage that silently is not
+        // there.
+        _ => format!("{{ Map<String,Integer> m = Map.of(\"a\", 1); try {{ m.merge({k}, {v}, {f}); }} catch (RuntimeException e) {{ System.out.println(\"im:\" + e.getClass().getName()); }} Map<String,Integer> h = new {ctor}<>(); h.put(\"one\", 1); h.put(\"two\", 2); try {{ h.compute({k}, null); }} catch (RuntimeException e) {{ System.out.println(\"nf:\" + e.getClass().getName()); }} }}"),
+    }
+}
+
+/// `T::new` on a *modeled stdlib* type. `ArrayList::new` was an unresolvable
+/// receiver and `String::new` an unmodeled reference before this round, and the
+/// generator named neither — it wrote only user-class constructor references,
+/// which took a different path.
+fn g_ctorref(r: &mut Rng) -> String {
+    match r.below(9) {
+        0 => "{ Gen<ArrayList<String>> s = ArrayList::new; ArrayList<String> l = s.get(); l.add(\"a\"); System.out.println(l + \" \" + (s.get() == s.get())); }".to_string(),
+        1 => "{ Gen<StringBuilder> s = StringBuilder::new; System.out.println(\"[\" + s.get().append(\"q\") + \"]\" + s.get().length()); }".to_string(),
+        2 => "{ Gen<String> s = String::new; System.out.println(\"[\" + s.get() + \"]\" + s.get().length() + \" \" + s.get().isEmpty()); }".to_string(),
+        3 => "{ Gen<Object> s = Object::new; System.out.println(s.get() != null); }".to_string(),
+        4 => "{ Gen<HashMap<String,Integer>> s = HashMap::new; Map<String,Integer> m = s.get(); m.put(\"k\", 1); System.out.println(m); }".to_string(),
+        5 => "{ Gen<TreeSet<String>> s = TreeSet::new; Set<String> t = s.get(); t.add(\"b\"); t.add(\"a\"); System.out.println(t); }".to_string(),
+        6 => "{ Gen<ArrayDeque<Integer>> s = ArrayDeque::new; Deque<Integer> d = s.get(); d.push(1); System.out.println(d); }".to_string(),
+        7 => "{ Gen<LinkedList<Integer>> s = LinkedList::new; List<Integer> l = s.get(); l.add(3); System.out.println(l + \" \" + l.size()); }".to_string(),
+        _ => "{ Gen<LinkedHashSet<String>> s = LinkedHashSet::new; Set<String> t = s.get(); t.add(\"z\"); t.add(\"a\"); System.out.println(t); }".to_string(),
+    }
+}
+
+/// `java.util.Optional`. The string `Optional` did not appear once in this
+/// generator; only `isPresent()` was reached at all, and only indirectly off an
+/// `IntStream.max()`.
+///
+/// `Optional.toString` is the arm most worth having: it is `Optional[x]` and
+/// `Optional.empty`, not the value, so any probe that prints one at all pins the
+/// rendering as well as the contents.
+fn g_optional(r: &mut Rng) -> String {
+    let v = pick(r, &["\"hi\"", "\"\"", "\"a longer one\""]);
+    let d = pick(r, &["\"z\"", "\"\""]);
+    match r.below(10) {
+        0 => format!("System.out.println(Optional.of({v}) + \" \" + Optional.empty() + \" \" + Optional.ofNullable(null));"),
+        1 => format!("System.out.println(Optional.of({v}).get() + \" \" + Optional.of({v}).isPresent() + \" \" + Optional.empty().isEmpty());"),
+        2 => format!("System.out.println(Optional.of({v}).orElse({d}) + \" \" + Optional.<String>empty().orElse({d}));"),
+        3 => format!("System.out.println(Optional.of({v}).map(String::toUpperCase) + \" \" + Optional.<String>empty().map(String::toUpperCase));"),
+        4 => format!("System.out.println(Optional.of({v}).filter(x -> x.length() > 1) + \" \" + Optional.of({v}).filter(x -> false));"),
+        5 => format!("System.out.println(Optional.<String>empty().orElseGet(() -> {d}) + \" \" + Optional.of({v}).orElseGet(() -> {d}));"),
+        6 => format!("System.out.println(Optional.of({v}).equals(Optional.of({v})) + \" \" + Optional.of({v}).equals(Optional.empty()) + \" \" + Optional.of({v}).hashCode());"),
+        7 => format!("{{ Optional.of({v}).ifPresent(x -> System.out.println(\"p:\" + x)); Optional.<String>empty().ifPresent(x -> System.out.println(\"never\")); System.out.println(\"done\"); }}"),
+        8 => format!("try {{ System.out.println(Optional.<String>empty().get()); }} catch (RuntimeException e) {{ System.out.println(e.getClass().getName() + \":\" + e.getMessage()); }}"),
+        _ => format!("try {{ System.out.println(Optional.<String>empty().orElseThrow()); }} catch (RuntimeException e) {{ System.out.println(e.getClass().getName()); }}"),
+    }
+}
+
+/// Streams reached through a *source that is not a string*, and the two APIs
+/// that only exist to consume them.
+///
+/// The `chars` mode reaches a stream only through `String.chars`/`codePoints`/
+/// `lines`; `Collection.stream()`, `Arrays.stream`, `Stream.of` and the
+/// `IntStream` factories had zero occurrences, and `Collectors` and `Comparator`
+/// did not appear in the generator at all — 7 collectors and 12 comparator
+/// members with no probe between them.
+fn g_stream(r: &mut Rng) -> String {
+    let l = "List.of(\"bb\", \"a\", \"ccc\", \"dd\")";
+    match r.below(14) {
+        0 => format!("System.out.println({l}.stream().map(String::toUpperCase).toList());"),
+        1 => format!("System.out.println({l}.stream().collect(Collectors.joining(\", \", \"[\", \"]\")));"),
+        2 => format!("System.out.println({l}.stream().collect(Collectors.groupingBy(String::length)));"),
+        3 => format!("System.out.println({l}.stream().collect(Collectors.toMap(x -> x, String::length)));"),
+        4 => format!("System.out.println({l}.stream().collect(Collectors.counting()) + \" \" + {l}.stream().collect(Collectors.toSet()).size());"),
+        5 => format!("{{ List<String> s = new ArrayList<>({l}); s.sort(Comparator.comparing(String::length)); System.out.println(s); }}"),
+        6 => format!("{{ List<String> s = new ArrayList<>({l}); s.sort(Comparator.comparing(String::length).reversed()); System.out.println(s); }}"),
+        7 => format!("{{ List<String> s = new ArrayList<>({l}); s.sort(Comparator.<String>naturalOrder()); System.out.println(s + \" \" + {l}.stream().sorted(Comparator.reverseOrder()).toList()); }}"),
+        8 => format!("System.out.println({l}.stream().anyMatch(x -> x.length() > 2) + \" \" + {l}.stream().allMatch(x -> !x.isEmpty()) + \" \" + {l}.stream().noneMatch(String::isEmpty));"),
+        9 => format!("System.out.println({l}.stream().reduce(\"\", (x, y) -> x + y) + \" \" + {l}.stream().findFirst().get());"),
+        10 => format!("System.out.println({l}.stream().skip(1).limit(2).toList() + \" \" + {l}.stream().distinct().count());"),
+        11 => format!("System.out.println(IntStream.range(0, 4).map(x -> x * x).boxed().toList() + \" \" + IntStream.rangeClosed(1, 3).sum());"),
+        12 => format!("System.out.println(Stream.of(1, 2, 3).mapToInt(x -> x).max().getAsInt() + \" \" + IntStream.of(1, 2, 3).average().getAsDouble());"),
+        _ => format!("System.out.println(Arrays.stream(new int[] {{3, 1, 2}}).sum() + \" \" + {l}.stream().mapToInt(String::length).sum());"),
+    }
+}
+
+/// The `java.util.Arrays` statics past the three the generator wrote. `asList`,
+/// `toString` and `deepToString` were the whole of its coverage; `sort`, `fill`,
+/// `copyOf`, `copyOfRange`, `binarySearch`, `equals`, `hashCode` and `stream`
+/// had none.
+///
+/// `binarySearch` on a value that is *not* present is the arm to keep: Java
+/// answers `-(insertion point) - 1`, not `-1`.
+fn g_arraysfn(r: &mut Rng) -> String {
+    let a = pick(r, &["{5, 1, 4, 2}", "{}", "{7}", "{3, 3, 1}", "{-1, 0, 1}"]);
+    let n = pick(r, &["0", "1", "3", "6"]);
+    let k = pick(r, &["1", "4", "3", "-5"]);
+    match r.below(10) {
+        0 => format!("{{ int[] a = {a}; Arrays.sort(a); System.out.println(Arrays.toString(a)); }}"),
+        1 => format!("{{ int[] a = {a}; Arrays.sort(a); System.out.println(Arrays.binarySearch(a, {k})); }}"),
+        2 => format!("{{ int[] a = new int[{n}]; Arrays.fill(a, {k}); System.out.println(Arrays.toString(a)); }}"),
+        3 => format!("{{ int[] a = {a}; System.out.println(Arrays.toString(Arrays.copyOf(a, {n}))); }}"),
+        4 => format!("{{ int[] a = {a}; try {{ System.out.println(Arrays.toString(Arrays.copyOfRange(a, 0, {n}))); }} catch (RuntimeException e) {{ System.out.println(\"cr:\" + e.getClass().getName()); }} }}"),
+        5 => format!("{{ int[] a = {a}; int[] b = {a}; System.out.println(Arrays.equals(a, b) + \" \" + (a == b) + \" \" + Arrays.hashCode(a)); }}"),
+        6 => format!("{{ int[] a = {a}; System.out.println(Arrays.stream(a).sum() + \" \" + Arrays.stream(a).count()); }}"),
+        7 => "{ String[] s = {\"b\", \"a\", \"c\"}; Arrays.sort(s); System.out.println(Arrays.toString(s) + \" \" + Arrays.binarySearch(s, \"b\")); }".to_string(),
+        8 => "{ double[] d = {1.5, -0.0, 0.0, Double.NaN}; Arrays.sort(d); System.out.println(Arrays.toString(d)); }".to_string(),
+        _ => format!("{{ long[] a = {{3L, 1L}}; Arrays.sort(a); System.out.println(Arrays.toString(a) + \" \" + Arrays.toString(Arrays.copyOf(a, {n}))); }}"),
+    }
+}
+
+/// The wrapper statics and the boxed accessors. `Long`, `Double`, `Float`,
+/// `Boolean` and most of `Character` had no static probed at all, and the nine
+/// `Number` converters (`intValue`, `doubleValue`, …) had none either.
+///
+/// The identity arms are the ones a `HashMap`-backed cache can get wrong:
+/// `Integer.valueOf` returns a shared object in `-128..=127` and a fresh one
+/// outside it, so `==` between two boxes flips at exactly that boundary.
+fn g_parsefn(r: &mut Rng) -> String {
+    let s = pick(r, &["\"42\"", "\"-1\"", "\"0\"", "\"2147483647\""]);
+    let d = pick(r, &["\"1.5\"", "\"-0.0\"", "\"1e300\"", "\"0\""]);
+    let i = pick(r, &["127", "128", "-128", "-129", "0", "1000"]);
+    let c = pick(r, &["'a'", "'Z'", "'7'", "' '", "'_'"]);
+    match r.below(12) {
+        0 => format!("System.out.println(Long.parseLong({s}) + \" \" + Long.valueOf({s}) + \" \" + Long.toString(9L) + \" \" + Long.compare(1L, 2L));"),
+        1 => format!("System.out.println(Long.toHexString(255L) + \" \" + Long.toOctalString(64L) + \" \" + Long.toBinaryString(5L) + \" \" + Long.max(1L, 2L));"),
+        2 => format!("System.out.println(Double.parseDouble({d}) + \" \" + Double.compare(1.0, 2.0) + \" \" + Double.toString(0.1) + \" \" + Double.valueOf({d}));"),
+        3 => format!("System.out.println(Double.isNaN(0.0 / 0.0) + \" \" + Double.isInfinite(1.0 / 0.0) + \" \" + Double.hashCode(1.5));"),
+        4 => format!("System.out.println(Float.parseFloat({d}) + \" \" + Float.compare(1.0f, 2.0f) + \" \" + Float.toString(0.1f) + \" \" + Float.isNaN(0.0f / 0.0f));"),
+        5 => format!("System.out.println(Boolean.parseBoolean(\"TRUE\") + \" \" + Boolean.parseBoolean(\"yes\") + \" \" + Boolean.compare(true, false) + \" \" + Boolean.toString(false));"),
+        6 => format!("System.out.println(Character.isLetter({c}) + \" \" + Character.isLetterOrDigit({c}) + \" \" + Character.isWhitespace({c}) + \" \" + Character.isUpperCase({c}) + \" \" + Character.isLowerCase({c}));"),
+        7 => format!("System.out.println(Character.getNumericValue({c}) + \" \" + Character.toString({c}) + \" \" + Character.hashCode({c}));"),
+        8 => format!("System.out.println(Integer.toOctalString(64) + \" \" + Integer.parseInt(\"ff\", 16) + \" \" + Integer.hashCode(7));"),
+        9 => format!("{{ Integer a = {i}, b = {i}; System.out.println((a == b) + \" \" + a.equals(b) + \" \" + (Integer.valueOf({i}) == Integer.valueOf({i}))); }}"),
+        10 => format!("{{ Integer a = {i}; System.out.println(a.intValue() + \" \" + a.longValue() + \" \" + a.doubleValue() + \" \" + a.byteValue() + \" \" + a.shortValue()); }}"),
+        _ => format!("{{ Double a = 3.9; System.out.println(a.intValue() + \" \" + a.longValue() + \" \" + a.floatValue() + \" \" + a.hashCode()); }}"),
+    }
+}
+
+/// Text blocks (JLS 3.10.6). The lexer has read them since before this round,
+/// but no probe contained one, so the incidental-whitespace rule they exist for
+/// was never checked against the reference.
+///
+/// The rule is that the common indentation of the content lines **and the
+/// closing delimiter's line** is stripped, then each line's trailing whitespace
+/// goes. So a closing `"""` outdented past the content changes the answer, and a
+/// line of trailing spaces is not preserved unless `\s` holds it — which is why
+/// the arms vary the delimiter's column rather than only the content.
+///
+/// Every arm is built from Rust string pieces rather than typed as one literal:
+/// the escapes a text block probes (`\s`, a line-continuation `\`) have to reach
+/// the generated file as two characters, and writing them inline is how they
+/// stop being two.
+fn g_textblock(r: &mut Rng) -> String {
+    let q = "\"\"\"";
+    let bs = '\\';
+    match r.below(8) {
+        0 => format!("System.out.println(\"[\" + {q}\n    alpha\n      beta\n    {q} + \"]\");"),
+        1 => format!("System.out.println(\"[\" + {q}\n        x\n     y\n   z{q} + \"]\");"),
+        2 => format!("System.out.println(\"[\" + {q}\n    kept   \n    or not\n    {q} + \"]\");"),
+        3 => format!("System.out.println(\"[\" + {q}\n    a{bs}\n    b\n    {q} + \"]\");"),
+        4 => format!("System.out.println(\"[\" + {q}\n    q{bs}s{bs}s\n    {q} + \"]\");"),
+        5 => format!("System.out.println(\"[\" + {q}\n    {q}.length() + \"]\");"),
+        6 => format!("System.out.println({q}\n    one\n    two\n    {q}.lines().count() + \" \" + {q}\n    one\n    two\n    {q}.length());"),
+        _ => format!("System.out.println(\"[\" + {q}\n    tab{bs}there\n    q{bs}\"q{bs}\"\n    {q} + \"]\");"),
+    }
+}
+
+/// Anonymous classes and the syntax around them that no probe wrote.
+///
+/// An anonymous class body is a *different* compiler path from the enum-constant
+/// body the `enum` mode already reaches, and it had zero occurrences. So did
+/// multi-catch, an instance initializer block, `X.class`, `%=`, `-=` and the
+/// unary `+` that promotes a `char` to an `int`.
+fn g_anon(r: &mut Rng) -> String {
+    let a = pick(r, &["7", "-3", "0", "100"]);
+    let b = pick(r, &["2", "-5", "3"]);
+    match r.below(11) {
+        0 => format!("{{ Gen<String> s = new Gen<String>() {{ public String get() {{ return \"anon{a}\"; }} }}; System.out.println(s.get()); }}"),
+        // Not `new Object() { toString }`: an anonymous `Object` overrides an
+        // inherited body rather than supplying an abstract method, so javars
+        // refuses it by name — see the parser's `anonymous_class`.
+        1 => format!("{{ Str1 f = new Str1() {{ public String of(String s) {{ return s + \"{a}\"; }} }}; System.out.println(f.of(\"o\")); }}"),
+        2 => format!("{{ Calc c = new Calc() {{ public int of(int x, int y) {{ return x * y + {a}; }} }}; System.out.println(c.of({a}, {b})); }}"),
+        3 => format!("{{ Greeter g = new Greeter() {{ public String name() {{ return \"n{a}\"; }} }}; System.out.println(g.greet() + \" \" + g.shout()); }}"),
+        4 => format!("{{ int base = {a}; Gen<Integer> s = new Gen<Integer>() {{ public Integer get() {{ return base + {b}; }} }}; System.out.println(s.get()); }}"),
+        5 => format!("try {{ if ({a} > 0) throw new IllegalStateException(\"s{a}\"); throw new IllegalArgumentException(\"a{a}\"); }} catch (IllegalArgumentException | IllegalStateException e) {{ System.out.println(e.getClass().getSimpleName() + \":\" + e.getMessage()); }}"),
+        6 => format!("try {{ Object o = null; System.out.println(o.toString()); }} catch (NullPointerException | ClassCastException e) {{ System.out.println(\"mc:\" + e.getClass().getSimpleName()); }}"),
+        7 => format!("{{ int v = {a}; v %= ({b} == 0 ? 1 : {b}); v -= {b}; System.out.println(v); }}"),
+        8 => format!("{{ char c = 'A'; System.out.println(+c + \" \" + (+{a}) + \" \" + -(+{a})); }}"),
+        9 => format!("System.out.println(String.class.getName() + \" \" + int.class + \" \" + Integer.class.getSimpleName());"),
+        _ => format!("{{ Ini x = new Ini({a}); System.out.println(x.seen + \" \" + x.v); }}"),
+    }
+}
+
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::All => "all",
@@ -2890,6 +3264,16 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Mutate => "mutate",
         Mode::Chars => "chars",
         Mode::Nested => "nested",
+        Mode::Builder => "builder",
+        Mode::MathFn => "mathfn",
+        Mode::MapFn => "mapfn",
+        Mode::CtorRef => "ctorref",
+        Mode::Optional => "optional",
+        Mode::Stream => "stream",
+        Mode::ArraysFn => "arraysfn",
+        Mode::ParseFn => "parsefn",
+        Mode::TextBlock => "textblock",
+        Mode::Anon => "anon",
     }
 }
 
@@ -2965,6 +3349,16 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Mutate => g_mutate(r),
         Mode::Chars => g_chars(r),
         Mode::Nested => g_nested(r),
+        Mode::Builder => g_builder(r),
+        Mode::MathFn => g_mathfn(r),
+        Mode::MapFn => g_mapfn(r),
+        Mode::CtorRef => g_ctorref(r),
+        Mode::Optional => g_optional(r),
+        Mode::Stream => g_stream(r),
+        Mode::ArraysFn => g_arraysfn(r),
+        Mode::ParseFn => g_parsefn(r),
+        Mode::TextBlock => g_textblock(r),
+        Mode::Anon => g_anon(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -2978,7 +3372,7 @@ fn gen_probes(seed: u64, mode: Mode, n: usize) -> Vec<String> {
 /// named for the file, so callers write it to `T.java`.
 fn build_program(probes: &[String]) -> String {
     let mut s = String::from(
-        "import java.util.*;\npublic class T {\n    public static void main(String[] args) {\n",
+        "import java.util.*;\nimport java.util.stream.*;\npublic class T {\n    public static void main(String[] args) {\n",
     );
     for probe in probes {
         s.push_str("        ");
