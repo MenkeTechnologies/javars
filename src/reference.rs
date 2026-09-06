@@ -972,6 +972,20 @@ pub const REFERENCE: &[Entry] = &[
         "The string repeated `count` times. A negative count raises `IllegalArgumentException` with Java's `count is negative: n` message.",
         "System.out.println(\"ab\".repeat(3));   // ababab",
     ),
+    (
+        "chars",
+        "String Methods",
+        "IntStream chars()   |   IntStream codePoints()",
+        "The characters as a stream of their code points. javars stores a string as Unicode scalars, so the two read the same values — they differ in Java only above the BMP, where `chars()` yields surrogate code units.",
+        "System.out.println(\"abc\".chars().sum());   // 294",
+    ),
+    (
+        "lines",
+        "String Methods",
+        "Stream<String> lines()",
+        "The lines, split on terminators rather than separators: a trailing newline ends the last line instead of starting an empty one, so `\"a\\\\n\"` is one line and `\"\"` is none. All of `\\\\n`, `\\\\r\\\\n` and a lone `\\\\r` terminate.",
+        "System.out.println(\"a\\\\nb\\\\n\".lines().count());   // 2",
+    ),
     // ── Static Library: the `(class, method, arity)` arms of `static_method` ──
     (
         "Math.abs",
@@ -1176,6 +1190,76 @@ pub const REFERENCE: &[Entry] = &[
         "The shallow `[e0, e1, …]` rendering of an array, each element through the same Java value-to-string rules. A null reference renders as `null`; a nested array renders as its handle, since the rendering is shallow.",
         "System.out.println(Arrays.toString(new int[]{1, 2, 3}));   // [1, 2, 3]",
     ),
+    (
+        "Integer.bitCount",
+        "Static Library",
+        "int Integer.bitCount(int i)   |   int Long.bitCount(long i)",
+        "The number of one-bits in the two's complement representation, read at the declared width — so `Integer.bitCount(-1)` is 32 and `Long.bitCount(-1L)` is 64.",
+        "System.out.println(Integer.bitCount(255) + \" \" + Long.bitCount(-1L));   // 8 64",
+    ),
+    (
+        "Integer.reverse",
+        "Static Library",
+        "int Integer.reverse(int i)   |   int Integer.reverseBytes(int i)",
+        "`reverse` reverses the bit order, `reverseBytes` the byte order, each at the declared width. `Integer.reverse(1)` is `Integer.MIN_VALUE`; the `Long` overloads answer at 64 bits.",
+        "System.out.println(Integer.reverse(1));   // -2147483648",
+    ),
+    (
+        "Integer.highestOneBit",
+        "Static Library",
+        "int Integer.highestOneBit(int i)   |   int Integer.lowestOneBit(int i)",
+        "The isolated highest or lowest set bit — a value with at most one bit set, not its index. Zero has no set bit, so both answer 0 for it. `Long` overloads answer at 64 bits.",
+        "System.out.println(Integer.highestOneBit(100) + \" \" + Integer.lowestOneBit(12));   // 64 4",
+    ),
+    (
+        "Integer.numberOfLeadingZeros",
+        "Static Library",
+        "int Integer.numberOfLeadingZeros(int i)   |   int Integer.numberOfTrailingZeros(int i)",
+        "The count of zero bits above the highest, or below the lowest, set bit. A zero argument answers the full width — 32 for `Integer`, 64 for `Long`.",
+        "System.out.println(Integer.numberOfTrailingZeros(8));   // 3",
+    ),
+    (
+        "Integer.rotateLeft",
+        "Static Library",
+        "int Integer.rotateLeft(int i, int distance)   |   int Integer.rotateRight(int i, int distance)",
+        "A circular shift: bits leaving one end re-enter at the other. The distance is taken modulo the width and a negative distance rotates the other way, so `Integer.rotateLeft(1, 33)` is 2 and `Integer.rotateLeft(1, -1)` is `Integer.MIN_VALUE`.",
+        "System.out.println(Integer.rotateLeft(1, 33));   // 2",
+    ),
+    (
+        "Integer.sum",
+        "Static Library",
+        "int Integer.sum(int a, int b)   |   long Long.sum(long a, long b)",
+        "Addition at the declared width, which is the whole reason the two exist separately: `Integer.sum(Integer.MAX_VALUE, 1)` wraps to `Integer.MIN_VALUE` where `Long.sum` of the same operands is 2147483648. `max`/`min`/`signum`/`compare` are the same shape.",
+        "System.out.println(Integer.sum(Integer.MAX_VALUE, 1));   // -2147483648",
+    ),
+    (
+        "Objects.hashCode",
+        "Static Library",
+        "int Objects.hashCode(Object o)   |   int Objects.hash(Object... values)",
+        "`hashCode` is the argument's own hash, or 0 for a null — a collection hashes by its contents, and a user class through its own `hashCode()`. `hash` folds a varargs array the way `Arrays.hashCode` does, seeded at 1, so `Objects.hash()` is 1 and `Objects.hash((Object) null)` is 31.",
+        "System.out.println(Objects.hashCode(null) + \" \" + Objects.hash(\"a\", \"b\"));   // 0 4066",
+    ),
+    (
+        "Objects.toString",
+        "Static Library",
+        "String Objects.toString(Object o)   |   String Objects.toString(Object o, String nullDefault)",
+        "The argument rendered as `println` would render it, reaching a user `toString()`. A null renders as the four-character string `null`, or as `nullDefault` when the two-argument form supplies one.",
+        "System.out.println(Objects.toString(null, \"none\"));   // none",
+    ),
+    (
+        "Objects.requireNonNull",
+        "Static Library",
+        "T Objects.requireNonNull(T o)   |   T Objects.requireNonNull(T o, String message)   |   T Objects.requireNonNullElse(T o, T other)",
+        "`requireNonNull` returns its argument or throws `NullPointerException` — with no detail message, or with the caller's text. `requireNonNullElse` returns the first non-null of the two and throws naming `defaultObj` when both are null.",
+        "System.out.println(Objects.requireNonNullElse(null, \"fallback\"));   // fallback",
+    ),
+    (
+        "Objects.isNull",
+        "Static Library",
+        "boolean Objects.isNull(Object o)   |   boolean Objects.nonNull(Object o)",
+        "The null test as a value, for use as a predicate. `Objects.equals(a, b)` is the matching equality test: `a == b || (a != null && a.equals(b))`, so it reaches a user `equals` and answers for a null receiver.",
+        "System.out.println(Objects.isNull(null) + \" \" + Objects.nonNull(null));   // true false",
+    ),
     // ── Collection Types: `collection_kind` / `is_concrete_collection` ──
     (
         "ArrayList",
@@ -1188,8 +1272,29 @@ pub const REFERENCE: &[Entry] = &[
         "LinkedList",
         "Collection Types",
         "new LinkedList<>()   |   new LinkedList<>(other)",
-        "Constructible, and backed by the same vector `ArrayList` uses. javars models the `List` contract, not the node-per-element representation, so the two differ only in name; the `Deque`/`Queue` methods are not implemented.",
+        "Constructible, and backed by the same vector `ArrayList` uses. javars models the `List` contract, not the node-per-element representation, so the two differ only in name. The `Deque`/`Queue` methods work on it, head at index 0.",
         "List<Integer> q = new LinkedList<>();",
+    ),
+    (
+        "ArrayDeque",
+        "Collection Types",
+        "new ArrayDeque<>()   |   new ArrayDeque<>(other)",
+        "A double-ended queue, on the same vector the lists use with the head at index 0. Every `Deque`/`Queue` method produces the reference's element order and its empty-receiver behaviour. Two things the shared shape cannot carry differ from the JDK's: `getClass()` names `ArrayList`, and a null element is accepted where the real `ArrayDeque` throws.",
+        "Deque<Integer> q = new ArrayDeque<>();\\nq.push(1);\\nq.addLast(2);\\nSystem.out.println(q);   // [1, 2]",
+    ),
+    (
+        "Deque",
+        "Collection Types",
+        "Deque<T> q = new ArrayDeque<>()",
+        "The declaration-only interface an `ArrayDeque` or `LinkedList` satisfies. Like `List` and `Map` it cannot be constructed directly.",
+        "Deque<String> q = new ArrayDeque<>();",
+    ),
+    (
+        "Queue",
+        "Collection Types",
+        "Queue<T> q = new ArrayDeque<>()",
+        "The declaration-only single-ended view of the same shape: `offer` adds at the tail and `poll`/`peek` read the head.",
+        "Queue<String> q = new LinkedList<>();",
     ),
     (
         "HashMap",
@@ -1445,6 +1550,41 @@ pub const REFERENCE: &[Entry] = &[
         "String toString()",
         "`AbstractCollection.toString` — `[a, b, c]`, each element rendered with Java's value-to-string rules. This is also what `System.out.println(list)` prints, without any explicit call.",
         "System.out.println(xs);   // [a, b, c]",
+    ),
+    (
+        "removeIf",
+        "List Methods",
+        "boolean removeIf(Predicate<? super T> filter)",
+        "Removes every element the predicate accepts and answers whether any went. The receiver's shape decides the refusal: an immutable `List.of`/`Set.of` throws `UnsupportedOperationException` before it looks at the argument, while a fixed-size `Arrays.asList` runs the predicate and throws — with the message `remove` its iterator names — only when something must actually go. Through a `subList` the removal reaches the backing list and leaves the view usable.",
+        "List<Integer> xs = new ArrayList<>(List.of(1, 2, 3, 4));\\nxs.removeIf(x -> x % 2 == 0);\\nSystem.out.println(xs);   // [1, 3]",
+    ),
+    (
+        "replaceAll",
+        "List Methods",
+        "void replaceAll(UnaryOperator<T> operator)",
+        "Rewrites every element in place. It counts as a structural modification whether or not any element changed, so an outstanding `subList` view of the receiver is stale afterwards. An immutable list refuses; a fixed-size one accepts, since the length does not change.",
+        "List<Integer> xs = new ArrayList<>(List.of(1, 2));\\nxs.replaceAll(x -> x * 10);\\nSystem.out.println(xs);   // [10, 20]",
+    ),
+    (
+        "addFirst",
+        "List Methods",
+        "void addFirst(T e)   |   void addLast(T e)   |   void push(T e)   |   boolean offer(T e)   |   boolean offerFirst(T e)   |   boolean offerLast(T e)",
+        "The `Deque` writers. `addFirst`/`offerFirst`/`push` insert at the head, `addLast`/`offerLast`/`offer` append at the tail — so a stack built with `push` reads back in reverse. The `offer` spellings answer `true`.",
+        "Deque<Integer> q = new ArrayDeque<>();\\nq.push(1);\\nq.push(2);\\nSystem.out.println(q);   // [2, 1]",
+    ),
+    (
+        "peekFirst",
+        "List Methods",
+        "T getFirst()   |   T getLast()   |   T element()   |   T peek()   |   T peekFirst()   |   T peekLast()",
+        "The `Deque` readers, which do not remove. On an empty receiver the two families part: `getFirst`/`getLast`/`element` throw `NoSuchElementException` where `peek`/`peekFirst`/`peekLast` answer `null`.",
+        "Deque<Integer> q = new ArrayDeque<>(List.of(1, 2));\\nSystem.out.println(q.peekFirst() + \" \" + q.peekLast());   // 1 2",
+    ),
+    (
+        "pollFirst",
+        "List Methods",
+        "T pop()   |   T poll()   |   T pollFirst()   |   T pollLast()   |   T removeFirst()   |   T removeLast()",
+        "The `Deque` readers that remove, on the same split: `pop`/`removeFirst`/`removeLast` throw `NoSuchElementException` on an empty receiver where `poll`/`pollFirst`/`pollLast` answer `null`. `pop` and `poll` both take the head; only the empty case tells them apart.",
+        "Deque<Integer> q = new ArrayDeque<>(List.of(1, 2, 3));\\nSystem.out.println(q.pollFirst() + \" \" + q.pollLast());   // 1 3",
     ),
     // ── Map Methods: `host.rs` `map_method`, plus `forEach`/`toString` ──
     (
@@ -1880,6 +2020,46 @@ pub const REFERENCE: &[Entry] = &[
         "interface ToDoubleFunction { double applyAsDouble(Object value); }",
         "A reference-to-`double` transformation.",
         "ToDoubleFunction half = s -> s.length() / 2.0;\nSystem.out.println(half.applyAsDouble(\"abc\"));   // 1.5",
+    ),
+    (
+        "ToLongFunction",
+        "Functional Interfaces",
+        "interface ToLongFunction { long applyAsLong(Object value); }",
+        "A reference-to-`long` transformation, the 64-bit sibling of `ToIntFunction`.",
+        "ToLongFunction big = s -> s.length() * 1000000000L;
+System.out.println(big.applyAsLong(\"abc\"));   // 3000000000",
+    ),
+    (
+        "IntFunction",
+        "Functional Interfaces",
+        "interface IntFunction { Object apply(int value); }",
+        "A primitive-to-reference transformation. Its declared *reference* return type is what converts a `char`-typed body: `IntFunction<Character> f = c -> (char) c; f.apply(97)` is `a`, not 97. `LongFunction` and `DoubleFunction` are the other two widths.",
+        "IntFunction<Character> ch = c -> (char) c;
+System.out.println(ch.apply(97));   // a",
+    ),
+    (
+        "IntToLongFunction",
+        "Functional Interfaces",
+        "interface IntToLongFunction { long applyAsLong(int value); }",
+        "A primitive-to-primitive transformation across widths. `IntToDoubleFunction`, `LongToIntFunction` and `DoubleToIntFunction` are the other three javars declares.",
+        "IntToLongFunction w = i -> i * 3000000000L;
+System.out.println(w.applyAsLong(2));   // 6000000000",
+    ),
+    (
+        "LongUnaryOperator",
+        "Functional Interfaces",
+        "interface LongUnaryOperator { long applyAsLong(long operand); }",
+        "A same-width transformation at 64 bits, with a `static identity()`. `DoubleUnaryOperator` is the floating one, and `LongBinaryOperator`/`DoubleBinaryOperator` take two operands.",
+        "LongUnaryOperator dbl = x -> x * 2;
+System.out.println(dbl.applyAsLong(3000000000L));   // 6000000000",
+    ),
+    (
+        "LongPredicate",
+        "Functional Interfaces",
+        "interface LongPredicate { boolean test(long value); }",
+        "A primitive test, with a `default negate()`. `DoublePredicate` is the floating one; `LongConsumer`/`DoubleConsumer` are the matching void sinks and `LongSupplier`/`DoubleSupplier` the sources.",
+        "LongPredicate big = x -> x > 1000000000L;
+System.out.println(big.test(2000000000L));   // true",
     ),
     // ── Class Members: the members a program declares, and the ones the parser
     //    and compiler synthesize for it ──

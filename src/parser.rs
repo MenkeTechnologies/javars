@@ -1286,9 +1286,22 @@ impl Parser {
     /// name).
     fn simple_type_name(&mut self) -> Result<String, String> {
         let mut ty = self.ident()?;
-        while ty.starts_with(|c: char| c.is_lowercase())
-            && self.is(&Tok::Dot)
-            && matches!(&self.toks[self.pos + 1].kind, Tok::Ident(_))
+        // Two kinds of qualifier lead to a type name, and they are told apart by
+        // which segment is capitalised:
+        //
+        //   `java.util.List xs`  — a *package* qualifier, lowercase segments
+        //   `T.Point p`          — an *enclosing class*, so the next segment is
+        //                          itself a type name and starts uppercase
+        //
+        // Only the last segment is kept either way: javars flattens a nested
+        // class to its simple name, which is the name `new Point(…)` already
+        // uses inside the same file. Requiring the *next* segment to be
+        // capitalised is what keeps `System.out.println(x)` an expression —
+        // `out` is a field, not a nested type.
+        while self.is(&Tok::Dot)
+            && matches!(&self.toks[self.pos + 1].kind,
+                Tok::Ident(n) if ty.starts_with(|c: char| c.is_lowercase())
+                    || n.starts_with(|c: char| c.is_uppercase()))
         {
             self.advance();
             ty = self.ident()?;
@@ -1683,13 +1696,20 @@ impl Parser {
             return false;
         }
         let mut j = start + 1;
-        // Step over a package qualifier (`java.util.List xs`), on the same
-        // lowercase-segment rule [`Parser::simple_type_name`] uses. An
-        // expression like `obj.field = 1` walks the same path and then fails the
-        // trailing-identifier test below, so it is still not a declaration.
-        while matches!(&self.toks[j - 1].kind, Tok::Ident(w) if w.starts_with(|c: char| c.is_lowercase()))
-            && matches!(self.toks[j].kind, Tok::Dot)
-            && matches!(self.toks.get(j + 1).map(|t| &t.kind), Some(Tok::Ident(_)))
+        // Step over a package qualifier (`java.util.List xs`) or an enclosing
+        // class (`T.Point p`), on the same rule [`Parser::simple_type_name`]
+        // uses: a lowercase segment is a package and continues, and a segment
+        // whose *successor* is capitalised names an enclosing type. An
+        // expression like `obj.field = 1` or `Color.RED;` walks the same path
+        // and then fails the trailing-identifier test below, so neither is a
+        // declaration.
+        while matches!(self.toks[j].kind, Tok::Dot)
+            && matches!(
+                (&self.toks[j - 1].kind, self.toks.get(j + 1).map(|t| &t.kind)),
+                (Tok::Ident(w), Some(Tok::Ident(n)))
+                    if w.starts_with(|c: char| c.is_lowercase())
+                        || n.starts_with(|c: char| c.is_uppercase())
+            )
         {
             j += 2;
         }

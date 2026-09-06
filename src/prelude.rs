@@ -248,6 +248,49 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
     ("IntBinaryOperator", "int applyAsInt(int left, int right)", ""),
     ("ToIntFunction", "int applyAsInt(Object value)", ""),
     ("ToDoubleFunction", "double applyAsDouble(Object value)", ""),
+    ("ToLongFunction", "long applyAsLong(Object value)", ""),
+    // The primitive-input, *reference*-output functions. Their declared return
+    // type is what tells the compiler a `char`-typed lambda body crosses into a
+    // reference position and has to box: without `IntFunction` declared,
+    // `IntFunction<Character> f = c -> (char) c; f.apply(97)` answered 97
+    // instead of `a`, because the lambda had no known return type to convert to.
+    ("IntFunction", "Object apply(int value)", ""),
+    ("LongFunction", "Object apply(long value)", ""),
+    ("DoubleFunction", "Object apply(double value)", ""),
+    ("IntToLongFunction", "long applyAsLong(int value)", ""),
+    ("IntToDoubleFunction", "double applyAsDouble(int value)", ""),
+    ("LongToIntFunction", "int applyAsInt(long value)", ""),
+    ("DoubleToIntFunction", "int applyAsInt(double value)", ""),
+    ("LongSupplier", "long getAsLong()", ""),
+    ("DoubleSupplier", "double getAsDouble()", ""),
+    (
+        "LongUnaryOperator",
+        "long applyAsLong(long operand)",
+        "static LongUnaryOperator identity() { return v -> v; }",
+    ),
+    ("LongBinaryOperator", "long applyAsLong(long left, long right)", ""),
+    (
+        "DoubleUnaryOperator",
+        "double applyAsDouble(double operand)",
+        "static DoubleUnaryOperator identity() { return v -> v; }",
+    ),
+    (
+        "DoubleBinaryOperator",
+        "double applyAsDouble(double left, double right)",
+        "",
+    ),
+    (
+        "LongPredicate",
+        "boolean test(long value)",
+        "default LongPredicate negate() { return value -> !this.test(value); }",
+    ),
+    (
+        "DoublePredicate",
+        "boolean test(double value)",
+        "default DoublePredicate negate() { return value -> !this.test(value); }",
+    ),
+    ("LongConsumer", "void accept(long value)", ""),
+    ("DoubleConsumer", "void accept(double value)", ""),
 ];
 
 /// True when `name` is one of the modeled functional interfaces.

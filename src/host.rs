@@ -413,6 +413,14 @@ pub mod f32_op {
     pub const REM: i64 = 4;
 }
 
+/// The argument snapshots a call whose arguments are all scalars borrows
+/// instead of allocating: every entry is `None`, which is what both readers
+/// answer for anything that is not a `Value::Obj`. Four entries covers every
+/// collection method javars models; `coll_method` slices to the call's arity
+/// and falls back to building a `Vec` for anything longer.
+static NO_ARG_SEQS: [Option<Vec<Value>>; 4] = [None, None, None, None];
+static NO_ARG_ENTRIES: [Option<Vec<(Value, Value)>>; 4] = [None, None, None, None];
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -2427,7 +2435,14 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// constructor supplied one.
 fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault> {
     let obj = match kind {
-        "ArrayList" | "LinkedList" | "List" => HostObj::List {
+        // `ArrayDeque`/`Deque`/`Queue` join `LinkedList` on the mutable-list
+        // shape. The `Deque` methods work on the same `Vec` (head at index 0),
+        // and the element order every one of them produces is the reference's.
+        // What this model does not carry is the *class*: like `LinkedList`
+        // before it, an `ArrayDeque` answers `getClass().getSimpleName()` with
+        // `ArrayList`, and it accepts a null element where the real
+        // `ArrayDeque` throws. BUGS.md records both.
+        "ArrayList" | "LinkedList" | "ArrayDeque" | "Deque" | "Queue" | "List" => HostObj::List {
             mods: 0,
             items: sequence_items(seed).unwrap_or_default(),
             fixed: Fixity::Mutable,
@@ -3456,13 +3471,23 @@ fn b_ffi_call(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// Pop a name operand (a method, class or type-tag `String` the compiler pushed
+/// as a constant) without copying it.
+///
+/// The obvious spelling, `pop().map(|v| v.as_str_cow().into_owned())`, allocates
+/// and frees a `String` on **every** dispatched call, because `into_owned`
+/// copies out of the `Cow::Borrowed` the constant already provides. Returning
+/// the `Value` instead lets the caller borrow through it: the name is read, not
+/// kept. The empty-stack fallback allocates, which is unreachable — the
+/// compiler emits the name operand with the call — and keeps the previous
+/// behaviour there exactly (an empty name, not `null`).
+fn pop_name(vm: &mut VM) -> Value {
+    vm.stack.pop().unwrap_or_else(|| Value::str(String::new()))
+}
+
 /// [`JCOLL_DISPATCH`] — an instance method on a collection receiver.
 fn b_coll_dispatch(vm: &mut VM, argc: u8) -> Value {
-    let method = vm
-        .stack
-        .pop()
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
+    let method_name = pop_name(vm);
     let n = argc.saturating_sub(2) as usize;
     let mut args = Vec::with_capacity(n);
     for _ in 0..n {
@@ -3470,6 +3495,7 @@ fn b_coll_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
     args.reverse();
     let recv = vm.stack.pop().unwrap_or(Value::Undef);
+    let method = method_name.as_str_cow();
     coll_method(vm, &recv, &method, &args)
 }
 
@@ -3524,6 +3550,93 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             }
             return Value::Undef;
         }
+        // `removeIf` and `replaceAll` run a user predicate/operator per element,
+        // so like `sort` they snapshot, re-enter the VM with no borrow held, and
+        // write the result back.
+        //
+        // Which exception a receiver answers with is decided by its [`Fixity`],
+        // and the three shapes disagree in a way a `catch` can see (measured on
+        // openjdk 21.0.12):
+        //
+        //   List.of(1,2).removeIf(x -> false)      UnsupportedOperationException
+        //   Arrays.asList(1,2).removeIf(x -> false)  false — the predicate ran
+        //   Arrays.asList(1,2).removeIf(x -> true)   UnsupportedOperationException
+        //   List.of(1,2).replaceAll(op)            UnsupportedOperationException
+        //   Arrays.asList(1,2).replaceAll(x -> x*3)  [3, 6] — a set, not a resize
+        //
+        // `ImmutableCollections` overrides both to throw before it looks at the
+        // argument, so `List.of(1,2).removeIf(null)` is the UOE and not the NPE
+        // that `Arrays.asList(1,2).removeIf(null)` gives.
+        ("removeIf", 1) | ("replaceAll", 1) if map_entries(recv).is_none() => {
+            let fixed = collection_fixity(recv).unwrap_or(Fixity::Mutable);
+            if fixed == Fixity::Immutable {
+                return raise(
+                    vm,
+                    Fault::java("UnsupportedOperationException", String::new()),
+                );
+            }
+            if matches!(args[0], Value::Undef) {
+                return raise(vm, Fault::java("NullPointerException", String::new()));
+            }
+            let Some(items) = sequence_items(recv) else {
+                return raise(
+                    vm,
+                    Fault::internal(format!("javars: `{method}` needs a List or Set receiver")),
+                );
+            };
+            if method == "replaceAll" {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(invoke_closure(vm, &args[0], &[it]));
+                    if PENDING.with(|p| p.borrow().is_some()) {
+                        return Value::Undef;
+                    }
+                }
+                // `ArrayList.replaceAll` bumps `modCount` whether or not any
+                // element changed, so an outstanding `subList` view is stale
+                // after it — verified against the reference, which throws
+                // `ConcurrentModificationException` reading the view after
+                // `l.replaceAll(x -> x)`.
+                if let Err(f) = write_collection(recv, out, true) {
+                    return raise(vm, f);
+                }
+                return Value::Undef;
+            }
+            let mut kept = Vec::with_capacity(items.len());
+            for it in items.iter() {
+                let verdict = invoke_closure(vm, &args[0], &[it.clone()]);
+                if PENDING.with(|p| p.borrow().is_some()) {
+                    return Value::Undef;
+                }
+                if !matches!(verdict, Value::Bool(true)) {
+                    kept.push(it.clone());
+                }
+            }
+            let removed = kept.len() != items.len();
+            // A fixed-size list can answer the query but not shrink: the JDK's
+            // default `removeIf` only reaches `iterator.remove` when the
+            // predicate said yes, so nothing to remove is a plain `false`.
+            // The message is `remove`, not empty: a fixed-size list reaches
+            // this through the default `Collection.removeIf`, which calls
+            // `it.remove()`, and `AbstractList`'s iterator throws
+            // `new UnsupportedOperationException("remove")` — naming the
+            // operation it cannot do. The `List.of` refusal above comes from
+            // `ImmutableCollections.uoe()` instead and carries no message, so
+            // the two receivers differ in the text as well as in when they
+            // throw.
+            if removed && fixed == Fixity::FixedSize {
+                return raise(
+                    vm,
+                    Fault::java("UnsupportedOperationException", "remove".to_string()),
+                );
+            }
+            if removed {
+                if let Err(f) = write_collection(recv, kept, true) {
+                    return raise(vm, f);
+                }
+            }
+            return Value::bool(removed);
+        }
         ("forEach", 1) => {
             // A `Map`'s consumer takes (key, value); a List/Set's takes one.
             if let Some(entries) = map_entries(recv) {
@@ -3573,15 +3686,33 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     }
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.
-    let arg_seqs: Vec<Option<Vec<Value>>> = args.iter().map(sequence_items).collect();
+    //
     // `Map.equals` reads the *other* map's entries, which `sequence_items` does
-    // not carry (a map is not a sequence). Snapshot it here for the same reason:
-    // the borrow below is exclusive, and reading the heap under it panics.
-    let arg_entries: Vec<Option<Vec<(Value, Value)>>> = args.iter().map(map_entries).collect();
+    // not carry (a map is not a sequence), so it is snapshotted separately for
+    // the same reason: the borrow below is exclusive, and reading the heap
+    // under it panics.
+    //
+    // Only a `Value::Obj` can be either — both readers answer `None` for
+    // anything else — and the overwhelming majority of calls (`add(int)`,
+    // `get(int)`, `put(k, v)` over scalars) pass none, so the two `Vec`s were
+    // two heap allocations per collection call that could only ever hold
+    // `None`. Borrowing a shared all-`None` slice in that case removes them:
+    // the values the callees see are identical, since a `Vec` of `None` and a
+    // slice of `None` differ only in where they live.
+    let none_seqs;
+    let none_entries;
+    let (arg_seqs, arg_entries): (&[Option<Vec<Value>>], &[Option<Vec<(Value, Value)>>]) =
+        if args.len() > NO_ARG_SEQS.len() || args.iter().any(|a| matches!(a, Value::Obj(_))) {
+            none_seqs = args.iter().map(sequence_items).collect::<Vec<_>>();
+            none_entries = args.iter().map(map_entries).collect::<Vec<_>>();
+            (&none_seqs, &none_entries)
+        } else {
+            (&NO_ARG_SEQS[..args.len()], &NO_ARG_ENTRIES[..args.len()])
+        };
     // Java answers a membership question with the element's own `equals`, whose
     // body needs the VM and no outstanding borrow — so it runs here, ahead of
     // the borrow, and the sections below read its verdicts.
-    let eq = eq_plan(vm, recv, method, args, &arg_seqs);
+    let eq = eq_plan(vm, recv, method, args, arg_seqs);
     // A throwable one of those bodies raised aborts the call rather than
     // answering from a half-resolved plan.
     if PENDING.with(|p| p.borrow().is_some()) {
@@ -3589,7 +3720,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     }
     let eq = eq.as_ref();
     if is_sublist(id) {
-        return match sublist_method(id, method, args, &arg_seqs, eq) {
+        return match sublist_method(id, method, args, arg_seqs, eq) {
             Ok(v) => v,
             Err(f) => raise(vm, f),
         };
@@ -3602,7 +3733,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         match obj {
             HostObj::List { items, fixed, mods } => {
                 let before = items.len();
-                let r = list_method(items, *fixed, method, args, &arg_seqs, eq);
+                let r = list_method(items, *fixed, method, args, arg_seqs, eq);
                 // Any length change is a structural modification, which is what
                 // Java's `modCount` counts (a `remove` that finds nothing does
                 // not bump it there either).
@@ -3625,7 +3756,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 index,
                 method,
                 args,
-                &arg_entries,
+                arg_entries,
                 eq,
             ),
             HostObj::Set {
@@ -3633,7 +3764,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 fixed,
                 index,
                 ..
-            } => set_method(items, *fixed, index, method, args, &arg_seqs, eq),
+            } => set_method(items, *fixed, index, method, args, arg_seqs, eq),
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -4678,6 +4809,68 @@ fn list_method(
             items.clear();
             Value::Undef
         }
+        // ── `Deque` / `Queue`, on the same `Vec` the `List` methods use ──
+        //
+        // Index 0 is the head, so `addFirst` inserts there and `addLast` pushes.
+        // The three families differ only in what they do when the deque is
+        // empty, and a program can see which one it called:
+        //
+        //   getFirst/getLast/element/removeFirst/removeLast/pop  NoSuchElementException
+        //   peek*/poll*                                          null
+        //   push/offer*/add*                                     n/a — they never fail
+        //
+        // `push`/`pop`/`peek` are the *stack* spellings, and they work on the
+        // head: `q.push(1)` then `q.push(2)` leaves `[2, 1]`, which is why
+        // `push` is `addFirst` and not `add`. `Queue`'s `offer`/`poll` work the
+        // other way round — tail in, head out — so `offer` is `addLast`.
+        ("addFirst" | "offerFirst" | "push", 1) => {
+            structural()?;
+            items.insert(0, args[0].clone());
+            match method {
+                "offerFirst" => Value::bool(true),
+                _ => Value::Undef,
+            }
+        }
+        ("addLast" | "offerLast" | "offer", 1) => {
+            structural()?;
+            items.push(args[0].clone());
+            match method {
+                "addLast" => Value::Undef,
+                _ => Value::bool(true),
+            }
+        }
+        ("getFirst" | "element" | "peekFirst" | "peek", 0)
+        | ("getLast" | "peekLast", 0)
+        | ("removeFirst" | "pop" | "pollFirst" | "poll", 0)
+        | ("removeLast" | "pollLast", 0) => {
+            let from_tail = matches!(method, "getLast" | "peekLast" | "removeLast" | "pollLast");
+            let removes = matches!(
+                method,
+                "removeFirst" | "pop" | "pollFirst" | "poll" | "removeLast" | "pollLast"
+            );
+            // The `get`/`remove`/`element`/`pop` spellings throw on empty; the
+            // `peek`/`poll` ones answer null. The JDK's
+            // `NoSuchElementException` from a deque carries no detail message.
+            let throws = matches!(
+                method,
+                "getFirst" | "getLast" | "element" | "removeFirst" | "removeLast" | "pop"
+            );
+            if items.is_empty() {
+                if throws {
+                    return Err(Fault::java("NoSuchElementException", String::new()));
+                }
+                Value::Undef
+            } else {
+                if removes {
+                    structural()?;
+                }
+                let at = if from_tail { items.len() - 1 } else { 0 };
+                match removes {
+                    true => items.remove(at),
+                    false => items[at].clone(),
+                }
+            }
+        }
         ("contains", 1) => Value::bool(eq_index(eq, items, &args[0], false).is_some()),
         ("indexOf", 1) => Value::Int(eq_index(eq, items, &args[0], false).map_or(-1, |i| i as i64)),
         ("lastIndexOf", 1) => {
@@ -5033,11 +5226,8 @@ fn render_map(entries: &[(Value, Value)], order: Order) -> String {
 /// arity, out-of-range index, unknown method) surfaces as a `javars:` error
 /// rather than silently returning a wrong value.
 fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
-    let method = vm
-        .stack
-        .pop()
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
+    let method_name = pop_name(vm);
+    let method = method_name.as_str_cow();
     let n = argc.saturating_sub(2) as usize; // minus receiver and method name
     let mut args = Vec::with_capacity(n);
     for _ in 0..n {
@@ -5093,7 +5283,7 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // `java.lang.StringBuilder@<id>`, and `builder_method` declines the three
     // names a builder really does inherit from `Object` so they fall through.
     if let Some(id) = is_builder(&recv) {
-        if !matches!(method.as_str(), "equals" | "hashCode" | "getClass") {
+        if !matches!(method.as_ref(), "equals" | "hashCode" | "getClass") {
             if let Some(r) = builder_method(vm, id, &method, &args) {
                 return match r {
                     Ok(v) => v,
@@ -5140,7 +5330,7 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // else re-enters with the primitive, so the tables above serve a boxed
     // receiver exactly as they serve a bare one.
     if unboxed(&recv).is_some() {
-        match (method.as_str(), args.len()) {
+        match (method.as_ref(), args.len()) {
             ("equals", 1) => return Value::bool(value_eq(&recv, &args[0])),
             ("hashCode", 0) => {
                 return java_hash(&recv).map_or(Value::Undef, |h| Value::Int(h.into()))
@@ -5337,11 +5527,8 @@ fn double_compare(a: f64, b: f64) -> i64 {
 
 /// [`JCOMPARE_TO`] — `compareTo` on a boxed primitive or a `String`.
 fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
-    let tag = vm
-        .stack
-        .pop()
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
+    let tag_name = pop_name(vm);
+    let tag = tag_name.as_str_cow();
     // Through any box, for the same reason [`natural_cmp`] is: `compareTo` reads
     // the value, not the handle.
     let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
@@ -5363,7 +5550,7 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     // parameter while doing so — measured on openjdk 21.0.12, one per type
     // rather than one shared wording, because the parameter names differ.
     if matches!(b, Value::Undef) {
-        let param = match tag.as_str() {
+        let param = match tag.as_ref() {
             "Integer" | "int" => "anotherInteger",
             "Long" | "long" => "anotherLong",
             "Double" | "double" | "Float" | "float" => "anotherDouble",
@@ -5410,7 +5597,7 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
             );
         }
     }
-    Value::Int(match tag.as_str() {
+    Value::Int(match tag.as_ref() {
         // Sign only: `Integer.compare` is `(x < y) ? -1 : ((x == y) ? 0 : 1)`.
         "Integer" | "int" | "Long" | "long" => as_i64(&a).cmp(&as_i64(&b)) as i64,
         // Difference: `Character.compareTo` is `this.value - other.value`, and
@@ -5690,6 +5877,42 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
                 Ok(Value::str(s.repeat(n as usize)))
             }
         }
+        // `chars()` and `codePoints()` are the two `IntStream` views of a
+        // string. They differ in Java only above the BMP, where `chars()` yields
+        // the two surrogate code *units* and `codePoints()` the one code point;
+        // javars stores a `String` as Unicode scalars, the same simplification
+        // `length` and `charAt` already make, so both read the same values here
+        // and `"é".chars().sum()` is 233 on either side.
+        ("chars" | "codePoints", 0) => Ok(stream_of(
+            s.chars().map(|c| Value::Int(i64::from(c as u32))).collect(),
+            StreamKind::Int,
+        )),
+        // `lines()` splits on *terminators*, not separators: a trailing newline
+        // ends the last line rather than starting an empty one, so `"a\n"` is
+        // one line and `""` is none. All three of `\n`, `\r\n` and a lone `\r`
+        // terminate — Rust's `str::lines` handles the first two and treats a
+        // lone `\r` as ordinary text, which is why this scans by hand.
+        ("lines", 0) => {
+            let mut out = Vec::new();
+            let mut line = String::new();
+            let mut it = s.chars().peekable();
+            while let Some(c) = it.next() {
+                match c {
+                    '\n' => out.push(Value::str(std::mem::take(&mut line))),
+                    '\r' => {
+                        if it.peek() == Some(&'\n') {
+                            it.next();
+                        }
+                        out.push(Value::str(std::mem::take(&mut line)));
+                    }
+                    other => line.push(other),
+                }
+            }
+            if !line.is_empty() {
+                out.push(Value::str(line));
+            }
+            Ok(stream_of(out, StreamKind::Ref))
+        }
         _ => Err(Fault::internal(format!(
             "javars: unsupported String method `{method}` with {} argument(s)",
             args.len()
@@ -5730,16 +5953,10 @@ fn char_index_of(s: &str, needle: &str) -> i64 {
 /// (bad arity, `NumberFormatException`, unknown method) surfaces as a `javars:`
 /// error rather than a wrong value.
 fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
-    let method = vm
-        .stack
-        .pop()
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
-    let class = vm
-        .stack
-        .pop()
-        .map(|v| v.as_str_cow().into_owned())
-        .unwrap_or_default();
+    let method_name = pop_name(vm);
+    let class_name = pop_name(vm);
+    let method = method_name.as_str_cow();
+    let class = class_name.as_str_cow();
     let n = argc.saturating_sub(2) as usize; // minus class name and method name
     let mut args = Vec::with_capacity(n);
     for _ in 0..n {
@@ -5836,6 +6053,23 @@ fn reject_null_element(items: &[Value]) -> Result<(), Fault> {
         true => Err(Fault::java("NullPointerException", String::new())),
         false => Ok(()),
     }
+}
+
+/// The hash `Objects.hashCode`/`Objects.hash` answers for one value.
+///
+/// A collection hashes by its *contents*, not by its handle:
+/// `Objects.hashCode(List.of(0, 0))` is 961, the `31 * h + e` fold, and reading
+/// the handle instead answered the slab index. [`collection_hash`] is the same
+/// computation `list.hashCode()` already used, so the two agree by
+/// construction rather than by a second implementation.
+fn objects_hash_of(vm: &mut VM, v: &Value) -> i32 {
+    if matches!(v, Value::Undef) {
+        return 0;
+    }
+    if let Some(Value::Int(h)) = collection_hash(vm, v, "hashCode", 0) {
+        return h as i32;
+    }
+    user_element_hash(vm, v).unwrap_or_else(|| element_hash(v))
 }
 
 /// The `java.util` statics: `Arrays.asList`, `List.of`/`Set.of`,
@@ -6012,6 +6246,59 @@ fn collection_static(
         ("Objects", "equals") if args.len() == 2 => {
             Ok(Value::bool(objects_equals(vm, &args[0], &args[1])))
         }
+        // The rest of `java.util.Objects`. Like `equals` they sit here rather
+        // than in the VM-less `static_method` because each may reach a user
+        // `hashCode`/`toString` body, which needs the VM.
+        //
+        // `Objects.hashCode(null)` is 0 and `Objects.toString(null)` is the
+        // four-character string "null" — the whole point of the class is that
+        // it answers for a null where the instance method throws.
+        ("Objects", "hashCode") if args.len() == 1 => {
+            Ok(Value::Int(objects_hash_of(vm, &args[0]).into()))
+        }
+        // `Objects.hash(a, b, …)` is `Arrays.hashCode` of the varargs array:
+        // seeded at 1, folded `31 * h + e`. So `Objects.hash()` is 1 and
+        // `Objects.hash((Object) null)` is 31, not 0.
+        ("Objects", "hash") => {
+            let items = varargs_items(args);
+            let mut h = 1i32;
+            for e in &items {
+                h = h.wrapping_mul(31).wrapping_add(objects_hash_of(vm, e));
+            }
+            Ok(Value::Int(h.into()))
+        }
+        ("Objects", "toString") if matches!(args.len(), 1 | 2) => {
+            Ok(match (&args[0], args.get(1)) {
+                (Value::Undef, Some(d)) => d.clone(),
+                (Value::Undef, None) => Value::str("null"),
+                (v, _) => Value::str(java_str_vm(vm, v)),
+            })
+        }
+        ("Objects", "isNull") if args.len() == 1 => {
+            Ok(Value::bool(matches!(args[0], Value::Undef)))
+        }
+        ("Objects", "nonNull") if args.len() == 1 => {
+            Ok(Value::bool(!matches!(args[0], Value::Undef)))
+        }
+        // `requireNonNull(obj)` throws a message-less NPE; the two-argument
+        // form throws with the caller's text. `requireNonNullElse` names the
+        // parameter it found null — `defaultObj` — because it is the default
+        // that was required, the first argument being allowed to be null.
+        ("Objects", "requireNonNull") if matches!(args.len(), 1 | 2) => match &args[0] {
+            Value::Undef => Err(Fault::java(
+                "NullPointerException",
+                args.get(1).map(|m| java_str_vm(vm, m)).unwrap_or_default(),
+            )),
+            v => Ok(v.clone()),
+        },
+        ("Objects", "requireNonNullElse") if args.len() == 2 => match (&args[0], &args[1]) {
+            (Value::Undef, Value::Undef) => Err(Fault::java(
+                "NullPointerException",
+                "defaultObj".to_string(),
+            )),
+            (Value::Undef, d) => Ok(d.clone()),
+            (v, _) => Ok(v.clone()),
+        },
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
                 Some(i) => i,
@@ -6071,6 +6358,79 @@ fn varargs_items(args: &[Value]) -> Vec<Value> {
 
 /// Overwrite a `List` handle's elements in place, so a sort or reverse is
 /// visible through every reference to it — Java's semantics for these statics.
+/// Replace a `List`'s or `Set`'s elements wholesale.
+///
+/// [`write_sequence`] writes a `List` (and walks a `subList` chain to its root);
+/// a `Set` keeps a position accelerator beside its elements, so replacing them
+/// has to invalidate it or the next lookup answers from stale positions. This is
+/// the one writer that covers both, which is what `removeIf`/`replaceAll` need:
+/// they are the only mutators Java defines on `Collection` rather than on `List`.
+fn write_collection(target: &Value, items: Vec<Value>, structural: bool) -> Result<(), Fault> {
+    let Value::Obj(id) = target else {
+        return Ok(());
+    };
+    let id = *id as usize;
+    // Writing *through* a view is not the same as writing past it. The view
+    // splices its window into the backing list and pushes the length change up
+    // its own ancestor chain — Java's `SubList.updateSizeAndModCount` — so the
+    // view it was called on stays usable, exactly as `v.add`/`v.remove`
+    // already do. Routing a view's `removeIf` through the plain list writer
+    // bumped the root's `modCount` without telling the view, and reading the
+    // view back raised `ConcurrentModificationException` for a change it had
+    // made itself.
+    if is_sublist(id) {
+        let (root, offset, len) = checked_window(id)?;
+        let delta = items.len() as isize - len as isize;
+        HEAP.with(|h| {
+            if let Some(HostObj::List {
+                items: dst, mods, ..
+            }) = h.borrow_mut().get_mut(root)
+            {
+                dst.splice(offset..offset + len, items);
+                if delta != 0 {
+                    *mods += 1;
+                }
+            }
+        });
+        if delta != 0 {
+            let new_mods = list_mods(root).unwrap_or_default();
+            resize_ancestors(id, delta, new_mods);
+        }
+        return Ok(());
+    }
+    let is_set = HEAP.with(|h| matches!(h.borrow().get(id), Some(HostObj::Set { .. })));
+    if !is_set {
+        return write_sequence(id, items, structural);
+    }
+    HEAP.with(|h| {
+        if let Some(HostObj::Set {
+            items: dst, index, ..
+        }) = h.borrow_mut().get_mut(id)
+        {
+            *dst = items;
+            index.invalidate();
+        }
+    });
+    Ok(())
+}
+
+/// The [`Fixity`] of a `List` (through any `subList` chain) or a `Set`.
+///
+/// [`sublist_root_fixity`] answers for lists only, and answering `None` for a
+/// `Set` would read `Set.of(…)` as mutable — so `Set.of(1, 2).removeIf(p)`
+/// would edit an immutable set instead of throwing.
+fn collection_fixity(v: &Value) -> Option<Fixity> {
+    if let Value::Obj(id) = v {
+        if let Some(f) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Set { fixed, .. }) => Some(*fixed),
+            _ => None,
+        }) {
+            return Some(f);
+        }
+    }
+    sublist_root_fixity(v)
+}
+
 fn write_list(target: &Value, items: Vec<Value>) -> Result<(), Fault> {
     let Value::Obj(id) = target else {
         return Ok(());
@@ -6288,10 +6648,84 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         }
         ("Integer" | "Long", "max", 2) => Ok(Value::Int(args[0].jint().max(args[1].jint()))),
         ("Integer" | "Long", "min", 2) => Ok(Value::Int(args[0].jint().min(args[1].jint()))),
-        ("Integer" | "Long", "sum", 2) => {
-            Ok(Value::Int(args[0].jint().wrapping_add(args[1].jint())))
-        }
+        // `Integer.sum` is `int + int`, so it wraps at 32 bits;
+        // `Long.sum` wraps at 64. Sharing one `i64` arm answered
+        // `Integer.sum(Integer.MAX_VALUE, 1)` with 2147483648, a value no `int`
+        // can hold, where the JDK gives -2147483648. Every other arithmetic
+        // site in javars narrows per its static width; this one did not.
+        ("Integer", "sum", 2) => Ok(Value::Int(
+            (args[0].jint() as i32)
+                .wrapping_add(args[1].jint() as i32)
+                .into(),
+        )),
+        ("Long", "sum", 2) => Ok(Value::Int(args[0].jint().wrapping_add(args[1].jint()))),
         ("Integer" | "Long", "signum", 1) => Ok(Value::Int(args[0].jint().signum())),
+        // The bit-twiddling statics. Each reads its argument as a two's
+        // complement pattern at the declared width and answers a value of that
+        // same width, so `Integer` narrows to `i32` and `Long` stays at 64:
+        // `Integer.reverse(1)` is Integer.MIN_VALUE where `Long.reverse(1L)` is
+        // Long.MIN_VALUE. Every one is exactly specified — a shift or a
+        // population count, never a transcendental — so there is one right
+        // answer and Rust's integer intrinsics give it.
+        //
+        // The rotate distance is taken modulo the width *by the JDK's own
+        // spec* ("bits shifted out of the left hand … re-entering on the
+        // right"), and a negative distance rotates the other way;
+        // `u32::rotate_left` masks the same way, so `Integer.rotateLeft(1, -1)`
+        // is Integer.MIN_VALUE on both sides.
+        ("Integer", "bitCount", 1) => Ok(Value::Int((args[0].jint() as i32).count_ones().into())),
+        ("Long", "bitCount", 1) => Ok(Value::Int(args[0].jint().count_ones().into())),
+        ("Integer", "numberOfLeadingZeros", 1) => {
+            Ok(Value::Int((args[0].jint() as i32).leading_zeros().into()))
+        }
+        ("Long", "numberOfLeadingZeros", 1) => {
+            Ok(Value::Int(args[0].jint().leading_zeros().into()))
+        }
+        ("Integer", "numberOfTrailingZeros", 1) => {
+            Ok(Value::Int((args[0].jint() as i32).trailing_zeros().into()))
+        }
+        ("Long", "numberOfTrailingZeros", 1) => {
+            Ok(Value::Int(args[0].jint().trailing_zeros().into()))
+        }
+        // `highestOneBit(0)` and `lowestOneBit(0)` are 0 — the JDK returns the
+        // isolated bit, and zero has none. `x & -x` isolates the lowest set
+        // bit and gives 0 for zero without a branch.
+        ("Integer", "highestOneBit", 1) => Ok(Value::Int(match args[0].jint() as i32 {
+            0 => 0,
+            n => (1u32 << (31 - n.leading_zeros())) as i32 as i64,
+        })),
+        ("Long", "highestOneBit", 1) => Ok(Value::Int(match args[0].jint() {
+            0 => 0,
+            n => (1u64 << (63 - n.leading_zeros())) as i64,
+        })),
+        ("Integer", "lowestOneBit", 1) => {
+            let n = args[0].jint() as i32;
+            Ok(Value::Int(i64::from(n & n.wrapping_neg())))
+        }
+        ("Long", "lowestOneBit", 1) => {
+            let n = args[0].jint();
+            Ok(Value::Int(n & n.wrapping_neg()))
+        }
+        ("Integer", "reverse", 1) => Ok(Value::Int(i64::from(
+            (args[0].jint() as i32).reverse_bits(),
+        ))),
+        ("Long", "reverse", 1) => Ok(Value::Int(args[0].jint().reverse_bits())),
+        ("Integer", "reverseBytes", 1) => {
+            Ok(Value::Int(i64::from((args[0].jint() as i32).swap_bytes())))
+        }
+        ("Long", "reverseBytes", 1) => Ok(Value::Int(args[0].jint().swap_bytes())),
+        ("Integer", "rotateLeft", 2) => Ok(Value::Int(i64::from(
+            (args[0].jint() as i32).rotate_left(args[1].jint() as u32),
+        ))),
+        ("Integer", "rotateRight", 2) => Ok(Value::Int(i64::from(
+            (args[0].jint() as i32).rotate_right(args[1].jint() as u32),
+        ))),
+        ("Long", "rotateLeft", 2) => Ok(Value::Int(
+            args[0].jint().rotate_left(args[1].jint() as u32),
+        )),
+        ("Long", "rotateRight", 2) => Ok(Value::Int(
+            args[0].jint().rotate_right(args[1].jint() as u32),
+        )),
         // `Xxx.hashCode(x)` is the static spelling of the boxed instance
         // method, and each box folds a different width: `Integer` is the value,
         // `Long` folds its halves, `Double` folds `doubleToLongBits`, and

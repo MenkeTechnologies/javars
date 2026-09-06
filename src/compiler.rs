@@ -5782,11 +5782,14 @@ impl Compiler {
                         _ => Some(Vec::new()),
                     })
                     .flatten();
-                // `Objects.equals(a, b)` runs `a.equals(b)`, which compares
-                // references — so both arguments cross into a reference position
-                // and autobox there, exactly as `x.equals(y)`'s does.
-                // `Objects.equals(aLong, 1000)` is `false` in Java.
-                let box_args = (class == "Objects" && method == "equals" && args.len() == 2)
+                // Every `java.util.Objects` static takes `Object`, so every
+                // primitive argument crosses into a reference position and
+                // autoboxes there. `Objects.equals(a, b)` runs `a.equals(b)`,
+                // which compares references, so `Objects.equals(aLong, 1000)` is
+                // `false` in Java; and a `char` has to arrive as a `Character`
+                // rather than as its code point, or `Objects.toString('c')`
+                // renders 99 where the reference renders `c`.
+                let box_args = class == "Objects"
                     // The collection factories build *elements*, so their
                     // arguments autobox exactly as `list.add(x)`'s does — which
                     // is what keeps `List.of(128, 128).get(0) == get(1)` the
@@ -5809,7 +5812,17 @@ impl Compiler {
                         self.expr(a)?;
                     }
                     if box_args {
-                        if let Some(code) = self.autobox_code(a) {
+                        // `autobox_code` has no `char` arm — a `char` is a code
+                        // point, not one of the numeric boxes — so the
+                        // `Character` box is named here, the same way
+                        // `emit_erased_arg` names it for `x.equals('z')`.
+                        // Without it `Objects.toString('c')` rendered the code
+                        // point, 99, where the reference renders `c`.
+                        let code = match self.expr_java_type(a).as_deref() {
+                            Some("char") => crate::host::box_class_code("Character"),
+                            _ => self.autobox_code(a),
+                        };
+                        if let Some(code) = code {
                             self.b.emit(Op::LoadInt(code), line);
                             self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
                         }
@@ -7818,8 +7831,8 @@ fn list_index_arg(kind: &str, method: &str, argc: usize, i: usize) -> bool {
 
 fn collection_kind(ty: &str) -> Option<&'static str> {
     Some(match ty {
-        "ArrayList" | "LinkedList" => "list",
-        "List" | "Collection" | "Iterable" => "list",
+        "ArrayList" | "LinkedList" | "ArrayDeque" => "list",
+        "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
         "HashMap" | "LinkedHashMap" | "TreeMap" | "Map" => "map",
         "HashSet" | "LinkedHashSet" | "TreeSet" | "Set" => "set",
         _ => return None,
@@ -7833,6 +7846,7 @@ fn is_concrete_collection(ty: &str) -> bool {
         ty,
         "ArrayList"
             | "LinkedList"
+            | "ArrayDeque"
             | "HashMap"
             | "LinkedHashMap"
             | "TreeMap"
@@ -7885,8 +7899,58 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         // though the type is not — which is what `javac` needs the target type
         // for and javars does not, being dynamically typed underneath.
         | ("String", "valueOf")
+        // The box factories. `Integer.valueOf` is overloaded on *type*
+        // (`int` and `String`) but not on arity, which is all a reference needs
+        // here — javars is dynamically typed underneath, so the one synthesized
+        // lambda serves both.
+        | ("Integer", "valueOf")
+        | ("Long", "valueOf")
+        | ("Double", "valueOf")
+        | ("Double", "parseDouble")
+        // The `java.lang.Math` statics javars models at arity 1. The
+        // transcendentals are deliberately unmodelled (see the note in
+        // `host::static_method`), so naming one here would synthesize a lambda
+        // whose body cannot run.
+        | ("Math", "abs")
+        | ("Math", "signum")
+        | ("Math", "toRadians")
+        | ("Math", "toDegrees")
+        | ("Math", "rint")
+        | ("Math", "ulp")
+        | ("Math", "nextUp")
+        | ("Math", "nextDown")
+        // The bit-twiddling statics, on both widths.
+        | ("Integer" | "Long", "bitCount")
+        | ("Integer" | "Long", "reverse")
+        | ("Integer" | "Long", "reverseBytes")
+        | ("Integer" | "Long", "highestOneBit")
+        | ("Integer" | "Long", "lowestOneBit")
+        | ("Integer" | "Long", "numberOfLeadingZeros")
+        | ("Integer" | "Long", "numberOfTrailingZeros")
+        | ("Integer" | "Long", "signum")
+        // `Objects::toString` and `Objects::requireNonNull` are overloaded on
+        // *arity* (1 and 2), so neither has an unambiguous one and neither is
+        // here; `javac` picks by target type, which this table cannot see.
+        //
+        // `Integer::hashCode` and its siblings are absent for a stronger
+        // reason: `javac` *rejects* them. The static `hashCode(int)` and the
+        // inherited `hashCode()` both match an arity-1 reference, and the
+        // error is "reference to hashCode is ambiguous" — measured on
+        // openjdk 21.0.12.1 — so listing one here would make javars run a
+        // program the reference refuses to compile.
+        | ("Objects", "isNull")
+        | ("Objects", "nonNull")
+        | ("Objects", "hashCode")
  => 1,
         ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,
+        // `Integer::sum` is the canonical `reduce`/`merge` operator and was the
+        // reference this table most often refused.
+        ("Integer" | "Long", "sum") => 2,
+        ("Integer" | "Long", "max") | ("Integer" | "Long", "min") => 2,
+        ("Integer" | "Long" | "Double" | "Boolean", "compare") => 2,
+        ("Integer" | "Long", "rotateLeft") | ("Integer" | "Long", "rotateRight") => 2,
+        ("Math", "floorDiv") | ("Math", "floorMod") | ("Math", "copySign") => 2,
+        ("Objects", "equals") | ("Objects", "requireNonNullElse") => 2,
         _ => return None,
     })
 }

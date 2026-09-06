@@ -1026,6 +1026,36 @@ storage-model differences:
   `List.subList` *is* a real aliasing view (above); these two are not, which is
   also why a cast of one names the set or list javars modeled it as rather than
   `HashMap$KeySet`.
+- **An arithmetic fault raised inside a lambda escapes the enclosing
+  `try`/`catch`.** This is one of the two VM-level limits on record — a pending
+  exception is checked after a `CallBuiltin` but not after an arithmetic op — and
+  it is reachable from every collection method that re-enters the VM to run a
+  user body. Measured on `openjdk 21.0.12.1`:
+
+  ```java
+  List<Integer> l = new ArrayList<>(List.of(1, 2));
+  try { l.forEach(x -> { int y = x % 0; }); }
+  catch (RuntimeException e) { System.out.println("caught"); }
+  // Java: caught     javars: java.lang.ArithmeticException: / by zero (uncaught)
+  ```
+
+  `forEach`, `sort`, `removeIf` and `replaceAll` all behave this way, and all of
+  them catch an *explicitly thrown* exception (`throw new
+  IllegalStateException(…)`) correctly — the gap is the implicit fault, not the
+  re-entry. The fix belongs in fusevm, which javars does not modify.
+- **A `char` a lambda returns stays a code point when the interface it
+  implements is not one javars declares.** The conversion to a `Character` is
+  driven by the single abstract method's declared return type, so it happens for
+  every functional interface in the prelude — including the primitive-input
+  `IntFunction`/`LongFunction`/`DoubleFunction` — and not for a stream stage,
+  whose lambda gets no target type:
+
+  ```java
+  System.out.println(Stream.of(97, 98).map(c -> (char)(int) c).toList());
+  // Java: [a, b]     javars: [97, 98]
+  java.util.function.IntFunction<Character> f = c -> (char) c;
+  System.out.println(f.apply(97));            // `a` on both
+  ```
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1068,6 +1098,17 @@ Detecting this needs block-scope tracking that does not exist yet; a flat check
 would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
+
+- **A `\uXXXX` escape that names a lone surrogate is refused.** JLS 3.3
+  translation itself is performed (over the whole source, before tokenizing, on
+  the even-preceding-backslash eligibility rule and accepting the `\uuuu0041`
+  form), so `"\u0041\u0042"` is `AB` and `'\u00e9'` is 233 — but javars stores
+  a `String` as Unicode *scalars*, the same simplification `length` and `charAt`
+  already make, and half a surrogate pair names no scalar. Measured on
+  `openjdk 21.0.12.1`, `String s = "\ud83d"; s.length()` prints 1 there;
+  javars stops with `unicode escape \ud83d names a surrogate, which javars's
+  scalar `char` model cannot hold`. Refusing is the safe direction — the
+  alternative is a replacement character presented as the program's own text.
 
 - **`StackOverflowError` and `OutOfMemoryError` are never raised**, and a
   program that would provoke either does not fail — it runs until the OS stops
@@ -1492,6 +1533,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
     it answers `instanceof ArrayList` `true` where Java says `false`. Every
     interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
     — is exact.
+  * **`new ArrayDeque<>()` is the same mutable list**, on the same terms. Its
+    `Deque`/`Queue` methods (`push`/`pop`/`peek*`/`poll*`/`add*`/`offer*`/
+    `get*`/`remove*`/`element`) produce the reference's element order and the
+    reference's empty-receiver behaviour — the throwing family and the
+    null-answering family are distinguished — but two things the list shape
+    cannot carry differ: `getClass().getSimpleName()` is `ArrayList`, and a null
+    element is accepted where the real `ArrayDeque` throws a
+    `NullPointerException`.
 
   One further limit is about reach rather than about the answer: pattern binding
   (`x instanceof Point p`) does not parse, the right-hand side being a bare type

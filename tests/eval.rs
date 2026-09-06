@@ -5081,3 +5081,243 @@ fn an_immutable_collection_refuses_a_null_query_instead_of_answering_false() {
         "c null\ni null\nl null\ns null\nk null\nv null\nfalse\n-1\n"
     );
 }
+
+// ── round 2: surfaces the generator had zero coverage of ──────────────────
+//
+// Every expectation below is the output measured from `java T.java` on
+// openjdk 21.0.12.1, the oracle `scripts/capture-parity.sh` and
+// `tests/parity.rs` both use.
+
+#[test]
+fn unicode_escapes_are_translated_before_lexing() {
+    // JLS 3.3 is a translation of the whole source file, not a string escape.
+    // javars performed none of it: the string lexer dropped the backslash and
+    // `"\u0041\u0042"` printed `u0041u0042` — a silent wrong answer, not a
+    // refusal — while `'\u00e9'` was `unterminated char literal`.
+    let (out, ok) = run(&wrap(
+        r#"System.out.println("\u0041\u0042"); char c = '\u00e9'; System.out.println((int) c + " " + "\u00e9".length());"#,
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "AB\n233 1\n");
+}
+
+#[test]
+fn an_escaped_backslash_does_not_open_a_unicode_escape() {
+    // The eligibility rule: a backslash opens an escape only when an even
+    // number of backslashes precedes it. Without it a program could not write
+    // the two characters `\u` at all.
+    let (out, ok) = run(&wrap(
+        r#"System.out.println("\\u0041".length() + "|" + "\\u0041");"#,
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "6|\\u0041\n");
+}
+
+#[test]
+fn a_unicode_escape_may_repeat_its_u_and_may_spell_an_identifier() {
+    let (out, ok) = run(&wrap(
+        r#"int \u0061bc = 5; System.out.println("\uuuu0041" + abc);"#,
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "A5\n");
+}
+
+#[test]
+fn a_surrogate_unicode_escape_is_refused_rather_than_mangled() {
+    // javars stores a `String` as Unicode scalars, so a lone surrogate names
+    // no value it can hold. Refusing beats inventing a replacement character.
+    let (_out, err, ok) = run_streams(&wrap(r#"System.out.println("\ud83d".length());"#));
+    assert!(!ok);
+    assert!(err.contains("surrogate"), "{err}");
+}
+
+#[test]
+fn integer_sum_wraps_at_thirty_two_bits_and_long_sum_does_not() {
+    // `Integer.sum` and `Long.sum` shared one 64-bit arm, so
+    // `Integer.sum(Integer.MAX_VALUE, 1)` answered 2147483648 — a value no
+    // `int` can hold — where the reference answers Integer.MIN_VALUE.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Integer.sum(Integer.MAX_VALUE, 1)); System.out.println(Long.sum(Integer.MAX_VALUE, 1));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "-2147483648\n2147483648\n");
+}
+
+#[test]
+fn the_bit_statics_answer_at_their_declared_width() {
+    let (out, ok) = run(&wrap(
+        "System.out.println(Integer.bitCount(-1) + \" \" + Long.bitCount(-1L));\
+         System.out.println(Integer.reverse(1) + \" \" + Long.reverse(1L));\
+         System.out.println(Integer.highestOneBit(0) + \" \" + Integer.highestOneBit(-1) + \" \" + Integer.lowestOneBit(-1));\
+         System.out.println(Integer.numberOfLeadingZeros(0) + \" \" + Long.numberOfTrailingZeros(0L));\
+         System.out.println(Integer.rotateLeft(1, 33) + \" \" + Integer.rotateLeft(1, -1) + \" \" + Long.rotateLeft(1L, 65));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "32 64\n-2147483648 -9223372036854775808\n0 -2147483648 1\n32 64\n2 -2147483648 2\n"
+    );
+}
+
+#[test]
+fn objects_answers_for_a_null_and_boxes_a_char() {
+    // `Objects.toString('c')` rendered 99: every `Objects` static takes
+    // `Object`, so a `char` argument has to arrive as a `Character` rather
+    // than as its code point.
+    let (out, ok) = run(&wrap(
+        "System.out.println(Objects.hashCode(null) + \" \" + Objects.toString(null) + \" \" + Objects.toString(null, \"d\"));\
+         System.out.println(Objects.hash() + \" \" + Objects.hash((Object) null) + \" \" + Objects.hash(\"a\", \"b\"));\
+         System.out.println(Objects.toString('c') + \" \" + Objects.isNull(null) + \" \" + Objects.nonNull(null));\
+         try { Objects.requireNonNullElse(null, null); } catch (NullPointerException e) { System.out.println(e.getMessage()); }",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "0 null d\n1 31 4066\nc true false\ndefaultObj\n");
+}
+
+#[test]
+fn remove_if_reports_through_the_receivers_fixity() {
+    // Three receivers, three answers, and a `catch` can tell them apart:
+    // `List.of` throws before it looks at the predicate; `Arrays.asList` runs
+    // the predicate and throws only when something must actually go, with the
+    // message `remove` its iterator names; an `ArrayList` does the work.
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> m = new java.util.ArrayList<>(java.util.List.of(1, 2, 3, 4));\
+         System.out.println(m.removeIf(x -> x % 2 == 0) + \" \" + m + \" \" + m.removeIf(x -> x > 9));\
+         try { java.util.List.of(1, 2).removeIf(null); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \"|\" + e.getMessage()); }\
+         System.out.println(java.util.Arrays.asList(1, 2).removeIf(x -> false));\
+         try { java.util.Arrays.asList(1, 2).removeIf(x -> true); } catch (RuntimeException e) { System.out.println(e.getClass().getName() + \"|\" + e.getMessage()); }",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "true [1, 3] false\njava.lang.UnsupportedOperationException|null\nfalse\njava.lang.UnsupportedOperationException|remove\n"
+    );
+}
+
+#[test]
+fn replace_all_writes_through_and_invalidates_a_view() {
+    // `ArrayList.replaceAll` bumps `modCount` whether or not any element
+    // changed, so a `subList` taken before it is stale after it.
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> m = new java.util.ArrayList<>(java.util.List.of(1, 2, 3));\
+         java.util.List<Integer> v = m.subList(0, 2);\
+         m.replaceAll(x -> x);\
+         System.out.println(m);\
+         try { System.out.println(v); } catch (RuntimeException e) { System.out.println(e.getClass().getSimpleName()); }\
+         java.util.List<Integer> f = java.util.Arrays.asList(1, 2); f.replaceAll(x -> x * 3); System.out.println(f);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[1, 2, 3]\nConcurrentModificationException\n[3, 6]\n");
+}
+
+#[test]
+fn a_deque_reads_from_both_ends_and_says_which_end_was_empty() {
+    // The `get`/`remove`/`element`/`pop` spellings throw on an empty deque and
+    // the `peek`/`poll` ones answer null — the only place the two families
+    // stop agreeing.
+    let (out, ok) = run(&wrap(
+        "java.util.Deque<Integer> q = new java.util.ArrayDeque<>();\
+         q.push(1); q.addLast(2); q.addFirst(0);\
+         System.out.println(q + \" \" + q.pop() + \" \" + q.peekLast() + \" \" + q.size());\
+         java.util.Deque<Integer> e = new java.util.ArrayDeque<>();\
+         System.out.println(e.poll() + \" \" + e.peekFirst() + \" \" + e.pollLast());\
+         try { e.getFirst(); } catch (java.util.NoSuchElementException x) { System.out.println(\"nse \" + x.getMessage()); }",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[0, 1, 2] 0 2 2\nnull null null\nnse null\n");
+}
+
+#[test]
+fn string_chars_and_lines_are_streams_over_terminators() {
+    // `lines()` splits on terminators, so a trailing newline ends the last
+    // line rather than starting an empty one, and a lone `\r` terminates too.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\".chars().sum() + \" \" + \"\".chars().count() + \" \" + \"abc\".codePoints().count());\
+         System.out.println(\"a\\nb\\r\\nc\\n\".lines().toList() + \" \" + \"\".lines().count() + \" \" + \"a\\n\\nb\".lines().count());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "294 0 3\n[a, b, c] 0 3\n");
+}
+
+#[test]
+fn a_nested_type_may_be_named_through_its_enclosing_class() {
+    // `T.Pt p = …` was a parse error: the type parser stepped over a lowercase
+    // package qualifier only, so a capitalised one ended the declaration.
+    let src = "public class T {\n\
+        static class Pt { final int x; Pt(int x) { this.x = x; } public String toString() { return \"P\" + x; } }\n\
+        public static void main(String[] a) {\n\
+        T.Pt p = new T.Pt(3); Pt q = new Pt(4);\n\
+        java.util.List<T.Pt> l = new java.util.ArrayList<>(); l.add(p); l.add(q);\n\
+        System.out.println(p + \" \" + q + \" \" + l);\n\
+        System.out.println(java.util.List.of(1).getClass() != null);\n\
+        } }\n";
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "P3 P4 [P3, P4]\ntrue\n");
+}
+
+#[test]
+fn a_capitalised_qualifier_that_is_not_a_type_stays_an_expression() {
+    // The same rule must not turn `Color.RED;` or `Config.MAX = 1;` into a
+    // declaration — both end in something other than an identifier, which is
+    // what `looks_like_decl` checks after stepping the qualifier.
+    let src = "public class T {\n\
+        enum Color { RED, GREEN }\n\
+        static int MAX = 1;\n\
+        public static void main(String[] a) {\n\
+        Color c = Color.RED; T.MAX = 7;\n\
+        System.out.println(c + \" \" + T.MAX + \" \" + Color.GREEN.ordinal());\n\
+        } }\n";
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "RED 7 1\n");
+}
+
+#[test]
+fn a_static_method_reference_names_the_bit_and_objects_statics() {
+    // `Integer::sum` — the operator `reduce` and `Map.merge` are written with
+    // — was refused as "not a method reference javars models".
+    let (out, ok) = run(&wrap(
+        "java.util.function.IntBinaryOperator s = Integer::sum;\
+         java.util.function.IntUnaryOperator b = Integer::bitCount;\
+         System.out.println(s.applyAsInt(2, 3) + \" \" + b.applyAsInt(255));\
+         System.out.println(java.util.stream.Stream.of(1, 2, 3).reduce(0, Integer::sum));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "5 8\n6\n");
+}
+
+#[test]
+fn a_primitive_input_function_boxes_a_char_result() {
+    // `IntFunction` was not a declared functional interface, so a lambda
+    // assigned to one had no known return type and `c -> (char) c` answered
+    // the code point instead of the character.
+    let (out, ok) = run(&wrap(
+        "java.util.function.IntFunction<Character> f = c -> (char) c;\
+         java.util.function.DoubleUnaryOperator d = x -> x / 2;\
+         System.out.println(f.apply(97) + \" \" + d.applyAsDouble(5));",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "a 2.5\n");
+}
+
+#[test]
+fn remove_if_through_a_view_keeps_the_view_usable() {
+    // A change made *through* a `subList` splices its window into the backing
+    // list and pushes the length change up its own ancestor chain, so the view
+    // that made it stays valid — Java's `SubList.updateSizeAndModCount`.
+    // Routing it through the plain list writer bumped the root's `modCount`
+    // without telling the view, and reading the view back raised
+    // `ConcurrentModificationException` for its own edit.
+    let (out, ok) = run(&wrap(
+        "java.util.List<Integer> m = new java.util.ArrayList<>(java.util.List.of(1, 2, 3, 4));\
+         java.util.List<Integer> v = m.subList(1, 3);\
+         System.out.println(v.removeIf(x -> x > 2) + \" \" + v + \" \" + m);\
+         java.util.List<Integer> n = new java.util.ArrayList<>(java.util.List.of(1, 2, 3, 4));\
+         java.util.List<Integer> w = n.subList(1, 3);\
+         w.replaceAll(x -> x * 10);\
+         System.out.println(w + \" \" + n);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "true [2] [1, 2, 4]\n[20, 30] [1, 20, 30, 4]\n");
+}

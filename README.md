@@ -242,7 +242,10 @@ Implemented and checked against the reference `java`:
   (javars runs one thread, so the lock itself is unobservable) and throws
   `NullPointerException` for a `null` monitor.
 - **Expressions** — integer (decimal, `0x`, `0b`, octal, `_`-separated) /
-  floating / string / char / boolean literals; the binary operators `+ - * / %`,
+  floating / string / char / boolean literals, with JLS 3.3 `\uXXXX` escapes
+  translated across the whole source before it is tokenized (so an escape spells
+  an identifier or a comment as readily as a string, `\\u0041` stays the two
+  characters it is written as, and `\uuuu0041` is the letter `A`); the binary operators `+ - * / %`,
   `== != < > <= >=`, `&& ||` (short-circuiting), the bitwise `& | ^` (Java's
   non-short-circuiting logical operators on booleans), and the shifts
   `<< >> >>>` with Java's per-width distance masking; unary `-`, `!`, `~`, and
@@ -352,12 +355,22 @@ Implemented and checked against the reference `java`:
   functional-interface variable may hold a lambda *or* a class instance; the
   runtime-class dispatch chain routes each. `return`, `break`/`continue`,
   `try`/`finally` and `throw` all work inside a lambda body.
-- **Method references** — `String::length`, `Integer::parseInt`, `Point::area`,
-  `obj::method`, `this::method`, `Point::new`, `System.out::println`.
-- **`java.util` collections** — `List`/`ArrayList`, `Map`/`HashMap`/
+- **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
+  `Point::area`, `obj::method`, `this::method`, `Point::new`,
+  `System.out::println`.
+- **`java.util` collections** — `List`/`ArrayList`/`LinkedList`,
+  `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
   constructors, `Arrays.asList`, `List.of`/`Set.of`, and
-  `Collections.sort`/`reverse`/`max`/`min`. `Arrays.asList` is fixed-size and
+  `Collections.sort`/`reverse`/`max`/`min`. A deque reads and writes at both
+  ends (`push`/`pop`/`peek`, `addFirst`/`addLast`, `offer*`, `poll*`,
+  `get*`/`remove*`/`element`) and distinguishes the two empty-receiver
+  families: the `get`/`remove`/`element`/`pop` spellings throw
+  `NoSuchElementException` where `peek`/`poll` answer `null`. `removeIf` and
+  `replaceAll` run a predicate or operator per element and report through the
+  receiver's shape — a `List.of` refuses before it looks at the argument, an
+  `Arrays.asList` runs the predicate and refuses only when something must
+  actually go. `Arrays.asList` is fixed-size and
   `List.of`/`Set.of` immutable, so a structural write to one throws
   `UnsupportedOperationException` as Java's does, and neither factory answers
   `instanceof` as the mutable kind it is not. The `of` factories also refuse a
@@ -483,9 +496,15 @@ integer-vs-float division, the ternary `?:` operator, `if` / `while` /
 compound forms), cast expressions, `++`/`--` in value position, `System.out`/`System.err` `print[ln]`, string concatenation,
 user-defined `static` methods (recursion, parameters, value returns over
 fusevm's `Op::Call` frame ABI), `String` instance methods, a first slice of the
-standard library (`Math.*`, the `Integer`/`Long`/`Double` parsing, radix, and
-constant statics, `Boolean.parseBoolean`, the `Character` predicates,
-`String.valueOf`/`join`/`format`, `System.out.printf`, and the `Arrays`
+standard library (`Math.*`, the `Integer`/`Long`/`Double` parsing, radix,
+bit-twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`,
+`lowestOneBit`, `numberOfLeading`/`TrailingZeros`, `rotateLeft`/`rotateRight`,
+each answering at its declared width) and constant statics,
+`Boolean.parseBoolean`, the `Character` predicates, the `java.util.Objects`
+statics (`hashCode`/`hash`/`toString`/`isNull`/`nonNull`/`equals`/
+`requireNonNull`/`requireNonNullElse`, each answering for a `null` where the
+instance method throws), `String.valueOf`/`join`/`format`, `String.chars`/
+`codePoints`/`lines`, `System.out.printf`, and the `Arrays`
 statics including `sort`/`fill`/`copyOf`/`deepToString`), **reference arrays** including **multi-dimensional**
 (default-valued `new T[n]` / `new T[m][n]`, `{…}` and nested `{{…},{…}}` literals,
 get/set indexing, `.length` at each level, and reference/aliasing semantics on a

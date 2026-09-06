@@ -140,6 +140,86 @@ impl fmt::Display for Tok {
 
 /// Lex `src` into a token vector terminated by `Tok::Eof`.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+    let translated = translate_unicode_escapes(src)?;
+    lex_translated(&translated)
+}
+
+/// JLS 3.3: replace every eligible `\uXXXX` in the source with the character it
+/// names, **before** the source is tokenized.
+///
+/// This is a translation of the whole file, not an escape the string lexer
+/// handles, and Java specifies it that way — `A` is the letter `A`
+/// wherever it appears, including in an identifier or a comment. javars did not
+/// perform it at all, so `System.out.println("AB")` printed
+/// `u0041u0042` (the string lexer dropped the unrecognised backslash) and
+/// `'é'` was an `unterminated char literal`. The first is the dangerous
+/// one: it is a silent wrong answer, not a refusal.
+///
+/// Two details of the rule are load-bearing and both are tested:
+///
+///   * A backslash starts an escape only when an **even** number of backslashes
+///     precedes it. `"\\u0041"` is therefore a literal backslash followed by
+///     `u0041`, not the letter `A` — which is how a Java program writes a
+///     regex like `\\u` without it being translated away.
+///   * `\uuuu0041` is legal: any run of `u`s after the backslash is part of the
+///     escape. (The convention exists so a translator can mark text it has
+///     already processed.)
+///
+/// A lone surrogate (`\ud83d`) names no Unicode scalar. javars stores a `String`
+/// as scalars — the same model `length` and `charAt` already use — so there is
+/// no value to produce, and this refuses rather than inventing one.
+fn translate_unicode_escapes(src: &str) -> Result<String, String> {
+    if !src.contains("\\u") {
+        return Ok(src.to_string());
+    }
+    let cs: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut line = 1u32;
+    while i < cs.len() {
+        if cs[i] != '\\' {
+            if cs[i] == '\n' {
+                line += 1;
+            }
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        // A run of backslashes: the k-th is preceded by k of them, so the only
+        // one that can open an escape is the last, and only when the run has
+        // odd length.
+        let start = i;
+        while i < cs.len() && cs[i] == '\\' {
+            i += 1;
+        }
+        let run = i - start;
+        if run % 2 == 0 || i >= cs.len() || cs[i] != 'u' {
+            out.extend(cs[start..i].iter());
+            continue;
+        }
+        // Keep every backslash but the one that opens the escape.
+        out.extend(std::iter::repeat_n('\\', run - 1));
+        while i < cs.len() && cs[i] == 'u' {
+            i += 1;
+        }
+        let hex: String = cs.get(i..i + 4).unwrap_or_default().iter().collect();
+        let value = (hex.len() == 4)
+            .then(|| u32::from_str_radix(&hex, 16).ok())
+            .flatten()
+            .ok_or_else(|| format!("javars: illegal unicode escape on line {line}"))?;
+        let ch = char::from_u32(value).ok_or_else(|| {
+            format!("javars: unicode escape \\u{hex} names a surrogate, which javars's scalar `char` model cannot hold (line {line})")
+        })?;
+        if ch == '\n' {
+            line += 1;
+        }
+        out.push(ch);
+        i += 4;
+    }
+    Ok(out)
+}
+
+fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut line = 1u32;
