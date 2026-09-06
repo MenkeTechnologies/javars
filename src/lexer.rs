@@ -227,7 +227,10 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
     let bytes = src.as_bytes();
     let mut i = 0usize;
     let mut line = 1u32;
-    let mut out = Vec::new();
+    // Java averages a little over four source bytes per token, so this is one
+    // allocation for the whole file rather than the ~20 doublings (each a
+    // `memmove` of everything lexed so far) a `Vec::new()` takes to get there.
+    let mut out = Vec::with_capacity(src.len() / 4 + 16);
 
     while i < bytes.len() {
         let c = bytes[i] as char;
@@ -494,21 +497,23 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
         }
 
         // operators & punctuation (longest match first)
-        let two = if i + 1 < bytes.len() {
-            &src[i..i + 2]
+        //
+        // Every three- and four-character form is a shift or a shift-assignment,
+        // so all four of them start with `<` or `>`. Gating on that first byte
+        // keeps two `str::get` slice-boundary checks and four string compares
+        // off every *other* token, which is nearly all of them.
+        let (kind, adv) = if c == '<' || c == '>' {
+            match src.get(i..i + 4).unwrap_or("") {
+                ">>>=" => (Tok::UshrAssign, 4),
+                _ => match src.get(i..i + 3).unwrap_or("") {
+                    ">>>" => (Tok::Ushr, 3),
+                    ">>=" => (Tok::ShrAssign, 3),
+                    "<<=" => (Tok::ShlAssign, 3),
+                    _ => lex_short(c, bytes.get(i + 1).copied(), line)?,
+                },
+            }
         } else {
-            ""
-        };
-        let three = src.get(i..i + 3).unwrap_or("");
-        let four = src.get(i..i + 4).unwrap_or("");
-        let (kind, adv) = match four {
-            ">>>=" => (Tok::UshrAssign, 4),
-            _ => match three {
-                ">>>" => (Tok::Ushr, 3),
-                ">>=" => (Tok::ShrAssign, 3),
-                "<<=" => (Tok::ShlAssign, 3),
-                _ => lex_short(two, c, line)?,
-            },
+            lex_short(c, bytes.get(i + 1).copied(), line)?
         };
         out.push(Token { kind, line });
         i += adv;
@@ -525,35 +530,49 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
 ///
 /// Split out of [`lex`] so the three- and four-character shift-assignment forms
 /// can be tried first without nesting the whole table another level deep.
-fn lex_short(two: &str, c: char, line: u32) -> Result<(Tok, usize), String> {
-    Ok(match two {
-        "+=" => (Tok::PlusAssign, 2),
-        "-=" => (Tok::MinusAssign, 2),
-        "*=" => (Tok::StarAssign, 2),
-        "/=" => (Tok::SlashAssign, 2),
-        "%=" => (Tok::PercentAssign, 2),
-        "++" => (Tok::PlusPlus, 2),
-        "--" => (Tok::MinusMinus, 2),
-        "==" => (Tok::EqEq, 2),
-        "!=" => (Tok::NotEq, 2),
-        "<=" => (Tok::Le, 2),
-        ">=" => (Tok::Ge, 2),
-        "&&" => (Tok::AndAnd, 2),
-        "||" => (Tok::OrOr, 2),
-        "&=" => (Tok::AmpAssign, 2),
-        "|=" => (Tok::PipeAssign, 2),
-        "^=" => (Tok::CaretAssign, 2),
-        "<<" => (Tok::Shl, 2),
+///
+/// The two-character forms are matched as a **byte pair**, not as a
+/// two-character `&str`. A `match` over string literals lowers (in an
+/// unoptimised build, which is the one that runs) to a linear chain of
+/// `memcmp` calls, and punctuation is a large fraction of every Java file — so
+/// each `;`, `)` or `.` used to walk all 21 two-character forms before reaching
+/// the one-character table below. `platform_memcmp` was the second-hottest
+/// symbol in the process under `sample` because of it. An integer-pair match
+/// switches on the bytes instead.
+///
+/// Taking the bytes also removes a latent panic: the old caller sliced
+/// `&src[i..i + 2]`, which is a panic rather than an error when the next byte
+/// is not a UTF-8 boundary — i.e. on a stray non-ASCII character in operator
+/// position, exactly the input that should reach the diagnostic below.
+fn lex_short(c: char, next: Option<u8>, line: u32) -> Result<(Tok, usize), String> {
+    Ok(match next.map(|n| (c as u8, n)) {
+        Some((b'+', b'=')) => (Tok::PlusAssign, 2),
+        Some((b'-', b'=')) => (Tok::MinusAssign, 2),
+        Some((b'*', b'=')) => (Tok::StarAssign, 2),
+        Some((b'/', b'=')) => (Tok::SlashAssign, 2),
+        Some((b'%', b'=')) => (Tok::PercentAssign, 2),
+        Some((b'+', b'+')) => (Tok::PlusPlus, 2),
+        Some((b'-', b'-')) => (Tok::MinusMinus, 2),
+        Some((b'=', b'=')) => (Tok::EqEq, 2),
+        Some((b'!', b'=')) => (Tok::NotEq, 2),
+        Some((b'<', b'=')) => (Tok::Le, 2),
+        Some((b'>', b'=')) => (Tok::Ge, 2),
+        Some((b'&', b'&')) => (Tok::AndAnd, 2),
+        Some((b'|', b'|')) => (Tok::OrOr, 2),
+        Some((b'&', b'=')) => (Tok::AmpAssign, 2),
+        Some((b'|', b'=')) => (Tok::PipeAssign, 2),
+        Some((b'^', b'=')) => (Tok::CaretAssign, 2),
+        Some((b'<', b'<')) => (Tok::Shl, 2),
         // `>>` is lexed here rather than being left as two `Gt`s, so the
         // shift is a single token; the generic-argument skippers ask
         // [`Tok::generic_closers`] instead of matching `Gt`, which is what
         // keeps `List<List<String>>` parsing.
-        ">>" => (Tok::Shr, 2),
+        Some((b'>', b'>')) => (Tok::Shr, 2),
         // `->` cannot collide with `-` followed by `>`: Java has no prefix
         // `>`, so a `-`/`>` adjacency is only ever the arrow. `::` likewise
         // cannot collide with the ternary/label `:`.
-        "->" => (Tok::Arrow, 2),
-        "::" => (Tok::ColonColon, 2),
+        Some((b'-', b'>')) => (Tok::Arrow, 2),
+        Some((b':', b':')) => (Tok::ColonColon, 2),
         _ => match c {
             '{' => (Tok::LBrace, 1),
             '}' => (Tok::RBrace, 1),
@@ -588,28 +607,62 @@ fn lex_short(two: &str, c: char, line: u32) -> Result<(Tok, usize), String> {
     })
 }
 
+/// Classify an identifier-shaped word: a reserved word becomes its own token,
+/// anything else becomes [`Tok::Ident`].
+///
+/// The keyword set is dispatched on **length** first. Written as one flat
+/// `match word { "class" => …, … }`, rustc's unoptimised build lowers it to a
+/// linear chain of `str` equality tests, so every identifier in the file — and
+/// identifiers are most of the tokens — paid up to 18 `memcmp` calls before
+/// falling through to the `Ident` arm. Under `sample`, `core::str::PartialEq::eq`
+/// plus `memcmp` were the two hottest symbols in the whole lexer for exactly
+/// this reason. Splitting on length first means a word of a length no keyword
+/// has (the common case: 1, or 9 and up) does zero comparisons, and no word
+/// does more than four.
 fn keyword_or_ident(word: &str) -> Tok {
-    match word {
-        "class" => Tok::Class,
-        "public" => Tok::Public,
-        "static" => Tok::Static,
-        "void" => Tok::Void,
-        "if" => Tok::If,
-        "else" => Tok::Else,
-        "while" => Tok::While,
-        "for" => Tok::For,
-        "do" => Tok::Do,
-        "switch" => Tok::Switch,
-        "case" => Tok::Case,
-        "default" => Tok::Default,
-        "return" => Tok::Return,
-        "break" => Tok::Break,
-        "continue" => Tok::Continue,
-        "true" => Tok::True,
-        "false" => Tok::False,
-        "new" => Tok::New,
-        _ => Tok::Ident(word.to_string()),
-    }
+    let kw = match word.len() {
+        2 => match word {
+            "if" => Some(Tok::If),
+            "do" => Some(Tok::Do),
+            _ => None,
+        },
+        3 => match word {
+            "for" => Some(Tok::For),
+            "new" => Some(Tok::New),
+            _ => None,
+        },
+        4 => match word {
+            "void" => Some(Tok::Void),
+            "else" => Some(Tok::Else),
+            "case" => Some(Tok::Case),
+            "true" => Some(Tok::True),
+            _ => None,
+        },
+        5 => match word {
+            "class" => Some(Tok::Class),
+            "while" => Some(Tok::While),
+            "break" => Some(Tok::Break),
+            "false" => Some(Tok::False),
+            _ => None,
+        },
+        6 => match word {
+            "public" => Some(Tok::Public),
+            "static" => Some(Tok::Static),
+            "switch" => Some(Tok::Switch),
+            "return" => Some(Tok::Return),
+            _ => None,
+        },
+        7 => match word {
+            "default" => Some(Tok::Default),
+            _ => None,
+        },
+        8 => match word {
+            "continue" => Some(Tok::Continue),
+            _ => None,
+        },
+        _ => None,
+    };
+    kw.unwrap_or_else(|| Tok::Ident(word.to_string()))
 }
 
 fn unescape(c: char) -> char {
