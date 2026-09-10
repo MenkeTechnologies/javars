@@ -333,6 +333,18 @@ pub const JBOX: u16 = 747;
 /// otherwise pass an existing object through.
 pub const JNEW_STRING: u16 = 749;
 
+/// Append elements to an array already on the stack. Stack
+/// `[array, e1, …, en]`; `argc == n + 1`, and the array is answered back.
+///
+/// The VM passes an argument count in a `u8`, so one [`JARRAY_LIT`] can carry
+/// at most 255 elements — and `{1.0, 2.0, …}` with more than that used to
+/// truncate the count silently, producing an array of `len % 256` elements
+/// holding the *last* of them. A 4000-element lookup table became a
+/// 160-element one and every index into it was wrong or out of bounds. The
+/// literal is built in chunks instead: the first 255 elements make the array
+/// and each further chunk is appended through here.
+pub const JARRAY_EXTEND: u16 = 750;
+
 /// Unbox a wrapper back to its primitive; the identity function on a value that
 /// is not boxed. Stack `[value]`; `argc == 1`.
 ///
@@ -1522,6 +1534,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JARRAY_NEW, b_array_new);
     vm.register_builtin(JARRAY_NEW_MULTI, b_array_new_multi);
     vm.register_builtin(JARRAY_LIT, b_array_lit);
+    vm.register_builtin(JARRAY_EXTEND, b_array_extend);
     vm.register_builtin(JARRAY_GET, b_array_get);
     vm.register_builtin(JARRAY_SET, b_array_set);
     vm.register_builtin(JNEW, b_new);
@@ -3493,6 +3506,24 @@ fn build_nested(sizes: &[i64], default: &Value) -> Option<Value> {
 fn b_array_lit(vm: &mut VM, argc: u8) -> Value {
     let elems = pop_args(vm, argc);
     Value::Obj(heap_alloc(HostObj::Array(elems)))
+}
+
+/// [`JARRAY_EXTEND`] — append this call's elements to the array beneath them.
+fn b_array_extend(vm: &mut VM, argc: u8) -> Value {
+    let mut args = pop_args(vm, argc);
+    if args.is_empty() {
+        return Value::Undef;
+    }
+    let rest = args.split_off(1);
+    let arr = args.remove(0);
+    if let Value::Obj(id) = arr {
+        HEAP.with(|h| {
+            if let Some(HostObj::Array(elems)) = h.borrow_mut().get_mut(id as usize) {
+                elems.extend(rest);
+            }
+        });
+    }
+    arr
 }
 
 /// `a[i]` read (stack `[array, index]`), bounds-checked.

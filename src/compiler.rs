@@ -1212,13 +1212,13 @@ impl Compiler {
     /// declaration order, exactly as Java hands out a fresh copy each call.
     fn emit_enum_values(&mut self, class: &str, line: u32) {
         let constants = self.classes[class].enum_constants.clone();
-        for c in &constants {
-            self.emit_global_get(&enum_global(class, c), line);
+        for (i, span) in array_build_chunks(constants.len()).into_iter().enumerate() {
+            let len = span.len();
+            for c in &constants[span] {
+                self.emit_global_get(&enum_global(class, c), line);
+            }
+            self.b.emit(array_build_op(i, len), line);
         }
-        self.b.emit(
-            Op::CallBuiltin(crate::host::JARRAY_LIT, constants.len() as u8),
-            line,
-        );
     }
 
     /// Lower `EnumName.valueOf(s)` — a name-to-constant lookup, raising Java's
@@ -6999,13 +6999,13 @@ impl Compiler {
     /// `elem_ty` is `None` for a bare `{…}` in a position javars cannot type,
     /// in which case the elements lower untargeted.
     fn array_lit(&mut self, elems: &[Expr], elem_ty: Option<&str>) -> Result<(), String> {
-        for el in elems {
-            self.expr_targeted(el, elem_ty)?;
+        for (i, span) in array_build_chunks(elems.len()).into_iter().enumerate() {
+            let len = span.len();
+            for el in &elems[span] {
+                self.expr_targeted(el, elem_ty)?;
+            }
+            self.b.emit(array_build_op(i, len), 0);
         }
-        self.b.emit(
-            Op::CallBuiltin(crate::host::JARRAY_LIT, elems.len() as u8),
-            0,
-        );
         Ok(())
     }
 
@@ -7931,6 +7931,43 @@ fn list_index_arg(kind: &str, method: &str, argc: usize, i: usize) -> bool {
                 | ("subList", 2, 0)
                 | ("subList", 2, 1)
         )
+}
+
+/// The spans an array of `n` elements is gathered in, in order.
+///
+/// Java puts no bound on an array initializer's length and the VM passes an
+/// argument count in a `u8`, so one call cannot carry more than 255 elements.
+/// Emitting `n as u8` truncated the count silently: a 4000-element table became
+/// a 160-element one holding the *last* 160 values, and every index into it
+/// read the wrong element or ran off the end. The elements are pushed and
+/// gathered a chunk at a time instead — invisible for the lengths a program
+/// usually writes (one span, exactly the call it emitted before) and correct
+/// for the lengths a lookup table occasionally reaches.
+///
+/// The first span makes the array and may hold 255; each later one appends to
+/// the array already on the stack, which costs one of the 255 slots.
+fn array_build_chunks(n: usize) -> Vec<std::ops::Range<usize>> {
+    const FIRST: usize = u8::MAX as usize;
+    const REST: usize = FIRST - 1;
+    let head = n.min(FIRST);
+    let mut spans = vec![0..head];
+    let mut at = head;
+    while at < n {
+        let end = (at + REST).min(n);
+        spans.push(at..end);
+        at = end;
+    }
+    spans
+}
+
+/// The op that gathers the `len` values on top of the stack: the first span
+/// builds the array, every later one appends to it.
+fn array_build_op(span_index: usize, len: usize) -> Op {
+    if span_index == 0 {
+        Op::CallBuiltin(crate::host::JARRAY_LIT, len as u8)
+    } else {
+        Op::CallBuiltin(crate::host::JARRAY_EXTEND, len as u8 + 1)
+    }
 }
 
 fn collection_kind(ty: &str) -> Option<&'static str> {
