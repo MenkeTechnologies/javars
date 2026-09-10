@@ -8126,34 +8126,397 @@ fn min_double(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Java's `Math.pow`, which is IEEE 754 `pow` with two documented exceptions.
+/// Java's `Math.pow`.
 ///
-/// `java.lang.Math.pow`'s contract says "if the second argument is NaN, then
-/// the result is NaN" with no carve-out for a base of 1, and "if the absolute
-/// value of the first argument equals 1 and the second argument is infinite,
-/// then the result is NaN". IEEE 754 — and so Rust's `powf` — instead makes
-/// `pow(1, y)` equal 1 for *every* `y`, NaN and infinity included. The
-/// zero-exponent rule comes first in Java's own list, so `pow(NaN, 0.0)` stays
-/// 1.0; everything outside these cases is left to `powf`.
+/// `java.lang.Math.pow` is specified to be within 1 ulp of the exact result and
+/// semi-monotonic, and `StrictMath.pow` to be fdlibm's answer exactly. On this
+/// JVM the two agree bit for bit at every one of the 90 grid points measured
+/// (openjdk 21.0.12.1), so the reference is fdlibm — see [`fdlibm_pow`], which
+/// is the whole implementation. The special cases the JLS lists are the ones
+/// fdlibm itself applies, so there is nothing left here to special-case.
 fn pow_double(a: f64, b: f64) -> f64 {
-    if b == 0.0 {
+    fdlibm_pow(a, b)
+}
+
+/// The high 32 bits of a `double`'s IEEE 754 encoding, as fdlibm's `__HI`.
+///
+/// The C original aliased a `double` through a two-`int` union; the JDK's Java
+/// port reads the bits explicitly, and so does this. Every fdlibm routine works
+/// on the halves directly — the exponent and the leading significand bits live
+/// in the high word — so a faithful port cannot avoid them.
+fn fd_hi(x: f64) -> i32 {
+    (x.to_bits() >> 32) as i32
+}
+
+/// The low 32 bits of a `double`'s encoding, as fdlibm's `__LO`.
+fn fd_lo(x: f64) -> i32 {
+    x.to_bits() as i32
+}
+
+/// `x` with its high 32 bits replaced, as fdlibm's two-argument `__HI`.
+fn fd_with_hi(x: f64, high: i32) -> f64 {
+    f64::from_bits((x.to_bits() & 0x0000_0000_FFFF_FFFF) | ((high as u32 as u64) << 32))
+}
+
+/// `x` with its low 32 bits replaced, as fdlibm's two-argument `__LO`.
+///
+/// This is fdlibm's way of *chopping* a value to 32 significant bits, which is
+/// what makes the two-piece (high + tail) arithmetic in `pow` exact.
+fn fd_with_lo(x: f64, low: i32) -> f64 {
+    f64::from_bits((x.to_bits() & 0xFFFF_FFFF_0000_0000) | (low as u32 as u64))
+}
+
+/// Java's `Math.scalb(double, int)` — `d * 2^scale_factor` with a single
+/// rounding, ported from `java.lang.Math`.
+///
+/// Rust has no `scalb`, and `d * 2f64.powi(n)` is not it: the power itself
+/// rounds once for a `n` outside the normal range, so the product rounds twice.
+/// The JDK splits the scaling into at most three exact multiplications instead,
+/// which is what keeps a subnormal result correct. `pow` reaches it only on the
+/// subnormal-output path, but the whole method is ported rather than the branch
+/// that path takes — a partial port is a landmine for the next caller.
+fn scalb(d: f64, scale_factor: i32) -> f64 {
+    const EXP_BIAS: i32 = 1023;
+    const PRECISION: i32 = 53;
+    // 2^1023, normal and exact.
+    const F_UP: f64 = f64::from_bits(0x7FE0_0000_0000_0000);
+    // 2^-1023, subnormal and exact.
+    const F_DOWN: f64 = f64::from_bits(0x0008_0000_0000_0000);
+    // `2^n` for an `n` the exponent field can hold, built from the bits.
+    fn pow2(n: i32) -> f64 {
+        f64::from_bits(((n + EXP_BIAS) as u64) << (PRECISION - 1))
+    }
+    if scale_factor > -EXP_BIAS {
+        if scale_factor <= EXP_BIAS {
+            return d * pow2(scale_factor);
+        }
+        if scale_factor <= 2 * EXP_BIAS {
+            return d * pow2(scale_factor - EXP_BIAS) * F_UP;
+        }
+        if scale_factor < 2 * EXP_BIAS + PRECISION - 1 {
+            return d * pow2(scale_factor - 2 * EXP_BIAS) * F_UP * F_UP;
+        }
+        return d * F_UP * F_UP * F_UP;
+    }
+    if scale_factor > -2 * EXP_BIAS {
+        return d * pow2(scale_factor + EXP_BIAS) * F_DOWN;
+    }
+    if scale_factor > -2 * EXP_BIAS - PRECISION {
+        return d * pow2(scale_factor + 2 * EXP_BIAS) * F_DOWN * F_DOWN;
+    }
+    d * f64::from_bits(1) * f64::from_bits(1)
+}
+
+/// `x**y`, ported statement for statement from `java.lang.FdLibm.Pow.compute`
+/// — the JDK's own Java translation of fdlibm 5.3's `__ieee754_pow`.
+///
+/// The platform `pow` is not this function. Rust's `f64::powf` calls the system
+/// libm, and on this machine that libm disagrees with the JDK in the last place
+/// at 11 of 90 grid points — `2.0^-0.5`, `2.0^2.5`, `10.0^2.5`, `7.0^-0.5` and
+/// the rest. Neither is wrong by IEEE's lights: `pow` is not a correctly-rounded
+/// operation, so every implementation is free to differ by an ulp, and the only
+/// way to answer what Java answers is to run what Java runs.
+///
+/// The source ported is `java.lang.FdLibm.Pow` as it stands in **jdk21u**, not
+/// in `jdk/master`: `StrictMath.pow` in this JDK compiles to
+/// `invokestatic java/lang/FdLibm$Pow.compute` (read off `javap -c
+/// java.lang.StrictMath`), and the two branches of that file disagree — see the
+/// note on `INV_LN2_H` below, which is the difference and which a translation
+/// of master gets wrong at a measurable point.
+///
+/// Every constant below is the bit pattern of the hexadecimal literal in the
+/// JDK source, quoted beside it. Writing them as decimals would be a
+/// transcription with a rounding step in it, and a single wrong bit in `L1`
+/// would move the answer without moving any test that does not check the last
+/// place.
+///
+/// One hazard a sibling port hit does not apply here: a C compiler is free to
+/// contract `a*b + c` into a fused multiply-add, which changes the result, and
+/// a literal C translation therefore has to match whatever the reference
+/// compiler chose. This port's reference is *Java*, where the JLS forbids that
+/// contraction, and Rust does not perform it either — so the expressions below
+/// evaluate exactly as the JDK's do.
+///
+/// Method (from the original): let x = 2^n * (1 + f); compute log2(x) as a
+/// two-piece sum whose head has 29 trailing zero bits, form y*log2(x) = n + y'
+/// with |y'| <= 0.5 in simulated multi-precision, and return 2^n * exp(y'*ln2).
+#[allow(clippy::excessive_precision)]
+fn fdlibm_pow(x: f64, y: f64) -> f64 {
+    // The mask that clears the sign bit of a *high word*.
+    const EXP_SIGNIF_BITS: i32 = 0x7fff_ffff;
+    // 0x1.0p53 — above this every double is an even integer.
+    const TWO_53: f64 = f64::from_bits(0x4340_0000_0000_0000);
+
+    let mut z: f64;
+    let (mut r, mut s, mut t, mut u, mut v, mut w): (f64, f64, f64, f64, f64, f64);
+    let (mut i, mut j, mut k, mut n): (i32, i32, i32, i32);
+
+    // y == zero: x**0 = 1
+    if y == 0.0 {
         return 1.0;
     }
-    if b.is_nan() || (a.abs() == 1.0 && b.is_infinite()) {
-        return f64::NAN;
+    // +/-NaN return x + y to propagate NaN significands
+    if x.is_nan() || y.is_nan() {
+        return x + y;
     }
-    // fdlibm's `__ieee754_pow` — the algorithm the JDK's `StrictMath.pow`
-    // implements and `Math.pow` agrees with here — short-circuits an exponent of
-    // exactly -1 to `1/x` rather than routing it through the log/exp core. The
-    // two disagree in the last place: `Math.pow(0.49999999999999994, -1)` is
-    // 2.0000000000000004 (the reciprocal) and Rust's `powf` answers 2.0.
-    // Measured over a 90-point grid against openjdk 21.0.12.1, this is the only
-    // exponent where taking the shortcut changes an answer, and it changes it
-    // toward the reference.
-    if b == -1.0 {
-        return 1.0 / a;
+    let y_abs = y.abs();
+    let mut x_abs = x.abs();
+    // Special values of y
+    if y == 2.0 {
+        return x * x;
+    } else if y == 0.5 {
+        if x >= -f64::MAX {
+            // Handle x == -infinity below; the `+ 0.0` handles x == -0.0
+            return (x + 0.0).sqrt();
+        }
+    } else if y_abs == 1.0 {
+        return if y == 1.0 { x } else { 1.0 / x };
+    } else if y_abs == f64::INFINITY {
+        if x_abs == 1.0 {
+            return y - y; // inf**+/-1 is NaN
+        } else if x_abs > 1.0 {
+            return if y >= 0.0 { y } else { 0.0 };
+        } else {
+            return if y < 0.0 { -y } else { 0.0 };
+        }
     }
-    a.powf(b)
+
+    let hx = fd_hi(x);
+    let mut ix = hx & EXP_SIGNIF_BITS;
+
+    // When x < 0, whether y is an integer, and whether an odd one:
+    //   0 ... not an integer, 1 ... an odd integer, 2 ... an even integer
+    let mut y_is_int: i32 = 0;
+    if hx < 0 {
+        if y_abs >= TWO_53 {
+            y_is_int = 2; // ulp(2^53) is 2.0, so y is an even integer
+        } else if y_abs >= 1.0 {
+            let y_abs_as_long = y_abs as i64;
+            if (y_abs_as_long as f64) == y_abs {
+                y_is_int = 2 - (y_abs_as_long & 0x1) as i32;
+            }
+        }
+    }
+
+    // Special values of x
+    if x_abs == 0.0 || x_abs == f64::INFINITY || x_abs == 1.0 {
+        z = x_abs; // x is +/-0, +/-inf, +/-1
+        if y < 0.0 {
+            z = 1.0 / z;
+        }
+        if hx < 0 {
+            if ((ix - 0x3ff00000) | y_is_int) == 0 {
+                z = (z - z) / (z - z); // (-1)**non-int is NaN
+            } else if y_is_int == 1 {
+                z = -1.0 * z; // (x < 0)**odd = -(|x|**odd)
+            }
+        }
+        return z;
+    }
+
+    n = (hx >> 31) + 1;
+
+    // (x < 0)**(non-int) is NaN
+    if (n | y_is_int) == 0 {
+        return (x - x) / (x - x);
+    }
+
+    s = 1.0; // sign of the result: -1 for (-ve)**(odd int), else 1
+    if (n | (y_is_int - 1)) == 0 {
+        s = -1.0;
+    }
+
+    let (mut p_h, mut p_l, mut t1, mut t2): (f64, f64, f64, f64);
+    // |y| is huge
+    if y_abs > f64::from_bits(0x41E0_0000_FFFF_FFFF) {
+        // > ~2**31; 0x1.00000_ffff_ffffp31
+        const INV_LN2: f64 = f64::from_bits(0x3FF7_1547_652B_82FE); // 0x1.7154_7652_b82fep0
+                                                                    // The 24-bit split of 1/ln2, and its tail. A LATER JDK narrows this to
+                                                                    // 21 bits (`0x1.7154_7p+0` with a `p-22` tail) and answers differently
+                                                                    // in the last places for a base near 1 with a huge exponent: at
+                                                                    // `pow(0.9999998892557204, -5025758185.603189)` the 21-bit split gives
+                                                                    // 5.212154459254282E241 where this one gives 5.212154459254522E241,
+                                                                    // which is what openjdk 21.0.12.1 answers. Porting the newer source
+                                                                    // would have been a faithful translation of the wrong reference.
+        const INV_LN2_H: f64 = f64::from_bits(0x3FF7_1547_6000_0000); // 0x1.715476p0
+        const INV_LN2_L: f64 = f64::from_bits(0x3E54_AE0B_F85D_DF44); // 0x1.4ae0_bf85_ddf44p-26
+
+        // Over/underflow if x is not close to one
+        if x_abs < f64::from_bits(0x3FEF_FFFF_0000_0000) {
+            // 0x1.fffff_0000_0000p-1
+            return if y < 0.0 { s * f64::INFINITY } else { s * 0.0 };
+        }
+        if x_abs > f64::from_bits(0x3FF0_0000_FFFF_FFFF) {
+            // 0x1.00000_ffff_ffffp0
+            return if y > 0.0 { s * f64::INFINITY } else { s * 0.0 };
+        }
+        // now |1-x| is tiny (<= 2**-20), so log(x) = x - x^2/2 + x^3/3 - x^4/4
+        t = x_abs - 1.0; // t has 20 trailing zeros
+        w = (t * t) * (0.5 - t * (0.3333333333333333333333 - t * 0.25));
+        u = INV_LN2_H * t; // INV_LN2_H has 21 significant bits
+        v = t * INV_LN2_L - w * INV_LN2;
+        t1 = u + v;
+        t1 = fd_with_lo(t1, 0);
+        t2 = v - (t1 - u);
+    } else {
+        const CP: f64 = f64::from_bits(0x3FEE_C709_DC3A_03FD); // 0x1.ec70_9dc3_a03fdp-1 = 2/(3ln2)
+        const CP_H: f64 = f64::from_bits(0x3FEE_C709_E000_0000); // 0x1.ec709ep-1 = (float) CP
+        const CP_L: f64 = f64::from_bits(0xBE3E_2FE0_145B_01F5); // -0x1.e2fe_0145_b01f5p-28
+
+        let (mut z_h, mut z_l, mut ss, mut s2, mut s_h, mut s_l, mut t_h, mut t_l): (
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        );
+        n = 0;
+        // Take care of subnormal numbers
+        if ix < 0x00100000 {
+            x_abs *= TWO_53;
+            n -= 53;
+            ix = fd_hi(x_abs);
+        }
+        n += (ix >> 20) - 0x3ff;
+        j = ix & 0x000fffff;
+        // Determine the interval
+        ix = j | 0x3ff00000; // normalize ix
+        if j <= 0x3988E {
+            k = 0; // |x| < sqrt(3/2)
+        } else if j < 0xBB67A {
+            k = 1; // |x| < sqrt(3)
+        } else {
+            k = 0;
+            n += 1;
+            ix -= 0x00100000;
+        }
+        x_abs = fd_with_hi(x_abs, ix);
+
+        // ss = s_h + s_l = (x-1)/(x+1) or (x-1.5)/(x+1.5)
+        const DP_H: f64 = f64::from_bits(0x3FE2_B803_4000_0000); // 0x1.2b80_34p-1
+        const DP_L: f64 = f64::from_bits(0x3E4C_FDEB_43CF_D006); // 0x1.cfde_b43c_fd006p-27
+
+        // Poly coefs for (3/2)*(log(x) - 2s - 2/3*s**3)
+        const L1: f64 = f64::from_bits(0x3FE3_3333_3333_3303); // 0x1.3333_3333_33303p-1
+        const L2: f64 = f64::from_bits(0x3FDB_6DB6_DB6F_ABFF); // 0x1.b6db_6db6_fabffp-2
+        const L3: f64 = f64::from_bits(0x3FD5_5555_518F_264D); // 0x1.5555_5518_f264dp-2
+        const L4: f64 = f64::from_bits(0x3FD1_7460_A91D_4101); // 0x1.1746_0a91_d4101p-2
+        const L5: f64 = f64::from_bits(0x3FCD_864A_93C9_DB65); // 0x1.d864_a93c_9db65p-3
+        const L6: f64 = f64::from_bits(0x3FCA_7E28_4A45_4EEF); // 0x1.a7e2_84a4_54eefp-3
+
+        let bp_k = 1.0 + 0.5 * f64::from(k); // BP[0] = 1.0, BP[1] = 1.5
+        u = x_abs - bp_k;
+        v = 1.0 / (x_abs + bp_k);
+        ss = u * v;
+        s_h = ss;
+        s_h = fd_with_lo(s_h, 0);
+        // t_h = x_abs + BP[k], high half
+        t_h = 0.0;
+        t_h = fd_with_hi(
+            t_h,
+            ((ix >> 1) | 0x20000000) + 0x00080000 + (k.wrapping_shl(18)),
+        );
+        t_l = x_abs - (t_h - bp_k);
+        s_l = v * ((u - s_h * t_h) - s_h * t_l);
+        // log(x_abs)
+        s2 = ss * ss;
+        r = s2 * s2 * (L1 + s2 * (L2 + s2 * (L3 + s2 * (L4 + s2 * (L5 + s2 * L6)))));
+        r += s_l * (s_h + ss);
+        s2 = s_h * s_h;
+        t_h = 3.0 + s2 + r;
+        t_h = fd_with_lo(t_h, 0);
+        t_l = r - ((t_h - 3.0) - s2);
+        // u + v = ss*(1 + ...)
+        u = s_h * t_h;
+        v = s_l * t_h + t_l * ss;
+        // 2/(3log2) * (ss + ...)
+        p_h = u + v;
+        p_h = fd_with_lo(p_h, 0);
+        p_l = v - (p_h - u);
+        z_h = CP_H * p_h; // CP_H + CP_L = 2/(3*log2)
+        z_l = CP_L * p_h + p_l * CP + DP_L * f64::from(k);
+        // log2(x_abs) = (ss + ..)*2/(3*log2) = n + DP_H + z_h + z_l
+        t = f64::from(n);
+        t1 = ((z_h + z_l) + DP_H * f64::from(k)) + t;
+        t1 = fd_with_lo(t1, 0);
+        t2 = z_l - (((t1 - t) - DP_H * f64::from(k)) - z_h);
+    }
+
+    // Split y into (y1 + y2) and compute (y1 + y2) * (t1 + t2)
+    let mut y1 = y;
+    y1 = fd_with_lo(y1, 0);
+    p_l = (y - y1) * t1 + y * t2;
+    p_h = y1 * t1;
+    z = p_l + p_h;
+    j = fd_hi(z);
+    i = fd_lo(z);
+    if j >= 0x40900000 {
+        // z >= 1024
+        if ((j - 0x40900000) | i) != 0 {
+            return s * f64::INFINITY; // overflow
+        }
+        // -(1024 - log2(ovfl + .5ulp))
+        const OVT: f64 = f64::from_bits(0x3C97_1547_652B_82FE); // 8.0085662595372944372e-17
+        if p_l + OVT > z - p_h {
+            return s * f64::INFINITY; // overflow
+        }
+    } else if (j & EXP_SIGNIF_BITS) >= 0x4090cc00 {
+        // z <= -1075
+        if ((j - 0xc090cc00u32 as i32) | i) != 0 {
+            return s * 0.0; // underflow
+        }
+        if p_l <= z - p_h {
+            return s * 0.0; // underflow
+        }
+    }
+
+    // Compute 2**(p_h + p_l)
+    const P1: f64 = f64::from_bits(0x3FC5_5555_5555_553E); // 0x1.5555_5555_5553ep-3
+    const P2: f64 = f64::from_bits(0xBF66_C16C_16BE_BD93); // -0x1.6c16_c16b_ebd93p-9
+    const P3: f64 = f64::from_bits(0x3F11_566A_AF25_DE2C); // 0x1.1566_aaf2_5de2cp-14
+    const P4: f64 = f64::from_bits(0xBEBB_BD41_C5D2_6BF1); // -0x1.bbd4_1c5d_26bf1p-20
+    const P5: f64 = f64::from_bits(0x3E66_3769_72BE_A4D0); // 0x1.6376_972b_ea4d0p-25
+    const LG2: f64 = f64::from_bits(0x3FE6_2E42_FEFA_39EF); // 0x1.62e4_2fef_a39efp-1
+    const LG2_H: f64 = f64::from_bits(0x3FE6_2E43_0000_0000); // 0x1.62e43p-1
+    const LG2_L: f64 = f64::from_bits(0xBE20_5C61_0CA8_6C39); // -0x1.05c6_10ca_86c39p-29
+
+    i = j & EXP_SIGNIF_BITS;
+    k = (i >> 20) - 0x3ff;
+    n = 0;
+    if i > 0x3fe00000 {
+        // |z| > 0.5, so set n = [z + 0.5]
+        n = j + (0x00100000i32.wrapping_shr((k + 1) as u32));
+        k = ((n & EXP_SIGNIF_BITS) >> 20) - 0x3ff; // new k for n
+        t = 0.0;
+        t = fd_with_hi(t, n & !(0x000fffffi32.wrapping_shr(k as u32)));
+        n = ((n & 0x000fffff) | 0x00100000).wrapping_shr((20 - k) as u32);
+        if j < 0 {
+            n = -n;
+        }
+        p_h -= t;
+    }
+    t = p_l + p_h;
+    t = fd_with_lo(t, 0);
+    u = t * LG2_H;
+    v = (p_l - (t - p_h)) * LG2 + t * LG2_L;
+    z = u + v;
+    w = v - (z - u);
+    t = z * z;
+    t1 = z - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
+    r = (z * t1) / (t1 - 2.0) - (w + z * w);
+    z = 1.0 - (r - z);
+    j = fd_hi(z);
+    j = j.wrapping_add(n.wrapping_shl(20));
+    if (j >> 20) <= 0 {
+        z = scalb(z, n); // subnormal output
+    } else {
+        let z_hi = fd_hi(z).wrapping_add(n.wrapping_shl(20));
+        z = fd_with_hi(z, z_hi);
+    }
+    s * z
 }
 
 /// Java's `Math.round(double)`, ported from `java.lang.Math`.
