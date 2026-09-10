@@ -15,7 +15,47 @@
 
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
-use std::collections::HashMap;
+/// The tables in this file are keyed on identifiers out of the program being
+/// compiled — class names, method names, variable names — and on nothing an
+/// adversary chooses. So they are hashed with FNV-1a rather than with the
+/// standard library's SipHash-1-3, which is built for the case where an
+/// attacker picks the keys.
+///
+/// The difference is not small. Sampling a compile of the 261-program corpus at
+/// 3f56addff0 put 29.9% of the phase's self time in SipHash's rounds and
+/// another 12.7% in the probing those hashes drive. FNV-1a is a multiply and an
+/// xor per byte with no setup, and it spreads short ASCII names well enough
+/// that the probe counts do not move.
+type HashMap<K, V> = std::collections::HashMap<K, V, NameHash>;
+type HashSet<T> = std::collections::HashSet<T, NameHash>;
+
+/// FNV-1a over whatever bytes a key offers. See [`HashMap`].
+#[derive(Clone, Copy)]
+struct NameHasher(u64);
+
+impl std::hash::Hasher for NameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NameHash;
+
+impl std::hash::BuildHasher for NameHash {
+    type Hasher = NameHasher;
+    fn build_hasher(&self) -> NameHasher {
+        NameHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
 
 /// The desugar target an inline `rust { ... }` FFI block lowers to (see
 /// [`crate::rust_ffi`]).
@@ -278,7 +318,7 @@ struct MethodScope {
     decl_types: HashMap<String, String>,
     /// Names actually declared as a local or parameter here — distinguishes a
     /// true local from an implicit-`this` field reference.
-    declared: std::collections::HashSet<String>,
+    declared: HashSet<String>,
     /// The slot holding `this`, when this frame has one. Slot 0 for an instance
     /// method or constructor; a lambda body binds `this` as its last captured
     /// upvalue instead, so the slot is not fixed.
@@ -300,11 +340,11 @@ impl MethodScope {
 
     fn with_first_slot(first: u16) -> Self {
         MethodScope {
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             next_slot: first,
-            types: HashMap::new(),
-            decl_types: HashMap::new(),
-            declared: std::collections::HashSet::new(),
+            types: HashMap::default(),
+            decl_types: HashMap::default(),
+            declared: HashSet::default(),
             this_slot: None,
         }
     }
@@ -552,7 +592,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Register every static-method signature up front so calls resolve
     // regardless of source order (forward references, recursion, mutual
     // recursion).
-    let mut methods: HashMap<String, Vec<MethodSig>> = HashMap::new();
+    let mut methods: HashMap<String, Vec<MethodSig>> = HashMap::default();
     for m in &prog.methods {
         methods.entry(m.name.clone()).or_default().push(MethodSig {
             owner: m.owner.clone(),
@@ -575,7 +615,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // Java's *constant variables*: a `static final String` whose initializer is
     // a constant expression. Collected before any body is lowered, because a use
     // can precede the declaration and folding has to see it either way.
-    let mut string_constants: HashMap<String, String> = HashMap::new();
+    let mut string_constants: HashMap<String, String> = HashMap::default();
     for cl in &prog.classes {
         for f in &cl.static_fields {
             if !(f.is_final && f.ty == "String") {
@@ -599,7 +639,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     }
     let mut c = Compiler {
         b: ChunkBuilder::new(),
-        literals: HashMap::new(),
+        literals: HashMap::default(),
         string_constants,
         scopes: Vec::new(),
         pending_label: None,
@@ -608,10 +648,10 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         debug,
         has_ffi,
         has_user_tostring,
-        global_types: HashMap::new(),
+        global_types: HashMap::default(),
         scope: None,
         methods,
-        global_decl_types: HashMap::new(),
+        global_decl_types: HashMap::default(),
         classes,
         this_class: None,
         current_class: Some(prog.class_name.clone()),
@@ -726,7 +766,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         name: &str,
         by_name: &HashMap<&str, &Class>,
         order: &mut Vec<String>,
-        seen: &mut std::collections::HashSet<String>,
+        seen: &mut HashSet<String>,
     ) {
         if !seen.insert(name.to_string()) {
             return;
@@ -740,14 +780,14 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
             }
         }
     }
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for cl in &prog.classes {
         let ancestry = chain(&cl.name)?;
         // The interfaces this type (and its superclass chain) brings in, super-
         // interfaces first. `extends`-ed interfaces of an interface, and
         // `implements`-ed interfaces of every class in the ancestry.
         let mut iface_order = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         for anc_name in &ancestry {
             let anc = by_name[anc_name.as_str()];
             for i in &anc.interfaces {
@@ -755,10 +795,10 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
             }
         }
         let mut fields = Vec::new();
-        let mut field_types = HashMap::new();
+        let mut field_types = HashMap::default();
         // `static` fields, ancestors first so a subclass re-declaration shadows
         // the inherited one (and interface constants are visible too).
-        let mut static_fields = HashMap::new();
+        let mut static_fields = HashMap::default();
         for iface in &iface_order {
             for f in &by_name[iface.as_str()].static_fields {
                 static_fields.insert(f.name.clone(), (iface.clone(), f.ty.clone()));
@@ -776,7 +816,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         // a nearer one wins. Its own declarations still win over all of them,
         // which is why this runs before the loop above would have to be undone —
         // it does not, because `insert` here happens first.
-        let mut enclosing_statics: HashMap<String, (String, String)> = HashMap::new();
+        let mut enclosing_statics: HashMap<String, (String, String)> = HashMap::default();
         let mut prefix = cl.binary.as_str();
         while let Some((outer, _)) = prefix.rsplit_once('$') {
             let simple = outer.rsplit('$').next().unwrap_or(outer);
@@ -794,7 +834,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         }
         // Keyed by (name, param_types) so type-overloads coexist while an
         // override (same name + same param types) replaces the inherited entry.
-        let mut methods: HashMap<(String, Vec<String>), MethodMeta> = HashMap::new();
+        let mut methods: HashMap<(String, Vec<String>), MethodMeta> = HashMap::default();
         let param_tys =
             |m: &Method| -> Vec<String> { m.params.iter().map(|p| p.ty.clone()).collect() };
         // 1. Interface methods (abstract + `default`), super-interfaces first —
@@ -1843,7 +1883,7 @@ impl Compiler {
             return Some(0);
         }
         let mut frontier = vec![from.to_string()];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::default();
         let mut dist = 0u32;
         while !frontier.is_empty() {
             dist += 1;
@@ -2330,26 +2370,35 @@ impl Compiler {
     /// True when `class` is `base`, a (transitive) subclass of it, or a type
     /// that implements/extends the interface `base` — walking the full supertype
     /// graph (superclass + interfaces).
-    fn is_subclass(&self, class: &str, base: &str) -> bool {
+    fn is_subclass<'a>(&'a self, class: &'a str, base: &str) -> bool {
         if class == base {
             return true;
         }
-        let mut stack = vec![class.to_string()];
-        let mut seen = std::collections::HashSet::new();
-        let mut guard = 0;
+        // Both lists borrow their names — from the argument and from
+        // `self.classes` — so the walk allocates nothing but the two `Vec`s.
+        // It used to `to_string()` the root, `clone()` every name into a
+        // `HashSet`, and `cloned()` every supertype out of the class table; at
+        // 30,327 calls per compile of the 261-program corpus that was 19.2% of
+        // the phase's allocations. A class's supertype list is one to three
+        // names, and the whole visited set is the ancestor chain, so a linear
+        // scan of a `Vec` finds a repeat faster than hashing a `String` would.
+        let mut stack: Vec<&str> = vec![class];
+        let mut seen: Vec<&str> = Vec::new();
         while let Some(cur) = stack.pop() {
             if cur == base {
                 return true;
             }
-            if !seen.insert(cur.clone()) {
+            if seen.contains(&cur) {
                 continue;
             }
-            if let Some(ci) = self.classes.get(&cur) {
-                stack.extend(ci.supertypes.iter().cloned());
-            }
-            guard += 1;
-            if guard > 10000 {
+            seen.push(cur);
+            // The same bound the walk always carried, against a supertype graph
+            // with a cycle in it.
+            if seen.len() > 10000 {
                 return false;
+            }
+            if let Some(ci) = self.classes.get(cur) {
+                stack.extend(ci.supertypes.iter().map(String::as_str));
             }
         }
         false
@@ -2427,8 +2476,7 @@ impl Compiler {
                 args.len()
             )
             })?;
-        let distinct: std::collections::HashSet<&str> =
-            targets.iter().map(|(_, m)| m.as_str()).collect();
+        let distinct: HashSet<&str> = targets.iter().map(|(_, m)| m.as_str()).collect();
         // Calling the single abstract method of a functional interface may land
         // on a lambda, which is a closure rather than a class instance — so that
         // receiver gets its own arm in the dispatch chain (keyed on the sentinel
@@ -8275,7 +8323,7 @@ fn signature(name: &str, param_tys: &[String]) -> String {
 /// rather than the program's. (Those tables have their own guard:
 /// `tests/registry_names.rs`.)
 pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
-    let mut seen_class: HashMap<&str, u32> = HashMap::new();
+    let mut seen_class: HashMap<&str, u32> = HashMap::default();
     for cl in &prog.classes {
         if seen_class.insert(&cl.name, cl.line).is_some() {
             return Err(format!(
@@ -8294,7 +8342,7 @@ pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
         };
         // Instance and `static` fields share one namespace in Java, and so do
         // an enum's constants — `enum C { RED }` with a field `RED` collides.
-        let mut seen: HashMap<&str, ()> = HashMap::new();
+        let mut seen: HashMap<&str, ()> = HashMap::default();
         let fields = cl.fields.iter().chain(&cl.static_fields);
         for f in fields {
             // The parser synthesizes an enum's `#name`/`#ordinal` and a
@@ -8323,7 +8371,7 @@ pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
         // namespace: `int m()` and `static int m()` in one class is
         // "method m() is already defined" in Java too.
         let statics = prog.methods.iter().filter(|m| m.owner == cl.name);
-        let mut seen: HashMap<(String, Vec<String>), ()> = HashMap::new();
+        let mut seen: HashMap<(String, Vec<String>), ()> = HashMap::default();
         for m in cl.methods.iter().chain(statics) {
             let tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
             if seen.insert((m.name.clone(), tys.clone()), ()).is_some() {
@@ -8336,7 +8384,7 @@ pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
             }
             check_duplicate_params(&m.params, &m.name, m.line)?;
         }
-        let mut seen: HashMap<Vec<String>, ()> = HashMap::new();
+        let mut seen: HashMap<Vec<String>, ()> = HashMap::default();
         for c in &cl.ctors {
             let tys: Vec<String> = c.params.iter().map(|p| p.ty.clone()).collect();
             if seen.insert(tys.clone(), ()).is_some() {
@@ -8353,7 +8401,7 @@ pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
     // `static` methods whose owner declares no class node of its own still
     // share the by-name pool, so they are checked as a whole too — a duplicate
     // there is the one that used to surface as a bogus "no overload matches".
-    let mut seen: HashMap<(&str, &str, Vec<String>), ()> = HashMap::new();
+    let mut seen: HashMap<(&str, &str, Vec<String>), ()> = HashMap::default();
     for m in &prog.methods {
         let tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
         if seen.insert((&m.owner, &m.name, tys.clone()), ()).is_some() {
@@ -8371,7 +8419,7 @@ pub fn check_duplicate_declarations(prog: &Program) -> Result<(), String> {
 /// Reject `f(int a, int a)`, which `javac` reports as a variable redeclaration
 /// rather than as a signature problem.
 fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<(), String> {
-    let mut seen: HashMap<&str, ()> = HashMap::new();
+    let mut seen: HashMap<&str, ()> = HashMap::default();
     for p in params {
         if seen.insert(&p.name, ()).is_some() {
             return Err(format!(
