@@ -455,6 +455,13 @@ enum HostObj {
     List {
         items: Vec<Value>,
         fixed: Fixity,
+        /// `Some` when this is the `values()` view a map handed out rather than
+        /// a list of its own; see [`SetView`], which draws the same
+        /// distinction for the map's other two views. A `values()` result is
+        /// the odd one of the three: Java's is a `Collection` and **not** a
+        /// `List`, so it is not interchangeable with an `ArrayList` even
+        /// though every method a program calls on it is the same.
+        view: Option<ViewOf>,
         /// Structural-modification counter, Java's `AbstractList.modCount`.
         /// Every `add`/`remove`/`clear` and every `sort` bumps it; a `subList`
         /// view snapshots it and refuses to operate once it has moved, which is
@@ -1463,6 +1470,13 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // A `Map.Entry` is an `Entry` and an `Object` and nothing else — not
         // `Serializable`, whichever map produced it. `Entry` is the simple name
         // `Map.Entry` flattens to, which is the name an `instanceof` writes.
+        // A `values()` view stops at `AbstractCollection`: it is a
+        // `Collection` and it is not a `List`, which is the one place the three
+        // map views disagree with each other.
+        "List$values$hash"
+        | "List$values$linked"
+        | "List$values$tree"
+        | "List$values$immutable" => &["AbstractCollection"],
         "Entry$hash" | "Entry$linked" | "Entry$tree" | "Entry$immutable" => &["Entry"],
         _ => &[],
     }
@@ -2785,6 +2799,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             mods: 0,
             items: sequence_items(seed).unwrap_or_default(),
             fixed: Fixity::Mutable,
+            view: None,
         },
         "HashMap" | "Map" => HostObj::Map {
             fixed: Fixity::Mutable,
@@ -3743,6 +3758,10 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Stream { .. } => "Stream$of".to_string(),
                     HostObj::Collector { .. } => "Collector$of".to_string(),
                     HostObj::Array(_) => "[]".to_string(),
+                    // The `values()` view is not a `List` at all in Java, so
+                    // it is read before the fixity — which would otherwise call
+                    // it an `ArrayList`.
+                    HostObj::List { view: Some(of), .. } => format!("List$values${}", of.tag()),
                     // `Arrays.asList` and `List.of` are `List`s that are not
                     // `ArrayList`s, and a `subList` view is a third answer
                     // again — see the note in [`jdk_supers`].
@@ -4293,7 +4312,18 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             return Err(Fault::internal("javars: dangling collection handle"));
         };
         match obj {
-            HostObj::List { items, fixed, mods } => {
+            HostObj::List {
+                items,
+                fixed,
+                mods,
+                view,
+            } => {
+                // A `values()` view refuses `add`, whatever the map's fixity —
+                // there is no key to file a bare value under. The same rule
+                // `set_method` applies to the other two views.
+                if view.is_some() && matches!(method, "add" | "addAll") {
+                    return Err(Fault::java("UnsupportedOperationException", String::new()));
+                }
                 let before = items.len();
                 let r = list_method(items, *fixed, method, args, arg_seqs, eq);
                 // Any length change is a structural modification, which is what
@@ -4849,6 +4879,7 @@ fn list_value(items: Vec<Value>, fixed: Fixity) -> Value {
         items,
         fixed,
         mods: 0,
+        view: None,
     }))
 }
 
@@ -5679,7 +5710,13 @@ fn map_method(
             NewColl::Alloc(HostObj::List {
                 mods: 0,
                 items: ordered,
-                fixed: Fixity::FixedSize,
+                // The view follows the map: a removal through the values of a
+                // `new HashMap<>()` is accepted (and, as a copy, lost — see
+                // BUGS.md) where a removal through a `Map.of`'s is refused. The
+                // marker is what refuses `add`, which Java refuses whatever the
+                // map, since a bare value has no key to be filed under.
+                fixed,
+                view: Some(ViewOf::of(order, fixed)),
             })
         }
         ("hashCode", 0) => NewColl::Value(Value::Int(map_hash(entries))),
@@ -6732,6 +6769,7 @@ fn collection_static(
             items,
             fixed,
             mods: 0,
+            view: None,
         })))
     };
     Some(match (class, method) {
@@ -8326,7 +8364,7 @@ fn fdlibm_pow(x: f64, y: f64) -> f64 {
         s = -1.0;
     }
 
-    let (mut p_h, mut p_l, mut t1, mut t2): (f64, f64, f64, f64);
+    let (mut p_h, mut p_l, mut t1, t2): (f64, f64, f64, f64);
     // |y| is huge
     if y_abs > f64::from_bits(0x41E0_0000_FFFF_FFFF) {
         // > ~2**31; 0x1.00000_ffff_ffffp31
@@ -8363,7 +8401,7 @@ fn fdlibm_pow(x: f64, y: f64) -> f64 {
         const CP_H: f64 = f64::from_bits(0x3FEE_C709_E000_0000); // 0x1.ec709ep-1 = (float) CP
         const CP_L: f64 = f64::from_bits(0xBE3E_2FE0_145B_01F5); // -0x1.e2fe_0145_b01f5p-28
 
-        let (mut z_h, mut z_l, mut ss, mut s2, mut s_h, mut s_l, mut t_h, mut t_l): (
+        let (z_h, z_l, ss, mut s2, mut s_h, s_l, mut t_h, mut t_l): (
             f64,
             f64,
             f64,
@@ -10944,6 +10982,10 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
             1 => "java.util.ImmutableCollections$Set12".to_string(),
             _ => "java.util.ImmutableCollections$MapN$1".to_string(),
         },
+        "List$values$hash" => "java.util.HashMap$Values".to_string(),
+        "List$values$linked" => "java.util.LinkedHashMap$LinkedValues".to_string(),
+        "List$values$tree" => "java.util.TreeMap$Values".to_string(),
+        "List$values$immutable" => "java.util.AbstractMap$2".to_string(),
         "Entry$hash" => "java.util.HashMap$Node".to_string(),
         "Entry$linked" => "java.util.LinkedHashMap$Entry".to_string(),
         "Entry$tree" => "java.util.TreeMap$Entry".to_string(),
