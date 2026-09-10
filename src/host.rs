@@ -493,9 +493,36 @@ enum HostObj {
         items: Vec<Value>,
         order: Order,
         fixed: Fixity,
+        /// Whether this set is one of its own or a view a `Map` handed out;
+        /// see [`SetView`].
+        view: SetView,
         /// Element -> position accelerator; see [`KeyIndex`].
         index: KeyIndex,
     },
+    /// A `java.util.Map.Entry` — one key/value pair, as `entrySet()` hands it
+    /// out and as `Map.entry(k, v)` builds one from nothing.
+    ///
+    /// `owner` is the map the pair was read out of. It is what makes
+    /// `setValue` write *through* to that map, which is the one thing an entry
+    /// is for that a two-element snapshot could not do: Java specifies
+    /// `entry.setValue(v)` as a write to the backing map, and a `for (var e :
+    /// m.entrySet()) e.setValue(…)` loop is the ordinary way to rewrite every
+    /// value in place. A `Map.entry(k, v)` pair owns no map, so it answers
+    /// `UnsupportedOperationException` instead — exactly as the JDK's
+    /// `KeyValueHolder` does.
+    ///
+    /// `owner` also decides the entry's *class*: the JDK gives each map
+    /// implementation its own private node type (`HashMap$Node`,
+    /// `LinkedHashMap$Entry`, `TreeMap$Entry`) and an ownerless pair is a
+    /// `java.util.KeyValueHolder`. All four are `Map.Entry` and none of them is
+    /// `Serializable` — measured, not assumed.
+    ///
+    /// The pair is stored *outside* `HEAP`, in [`PAIRS`], for the reason
+    /// [`HostObj::Boxed`] gives for a box: an entry sitting in a `Set` is
+    /// compared and hashed while that set is borrowed, so reading its key back
+    /// out of `HEAP` would be a re-entrant borrow and panic. The slot is still
+    /// allocated here so an entry owns a handle no other object can be given.
+    Entry,
     /// A `java.lang.StringBuilder` (or `StringBuffer`) — the mutable character
     /// sequence, which `+` concatenation cannot stand in for once a program
     /// builds one in a loop.
@@ -719,6 +746,12 @@ fn index_key(v: &Value) -> Option<IndexKey> {
         // which is where the class check lives — so sharing one is free.
         Value::Obj(id) => match unboxed(v) {
             Some(inner) => return index_key(&inner),
+            // A `Map.Entry` is compared by its *pair*, so two equal entries
+            // have two different handles and bucketing on the handle would make
+            // `m.entrySet().contains(Map.entry(k, v))` miss where the scan it
+            // replaces hits. It declines, which is what the accelerator is
+            // specified to do wherever the correspondence is not provable.
+            None if entry_pair(v).is_some() => return None,
             None => IndexKey::Obj(*id),
         },
         Value::Undef => IndexKey::Null,
@@ -833,6 +866,86 @@ enum Order {
     Sorted,
 }
 
+/// Whether a `Set` on the heap is one of its own or a view a `Map` handed out.
+///
+/// It exists for two questions the JDK answers differently for the two, both
+/// measured against openjdk 21.0.12:
+///
+///   * `getClass().getName()`. A `new HashSet<>()` is a `java.util.HashSet`;
+///     `m.keySet()` is a private class named for the map that produced it
+///     (`java.util.HashMap$KeySet`, `java.util.TreeMap$EntrySet`, …), and
+///     `m.keySet() instanceof HashSet` is therefore `false`.
+///   * `add`. Every map view refuses it with `UnsupportedOperationException`,
+///     because there is no value to give a key that arrived on its own. A set
+///     of its own accepts it.
+///
+/// The payload is the shape of the map behind the view, which is what picks
+/// among the JDK's per-implementation names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetView {
+    /// A set of its own — `new HashSet<>()`, `Set.of`, `Collectors.toSet`.
+    Own,
+    /// `map.keySet()`.
+    Keys(ViewOf),
+    /// `map.entrySet()`.
+    Entries(ViewOf),
+}
+
+/// Which `java.util.Map` implementation a view was taken from. The JDK names
+/// each view class after it, and the immutable factory's views are named after
+/// neither the map nor the ordinary abstract classes — `Map.of(…).keySet()` is
+/// an anonymous `java.util.AbstractMap$1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewOf {
+    Hash,
+    Linked,
+    Tree,
+    Immutable,
+}
+
+impl ViewOf {
+    /// The map implementation a map with this order and fixity presents as.
+    fn of(order: Order, fixed: Fixity) -> ViewOf {
+        match (fixed, order) {
+            (Fixity::Immutable, _) => ViewOf::Immutable,
+            (_, Order::Hash) => ViewOf::Hash,
+            (_, Order::Insertion) => ViewOf::Linked,
+            (_, Order::Sorted) => ViewOf::Tree,
+        }
+    }
+
+    /// The discriminator that goes into the internal class tag a view or an
+    /// entry carries (`Set$keys$hash`, `Entry$tree`). It is a name no Java
+    /// program can write, which is the point: [`binary_name`] turns it into the
+    /// JDK's own name and nothing else ever sees it.
+    fn tag(self) -> &'static str {
+        match self {
+            ViewOf::Hash => "hash",
+            ViewOf::Linked => "linked",
+            ViewOf::Tree => "tree",
+            ViewOf::Immutable => "immutable",
+        }
+    }
+}
+
+/// The map implementation an entry with this owner belongs to.
+///
+/// An entry with no owner is `Map.entry(k, v)`, whose class is
+/// `java.util.KeyValueHolder` — which is also the class of an *immutable* map's
+/// entries, so the two answer alike.
+fn entry_view(owner: Option<u32>) -> ViewOf {
+    let Some(id) = owner else {
+        return ViewOf::Immutable;
+    };
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map { order, fixed, .. }) => ViewOf::of(*order, *fixed),
+        // The owner is gone or is not a map, which the heap makes impossible —
+        // an entry only ever names the map it was read out of, and the heap is
+        // never compacted. Answer as an ownerless pair rather than panicking.
+        _ => ViewOf::Immutable,
+    })
+}
+
 /// Whether a list accepts structural modification. `Arrays.asList` is
 /// fixed-size (`set` yes, `add`/`remove` no) and `List.of` is fully immutable —
 /// both throw `UnsupportedOperationException` in Java, so javars throws too
@@ -896,6 +1009,44 @@ thread_local! {
     /// handle rather than hashed on it, because unboxing is on the path of every
     /// arithmetic operation a wrapper takes part in and every erased read.
     static BOXES: RefCell<Vec<Option<(&'static str, Value)>>> = const { RefCell::new(Vec::new()) };
+    /// Every live `Map.Entry`: handle -> the pair and the map it belongs to.
+    ///
+    /// Separate from `HEAP` for the reason [`HostObj::Entry`] gives, and
+    /// indexed by the handle for the reason [`BOXES`] gives: an entry inside a
+    /// `Set` is compared against every candidate a `contains` walks.
+    static PAIRS: RefCell<Vec<Option<Pair>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A `Map.Entry`'s payload — see [`HostObj::Entry`].
+#[derive(Clone)]
+struct Pair {
+    key: Value,
+    value: Value,
+    /// The map `setValue` writes back to, or `None` for a `Map.entry(k, v)`
+    /// pair that belongs to no map.
+    owner: Option<u32>,
+}
+
+/// Give an entry a heap handle of its own and record its pair in [`PAIRS`].
+fn alloc_entry(key: Value, value: Value, owner: Option<u32>) -> Value {
+    let id = heap_alloc(HostObj::Entry);
+    PAIRS.with(|p| {
+        let mut p = p.borrow_mut();
+        p.resize(id as usize + 1, None);
+        p[id as usize] = Some(Pair { key, value, owner });
+    });
+    Value::Obj(id)
+}
+
+/// The pair inside a `Map.Entry` handle, or `None` for anything else.
+///
+/// Every equality, hashing and rendering surface asks this first, so a value
+/// that is not an entry answers exactly as it did before rather than wrongly.
+fn entry_pair(v: &Value) -> Option<Pair> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    PAIRS.with(|p| p.borrow().get(*id as usize)?.clone())
 }
 
 /// Box `v` as the wrapper class at index `code` in [`BOX_CLASSES`], returning
@@ -1045,6 +1196,7 @@ pub fn heap_reset() {
     // objects occupy, and `Integer.valueOf(1)` would answer someone else's list.
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
+    PAIRS.with(|p| p.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     BINARY.with(|b| b.borrow_mut().clear());
@@ -1285,6 +1437,21 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         "Map$immutable" => &["AbstractMap", "Map", "Serializable"],
         "List$fixed" => &["AbstractList", "RandomAccess", "Serializable"],
         "List$sub" => &["AbstractList", "RandomAccess"],
+        // The `Map` views. Every one of them is an `AbstractSet` — including
+        // the immutable factory's `keySet`, which is `AbstractMap`'s own
+        // anonymous one — and *none* of them is `Cloneable` or `Serializable`,
+        // which is what separates a view from the `HashSet` it used to be
+        // modeled as. The immutable `entrySet` is the exception: it stops at
+        // `AbstractCollection`, exactly as `Set.of` does.
+        "Set$keys$hash" | "Set$keys$linked" | "Set$keys$tree" | "Set$keys$immutable" => {
+            &["AbstractSet"]
+        }
+        "Set$entries$hash" | "Set$entries$linked" | "Set$entries$tree" => &["AbstractSet"],
+        "Set$entries$immutable" => &["AbstractCollection", "Set"],
+        // A `Map.Entry` is an `Entry` and an `Object` and nothing else — not
+        // `Serializable`, whichever map produced it. `Entry` is the simple name
+        // `Map.Entry` flattens to, which is the name an `instanceof` writes.
+        "Entry$hash" | "Entry$linked" | "Entry$tree" | "Entry$immutable" => &["Entry"],
         _ => &[],
     }
 }
@@ -1834,11 +2001,86 @@ fn java_hash(v: &Value) -> Option<i32> {
 fn element_hash(v: &Value) -> i32 {
     match java_hash(v) {
         Some(h) => h,
-        None => match v {
-            Value::Obj(id) => *id as i32,
-            _ => 0,
+        // `Map.Entry.hashCode` is specified as `keyHash ^ valueHash`, not the
+        // identity hash a handle would otherwise get. It is what makes
+        // `m.entrySet().hashCode() == m.hashCode()`, since [`map_hash`] sums
+        // exactly that quantity over the same pairs.
+        None => match entry_pair(v) {
+            Some(p) => element_hash(&p.key) ^ element_hash(&p.value),
+            None => match v {
+                Value::Obj(id) => *id as i32,
+                _ => 0,
+            },
         },
     }
+}
+
+/// `getKey` / `getValue` / `setValue` and the three `Object` methods a
+/// `Map.Entry` overrides, on an [`HostObj::Entry`] receiver.
+///
+/// `None` for any other receiver or for `getClass`, which leaves the call to
+/// the dispatch that follows — an entry's binary name is decided by
+/// [`binary_name`] like every other shape's.
+///
+/// `setValue` is the reason an entry carries its map rather than a copy of the
+/// pair: Java specifies it as a write to the *backing map*, and rewriting every
+/// value in place through `for (var e : m.entrySet()) e.setValue(f(e))` is the
+/// ordinary way to use one. An entry with no map behind it — `Map.entry(k, v)`,
+/// or one read out of a `Map.of` — refuses with the JDK's own message.
+fn entry_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let pair = entry_pair(recv)?;
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    Some(match (method, args.len()) {
+        ("getKey", 0) => Ok(pair.key),
+        ("getValue", 0) => Ok(pair.value),
+        ("setValue", 1) => match pair.owner.filter(|o| map_is_writable(*o)) {
+            Some(owner) => Ok(set_entry_value(*id, owner, &pair.key, args[0].clone())),
+            None => Err(Fault::java(
+                "UnsupportedOperationException",
+                "not supported".to_string(),
+            )),
+        },
+        ("toString", 0) => Ok(Value::str(java_str(recv))),
+        ("equals", 1) => Ok(Value::bool(value_eq(recv, &args[0]))),
+        ("hashCode", 0) => Ok(Value::Int(element_hash(recv).into())),
+        _ => return None,
+    })
+}
+
+/// True when the map at `id` accepts a `put` — an entry read out of a `Map.of`
+/// refuses `setValue` for the same reason the map refuses `put`.
+fn map_is_writable(id: u32) -> bool {
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(id as usize),
+            Some(HostObj::Map { fixed, .. }) if *fixed != Fixity::Immutable
+        )
+    })
+}
+
+/// Write `v` through an entry to the map that owns it, answering the value the
+/// entry held before.
+///
+/// The map is only touched where the key is still in it: an entry whose key has
+/// since been removed is a *detached* node in the JDK too, and writing to it
+/// updates the node and nothing else.
+fn set_entry_value(id: u32, owner: u32, key: &Value, v: Value) -> Value {
+    let old = PAIRS.with(|p| {
+        let mut p = p.borrow_mut();
+        let slot = p.get_mut(id as usize).and_then(|s| s.as_mut());
+        slot.map(|pair| std::mem::replace(&mut pair.value, v.clone()))
+            .unwrap_or(Value::Undef)
+    });
+    HEAP.with(|h| {
+        if let Some(HostObj::Map { entries, .. }) = h.borrow_mut().get_mut(owner as usize) {
+            if let Some((_, slot)) = entries.iter_mut().find(|(k, _)| value_eq(k, key)) {
+                *slot = v;
+            }
+        }
+    });
+    old
 }
 
 /// `hasNext` / `next` / `remove` on an [`HostObj::Iterator`] receiver.
@@ -2088,6 +2330,15 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Some(x), Some(y)) if x != y => return false,
         (Some(_), _) | (_, Some(_)) => return value_eq(&deboxed(a), &deboxed(b)),
         _ => {}
+    }
+    // `Map.Entry.equals` is a *value* comparison — the key and the value both —
+    // and it holds across implementations: a `HashMap$Node` equals the
+    // `KeyValueHolder` `Map.entry` builds from the same pair, which is what
+    // makes `m.entrySet().contains(Map.entry(k, v))` answer `true`. Only a pair
+    // against a pair; an entry against anything else falls to the identity
+    // comparison below and is `false`, as `Map.entry("a", 1).equals("a=1")` is.
+    if let (Some(x), Some(y)) = (entry_pair(a), entry_pair(b)) {
+        return value_eq(&x.key, &y.key) && value_eq(&x.value, &y.value);
     }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
@@ -2544,18 +2795,21 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Hash,
             fixed: Fixity::Mutable,
+            view: SetView::Own,
             index: KeyIndex::default(),
         },
         "LinkedHashSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Insertion,
             fixed: Fixity::Mutable,
+            view: SetView::Own,
             index: KeyIndex::default(),
         },
         "TreeSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
             order: Order::Sorted,
             fixed: Fixity::Mutable,
+            view: SetView::Own,
             index: KeyIndex::default(),
         },
         other => {
@@ -3475,6 +3729,20 @@ fn value_class(v: &Value) -> Option<String> {
                     },
                     // `Set.of` is not a `HashSet`, exactly as `List.of` is not
                     // an `ArrayList`; without the fixity it answered to both.
+                    // A `keySet`/`entrySet` view is a `Set` that is not a
+                    // `HashSet` (nor any other set a program can construct):
+                    // the JDK gives each map implementation its own private
+                    // view class. The marker is read before the fixity so a
+                    // view of an immutable map does not answer `Set$immutable`,
+                    // which is `Set.of`'s class and not a view's.
+                    HostObj::Set {
+                        view: SetView::Keys(of),
+                        ..
+                    } => format!("Set$keys${}", of.tag()),
+                    HostObj::Set {
+                        view: SetView::Entries(of),
+                        ..
+                    } => format!("Set$entries${}", of.tag()),
                     HostObj::Set { order, fixed, .. } => match (fixed, order) {
                         (Fixity::Mutable | Fixity::FixedSize, Order::Hash) => "HashSet".to_string(),
                         (Fixity::Mutable | Fixity::FixedSize, Order::Insertion) => {
@@ -3485,6 +3753,14 @@ fn value_class(v: &Value) -> Option<String> {
                         }
                         (Fixity::Immutable, _) => "Set$immutable".to_string(),
                     },
+                    // An entry is named for the map it came out of, and an
+                    // ownerless one (`Map.entry(k, v)`) is a `KeyValueHolder` —
+                    // which is also what an *immutable* map's entries are, so
+                    // the two share `ViewOf::Immutable` here.
+                    HostObj::Entry => format!(
+                        "Entry${}",
+                        entry_view(entry_pair(v).and_then(|p| p.owner)).tag()
+                    ),
                     HostObj::Builder { buffer, .. } => if *buffer {
                         "StringBuffer"
                     } else {
@@ -3612,6 +3888,15 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // (`toString`, `sort`, `forEach`).
     if let Some(f) = stale_view(recv) {
         return raise(vm, f);
+    }
+    // A `Map.Entry` receiver reaches here when the compiler could type it
+    // (`Map.Entry<K, V> e = …`), and reaches `entry_method` directly from
+    // `b_str_dispatch` when it could not. One implementation, both routes.
+    if let Some(r) = entry_method(recv, method, args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
     }
     // `subList` allocates a view over the receiver, so it needs the receiver's
     // handle — which `list_method` (working on a plain `&mut Vec`) never sees.
@@ -4008,9 +4293,10 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             HostObj::Set {
                 items,
                 fixed,
+                view,
                 index,
                 ..
-            } => set_method(items, *fixed, index, method, args, arg_seqs, eq),
+            } => set_method(items, *fixed, *view, index, method, args, arg_seqs, eq),
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -4021,6 +4307,21 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         // A derived view (`keySet`, `values`) is allocated after the borrow is
         // released, because allocating touches the same slab.
         Ok(NewColl::Alloc(obj)) => Value::Obj(heap_alloc(obj)),
+        Ok(NewColl::Entries { pairs, fixed, of }) => {
+            let items: Vec<Value> = pairs
+                .into_iter()
+                .map(|(key, value)| alloc_entry(key, value, Some(id as u32)))
+                .collect();
+            Value::Obj(heap_alloc(HostObj::Set {
+                items,
+                // The pairs arrive already in the map's presentation order, so
+                // the view walks them as they lie.
+                order: Order::Insertion,
+                fixed,
+                view: SetView::Entries(of),
+                index: KeyIndex::default(),
+            }))
+        }
         Err(f) => raise(vm, f),
     }
 }
@@ -4030,6 +4331,15 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
 enum NewColl {
     Value(Value),
     Alloc(HostObj),
+    /// `map.entrySet()` — the map's pairs in presentation order, to be turned
+    /// into one [`HostObj::Entry`] each and gathered into a view set. Unlike
+    /// [`NewColl::Alloc`] this needs the *receiver's* handle, because every
+    /// entry has to remember the map `setValue` writes back to.
+    Entries {
+        pairs: Vec<(Value, Value)>,
+        fixed: Fixity,
+        of: ViewOf,
+    },
 }
 
 // ── `List.subList` views ────────────────────────────────────────────────────
@@ -4539,6 +4849,7 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
                 items: out,
                 order: Order::Hash,
                 fixed: Fixity::Mutable,
+                view: SetView::Own,
                 index: KeyIndex::default(),
             }))
         }
@@ -4787,6 +5098,10 @@ fn sublist_method(
     Ok(match out {
         NewColl::Value(v) => v,
         NewColl::Alloc(obj) => Value::Obj(heap_alloc(obj)),
+        // Only `map_method` builds one, and a `subList` view is over a `List`.
+        NewColl::Entries { .. } => {
+            return Err(Fault::internal("javars: a subList has no entry set"))
+        }
     })
 }
 
@@ -5292,16 +5607,37 @@ fn map_method(
                 .map(|i| keys[i].clone())
                 .collect();
             // The view is a `Set` that already holds the map's order, so it
-            // iterates and prints exactly as the map does.
+            // iterates and prints exactly as the map does. It is marked as a
+            // view rather than passed off as a set of its own, which is what
+            // makes `m.keySet().add(k)` the `UnsupportedOperationException`
+            // Java raises (there is no value to give a bare key) and
+            // `m.keySet() instanceof HashSet` the `false` Java answers.
             NewColl::Alloc(HostObj::Set {
                 items: ordered,
                 order: Order::Insertion,
-                // A `keySet` view is writable in Java (a removal writes through
-                // to the map); javars models it as a copy, so it is at least not
-                // an immutable one.
-                fixed: Fixity::Mutable,
+                // A `keySet` view is removable-through in Java when the map is;
+                // javars models it as a copy, so a removal is at least accepted
+                // where Java accepts it and refused where Java refuses it.
+                fixed,
+                view: SetView::Keys(ViewOf::of(order, fixed)),
                 index: KeyIndex::default(),
             })
+        }
+        // `entrySet` is the one view whose elements are objects in their own
+        // right, so it cannot be built here: an entry carries a handle to the
+        // map it came from, and this runs while that map is borrowed. The pairs
+        // go back to `coll_method`, which allocates once the borrow is gone.
+        ("entrySet", 0) => {
+            let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            let pairs = present_order(&keys, order)
+                .into_iter()
+                .map(|i| entries[i].clone())
+                .collect();
+            NewColl::Entries {
+                pairs,
+                fixed,
+                of: ViewOf::of(order, fixed),
+            }
         }
         ("values", 0) => {
             let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
@@ -5348,6 +5684,7 @@ fn map_method(
 fn set_method(
     items: &mut Vec<Value>,
     fixed: Fixity,
+    view: SetView,
     index: &mut KeyIndex,
     method: &str,
     args: &[Value],
@@ -5378,6 +5715,14 @@ fn set_method(
     };
     if (method, args.len()) == ("contains", 1) {
         reject_null_probe(fixed, &args[0])?;
+    }
+    // A map view refuses `add` whatever the map's fixity: `m.keySet().add(k)`
+    // would have to invent a value for `k`, and `m.entrySet().add(e)` an entry
+    // the map does not own. Both are `UnsupportedOperationException` on a
+    // `new HashMap<>()` — measured — where the `fixed` guard above, reading
+    // `Mutable`, would have let them through.
+    if view != SetView::Own && matches!(method, "add" | "addAll") {
+        return Err(Fault::java("UnsupportedOperationException", String::new()));
     }
     let v = match (method, args.len()) {
         ("size", 0) => Value::Int(items.len() as i64),
@@ -5529,6 +5874,15 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // through to the `String` table and `it.hasNext()` was
     // ``unsupported String method `hasNext` ``.
     if let Some(r) = iterator_method(&recv, &method, args.len()) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
+    // A `Map.Entry` receiver. It is not a collection, so like an `Iterator` it
+    // would otherwise fall through to the `String` table and `e.getKey()` would
+    // be ``unsupported String method `getKey` ``.
+    if let Some(r) = entry_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
             Err(f) => raise(vm, f),
@@ -6381,6 +6735,7 @@ fn collection_static(
                 items: unique,
                 order: Order::Hash,
                 fixed: Fixity::Immutable,
+                view: SetView::Own,
                 index: KeyIndex::default(),
             })))
         }
@@ -6493,6 +6848,40 @@ fn collection_static(
                     )));
                 }
                 entries.push((k, v));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Map {
+                entries,
+                order: Order::Hash,
+                fixed: Fixity::Immutable,
+                index: KeyIndex::default(),
+            })))
+        }
+        // `Map.entry(k, v)` — one immutable pair, belonging to no map. Both
+        // halves are rejected when null, which is the whole difference from a
+        // `HashMap` entry (a `HashMap` accepts a null key and a null value, and
+        // `m.entrySet()` therefore hands out entries holding them).
+        ("Map", "entry") if args.len() == 2 => {
+            if matches!(args[0], Value::Undef) || matches!(args[1], Value::Undef) {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            Ok(alloc_entry(args[0].clone(), args[1].clone(), None))
+        }
+        // `Map.ofEntries(e1, e2, …)` — the same immutable map `Map.of` builds,
+        // spelled as pairs. It applies `Map.of`'s rules (no null, no repeated
+        // key) because it is the same factory underneath.
+        ("Map", "ofEntries") => {
+            let mut entries: Vec<(Value, Value)> = Vec::with_capacity(args.len());
+            for arg in varargs_items(args) {
+                let Some(pair) = entry_pair(&arg) else {
+                    return Some(Err(Fault::java("NullPointerException", String::new())));
+                };
+                if entries.iter().any(|(prev, _)| value_eq(prev, &pair.key)) {
+                    return Some(Err(Fault::java(
+                        "IllegalArgumentException",
+                        format!("duplicate key: {}", java_str_vm(vm, &pair.key)),
+                    )));
+                }
+                entries.push((pair.key, pair.value));
             }
             Ok(Value::Obj(heap_alloc(HostObj::Map {
                 entries,
@@ -9158,6 +9547,8 @@ enum RenderShape {
     Sequence(Vec<Value>),
     /// A `Map`, already in presentation order.
     Entries(Vec<(Value, Value)>),
+    /// One `Map.Entry`.
+    Pair(Value, Value),
     /// An array, a lambda, or a dangling handle — nothing to recurse into, so
     /// the pure renderer answers.
     Opaque,
@@ -9192,6 +9583,14 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
                         .collect(),
                 )
             }
+            // A single pair, which renders `key=value` rather than the braced
+            // form a whole map takes. Both sides go through their own
+            // `toString()`, so an entry holding a user instance shows the
+            // override.
+            Some(HostObj::Entry) => match entry_pair(&Value::Obj(id)) {
+                Some(p) => RenderShape::Pair(p.key, p.value),
+                None => RenderShape::Opaque,
+            },
             _ => RenderShape::Opaque,
         }
     });
@@ -9213,6 +9612,7 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
             None => enum_name.unwrap_or_else(|| obj_default_str(id)),
         },
         RenderShape::Sequence(items) => render_sequence_vm(vm, &items),
+        RenderShape::Pair(k, v) => format!("{}={}", java_str_vm(vm, &k), java_str_vm(vm, &v)),
         RenderShape::Entries(entries) => {
             let body: Vec<String> = entries
                 .iter()
@@ -9301,6 +9701,13 @@ fn obj_default_str(id: u32) -> String {
             ),
             Some(HostObj::Set { items, order, .. }) => render_set(items, *order),
             Some(HostObj::Map { entries, order, .. }) => render_map(entries, *order),
+            // `Map.Entry.toString()` is `key + "=" + value` — the same shape a
+            // map's own rendering gives each pair, which is why an `entrySet`
+            // prints as `[a=1, b=2]`.
+            Some(HostObj::Entry) => match entry_pair(&Value::Obj(id)) {
+                Some(p) => format!("{}={}", java_str(&p.key), java_str(&p.value)),
+                None => format!("(entry:{id})"),
+            },
             // Java renders a lambda as `Class$$Lambda/0x…@<identity hash>`,
             // which is not reproducible (and not stable across JVM runs), so
             // javars prints a fixed marker instead. See `BUGS.md`.
@@ -10031,6 +10438,28 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
             1 => "java.util.ImmutableCollections$Map1".to_string(),
             _ => "java.util.ImmutableCollections$MapN".to_string(),
         },
+        // The two `Map` views and the entries they hand out. Each map
+        // implementation has its own private class for all three, and the
+        // immutable factory's are named after neither the map nor the abstract
+        // classes: its `keySet` is an anonymous `AbstractMap$1` and its
+        // `entrySet` is an ordinary immutable set at one entry and an anonymous
+        // `MapN$1` otherwise. Every name here was read off
+        // `getClass().getName()` under the reference JDK.
+        "Set$keys$hash" => "java.util.HashMap$KeySet".to_string(),
+        "Set$keys$linked" => "java.util.LinkedHashMap$LinkedKeySet".to_string(),
+        "Set$keys$tree" => "java.util.TreeMap$KeySet".to_string(),
+        "Set$keys$immutable" => "java.util.AbstractMap$1".to_string(),
+        "Set$entries$hash" => "java.util.HashMap$EntrySet".to_string(),
+        "Set$entries$linked" => "java.util.LinkedHashMap$LinkedEntrySet".to_string(),
+        "Set$entries$tree" => "java.util.TreeMap$EntrySet".to_string(),
+        "Set$entries$immutable" => match len() {
+            1 => "java.util.ImmutableCollections$Set12".to_string(),
+            _ => "java.util.ImmutableCollections$MapN$1".to_string(),
+        },
+        "Entry$hash" => "java.util.HashMap$Node".to_string(),
+        "Entry$linked" => "java.util.LinkedHashMap$Entry".to_string(),
+        "Entry$tree" => "java.util.TreeMap$Entry".to_string(),
+        "Entry$immutable" => "java.util.KeyValueHolder".to_string(),
         "List$sub" => match sublist_root_fixity(v) {
             Some(Fixity::Mutable) => "java.util.ArrayList$SubList".to_string(),
             Some(Fixity::FixedSize) => "java.util.AbstractList$RandomAccessSubList".to_string(),

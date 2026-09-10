@@ -5707,6 +5707,28 @@ impl Compiler {
                 .emit(Op::CallBuiltin(crate::host::JBINARY_CLASS, 2), line);
             return Ok(());
         }
+        // `Map.Entry.comparingByKey()` / `comparingByValue()` — the two
+        // comparators an `entrySet()` is nearly always sorted with. Each is
+        // synthesized as the lambda the JDK's own implementation is, so it
+        // reaches the same erased `compareTo` dispatch every other comparator
+        // does and needs no host support of its own. The receiver is the *type*
+        // `Map.Entry`, which parses as a field access on `Map` and would
+        // otherwise be looked up as a variable.
+        if let Expr::Field { recv: outer, name } = recv {
+            if name == "Entry"
+                && matches!(outer.as_ref(), Expr::Var(c) if c == "Map")
+                && !self.is_declared_var("Map")
+                && args.is_empty()
+            {
+                if let Some(accessor) = match method {
+                    "comparingByKey" => Some("getKey"),
+                    "comparingByValue" => Some("getValue"),
+                    _ => None,
+                } {
+                    return self.expr(&entry_comparator(accessor, line));
+                }
+            }
+        }
         // A sort with no comparator orders by the elements' own `compareTo`,
         // which only a Java-level call can reach — the host's `natural_cmp`
         // knows numbers and strings and answers "equal" for everything else, so
@@ -7786,6 +7808,30 @@ fn natural_order_comparator(line: u32) -> Expr {
     }
 }
 
+/// The comparator `Map.Entry.comparingByKey()` denotes, as a lambda:
+/// `(a, b) -> a.getKey().compareTo(b.getKey())` — and the same with `getValue`
+/// for `comparingByValue()`. The `#` in the parameter names is not a legal Java
+/// identifier character, so they cannot collide with a user variable.
+fn entry_comparator(accessor: &str, line: u32) -> Expr {
+    let (a, b) = ("#ent0".to_string(), "#ent1".to_string());
+    let read = |v: String| Expr::MethodCall {
+        recv: Box::new(Expr::Var(v)),
+        method: accessor.to_string(),
+        args: vec![],
+        line,
+    };
+    Expr::Lambda {
+        params: vec![a.clone(), b.clone()],
+        body: LambdaBody::Expr(Box::new(Expr::MethodCall {
+            recv: Box::new(read(a)),
+            method: "compareTo".to_string(),
+            args: vec![read(b)],
+            line,
+        })),
+        line,
+    }
+}
+
 fn is_boxing_call(e: &Expr) -> bool {
     matches!(
         e,
@@ -7893,6 +7939,11 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
         "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
         "HashMap" | "LinkedHashMap" | "TreeMap" | "Map" => "map",
         "HashSet" | "LinkedHashSet" | "TreeSet" | "Set" => "set",
+        // `Map.Entry`, which the type parser flattens to its simple name. It is
+        // not a collection, but it reaches the host down the same route: the
+        // dispatch builtin takes any receiver whose methods the host models,
+        // and `entry_method` answers before the collection tables are consulted.
+        "Entry" => "entry",
         _ => return None,
     })
 }
@@ -7935,7 +7986,12 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         ("removeObject", 1) => "boolean",
         ("toString", 0) => "String",
         ("keySet", 0) => "Set",
+        ("entrySet", 0) => "Set",
         ("values", 0) => "List",
+        // A `Map.Entry`'s own methods. `getKey`/`getValue` answer the erased
+        // key and value types, which javars does not track, so they stay
+        // unknown — the same place `Map.get` leaves its result.
+        ("setValue", 1) if kind == "entry" => return None,
         // A `subList` view is a `List`, so methods chain off it and a nested
         // `subList` resolves through the collection path rather than falling
         // through to the `String` methods.

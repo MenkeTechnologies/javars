@@ -2545,7 +2545,13 @@ impl Parser {
             if matches!(self.peek(), Tok::Ident(w) if w == "instanceof") && BP_RELATIONAL >= min_bp
             {
                 self.advance();
-                let class = self.ident()?;
+                // The type is read the way every other type position reads one,
+                // so a qualified name works here too: `o instanceof Map.Entry`
+                // flattens to `Entry` and `o instanceof java.util.List` to
+                // `List`. `ident()` alone stopped at the first segment and left
+                // the `.` for the expression parser, which then reported a
+                // missing `)`.
+                let class = self.simple_type_name()?;
                 // `o instanceof List<?>` — the type argument is erased, so it is
                 // parsed and discarded exactly as every other type position's is.
                 self.skip_generics();
