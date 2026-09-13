@@ -1014,9 +1014,9 @@ storage-model differences:
   cell rather than two, so the parent's own methods and a parent-typed reference
   read the subclass's value. See "Field *hiding* collapses to one cell" below
   for the reproducer and the exact divergence.
-- **`keySet()`/`values()` are copies, not views.** Java's are backed by the map,
-  so `m.keySet().remove(k)` removes the entry; javars builds a fresh set or list
-  in the map's order, so the removal is lost:
+- **`keySet()`/`values()`/`entrySet()` are copies, not views.** Java's are backed
+  by the map, so `m.keySet().remove(k)` removes the entry; javars builds a fresh
+  set or list in the map's order, so the removal is lost:
 
   ```java
   Map<String, String> m = new HashMap<>();
@@ -1025,9 +1025,32 @@ storage-model differences:
   System.out.println(m.size());   // Java: 1     javars: 2
   ```
 
-  `List.subList` *is* a real aliasing view (above); these two are not, which is
-  also why a cast of one names the set or list javars modeled it as rather than
-  `HashMap$KeySet`.
+  `List.subList` *is* a real aliasing view (above); these three are not. Two
+  consequences, both measured on `openjdk 21.0.12.1`:
+
+  ```java
+  Map<String, Integer> m = new LinkedHashMap<>();
+  m.put("a", 1); m.put("b", 2);
+  Set<Map.Entry<String, Integer>> es = m.entrySet();
+  m.put("c", 3);
+  System.out.println(es.size());               // Java: 3     javars: 2
+  System.out.println(m.entrySet() == m.entrySet());  // Java: true  javars: false
+  ```
+
+  A held view does not see later changes to the map, and the view object is
+  rebuilt per call where Java's map caches one and hands back the same object.
+
+  The *entries inside* an `entrySet()` are not copies in that sense: a map hands
+  out one `Map.Entry` per key and keeps handing back that same object, its
+  `getValue()` follows the map, and it detaches when its key is removed — see
+  the `Pair::detached` doc comment in `src/host.rs` for the measured sequence.
+  Only the surrounding set is a snapshot.
+
+  Copying is also why a cast of a `keySet()`/`values()` result names the set or
+  list javars modeled it as rather than `HashMap$KeySet`. An `entrySet()` result
+  is exempt: it carries the map's own view class, so
+  `m.entrySet().getClass().getName()` is `java.util.LinkedHashMap$LinkedEntrySet`
+  as in Java.
 - **An arithmetic fault raised inside a lambda escapes the enclosing
   `try`/`catch`.** This is one of the two VM-level limits on record — a pending
   exception is checked after a `CallBuiltin` but not after an arithmetic op — and
@@ -1324,9 +1347,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   Java but not in the engine), and a named error beats a silently different
   answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
   four `String` methods are the whole surface.
-- **The other collection view methods** (`Map.entrySet`, `List.listIterator`).
-  `List.subList` is implemented as a real aliasing view (above); these two are
-  not, and an unsupported-method error is the honest answer until they are.
+- **`List.listIterator`.** The other two collection view methods now run:
+  `List.subList` as a real aliasing view, and `Map.entrySet` as a set of the
+  map's entries (see the `keySet()`/`values()`/`entrySet()` entry above for the
+  one way it still falls short of Java's). This one is not implemented, and an
+  unsupported-method error is the honest answer until it is.
 - **`Map.of`.** `List.of` and `Set.of` are implemented, each as the immutable
   collection Java returns rather than as a mutable one wearing the same name;
   the map factory is not, so there is no `HashMap`-vs-`Map.of` pair for the type

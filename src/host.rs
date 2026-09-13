@@ -1040,6 +1040,10 @@ thread_local! {
     /// indexed by the handle for the reason [`BOXES`] gives: an entry inside a
     /// `Set` is compared against every candidate a `contains` walks.
     static PAIRS: RefCell<Vec<Option<Pair>>> = const { RefCell::new(Vec::new()) };
+    /// For every map that has handed out entries: the entries it handed out.
+    /// See [`entry_for`] for why a map must hand out the *same* entry for a key
+    /// every time, and [`OwnerEntries`] for the accelerator and the scan.
+    static ENTRY_INDEX: RefCell<HashMap<u32, OwnerEntries>> = RefCell::new(HashMap::new());
 }
 
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
@@ -1050,6 +1054,25 @@ struct Pair {
     /// The map `setValue` writes back to, or `None` for a `Map.entry(k, v)`
     /// pair that belongs to no map.
     owner: Option<u32>,
+    /// True once the owner stopped holding this key.
+    ///
+    /// Java's entry *is* the map's node, so it reads the map's current value
+    /// until the key is removed — and then keeps the last value it had, while a
+    /// later re-insertion of the same key builds a *new* node this one never
+    /// sees. Measured on `openjdk 21.0.12.1`:
+    ///
+    /// ```text
+    /// m.put("k", 1); e = m.entrySet().iterator().next();
+    /// m.put("k", 99);   e.getValue()  99
+    /// m.remove("k");    e.getValue()  99   (the map no longer has the key)
+    /// m.put("k", 7);    e.getValue()  99   (a new node; this one stays dead)
+    ///                   e == m.entrySet().iterator().next()   false
+    /// ```
+    ///
+    /// javars keeps a *copy* of the pair rather than pointing at the map's
+    /// slot, so [`refresh_entries`] carries each map write across to the
+    /// entries that map owns and detaches the ones whose key has gone.
+    detached: bool,
 }
 
 /// Give an entry a heap handle of its own and record its pair in [`PAIRS`].
@@ -1058,7 +1081,12 @@ fn alloc_entry(key: Value, value: Value, owner: Option<u32>) -> Value {
     PAIRS.with(|p| {
         let mut p = p.borrow_mut();
         p.resize(id as usize + 1, None);
-        p[id as usize] = Some(Pair { key, value, owner });
+        p[id as usize] = Some(Pair {
+            key,
+            value,
+            owner,
+            detached: false,
+        });
     });
     Value::Obj(id)
 }
@@ -1222,6 +1250,10 @@ pub fn heap_reset() {
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
     PAIRS.with(|p| p.borrow_mut().clear());
+    // Keyed by heap handle like the caches above, so it goes with the heap for
+    // the same reason: a surviving bucket would hand the next program's map an
+    // entry belonging to this one's.
+    ENTRY_INDEX.with(|x| x.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     BINARY.with(|b| b.borrow_mut().clear());
@@ -2068,9 +2100,20 @@ fn entry_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Val
     Some(match (method, args.len()) {
         ("getKey", 0) => Ok(pair.key),
         ("getValue", 0) => Ok(pair.value),
-        ("setValue", 1) => match pair.owner.filter(|o| map_is_writable(*o)) {
-            Some(owner) => Ok(set_entry_value(*id, owner, &pair.key, args[0].clone())),
-            None => Err(Fault::java(
+        ("setValue", 1) => match pair.owner {
+            // A live entry writes through to its map, which is the whole point
+            // of the method.
+            Some(owner) if !pair.detached && map_is_writable(owner) => {
+                Ok(set_entry_value(*id, owner, &pair.key, args[0].clone()))
+            }
+            // A *detached* entry writes only itself, exactly as the JDK's dead
+            // node does. Measured: after `m.remove("k")` on a map that held
+            // `k=1`, `e.setValue(42)` answers `1`, `e.getValue()` is then `42`,
+            // and `m` is still `{}`.
+            Some(owner) if map_is_writable(owner) => Ok(store_entry_value(*id, args[0].clone())),
+            // An entry read out of a `Map.of`, or a `Map.entry(k, v)` that
+            // belongs to no map at all.
+            _ => Err(Fault::java(
                 "UnsupportedOperationException",
                 "not supported".to_string(),
             )),
@@ -2093,19 +2136,29 @@ fn map_is_writable(id: u32) -> bool {
     })
 }
 
+/// Write an entry's own copy of the value, answering the one it held.
+fn store_entry_value(id: u32, v: Value) -> Value {
+    PAIRS.with(|p| {
+        let mut p = p.borrow_mut();
+        p.get_mut(id as usize)
+            .and_then(|s| s.as_mut())
+            .map(|pair| std::mem::replace(&mut pair.value, v))
+            .unwrap_or(Value::Undef)
+    })
+}
+
 /// Write `v` through an entry to the map that owns it, answering the value the
 /// entry held before.
 ///
 /// The map is only touched where the key is still in it: an entry whose key has
 /// since been removed is a *detached* node in the JDK too, and writing to it
 /// updates the node and nothing else.
+///
+/// No other entry has to be told: [`entry_for`] hands out exactly one live
+/// entry per key per map, so the entry written here is the only one on that key
+/// — which is also the shape Java has, where it is the map's single node.
 fn set_entry_value(id: u32, owner: u32, key: &Value, v: Value) -> Value {
-    let old = PAIRS.with(|p| {
-        let mut p = p.borrow_mut();
-        let slot = p.get_mut(id as usize).and_then(|s| s.as_mut());
-        slot.map(|pair| std::mem::replace(&mut pair.value, v.clone()))
-            .unwrap_or(Value::Undef)
-    });
+    let old = store_entry_value(id, v.clone());
     HEAP.with(|h| {
         if let Some(HostObj::Map { entries, .. }) = h.borrow_mut().get_mut(owner as usize) {
             if let Some((_, slot)) = entries.iter_mut().find(|(k, _)| value_eq(k, key)) {
@@ -2114,6 +2167,176 @@ fn set_entry_value(id: u32, owner: u32, key: &Value, v: Value) -> Value {
         }
     });
     old
+}
+
+/// The entries one map has handed out.
+#[derive(Default)]
+struct OwnerEntries {
+    /// Every live entry of this map, in hand-out order. The authority: an entry
+    /// whose key [`index_key`] cannot bucket is here and nowhere else.
+    live: Vec<u32>,
+    /// The bucket accelerator [`existing_entry`] tries first. Only keys
+    /// `index_key` can bucket appear, on the same terms as [`KeyIndex`] — an
+    /// accelerator that declines is correct, one that misses is not.
+    by_key: HashMap<IndexKey, u32>,
+}
+
+/// The entry this map already hands out for `key`, or a fresh one.
+///
+/// Java's `entrySet()` builds nothing: the map keeps one node per key and the
+/// view walks them, so two `entrySet().iterator().next()` calls on the same map
+/// answer the *same object* and `==` between them is `true`. Handing out a new
+/// pair per call made that `false`, and made a loop that calls `entrySet()`
+/// repeatedly allocate a fresh entry per key per iteration.
+///
+/// A detached entry is never reused: its key has been removed, and Java builds
+/// a new node when the same key comes back.
+fn entry_for(owner: u32, key: Value, value: Value) -> Value {
+    if let Some(id) = existing_entry(owner, &key) {
+        store_entry_value(id, value);
+        return Value::Obj(id);
+    }
+    let bucket = index_key(&key);
+    let v = alloc_entry(key, value, Some(owner));
+    if let Value::Obj(id) = &v {
+        ENTRY_INDEX.with(|x| {
+            let mut x = x.borrow_mut();
+            let owned = x.entry(owner).or_default();
+            owned.live.push(*id);
+            if let Some(bucket) = bucket {
+                owned.by_key.insert(bucket, *id);
+            }
+        });
+    }
+    v
+}
+
+/// The live entry `owner` hands out for `key`, if it has one.
+fn existing_entry(owner: u32, key: &Value) -> Option<u32> {
+    // The key of a live (non-detached) entry, for confirming a candidate.
+    let live_key = |id: u32| {
+        PAIRS.with(|p| {
+            p.borrow()
+                .get(id as usize)?
+                .as_ref()
+                .filter(|pair| pair.owner == Some(owner) && !pair.detached)
+                .map(|pair| pair.key.clone())
+        })
+    };
+    let (hit, others) = ENTRY_INDEX.with(|x| {
+        let x = x.borrow();
+        let Some(owned) = x.get(&owner) else {
+            return (None, Vec::new());
+        };
+        match index_key(key).and_then(|b| owned.by_key.get(&b).copied()) {
+            Some(id) => (Some(id), Vec::new()),
+            // No bucket, or none stored under it: fall back to the scan the
+            // accelerator replaces, over this map's entries only.
+            None => (None, owned.live.clone()),
+        }
+    });
+    if let Some(id) = hit {
+        // A bucket is an accelerator; the candidate is still confirmed.
+        return live_key(id).filter(|k| value_eq(k, key)).map(|_| id);
+    }
+    others
+        .into_iter()
+        .find(|id| live_key(*id).is_some_and(|k| value_eq(&k, key)))
+}
+
+/// Mark an entry detached and drop it from [`ENTRY_INDEX`], so the next
+/// `entrySet()` over a re-inserted key builds a new one.
+fn detach_entry(id: u32) {
+    let removed = PAIRS.with(|p| {
+        let mut p = p.borrow_mut();
+        let pair = p.get_mut(id as usize).and_then(|s| s.as_mut())?;
+        pair.detached = true;
+        Some((pair.owner?, pair.key.clone()))
+    });
+    let Some((owner, key)) = removed else {
+        return;
+    };
+    let bucket = index_key(&key);
+    ENTRY_INDEX.with(|x| {
+        let mut x = x.borrow_mut();
+        let Some(owned) = x.get_mut(&owner) else {
+            return;
+        };
+        owned.live.retain(|e| *e != id);
+        // Only where this entry is the one filed under the bucket: a later
+        // entry on an equal key may already have replaced it.
+        if let Some(bucket) = bucket {
+            if owned.by_key.get(&bucket) == Some(&id) {
+                owned.by_key.remove(&bucket);
+            }
+        }
+    });
+}
+
+/// Carry a map's contents across to the entries it has handed out.
+///
+/// javars' entry holds a *copy* of the pair where Java's **is** the map's node,
+/// so every mutation of a map that has handed out entries is followed by this:
+/// an entry whose key is still there takes the map's current value, and one
+/// whose key has gone [detaches](Pair::detached).
+///
+/// Maps that never handed out an entry — nearly all of them — are absent from
+/// [`ENTRY_INDEX`] and leave on the first line, so the ordinary `put`/`get`
+/// path pays one hash lookup and nothing else. A map that *has* handed entries
+/// out pays one pass over them per mutation; the bucket map built here keeps
+/// that pass linear rather than making it a scan per entry.
+fn refresh_entries(owner: u32) {
+    let watched: Vec<u32> = ENTRY_INDEX.with(|x| match x.borrow().get(&owner) {
+        Some(owned) => owned.live.clone(),
+        None => Vec::new(),
+    });
+    if watched.is_empty() {
+        return;
+    }
+    // Cloned out from under the borrow: `value_eq` below runs user-visible
+    // `equals` bodies and must not be holding the heap when it does.
+    let Some(entries) = map_entries(&Value::Obj(owner)) else {
+        return;
+    };
+    let mut by_key: HashMap<IndexKey, usize> = HashMap::new();
+    let mut unindexed = false;
+    for (i, (k, _)) in entries.iter().enumerate() {
+        match index_key(k) {
+            // First wins: a map holds one entry per key, so a later equal key
+            // cannot occur, and an unequal key sharing a bucket is rejected by
+            // the `value_eq` confirmation below.
+            Some(b) => {
+                by_key.entry(b).or_insert(i);
+            }
+            None => unindexed = true,
+        }
+    }
+    for id in watched {
+        let Some(key) = PAIRS.with(|p| {
+            p.borrow()
+                .get(id as usize)?
+                .as_ref()
+                .filter(|pair| !pair.detached)
+                .map(|pair| pair.key.clone())
+        }) else {
+            continue;
+        };
+        // The accelerator only answers where every stored key could be
+        // bucketed; otherwise the scan it replaces runs, as in [`KeyIndex`].
+        let found = match index_key(&key).filter(|_| !unindexed) {
+            Some(b) => by_key
+                .get(&b)
+                .map(|i| &entries[*i])
+                .filter(|(k, _)| value_eq(k, &key)),
+            None => entries.iter().find(|(k, _)| value_eq(k, &key)),
+        };
+        match found {
+            Some((_, v)) => {
+                store_entry_value(id, v.clone());
+            }
+            None => detach_entry(id),
+        }
+    }
 }
 
 /// `hasNext` / `next` / `remove` on an [`HostObj::Iterator`] receiver.
@@ -4380,6 +4603,13 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             ))),
         }
     });
+    // The one place every map mutation passes through. An entry javars handed
+    // out is a copy of the map's pair, not the pair itself, so the map's new
+    // contents are carried across to its entries here — and this is also where
+    // an entry whose key has just been removed learns that it is detached,
+    // which is what keeps a re-inserted key from reviving the old entry. Free
+    // for a map that has handed out no entries, which is nearly all of them.
+    refresh_entries(id as u32);
     match result {
         Ok(NewColl::Value(v)) => v,
         // A derived view (`keySet`, `values`) is allocated after the borrow is
@@ -4388,7 +4618,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         Ok(NewColl::Entries { pairs, fixed, of }) => {
             let items: Vec<Value> = pairs
                 .into_iter()
-                .map(|(key, value)| alloc_entry(key, value, Some(id as u32)))
+                .map(|(key, value)| entry_for(id as u32, key, value))
                 .collect();
             Value::Obj(heap_alloc(HostObj::Set {
                 items,

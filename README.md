@@ -572,11 +572,11 @@ Next waves, in priority order:
    element; compile-time pipeline fusion is one way to build it, not a
    prerequisite. See [`BUGS.md`](BUGS.md) for which callback shapes can re-enter
    and which cannot.
-2. **`Map.entrySet`** and the remaining collection views (`List.listIterator`),
-   plus wider stdlib coverage (a `record`'s derived `hashCode`,
-   `Collectors.toCollection`). The pattern forms this line used to list —
-   `case Integer i ->`, `case null`, `when` guards — and `Iterator` all run;
-   measured against the reference on openjdk 21.0.12.1.
+2. **The remaining collection view** (`List.listIterator`), plus wider stdlib
+   coverage (a `record`'s derived `hashCode`, `Collectors.toCollection`). The
+   pattern forms this line used to list — `case Integer i ->`, `case null`,
+   `when` guards — and `Iterator` and `Map.entrySet` all run; measured against
+   the reference on openjdk 21.0.12.1.
 3. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 

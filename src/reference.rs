@@ -1363,7 +1363,7 @@ pub const REFERENCE: &[Entry] = &[
         "Map",
         "Collection Types",
         "Map<K,V> name = …;",
-        "Declaration-only. The map methods available on the variable are the ones the modeled implementations provide; `entrySet` is not among them.",
+        "Declaration-only. The map methods available on the variable are the ones the modeled implementations provide, `entrySet` among them — it answers a set of `Map.Entry` objects, one per key, that read through to the map.",
         "Map<String,Integer> m = new HashMap<>();",
     ),
     (

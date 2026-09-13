@@ -5536,3 +5536,82 @@ fn an_anonymous_object_that_overrides_tostring_is_refused_not_desugared() {
     assert!(ok, "{out}");
     assert_eq!(out, "ran\n");
 }
+
+/// A map keeps one node per key, so the view hands back the *same* entry object
+/// every time and `==` between two of them holds. Two maps holding an equal key
+/// still have entries of their own. Measured on `openjdk 21.0.12.1`.
+#[test]
+fn map_entry_is_one_node_per_key() {
+    let (out, ok) = run(&wrap(
+        "Map<String, Integer> m = new LinkedHashMap<>();\
+         m.put(\"a\", 1); m.put(\"b\", 2);\
+         Map.Entry<String, Integer> e1 = m.entrySet().iterator().next();\
+         Map.Entry<String, Integer> e2 = m.entrySet().iterator().next();\
+         System.out.println((e1 == e2) + \" \" + e1.equals(e2));\
+         Map<String, Integer> other = new LinkedHashMap<>();\
+         other.put(\"a\", 1);\
+         System.out.println(e1 == other.entrySet().iterator().next());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "true true\nfalse\n");
+}
+
+/// An entry *is* the map's node, so a write to the map behind it shows through
+/// — whether the write came from `put`, from `merge`, or from another entry's
+/// `setValue`. Measured on `openjdk 21.0.12.1`.
+#[test]
+fn map_entry_value_follows_the_map() {
+    let (out, ok) = run(&wrap(
+        "Map<String, Integer> m = new LinkedHashMap<>();\
+         m.put(\"k\", 1);\
+         Map.Entry<String, Integer> e = m.entrySet().iterator().next();\
+         m.put(\"k\", 99);\
+         System.out.println(e.getValue() + \" \" + e);\
+         m.merge(\"k\", 5, (x, y) -> x + y);\
+         System.out.println(e.getValue());\
+         for (Map.Entry<String, Integer> it : m.entrySet()) it.setValue(it.getValue() * 2);\
+         System.out.println(m + \" \" + e.getValue());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "99 k=99\n104\n{k=208} 208\n");
+}
+
+/// Removing the key *detaches* the entry: it keeps the value it last reported,
+/// a re-insertion of the same key builds a new node that the old entry is not,
+/// and `setValue` on the dead one moves its own field and leaves the map alone.
+/// Measured on `openjdk 21.0.12.1`.
+#[test]
+fn map_entry_detaches_when_its_key_is_removed() {
+    let (out, ok) = run(&wrap(
+        "Map<String, Integer> m = new LinkedHashMap<>();\
+         m.put(\"k\", 1);\
+         Map.Entry<String, Integer> e = m.entrySet().iterator().next();\
+         m.remove(\"k\");\
+         System.out.println(e.getValue() + \" \" + m);\
+         m.put(\"k\", 7);\
+         Map.Entry<String, Integer> fresh = m.entrySet().iterator().next();\
+         System.out.println((e == fresh) + \" \" + e.getValue() + \" \" + fresh.getValue());\
+         System.out.println(e.setValue(42) + \" \" + e.getValue() + \" \" + m);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "1 {}\nfalse 1 7\n1 42 {k=7}\n");
+}
+
+/// The entry bookkeeping has a bucket accelerator, and a fractional `double`
+/// key is exactly what it declines to bucket — so this drives the scan behind
+/// it. Read-through and detachment have to hold there too.
+/// Measured on `openjdk 21.0.12.1`.
+#[test]
+fn map_entry_holds_for_keys_the_bucket_index_declines() {
+    let (out, ok) = run(&wrap(
+        "Map<Double, String> m = new LinkedHashMap<>();\
+         m.put(0.5, \"a\"); m.put(1.5, \"b\");\
+         Map.Entry<Double, String> e = m.entrySet().iterator().next();\
+         m.put(0.5, \"z\");\
+         System.out.println(e.getValue() + \" \" + e.getKey());\
+         m.remove(0.5);\
+         System.out.println(e.getValue() + \" \" + m);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "z 0.5\nz {1.5=b}\n");
+}
