@@ -5615,3 +5615,26 @@ fn map_entry_holds_for_keys_the_bucket_index_declines() {
     assert!(ok, "{out}");
     assert_eq!(out, "z 0.5\nz {1.5=b}\n");
 }
+
+/// The removal has to be noticed while it is visible. Nothing reads the entry
+/// between the `remove` and the re-insert here, so a design that only repaired
+/// an entry when it was read would see a map holding the key both before and
+/// after and hand the old entry back — reviving a node Java replaced. `clear()`
+/// is the same case with every key at once. Measured on `openjdk 21.0.12.1`.
+#[test]
+fn map_entry_detaches_even_when_nothing_reads_it_in_between() {
+    let (out, ok) = run(&wrap(
+        "Map<String, Integer> m = new LinkedHashMap<>();\
+         m.put(\"k\", 1);\
+         Map.Entry<String, Integer> e = m.entrySet().iterator().next();\
+         m.remove(\"k\");\
+         m.put(\"k\", 7);\
+         Map.Entry<String, Integer> back = m.entrySet().iterator().next();\
+         System.out.println((e == back) + \" \" + e.getValue() + \" \" + back.getValue());\
+         m.clear();\
+         m.put(\"k\", 9);\
+         System.out.println(e.getValue() + \" \" + m.entrySet().iterator().next().getValue());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "false 1 7\n1 9\n");
+}
