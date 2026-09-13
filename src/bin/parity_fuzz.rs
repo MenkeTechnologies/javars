@@ -82,6 +82,12 @@
 //!         ./target/debug/parity-fuzz --seed 12345 --once
 //!         ./target/debug/parity-fuzz --mode concat --iters 50
 
+// Every probe generator is a table of `match` arms, each one program source.
+// Most arms interpolate the case's seeded operands; the handful that happen to
+// need none are still written `format!` so the table reads as one shape and an
+// arm can gain an operand without being respelled.
+#![allow(clippy::useless_format)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

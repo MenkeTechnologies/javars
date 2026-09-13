@@ -433,6 +433,12 @@ pub mod f32_op {
 static NO_ARG_SEQS: [Option<Vec<Value>>; 4] = [None, None, None, None];
 static NO_ARG_ENTRIES: [Option<Vec<(Value, Value)>>; 4] = [None, None, None, None];
 
+/// The two snapshot slices `coll_method` hands every collection callee: one
+/// entry per argument, `Some` only where that argument is a `Value::Obj` the
+/// reader could resolve. Named because the pair appears in signatures.
+type ArgSeqs<'a> = &'a [Option<Vec<Value>>];
+type ArgEntries<'a> = &'a [Option<Vec<(Value, Value)>>];
+
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
@@ -3274,7 +3280,7 @@ fn builder_method(
                     // Java pads the extra positions with the NUL character,
                     // which is observable: after `setLength(4)` on "ab",
                     // `charAt(3)` is 0.
-                    s.extend(std::iter::repeat('\0').take(n - len));
+                    s.extend(std::iter::repeat_n('\0', n - len));
                 }
                 *count = n;
                 *cap = sb_grow(*cap, n);
@@ -4029,7 +4035,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             }
             let mut kept = Vec::with_capacity(items.len());
             for it in items.iter() {
-                let verdict = invoke_closure(vm, &args[0], &[it.clone()]);
+                let verdict = invoke_closure(vm, &args[0], std::slice::from_ref(it));
                 if PENDING.with(|p| p.borrow().is_some()) {
                     return Value::Undef;
                 }
@@ -4131,7 +4137,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 return Value::Undef;
             }
             let key = args[0].clone();
-            let old = coll_method(vm, recv, "get", &[key.clone()]);
+            let old = coll_method(vm, recv, "get", std::slice::from_ref(&key));
             if PENDING.with(|p| p.borrow().is_some()) {
                 return Value::Undef;
             }
@@ -4152,7 +4158,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 return old;
             }
             let fresh = match method {
-                "computeIfAbsent" => invoke_closure(vm, &args[1], &[key.clone()]),
+                "computeIfAbsent" => invoke_closure(vm, &args[1], std::slice::from_ref(&key)),
                 "computeIfPresent" | "compute" => {
                     invoke_closure(vm, &args[1], &[key.clone(), old.clone()])
                 }
@@ -4282,7 +4288,7 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     // slice of `None` differ only in where they live.
     let none_seqs;
     let none_entries;
-    let (arg_seqs, arg_entries): (&[Option<Vec<Value>>], &[Option<Vec<(Value, Value)>>]) =
+    let (arg_seqs, arg_entries): (ArgSeqs, ArgEntries) =
         if args.len() > NO_ARG_SEQS.len() || args.iter().any(|a| matches!(a, Value::Obj(_))) {
             none_seqs = args.iter().map(sequence_items).collect::<Vec<_>>();
             none_entries = args.iter().map(map_entries).collect::<Vec<_>>();
@@ -4357,7 +4363,18 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 view,
                 index,
                 ..
-            } => set_method(items, *fixed, *view, index, method, args, arg_seqs, eq),
+            } => set_method(
+                items,
+                SetShape {
+                    fixed: *fixed,
+                    view: *view,
+                },
+                index,
+                method,
+                args,
+                arg_seqs,
+                eq,
+            ),
             _ => Err(Fault::internal(format!(
                 "javars: `{method}` is not a collection method"
             ))),
@@ -5749,16 +5766,27 @@ fn map_method(
 }
 
 /// `java.util.Set` methods.
+/// The two properties of a `Set` that are not its contents: whether it can be
+/// written to and whether it is a map's view rather than a set of its own.
+/// Passed as one value for the same reason as [`MapShape`].
+#[derive(Clone, Copy)]
+struct SetShape {
+    /// Whether the set accepts a mutator (`Set.of` does not).
+    fixed: Fixity,
+    /// Which map view this is, or `Own` for a freestanding set.
+    view: SetView,
+}
+
 fn set_method(
     items: &mut Vec<Value>,
-    fixed: Fixity,
-    view: SetView,
+    shape: SetShape,
     index: &mut KeyIndex,
     method: &str,
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
     eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
+    let SetShape { fixed, view } = shape;
     // See the note at the top of `map_method`: one repair point, here.
     if index.dirty {
         index.rebuild(items.iter());
@@ -8278,6 +8306,11 @@ fn scalb(d: f64, scale_factor: i32) -> f64 {
 /// Method (from the original): let x = 2^n * (1 + f); compute log2(x) as a
 /// two-piece sum whose head has 29 trailing zero bits, form y*log2(x) = n + y'
 /// with |y'| <= 0.5 in simulated multi-precision, and return 2^n * exp(y'*ln2).
+// `y - y` and `(x - x) / (x - x)` are fdlibm's own spellings of "a NaN that
+// carries this operand's payload", and `-1.0 * z` is how the original flips
+// the sign; the port keeps all three verbatim, so the lints that want them
+// rewritten are off for this function rather than for the file.
+#[allow(clippy::eq_op, clippy::neg_multiply, clippy::assign_op_pattern)]
 #[allow(clippy::excessive_precision)]
 fn fdlibm_pow(x: f64, y: f64) -> f64 {
     // The mask that clears the sign bit of a *high word*.

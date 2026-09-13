@@ -1397,7 +1397,7 @@ impl Parser {
         let mut ty = self.simple_type_name()?;
         // A name bound as a type parameter erases to `Object`, not to itself —
         // see [`Parser::type_params`].
-        if self.type_params.iter().any(|p| *p == ty) {
+        if self.type_params.contains(&ty) {
             ty = "Object".to_string();
         }
         // Naming a functional interface pulls in the prelude that declares it,

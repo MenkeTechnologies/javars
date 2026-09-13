@@ -7998,7 +7998,8 @@ fn array_build_chunks(n: usize) -> Vec<std::ops::Range<usize>> {
     const FIRST: usize = u8::MAX as usize;
     const REST: usize = FIRST - 1;
     let head = n.min(FIRST);
-    let mut spans = vec![0..head];
+    let mut spans = Vec::new();
+    spans.push(0..head);
     let mut at = head;
     while at < n {
         let end = (at + REST).min(n);

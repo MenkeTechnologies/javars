@@ -2,7 +2,10 @@
 name = "javars"
 version = "0.1.9"
 edition = "2021"
-rust-version = "1.80"
+# The fdlibm `Math.pow` port (src/host.rs) builds its coefficients with
+# `f64::from_bits` in `const` position, const-stable since 1.83, and the
+# lexer's unicode-escape scan uses `std::iter::repeat_n` (1.82).
+rust-version = "1.83"
 description = "Java as a fusevm frontend: lexer, parser, and compiler to fusevm::Chunk, run on the shared three-tier Cranelift JIT — no bespoke VM or JVM"
 license = "MIT"
 documentation = "https://docs.rs/javars"
