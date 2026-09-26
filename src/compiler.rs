@@ -3705,6 +3705,27 @@ impl Compiler {
                 }
             }
         }
+        // `String[]::new` — `n -> new String[n]`, the generator
+        // `toArray(IntFunction)` and `Stream.toArray` take.
+        if let Expr::Var(name) = recv {
+            if let Some(elem) = name.strip_suffix("[]") {
+                if method == "new" {
+                    let ps = mk(1);
+                    let (base, extra) = {
+                        let base = elem.trim_end_matches("[]");
+                        (base.to_string(), (elem.len() - base.len()) / 2)
+                    };
+                    return Ok(lambda(
+                        ps.clone(),
+                        Expr::NewArray {
+                            elem_ty: base,
+                            sizes: vars(&ps),
+                            extra_dims: extra,
+                        },
+                    ));
+                }
+            }
+        }
         // A bare type name on the left: `Point::new`, `Point::area`,
         // `Integer::parseInt`, `String::length`.
         if let Expr::Var(name) = recv {

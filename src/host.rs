@@ -6005,6 +6005,11 @@ fn stream_method(
         // ── terminal ──
         ("toList", 0) => Ok(list_value(all(vm), Fixity::Immutable)),
         ("toArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(all(vm))))),
+        // `toArray(generator)`: the elements, in the array the generator makes.
+        ("toArray", 1) => {
+            let items = all(vm);
+            collection_to_array(vm, items, Some(&args[0]))
+        }
         ("count", 0) => Ok(Value::Int(all(vm).len() as i64)),
         ("forEach" | "forEachOrdered", 1) => {
             let f = args[0].clone();

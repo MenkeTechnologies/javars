@@ -6004,3 +6004,18 @@ fn remove_int_is_by_element_off_a_list_static_type() {
         "true [5, 7]\ntrue [1, 3]\ntrue [4, 9]\n1 [4, 9]\n4 3[]\nNSE\n"
     );
 }
+
+/// `T[]::new` is the array constructor reference `n -> new T[n]` — the
+/// generator `Collection.toArray` and `Stream.toArray` take — at any depth
+/// (`String[][]::new` makes the outer dimension, rows `null`). Measured on
+/// `openjdk 27`.
+#[test]
+fn array_constructor_references() {
+    let (out, ok) = run("import java.util.*; import java.util.function.*; import java.util.stream.*; public class T { public static void main(String[] a) {\
+         String[] g = List.of(\"x\", \"y\").toArray(String[]::new); System.out.println(g.length + g[1]);\
+         System.out.println(Arrays.toString(Stream.of(\"a\", \"b\", \"c\").toArray(String[]::new)));\
+         IntFunction<int[]> mk = int[]::new; System.out.println(mk.apply(3).length + \" \" + mk.apply(2)[0]);\
+         Function<Integer, String[][]> m2 = String[][]::new; System.out.println(m2.apply(2).length + \" \" + m2.apply(2)[0]); } }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "2y\n[a, b, c]\n3 0\n2 null\n");
+}

@@ -2983,6 +2983,36 @@ impl Parser {
                     method,
                     line,
                 };
+            } else if self.is(&Tok::LBracket)
+                && matches!(e, Expr::Var(_))
+                && matches!(self.toks[self.pos + 1].kind, Tok::RBracket)
+            {
+                // `String[]::new` / `int[][]::new` — an array constructor
+                // reference. `T[]` is never an expression on its own, so an
+                // empty bracket pair after a name can only be this.
+                let line = self.line();
+                let Expr::Var(base) = &e else { unreachable!() };
+                let mut ty = base.clone();
+                while self.is(&Tok::LBracket)
+                    && matches!(self.toks[self.pos + 1].kind, Tok::RBracket)
+                {
+                    self.advance();
+                    self.advance();
+                    ty.push_str("[]");
+                }
+                self.eat(&Tok::ColonColon)?;
+                if !self.is(&Tok::New) {
+                    return Err(format!(
+                        "javars: expected `new` after `{ty}::` on line {line}"
+                    ));
+                }
+                self.advance();
+                self.uses_functional = true;
+                e = Expr::MethodRef {
+                    recv: Box::new(Expr::Var(ty)),
+                    method: "new".to_string(),
+                    line,
+                };
             } else if self.is(&Tok::LBracket) {
                 self.advance();
                 let index = self.expression()?;
