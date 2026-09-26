@@ -1010,12 +1010,10 @@ other than Java is named in "Modeled with a documented simplification" below,
 and each is a deliberate, bounded model rather than a bug found and left.
 
 Some of those simplifications do print a different answer for a program `javac`
-accepts, and it is worth naming which. The first two are missing *conversions*
-javars's untyped runtime never performs, not wrong arithmetic; the last two are
+accepts, and it is worth naming which. The first is a missing *conversion*
+javars's untyped runtime never performs, not wrong arithmetic; the next two are
 storage-model differences:
 
-- `s.get() / 2` on a `Supplier<Integer>` prints `3.5`, not `3` (the erased
-  interface returns `Object`, so javars cannot type the result as `int`).
 - `int` arithmetic whose operand types are not statically known keeps fusevm's
   64-bit result rather than wrapping at 32 bits.
 - A subclass that **re-declares a field its parent already declares** gets one
@@ -1756,10 +1754,17 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   argument still throws exactly where Java throws, but a `Long`/`Float`/
   `Character` one names the wrong class in the detail message.
 - **Floating `/` routes through a builtin.** Statically-integral division keeps
-  the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating or
-  statically-unknown operand routes through `JDIV`, because Java floating
-  division is IEEE-754 (`x / 0.0` is a signed infinity, `0.0 / 0.0` is NaN)
-  where the native op yields `Undef`.
+  the native op pair (`Div` + `TruncInt`) so the JIT can trace it; a floating
+  operand routes through `JDIV`, because Java floating division is IEEE-754
+  (`x / 0.0` is a signed infinity, `0.0 / 0.0` is NaN) where the native op
+  yields `Undef`. An operand whose static type is unknown — an untyped lambda
+  parameter, an erased `Supplier<Integer>.get()` — routes through `JDIV_DYN`,
+  which reads the runtime values: two integral values divide integrally and a
+  zero divisor is `ArithmeticException`, so `IntStream.range(0, 3).map(i -> i /
+  2)` is `0, 0, 1` as in Java. It relies on a `double` never being held as an
+  integral value, which is why a `DoubleStream` widens its elements on entry
+  and after every stage that produces them (`DoubleStream.of(4, 3)` holds `4.0`
+  and `3.0`).
 - **32-bit `int` wrapping needs a statically known `int` type.** An arithmetic
   operation whose operands are *statically* `int` (or the `byte`/`short` that
   promote to it) wraps at 32 bits exactly like Java — literals, `int` locals,
@@ -1892,8 +1897,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   the one programs actually write — is exact.
 - **A lambda's result type is its interface's erasure.** `Supplier<Integer> s`
   declares `Object get()` after erasure — exactly what `javac` compiles it to —
-  so javars cannot statically type `s.get()` as `int` and `s.get() / 2` does not
-  truncate. Java recovers the type from the generic signature and inserts a
+  so javars cannot statically type `s.get()` as `int`. Division recovers it at
+  run time (`s.get() / 2` is `3`, see the `/` entry above); 32-bit wrapping does
+  not. Java recovers the type from the generic signature and inserts a
   checked cast; javars does not model generic signatures (see the type-erasure
   entry above). A lambda's *parameters* are typed, because those come from the
   interface's own declaration rather than from a type argument.

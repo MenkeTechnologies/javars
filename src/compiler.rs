@@ -7523,6 +7523,12 @@ impl Compiler {
                 self.b.emit(Op::CallBuiltin(crate::host::JIDIV, 2), line);
             }
         } else {
+            // Neither side is statically floating, so at least one is unknown:
+            // only the runtime values can say whether this is `int` division.
+            if l != NumType::Float && r != NumType::Float {
+                self.emit_raising_builtin(crate::host::JDIV_DYN, 2, line);
+                return;
+            }
             self.b.emit(Op::CallBuiltin(crate::host::JDIV, 2), line);
         }
     }

@@ -315,6 +315,9 @@ Implemented and checked against the reference `java`:
 - **Division** — Java's binary numeric promotion: `int / int` truncates toward
   zero (`7 / 2` → `3`, `-7 / 2` → `-3`), and a `double` operand keeps the
   fractional result (`7.0 / 2` → `3.5`), decided from the operands' static types.
+  An operand whose static type is unknown — an untyped lambda parameter, an
+  erased `Supplier<Integer>.get()` — is decided from its runtime value instead,
+  so `IntStream.range(0, 3).map(i -> i / 2)` is `0, 0, 1`.
   `int`-width division stays on fusevm's native op pair, where computing in
   `f64` is provably exact; a `long` divides in `i64` through a builtin instead,
   so `Long.MAX_VALUE / 2` is `4611686018427387903` and `Long.MIN_VALUE / -1`

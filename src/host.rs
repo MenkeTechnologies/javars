@@ -126,6 +126,14 @@ pub const JDIV: u16 = 719;
 /// division routes here instead and divides in `i64`.
 pub const JIDIV: u16 = 745;
 
+/// Builtin id for Java `/` whose operand types are not statically known — an
+/// untyped lambda parameter (`IntStream.range(0, 3).map(i -> i / 2)`), an erased
+/// `Supplier<Integer>.get()`. The runtime value decides what the static type
+/// could not: two integral values divide integrally (and a zero divisor is
+/// `ArithmeticException`), anything floating divides as IEEE-754 the way
+/// [`JDIV`] does. Sending these through `JDIV` answered `0.5` for `1 / 2`.
+pub const JDIV_DYN: u16 = 751;
+
 /// `new StringBuilder(…)` / `new StringBuffer(…)` — stack `[kind, arg]`, where
 /// `kind` is the class's simple name and `arg` is the constructor's single
 /// argument (`Undef` for the no-arg form). Which constructor that is is read
@@ -677,6 +685,12 @@ enum Stage {
     Distinct,
     /// `sorted()` / `sorted(cmp)` — a barrier.
     Sorted(Option<Value>),
+    /// The element becomes a `double` — appended after every stage whose result
+    /// a `DoubleStream` holds (`mapToDouble`, `asDoubleStream`, `map` on a
+    /// `DoubleStream`). Java converts there, and a later untyped `x / 2` or a
+    /// `boxed()` rendering reads the value's own kind: `DoubleStream.of(4, 3)`
+    /// holding the integers 4 and 3 printed `[4, 3]` and divided integrally.
+    Widen,
 }
 
 /// Which of the four stream shapes a pipeline is, which decides what its
@@ -1611,6 +1625,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JCLASSOF, b_classof);
     vm.register_builtin(JDIV, b_div);
     vm.register_builtin(JIDIV, b_idiv);
+    vm.register_builtin(JDIV_DYN, b_div_dyn);
     vm.register_builtin(JUSHR, b_ushr);
     vm.register_builtin(JCAST, b_cast);
     vm.register_builtin(JCHR_STR, b_chr_str);
@@ -4864,6 +4879,16 @@ fn as_stream(v: &Value) -> Option<(Vec<Value>, Vec<Stage>, StreamKind)> {
 
 /// Allocate a stream over `source`.
 fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
+    // A `DoubleStream` holds doubles whatever its source spelled:
+    // `DoubleStream.of(4, 3)` is `4.0, 3.0`.
+    let source = if kind == StreamKind::Double {
+        source
+            .iter()
+            .map(|v| Value::float(deboxed(v).jfloat()))
+            .collect()
+    } else {
+        source
+    };
     Value::Obj(heap_alloc(HostObj::Stream {
         source,
         stages: Vec::new(),
@@ -4877,11 +4902,13 @@ fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
 /// to a *copy* rather than mutating in place is the safe reading: a program that
 /// (illegally) reuses one sees the pipeline it built, not one a later stage
 /// extended underneath it.
-fn stream_with(recv: &Value, kind: StreamKind, stage: Option<Stage>) -> Option<Value> {
+fn stream_with(
+    recv: &Value,
+    kind: StreamKind,
+    added: impl IntoIterator<Item = Stage>,
+) -> Option<Value> {
     let (source, mut stages, _) = as_stream(recv)?;
-    if let Some(stage) = stage {
-        stages.push(stage);
-    }
+    stages.extend(added);
     Some(Value::Obj(heap_alloc(HostObj::Stream {
         source,
         stages,
@@ -4922,6 +4949,13 @@ fn stream_push(
             let mapped = invoke_closure(vm, f, &[v]);
             stream_push(vm, mapped, rest, rest_counts, sink)
         }
+        Stage::Widen => stream_push(
+            vm,
+            Value::float(deboxed(&v).jfloat()),
+            rest,
+            rest_counts,
+            sink,
+        ),
         Stage::FlatMap(f) => {
             let inner = invoke_closure(vm, f, &[v]);
             // The mapper answers a stream (or, tolerantly, a collection): its
@@ -5075,6 +5109,14 @@ fn stream_method(
     Some(match (method, args.len()) {
         // ── intermediate ──
         ("filter", 1) => stage(Stage::Filter(args[0].clone())),
+        // A `DoubleStream`'s `map` is a `DoubleUnaryOperator`, whose result is a
+        // `double` even when the body is integral.
+        ("map", 1) if kind == StreamKind::Double => {
+            Ok(
+                stream_with(recv, kind, [Stage::Map(args[0].clone()), Stage::Widen])
+                    .expect("receiver is a stream"),
+            )
+        }
         ("map", 1) => stage(Stage::Map(args[0].clone())),
         ("flatMap", 1) => stage(Stage::FlatMap(args[0].clone())),
         ("peek", 1) => stage(Stage::Peek(args[0].clone())),
@@ -5098,12 +5140,12 @@ fn stream_method(
                     .expect("receiver is a stream"),
             )
         }
-        ("mapToDouble", 1) => {
-            Ok(
-                stream_with(recv, StreamKind::Double, Some(Stage::Map(args[0].clone())))
-                    .expect("receiver is a stream"),
-            )
-        }
+        ("mapToDouble", 1) => Ok(stream_with(
+            recv,
+            StreamKind::Double,
+            [Stage::Map(args[0].clone()), Stage::Widen],
+        )
+        .expect("receiver is a stream")),
         ("mapToObj", 1) => {
             Ok(
                 stream_with(recv, StreamKind::Ref, Some(Stage::Map(args[0].clone())))
@@ -5112,7 +5154,9 @@ fn stream_method(
         }
         ("boxed", 0) => retyped(StreamKind::Ref),
         ("asLongStream", 0) => retyped(StreamKind::Long),
-        ("asDoubleStream", 0) => retyped(StreamKind::Double),
+        ("asDoubleStream", 0) => Ok(
+            stream_with(recv, StreamKind::Double, [Stage::Widen]).expect("receiver is a stream")
+        ),
         // ── terminal ──
         ("toList", 0) => Ok(list_value(all(vm), Fixity::Immutable)),
         ("toArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(all(vm))))),
@@ -11652,6 +11696,22 @@ fn b_div(vm: &mut VM, _argc: u8) -> Value {
     let b = vm.stack.pop().unwrap_or(Value::Undef);
     let a = vm.stack.pop().unwrap_or(Value::Undef);
     Value::float(as_f64(&a) / as_f64(&b))
+}
+
+/// Java `/` on operands whose types only the runtime knows. See [`JDIV_DYN`].
+/// A box is read through to its value first: an erased `Integer` is a handle.
+/// The integral quotient is `i64`-wide, which is the documented width of every
+/// statically-untyped integral operation (see BUGS.md).
+fn b_div_dyn(vm: &mut VM, _argc: u8) -> Value {
+    let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    match (&a, &b) {
+        (Value::Int(_), Value::Int(0)) => {
+            raise(vm, Fault::java("ArithmeticException", "/ by zero"))
+        }
+        (Value::Int(x), Value::Int(y)) => Value::Int(x.wrapping_div(*y)),
+        _ => Value::float(as_f64(&a) / as_f64(&b)),
+    }
 }
 
 /// Java's 64-bit integral `/`, divided in `i64` rather than in `f64`. See
