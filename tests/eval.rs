@@ -5944,3 +5944,43 @@ public class T { public static void main(String[] a) {
         "java.lang.StringIndexOutOfBoundsException: Range [1, 1 + 9) out of bounds for length 5\njava.lang.StringIndexOutOfBoundsException: Range [-1, -1 + 2) out of bounds for length 5\njava.lang.StringIndexOutOfBoundsException: Range [3, 3 + -1) out of bounds for length 5\njava.lang.IllegalArgumentException: Not a valid Unicode code point: 0xFFFFFFFB\njava.lang.IllegalArgumentException: Not a valid Unicode code point: 0x110000\n55357 56832 2\ntruehello\ntrue false true true false true true\n"
     );
 }
+
+/// Local `record`, `enum`, `interface`, and `class` declarations in a method
+/// body. The type keeps `javac`'s binary name (`T$1P`), a local record can
+/// implement `Comparable` and sort, a local enum's constants can carry bodies,
+/// and a local class that reads an enclosing local is refused rather than
+/// run without its capture. Measured on `openjdk 27`.
+#[test]
+fn local_type_declarations() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+  static String f() { record P(int a) {} return new P(1).toString() + new P(1).getClass().getName(); }
+  static String g() { record Q(String s, int n) {} return new Q("z", 2).toString() + new Q("z", 2).getClass().getName(); }
+  public static void main(String[] args) {
+    System.out.println(f()); System.out.println(g());
+    int base = 10;
+    record Pair(String k, int v) implements Comparable<Pair> { public int compareTo(Pair o) { return Integer.compare(v, o.v); } }
+    List<Pair> l = new ArrayList<>(List.of(new Pair("b", 2), new Pair("a", 1)));
+    Collections.sort(l); System.out.println(l);
+    enum Op { ADD { int ap(int a, int b) { return a + b; } }, MUL { int ap(int a, int b) { return a * b; } }; abstract int ap(int a, int b); }
+    for (Op o : Op.values()) System.out.print(o + "=" + o.ap(3, 4) + " ");
+    System.out.println();
+  }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "P[a=1]T$1P\nQ[s=z, n=2]T$1Q\n[Pair[k=a, v=1], Pair[k=b, v=2]]\nADD=7 MUL=12 \n"
+    );
+    let (out, ok) = run(&wrap(
+        "interface F { int f(); } F f = () -> 4; class L { int v = 3; } System.out.println(f.f() + new L().v);",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "7\n");
+    let (_, ok) = run(&wrap(
+        "int base = 10; class A { int f() { return base + 1; } } System.out.println(new A().f());",
+    ));
+    assert!(!ok);
+}

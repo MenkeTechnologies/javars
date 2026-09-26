@@ -21,6 +21,11 @@ pub fn parse(src: &str) -> Result<Program, String> {
         uses_functional: false,
         switch_expr_depth: 0,
         type_params: Vec::new(),
+        enclosing: Vec::new(),
+        local_binary: None,
+        local_counts: std::collections::HashMap::new(),
+        local_methods: Vec::new(),
+        local_classes: Vec::new(),
     };
     p.program()
 }
@@ -74,6 +79,20 @@ struct Parser {
     /// for an unbounded parameter and which leaves the call to dispatch on the
     /// receiver at run time.
     type_params: Vec<String>,
+    /// The binary names of the type declarations enclosing the cursor,
+    /// innermost last — what a local type declared in a method body is named
+    /// after.
+    enclosing: Vec<String>,
+    /// The binary name the next [`Parser::parse_class`] takes instead of
+    /// deriving one, set for a local type (`T$1Point`).
+    local_binary: Option<String>,
+    /// How many local types of each simple name the outermost class holds so
+    /// far, which is the number `javac` puts in the binary name.
+    local_counts: std::collections::HashMap<(String, String), usize>,
+    /// Local types, and the `static` methods they declare, hoisted out of the
+    /// method bodies that declared them and added to the program at the end.
+    local_methods: Vec<Method>,
+    local_classes: Vec<Class>,
 }
 
 impl Parser {
@@ -134,6 +153,8 @@ impl Parser {
         while !self.is(&Tok::Eof) {
             self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
         }
+        methods.append(&mut self.local_methods);
+        classes.append(&mut self.local_classes);
         match entry {
             Some(entry) => Ok(Program {
                 class_name: entry.class_name,
@@ -186,10 +207,12 @@ impl Parser {
         let name = self.ident()?;
         // Java's binary name nests with `$`; the enclosing declaration passes
         // down its own binary name, so a doubly-nested type is `A$B$C`.
-        let binary = match enclosing {
-            Some(outer) => format!("{outer}${name}"),
-            None => name.clone(),
+        let binary = match (self.local_binary.take(), enclosing) {
+            (Some(local), _) => local,
+            (None, Some(outer)) => format!("{outer}${name}"),
+            (None, None) => name.clone(),
         };
+        self.enclosing.push(binary.clone());
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
         // `<K, V>` — erased, but the names stay in scope for the body so a
         // parameter that shadows a class name is not read as that class.
@@ -315,6 +338,7 @@ impl Parser {
                 self.skip_member()?;
             }
         }
+        self.enclosing.pop();
         self.eat(&Tok::RBrace)?;
         if is_enum {
             enum_members(line, &name, &mut fields, &mut inst_methods);
@@ -1086,6 +1110,32 @@ impl Parser {
             || record_at(&self.toks, j)
     }
 
+    /// Parse a local type declaration and hoist it (see `statement_kind`).
+    fn local_type_decl(&mut self) -> Result<(), String> {
+        let mut j = self.pos;
+        loop {
+            let n = class_modifier_len(&self.toks, j);
+            if n == 0 {
+                break;
+            }
+            j += n;
+        }
+        let name = match &self.toks[j + 1].kind {
+            Tok::Ident(n) => n.clone(),
+            other => return Err(format!("javars: expected a type name but found {other}")),
+        };
+        let outer = self.enclosing.last().cloned().unwrap_or_default();
+        let top = outer.split('$').next().unwrap_or_default().to_string();
+        let n = self.local_counts.entry((top, name.clone())).or_insert(0);
+        *n += 1;
+        self.local_binary = Some(format!("{outer}${n}{name}"));
+        let (mut entry, mut methods, mut classes) = (None, Vec::new(), Vec::new());
+        self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
+        self.local_methods.append(&mut methods);
+        self.local_classes.append(&mut classes);
+        Ok(())
+    }
+
     /// True when the cursor is on a `record Name(` header. `record` is a
     /// contextual keyword in Java, so the shape — not the word alone — is what
     /// makes it one; a variable or method named `record` still parses.
@@ -1516,6 +1566,16 @@ impl Parser {
     }
 
     fn statement_kind(&mut self) -> Result<StmtKind, String> {
+        // A local `class`, `record`, `enum`, or `interface` (JLS 14.3). Records,
+        // enums, and interfaces declared in a body are implicitly `static`, so
+        // hoisting one to the program's type list changes nothing it can see;
+        // a local class that reads an enclosing local is refused where that
+        // name fails to resolve rather than capturing it. The type keeps
+        // `javac`'s binary name, `Outer$1Name`.
+        if self.at_nested_class() {
+            self.local_type_decl()?;
+            return Ok(StmtKind::Locals(Vec::new()));
+        }
         // A labeled statement `label: <stmt>` — an identifier immediately
         // followed by `:`. (A ternary is never a valid statement expression, so
         // a leading `Ident :` is unambiguously a label.)
