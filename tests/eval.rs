@@ -5799,10 +5799,7 @@ public class T { public static void main(String[] a) {
 }}
 "#);
     assert!(ok, "{out}");
-    assert_eq!(
-        out,
-        "[x, y]2\ntrue[x, y, null, d]\n[1, 2, 3]\n9\n[k]\n"
-    );
+    assert_eq!(out, "[x, y]2\ntrue[x, y, null, d]\n[1, 2, 3]\n9\n[k]\n");
 }
 
 /// `Stream.iterate(seed, f)` and `Stream.generate(s)` are unbounded and lazy:
@@ -5822,7 +5819,10 @@ fn unbounded_stream_sources_are_pulled_lazily() {
          System.out.println(java.util.stream.Stream.of(1, 2).flatMap(x -> java.util.stream.Stream.iterate(x, y -> y * 10).limit(3)).toList());",
     ));
     assert!(ok, "{out}");
-    assert_eq!(out, "[1, 2, 4, 8, 16]\np1p2p33 2\n3 4\n40\ntrue\n[1, 10, 100, 2, 20, 200]\n");
+    assert_eq!(
+        out,
+        "[1, 2, 4, 8, 16]\np1p2p33 2\n3 4\n40\ntrue\n[1, 10, 100, 2, 20, 200]\n"
+    );
 }
 
 /// A `double` stream sums with `Collectors.sumWithCompensation` (Kahan), an

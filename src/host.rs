@@ -704,7 +704,10 @@ enum HostObj {
 #[derive(Clone)]
 enum Source {
     Items(Vec<Value>),
-    Iterate { seed: Value, f: Value },
+    Iterate {
+        seed: Value,
+        f: Value,
+    },
     Generate(Value),
     /// `Stream.concat(a, b)`: the two stream handles, driven in order.
     Concat(Box<(Value, Value)>),
@@ -2606,7 +2609,10 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
             if stale() {
                 return Some(Err(comodification()));
             }
-            match pos.checked_sub(1).and_then(|at| items.get(at).map(|v| (at, v))) {
+            match pos
+                .checked_sub(1)
+                .and_then(|at| items.get(at).map(|v| (at, v)))
+            {
                 Some((at, v)) => {
                     set_cursor(id, at, Some(at), exp_mods);
                     Ok(v.clone())
@@ -2716,7 +2722,11 @@ fn set_cursor(id: u32, to: usize, ret: Option<usize>, mods: u64) {
 /// just past the last element set to `null` when there is room; a shorter one
 /// only names the type, and a fresh array is returned. The generator form is
 /// `toArray(generator.apply(0))`, as `Collection`'s default declares it.
-fn collection_to_array(vm: &mut VM, items: Vec<Value>, arg: Option<&Value>) -> Result<Value, Fault> {
+fn collection_to_array(
+    vm: &mut VM,
+    items: Vec<Value>,
+    arg: Option<&Value>,
+) -> Result<Value, Fault> {
     let fresh = |items: Vec<Value>| Ok(Value::Obj(heap_alloc(HostObj::Array(items))));
     let target = match arg {
         None => return fresh(items),
@@ -2804,7 +2814,14 @@ fn pq_sift_up(vm: &mut VM, heap: &mut [Value], mut k: usize, x: Value, cmp: &Val
 /// sink it below the smaller child (the right one only when it compares
 /// strictly smaller) while that child compares strictly below `x`. Returns
 /// the slot `x` came to rest in.
-fn pq_sift_down(vm: &mut VM, heap: &mut [Value], mut k: usize, x: Value, n: usize, cmp: &Value) -> usize {
+fn pq_sift_down(
+    vm: &mut VM,
+    heap: &mut [Value],
+    mut k: usize,
+    x: Value,
+    n: usize,
+    cmp: &Value,
+) -> usize {
     let half = n >> 1;
     while k < half {
         let mut child = 2 * k + 1;
@@ -2869,8 +2886,16 @@ fn pq_remove_at(vm: &mut VM, heap: &mut Vec<Value>, i: usize, cmp: &Value) -> Op
 /// and a collection seeds the queue. A `PriorityQueue` seed hands over its heap
 /// array and its comparator unchanged, a sorted set its ascending order (a
 /// valid heap already); any other collection is copied and heapified.
-fn new_priority_queue(vm: &mut VM, a0: &Value, a1: &Value, natural_cmp: &Value) -> Result<Value, Fault> {
-    let explicit = [a1, a0].into_iter().find(|v| closure_meta(v).is_some()).cloned();
+fn new_priority_queue(
+    vm: &mut VM,
+    a0: &Value,
+    a1: &Value,
+    natural_cmp: &Value,
+) -> Result<Value, Fault> {
+    let explicit = [a1, a0]
+        .into_iter()
+        .find(|v| closure_meta(v).is_some())
+        .cloned();
     let seed = match a0 {
         Value::Obj(sid) if closure_meta(a0).is_none() => Some(*sid),
         _ => None,
@@ -2922,7 +2947,8 @@ fn new_priority_queue(vm: &mut VM, a0: &Value, a1: &Value, natural_cmp: &Value) 
 /// `PriorityQueue`'s own iterator and `toString` present.
 fn pq_method(vm: &mut VM, id: u32, method: &str, args: &[Value]) -> Option<Value> {
     let (mut heap, cmp, natural, mods) = pq_state(id)?;
-    let fail = |vm: &mut VM, class: &'static str| Some(raise(vm, Fault::java(class, String::new())));
+    let fail =
+        |vm: &mut VM, class: &'static str| Some(raise(vm, Fault::java(class, String::new())));
     let result = match (method, args.len()) {
         ("add" | "offer", 1) => {
             if matches!(args[0], Value::Undef) {
@@ -3031,7 +3057,12 @@ fn pq_method(vm: &mut VM, id: u32, method: &str, args: &[Value]) -> Option<Value
 /// `PriorityQueue.Itr` line for line — including the `forgetMeNot` elements a
 /// `remove()` lifted into already-visited slots, which `next()` returns once
 /// the array walk is done.
-fn pq_iter_method(vm: &mut VM, recv: &Value, method: &str, argc: usize) -> Option<Result<Value, Fault>> {
+fn pq_iter_method(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    argc: usize,
+) -> Option<Result<Value, Fault>> {
     let Value::Obj(it) = recv else {
         return None;
     };
@@ -3045,7 +3076,14 @@ fn pq_iter_method(vm: &mut VM, recv: &Value, method: &str, argc: usize) -> Optio
                 forget,
                 last_elt,
                 exp_mods,
-            }) => Some((*source, *cursor, *last, forget.clone(), last_elt.clone(), *exp_mods)),
+            }) => Some((
+                *source,
+                *cursor,
+                *last,
+                forget.clone(),
+                last_elt.clone(),
+                *exp_mods,
+            )),
             _ => None,
         })?;
     let (mut heap, cmp, _, mods) = pq_state(source)?;
@@ -5339,7 +5377,10 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             if start < 0 || start as usize > size {
                 return raise(
                     vm,
-                    Fault::java("IndexOutOfBoundsException", format!("Index: {start}, Size: {size}")),
+                    Fault::java(
+                        "IndexOutOfBoundsException",
+                        format!("Index: {start}, Size: {size}"),
+                    ),
                 );
             }
             return Value::Obj(heap_alloc(HostObj::Iterator {
@@ -6218,7 +6259,8 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
                         coll_method(vm, &map, "merge", &[key, val, merge.clone()]);
                     }
                     None => {
-                        let prior = coll_method(vm, &map, "putIfAbsent", &[key.clone(), val.clone()]);
+                        let prior =
+                            coll_method(vm, &map, "putIfAbsent", &[key.clone(), val.clone()]);
                         if !matches!(prior, Value::Undef) {
                             return Err(Fault::java(
                                 "IllegalStateException",
@@ -8338,7 +8380,10 @@ fn collection_static(
             ))
         }
         ("Stream", "ofNullable") if args.len() == 1 => Ok(stream_of(
-            args.iter().filter(|v| !matches!(v, Value::Undef)).cloned().collect(),
+            args.iter()
+                .filter(|v| !matches!(v, Value::Undef))
+                .cloned()
+                .collect(),
             StreamKind::Ref,
         )),
         // `concat(a, b)` takes its shape from `a` — `IntStream.concat` answers
