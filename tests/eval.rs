@@ -5804,3 +5804,23 @@ public class T { public static void main(String[] a) {
         "[x, y]2\ntrue[x, y, null, d]\n[1, 2, 3]\n9\n[k]\n"
     );
 }
+
+/// `Stream.iterate(seed, f)` and `Stream.generate(s)` are unbounded and lazy:
+/// `f`/`s` run only when the pipeline pulls another element, so a `limit`, a
+/// `findFirst`, or an `anyMatch` ends them, and a side-effecting generator is
+/// called exactly as often as on the JDK. Measured on `openjdk 17`.
+#[test]
+fn unbounded_stream_sources_are_pulled_lazily() {
+    let (out, ok) = run(&wrap(
+        "System.out.println(java.util.stream.Stream.iterate(1, x -> x * 2).limit(5).collect(java.util.stream.Collectors.toList()));\
+         int[] calls = {0};\
+         System.out.println(java.util.stream.Stream.iterate(1, x -> { calls[0]++; return x + 1; }).peek(x -> System.out.print(\"p\" + x)).limit(3).count() + \" \" + calls[0]);\
+         int[] c = {0};\
+         System.out.println(java.util.stream.Stream.generate(() -> c[0]++).filter(x -> x % 3 == 0).skip(1).findFirst().get() + \" \" + c[0]);\
+         System.out.println(java.util.stream.IntStream.iterate(1, x -> x * 3).limit(4).sum());\
+         System.out.println(java.util.stream.Stream.iterate(\"a\", s -> s + \"b\").map(String::length).anyMatch(n -> n == 4));\
+         System.out.println(java.util.stream.Stream.of(1, 2).flatMap(x -> java.util.stream.Stream.iterate(x, y -> y * 10).limit(3)).toList());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[1, 2, 4, 8, 16]\np1p2p33 2\n3 4\n40\ntrue\n[1, 10, 100, 2, 20, 200]\n");
+}

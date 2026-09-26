@@ -672,7 +672,7 @@ enum HostObj {
     /// specifies and what a program can *see*: `l.stream().peek(p).limit(2)`
     /// calls `p` twice, not once per source element.
     Stream {
-        source: Vec<Value>,
+        source: Source,
         stages: Vec<Stage>,
         kind: StreamKind,
     },
@@ -691,6 +691,71 @@ enum HostObj {
     /// owns a handle no other object can be given, which is what makes `==` on
     /// two of them mean anything.
     Boxed,
+}
+
+/// Where a stream's elements come from.
+///
+/// A finite source is a `Vec`. `Stream.iterate(seed, f)` and
+/// `Stream.generate(s)` are unbounded, so they are held as the recipe and
+/// pulled one element at a time by the terminal that drives the pipeline — a
+/// `limit` or a short-circuiting terminal stops the pulling, exactly as it
+/// stops Java's spliterator, and `f`/`s` run only as often as an element is
+/// actually demanded.
+#[derive(Clone)]
+enum Source {
+    Items(Vec<Value>),
+    Iterate { seed: Value, f: Value },
+    Generate(Value),
+}
+
+impl Source {
+    fn cursor(self) -> SourceCursor {
+        match self {
+            Source::Items(v) => SourceCursor::Items(v.into_iter()),
+            Source::Iterate { seed, f } => SourceCursor::Iterate {
+                prev: None,
+                seed: Some(seed),
+                f,
+            },
+            Source::Generate(s) => SourceCursor::Generate(s),
+        }
+    }
+}
+
+/// A [`Source`] being consumed.
+enum SourceCursor {
+    Items(std::vec::IntoIter<Value>),
+    /// `Stream.iterate`'s spliterator: the seed first, then `f` applied to the
+    /// previous element — computed at the pull that needs it, never ahead.
+    Iterate {
+        prev: Option<Value>,
+        seed: Option<Value>,
+        f: Value,
+    },
+    Generate(Value),
+}
+
+impl SourceCursor {
+    /// The next element, or `None` when a finite source is exhausted or a user
+    /// closure raised.
+    fn pull(&mut self, vm: &mut VM) -> Option<Value> {
+        let v = match self {
+            SourceCursor::Items(it) => return it.next(),
+            SourceCursor::Iterate { prev, seed, f } => {
+                let v = match seed.take() {
+                    Some(s) => s,
+                    None => invoke_closure(vm, f, std::slice::from_ref(prev.as_ref()?)),
+                };
+                *prev = Some(v.clone());
+                v
+            }
+            SourceCursor::Generate(s) => invoke_closure(vm, s, &[]),
+        };
+        if pending() {
+            return None;
+        }
+        Some(v)
+    }
 }
 
 /// One stage of a stream pipeline, in the order the program wrote them.
@@ -5551,7 +5616,7 @@ fn as_optional_full(v: &Value) -> Option<(&'static str, Option<Value>)> {
 }
 
 /// The source and pipeline of a `Stream` handle, or `None` for anything else.
-fn as_stream(v: &Value) -> Option<(Vec<Value>, Vec<Stage>, StreamKind)> {
+fn as_stream(v: &Value) -> Option<(Source, Vec<Stage>, StreamKind)> {
     let Value::Obj(id) = v else {
         return None;
     };
@@ -5578,7 +5643,7 @@ fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
         source
     };
     Value::Obj(heap_alloc(HostObj::Stream {
-        source,
+        source: Source::Items(source),
         stages: Vec::new(),
         kind,
     }))
@@ -5652,7 +5717,8 @@ fn stream_push(
                 Some((src, st, _)) => {
                     let mut out = Vec::new();
                     let mut cs = vec![0i64; st.len()];
-                    for e in src {
+                    let mut src = src.cursor();
+                    while let Some(e) = src.pull(vm) {
                         if !stream_push(vm, e, &st, &mut cs, &mut |_vm, x| {
                             out.push(x);
                             true
@@ -5709,7 +5775,7 @@ fn stream_push(
 /// `limit` does not.
 fn stream_drive(
     vm: &mut VM,
-    source: Vec<Value>,
+    source: Source,
     stages: &[Stage],
     sink: &mut dyn FnMut(&mut VM, Value) -> bool,
 ) {
@@ -5735,10 +5801,11 @@ fn stream_drive(
             Stage::Sorted(cmp) => sort_values(vm, buf, cmp.as_ref()),
             _ => unreachable!("the position above found a barrier"),
         };
-        return stream_drive(vm, buf, &stages[i + 1..], sink);
+        return stream_drive(vm, Source::Items(buf), &stages[i + 1..], sink);
     }
     let mut counters = vec![0i64; stages.len()];
-    for v in source {
+    let mut source = source.cursor();
+    while let Some(v) = source.pull(vm) {
         if !stream_push(vm, v, stages, &mut counters, sink) {
             break;
         }
@@ -5769,7 +5836,7 @@ fn sort_values(vm: &mut VM, items: Vec<Value>, cmp: Option<&Value>) -> Vec<Value
 }
 
 /// Every element a pipeline yields.
-fn stream_collect(vm: &mut VM, source: Vec<Value>, stages: &[Stage]) -> Vec<Value> {
+fn stream_collect(vm: &mut VM, source: Source, stages: &[Stage]) -> Vec<Value> {
     let mut out = Vec::new();
     stream_drive(vm, source, stages, &mut |_vm, v| {
         out.push(v);
@@ -7923,13 +7990,9 @@ fn collection_static(
         )),
         // ── java.util.stream sources ──
         ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
-        // `Stream.iterate(seed, f)` and `Stream.generate(s)` are *infinite*, and
-        // a stream source here is a `Vec`. Both are therefore refused unless the
-        // pipeline that follows bounds them — which is what the three-argument
-        // `iterate(seed, hasNext, f)` does itself, and what a `limit` does for
-        // the other two. Producing some arbitrary prefix and hoping the program
-        // limits it below would answer a truncated stream as though it were the
-        // whole one.
+        // The three-argument `iterate(seed, hasNext, f)` bounds itself, so it is
+        // collected up front; the unbounded two-argument form and `generate`
+        // are a lazy [`Source`] below.
         ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "iterate") if args.len() == 3 => {
             let mut items = Vec::new();
             let mut cur = args[0].clone();
@@ -7948,6 +8011,35 @@ fn collection_static(
                     primitive_stream_kind(class)
                 },
             ))
+        }
+        ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "iterate" | "generate")
+            if args.len() == if method == "iterate" { 2 } else { 1 } =>
+        {
+            let source = if method == "iterate" {
+                Source::Iterate {
+                    seed: args[0].clone(),
+                    f: args[1].clone(),
+                }
+            } else {
+                Source::Generate(args[0].clone())
+            };
+            let kind = if class == "Stream" {
+                StreamKind::Ref
+            } else {
+                primitive_stream_kind(class)
+            };
+            // A `DoubleStream` holds doubles whatever its seed or supplier
+            // spelled, the same widening `stream_of` gives a finite source.
+            let stages = if kind == StreamKind::Double {
+                vec![Stage::Widen]
+            } else {
+                Vec::new()
+            };
+            Ok(Value::Obj(heap_alloc(HostObj::Stream {
+                source,
+                stages,
+                kind,
+            })))
         }
         ("IntStream" | "LongStream" | "DoubleStream", "of") => {
             Ok(stream_of(varargs_items(args), primitive_stream_kind(class)))
