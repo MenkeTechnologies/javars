@@ -523,6 +523,13 @@ struct Compiler {
     /// parameters from the interface's single abstract method, which is how
     /// `Calc c = x -> 100 / x;` gets Java's integral division inside the body.
     lambda_target: Option<String>,
+    /// The return type a lambda literal takes when its context names no
+    /// functional interface but the JDK method it is passed to fixes the
+    /// single abstract method's result as a *reference* (`Stream.map`,
+    /// `IntStream.mapToObj`, …). Only the return is known there, so the
+    /// parameters stay untyped; what the hint buys is the boxing conversion on
+    /// the result, which is what turns a `char` body into a `Character`.
+    lambda_ret_hint: Option<String>,
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
@@ -662,6 +669,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         pending_lambdas: Vec::new(),
         lambda_counter: 0,
         lambda_target: None,
+        lambda_ret_hint: None,
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
@@ -3401,9 +3409,10 @@ impl Compiler {
         // `F f = a -> a; f.of(4)` is 4.0 exactly as Java's assignment
         // conversion on the `return` makes it.
         let target = self.lambda_target.take();
+        let hint = self.lambda_ret_hint.take();
         let sam = target.as_deref().and_then(|t| self.functional_sam_meta(t));
         let param_tys: Vec<String> = sam.map(|s| s.param_tys.clone()).unwrap_or_default();
-        let ret_ty: Option<String> = sam.map(|s| s.ret.clone());
+        let ret_ty: Option<String> = sam.map(|s| s.ret.clone()).or(hint);
         // Capture every name declared in the enclosing scope that the lambda's
         // own parameters do not shadow. Compiler temps are deliberately not in
         // `declared`, so none are captured.
@@ -6329,10 +6338,11 @@ impl Compiler {
         // with. Only `equals` gets this — every other erased call reads its
         // argument as a number, where a box would be an allocation for nothing.
         let box_arg = method == "equals" && args.len() == 1;
+        let ref_result = self.lambda_returns_reference(recv, method);
         if targets.is_empty() {
             self.expr(recv)?;
             for a in args {
-                self.emit_erased_arg(a, raw_args, box_arg)?;
+                self.emit_erased_arg_hinted(a, raw_args, box_arg, ref_result)?;
             }
             fallback(self);
             return Ok(());
@@ -6345,7 +6355,7 @@ impl Compiler {
             .iter()
             .map(|a| {
                 let t = self.temp();
-                self.emit_erased_arg(a, raw_args, box_arg)?;
+                self.emit_erased_arg_hinted(a, raw_args, box_arg, ref_result)?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -6385,6 +6395,81 @@ impl Compiler {
             self.b.patch_jump(j, end);
         }
         Ok(())
+    }
+
+    /// Lower an erased call's argument, handing a lambda literal the reference
+    /// result type the JDK method fixes for it when `ref_result` says so.
+    fn emit_erased_arg_hinted(
+        &mut self,
+        a: &Expr,
+        raw: bool,
+        boxed: bool,
+        ref_result: bool,
+    ) -> Result<(), String> {
+        if ref_result && matches!(a, Expr::Lambda { .. }) {
+            self.lambda_ret_hint = Some("Object".to_string());
+        }
+        let r = self.emit_erased_arg(a, raw, boxed);
+        self.lambda_ret_hint = None;
+        r
+    }
+
+    /// Whether a lambda passed to `recv.method(…)` returns a *reference* in the
+    /// JDK's signature for that method. `mapToObj` exists only on the primitive
+    /// streams and always does; `map` does on a `Stream` (`Function`) and does
+    /// not on an `IntStream` (`IntUnaryOperator`), where the same `(char) c`
+    /// body widens to the `int` 97 rather than boxing to `'a'` — so `map` is
+    /// hinted only when the receiver is recognisably a `Stream`.
+    fn lambda_returns_reference(&self, recv: &Expr, method: &str) -> bool {
+        match method {
+            "mapToObj" => true,
+            "map" => self.stream_is_ref(recv) == Some(true),
+            _ => false,
+        }
+    }
+
+    /// `Some(true)` for an expression that is a `Stream`, `Some(false)` for an
+    /// `IntStream`/`LongStream`/`DoubleStream`, and `None` when it is neither
+    /// recognisably — read off the pipeline's shape, since the static types of
+    /// stream expressions are not otherwise tracked.
+    fn stream_is_ref(&self, e: &Expr) -> Option<bool> {
+        let Expr::MethodCall {
+            recv, method, args, ..
+        } = e
+        else {
+            let ty = self.expr_java_type(e)?;
+            return match ty.split('<').next()? {
+                "Stream" => Some(true),
+                "IntStream" | "LongStream" | "DoubleStream" => Some(false),
+                _ => None,
+            };
+        };
+        if let Expr::Var(c) = recv.as_ref() {
+            if !self.is_declared_var(c) {
+                match c.as_str() {
+                    "Stream" => return Some(true),
+                    "IntStream" | "LongStream" | "DoubleStream" => return Some(false),
+                    "Arrays" if method == "stream" => {
+                        let ty = self.expr_java_type(args.first()?)?;
+                        return Some(!matches!(ty.as_str(), "int[]" | "long[]" | "double[]"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        match method.as_str() {
+            "stream" | "parallelStream" if args.is_empty() => Some(true),
+            "mapToObj" | "boxed" => Some(true),
+            "chars" | "codePoints" | "mapToInt" | "mapToLong" | "mapToDouble" | "asLongStream"
+            | "asDoubleStream" | "flatMapToInt" | "flatMapToLong" | "flatMapToDouble" => {
+                Some(false)
+            }
+            "filter" | "map" | "sorted" | "distinct" | "limit" | "skip" | "peek" | "parallel"
+            | "sequential" | "unordered" | "takeWhile" | "dropWhile" | "flatMap" => {
+                self.stream_is_ref(recv)
+            }
+            _ => None,
+        }
     }
 
     /// Lower one argument of an erased instance call.

@@ -1076,18 +1076,21 @@ storage-model differences:
   them catch an *explicitly thrown* exception (`throw new
   IllegalStateException(…)`) correctly — the gap is the implicit fault, not the
   re-entry. The fix belongs in fusevm, which javars does not modify.
-- **A `char` a lambda returns stays a code point when the interface it
-  implements is not one javars declares.** The conversion to a `Character` is
-  driven by the single abstract method's declared return type, so it happens for
-  every functional interface in the prelude — including the primitive-input
-  `IntFunction`/`LongFunction`/`DoubleFunction` — and not for a stream stage,
-  whose lambda gets no target type:
+- **A `char` a lambda returns stays a code point when nothing names the
+  reference type it returns.** The conversion to a `Character` is driven by the
+  single abstract method's declared return type, so it happens for every
+  functional interface in the prelude and for the two stream stages whose
+  result is a reference by signature — `mapToObj`, and `map` on a pipeline the
+  compiler can read as a `Stream` (`"abc".chars().mapToObj(c -> (char) c)` is
+  `[a, b, c]`, and `IntStream.map` still widens the same body to `97`). The
+  other JDK methods that take an untargeted lambda do not convert yet, measured
+  on `openjdk 27`:
 
   ```java
-  System.out.println(Stream.of(97, 98).map(c -> (char)(int) c).toList());
-  // Java: [a, b]     javars: [97, 98]
-  java.util.function.IntFunction<Character> f = c -> (char) c;
-  System.out.println(f.apply(97));            // `a` on both
+  System.out.println(Stream.of("ab").collect(Collectors.toMap(s -> s.charAt(0), s -> 1)));
+  // Java: {a=1}     javars: {97=1}
+  System.out.println(Optional.of("q").map(s -> s.charAt(0)).get());
+  // Java: q         javars: 113
   ```
 
 Everything else javars accepts runs with Java's meaning, and the differential
