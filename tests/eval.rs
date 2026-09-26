@@ -5647,8 +5647,7 @@ fn map_entry_detaches_even_when_nothing_reads_it_in_between() {
 /// left is still refused. Measured on `openjdk 27`.
 #[test]
 fn assignment_is_an_expression() {
-    let (out, ok) = run(
-        "import java.util.*;\
+    let (out, ok) = run("import java.util.*;\
          public class T { static int k = 0; static int idx() { return k++; }\
          public static void main(String[] args) {\
          int x, y; x = y = 7; System.out.println(x + y);\
@@ -5656,8 +5655,7 @@ fn assignment_is_an_expression() {
          int[] a = {1, 2, 3};\
          System.out.println((a[idx()] = 9) + \" \" + k + \" \" + Arrays.toString(a));\
          int c, i = 0; while ((c = a[i++]) != 3) System.out.print(c + \";\");\
-         System.out.println(); } }",
-    );
+         System.out.println(); } }");
     assert!(ok, "{out}");
     assert_eq!(out, "14\n-126\n9 1 [9, 2, 3]\n9;2;\n");
     let (_, ok) = run(&wrap("int a = 1, b = 2; int c = (a + b = 3);"));

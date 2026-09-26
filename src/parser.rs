@@ -1687,7 +1687,10 @@ impl Parser {
         // A top-level assignment is a statement, and keeps the statement
         // lowering (which leaves nothing on the stack) rather than the value
         // form's read-back.
-        if let Expr::Assign { target, op, value, .. } = lhs {
+        if let Expr::Assign {
+            target, op, value, ..
+        } = lhs
+        {
             if expect_semi {
                 self.eat(&Tok::Semi)?;
             }
