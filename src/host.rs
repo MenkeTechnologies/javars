@@ -6115,6 +6115,31 @@ fn primitive_stream_kind(class: &str) -> StreamKind {
     }
 }
 
+/// The `'static` name a `Collectors.*` recipe is stored under, for the factory
+/// arms that match several method names at once.
+fn static_kind(method: &str) -> &'static str {
+    const KINDS: &[&str] = &[
+        "mapping",
+        "filtering",
+        "flatMapping",
+        "collectingAndThen",
+        "summingInt",
+        "summingLong",
+        "summingDouble",
+        "averagingInt",
+        "averagingLong",
+        "averagingDouble",
+        "minBy",
+        "maxBy",
+        "toCollection",
+    ];
+    KINDS
+        .iter()
+        .find(|k| **k == method)
+        .copied()
+        .expect("every factory arm names a listed collector")
+}
+
 /// Allocate a `Collectors.*` recipe.
 fn collector(kind: &'static str, args: Vec<Value>) -> Value {
     Value::Obj(heap_alloc(HostObj::Collector { kind, args }))
@@ -6170,41 +6195,239 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
             let body: Vec<String> = items.iter().map(java_str).collect();
             Value::str(format!("{pre}{}{suf}", body.join(&sep)))
         }
-        // `toMap(k, v)` and `groupingBy(k)` both key by a mapper's answer; they
-        // differ in what they put under a repeated key — the later value, and a
-        // list of every value.
-        "toMap" | "groupingBy" => {
-            let mut entries: Vec<(Value, Value)> = Vec::new();
+        // `toMap(k, v)` refuses a repeated key the way `uniqKeysMapAccumulator`
+        // does; `toMap(k, v, merge)` folds it with `Map.merge`; a fourth
+        // argument supplies the map. Both write through the map's own `put`
+        // path, so a `TreeMap::new` result is ordered like one.
+        "toMap" => {
+            let map = match cargs.get(3) {
+                Some(factory) => invoke_closure(vm, factory, &[]),
+                None => new_collection(vm, "HashMap", &Value::Undef)?,
+            };
             for v in items {
                 let key = invoke_closure(vm, &cargs[0], std::slice::from_ref(&v));
-                let val = if kind == "toMap" {
-                    invoke_closure(vm, &cargs[1], std::slice::from_ref(&v))
-                } else {
-                    v
-                };
-                match entries.iter_mut().find(|(k, _)| value_eq(k, &key)) {
-                    Some((_, slot)) if kind == "toMap" => *slot = val,
-                    Some((_, slot)) => {
-                        let mut group = sequence_items(slot).unwrap_or_default();
-                        group.push(val);
-                        *slot = list_value(group, Fixity::Mutable);
+                let val = invoke_closure(vm, &cargs[1], std::slice::from_ref(&v));
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+                if matches!(val, Value::Undef) {
+                    return Err(Fault::java("NullPointerException", String::new()));
+                }
+                match cargs.get(2) {
+                    Some(merge) => {
+                        coll_method(vm, &map, "merge", &[key, val, merge.clone()]);
                     }
-                    None => entries.push((
-                        key,
-                        if kind == "toMap" {
-                            val
-                        } else {
-                            list_value(vec![val], Fixity::Mutable)
-                        },
-                    )),
+                    None => {
+                        let prior = coll_method(vm, &map, "putIfAbsent", &[key.clone(), val.clone()]);
+                        if !matches!(prior, Value::Undef) {
+                            return Err(Fault::java(
+                                "IllegalStateException",
+                                format!(
+                                    "Duplicate key {} (attempted merging values {} and {})",
+                                    java_str_vm(vm, &key),
+                                    java_str_vm(vm, &prior),
+                                    java_str_vm(vm, &val)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if pending() {
+                    return Ok(Value::Undef);
                 }
             }
+            map
+        }
+        // `groupingBy(k)`, `groupingBy(k, downstream)`, and
+        // `groupingBy(k, mapFactory, downstream)`: the groups keep encounter
+        // order, each is reduced by its downstream collector (`toList` when
+        // none is named), and the results are `put` into the map.
+        "groupingBy" => {
+            let (factory, downstream) = match cargs.len() {
+                3 => (Some(&cargs[1]), Some(&cargs[2])),
+                2 => (None, Some(&cargs[1])),
+                _ => (None, None),
+            };
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for v in items {
+                let key = invoke_closure(vm, &cargs[0], std::slice::from_ref(&v));
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+                if matches!(key, Value::Undef) {
+                    return Err(Fault::java(
+                        "NullPointerException",
+                        "element cannot be mapped to a null key".to_string(),
+                    ));
+                }
+                match groups.iter_mut().find(|(k, _)| value_eq(k, &key)) {
+                    Some((_, g)) => g.push(v),
+                    None => groups.push((key, vec![v])),
+                }
+            }
+            let map = match factory {
+                Some(f) => invoke_closure(vm, f, &[]),
+                None => new_collection(vm, "HashMap", &Value::Undef)?,
+            };
+            for (key, group) in groups {
+                let reduced = match downstream {
+                    Some(d) => collect_with(vm, group, d)?,
+                    None => list_value(group, Fixity::Mutable),
+                };
+                coll_method(vm, &map, "put", &[key, reduced]);
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+            }
+            map
+        }
+        // `partitioningBy(p[, downstream])`: always both keys, `false` first,
+        // in a map that refuses `put` like the JDK's `Partition`.
+        "partitioningBy" => {
+            let (mut no, mut yes) = (Vec::new(), Vec::new());
+            for v in items {
+                let verdict = invoke_closure(vm, &cargs[0], std::slice::from_ref(&v));
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+                if matches!(verdict, Value::Bool(true)) {
+                    yes.push(v);
+                } else {
+                    no.push(v);
+                }
+            }
+            let reduce = |vm: &mut VM, part: Vec<Value>| match cargs.get(1) {
+                Some(d) => collect_with(vm, part, d),
+                None => Ok(list_value(part, Fixity::Mutable)),
+            };
+            let (no, yes) = (reduce(vm, no)?, reduce(vm, yes)?);
             Value::Obj(heap_alloc(HostObj::Map {
-                entries,
-                order: Order::Hash,
-                fixed: Fixity::Mutable,
+                entries: vec![(Value::bool(false), no), (Value::bool(true), yes)],
+                order: Order::Insertion,
+                fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             }))
+        }
+        // The adapters: transform or filter each element, or the finished
+        // result, and hand the rest to the downstream collector.
+        "mapping" | "filtering" | "flatMapping" => {
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                let r = invoke_closure(vm, &cargs[0], std::slice::from_ref(&v));
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+                match kind {
+                    "mapping" => out.push(r),
+                    "filtering" => {
+                        if matches!(r, Value::Bool(true)) {
+                            out.push(v);
+                        }
+                    }
+                    _ => {
+                        if let Some((src, st, _)) = as_stream(&r) {
+                            out.extend(stream_collect(vm, src, &st));
+                        }
+                    }
+                }
+            }
+            collect_with(vm, out, &cargs[1])?
+        }
+        "collectingAndThen" => {
+            let done = collect_with(vm, items, &cargs[0])?;
+            invoke_closure(vm, &cargs[1], &[done])
+        }
+        // `teeing(a, b, merger)`: both collectors see every element.
+        "teeing" => {
+            let a = collect_with(vm, items.clone(), &cargs[0])?;
+            let b = collect_with(vm, items, &cargs[1])?;
+            invoke_closure(vm, &cargs[2], &[a, b])
+        }
+        // The numeric reducers apply their mapper first. `summingInt` keeps an
+        // `int` accumulator (it wraps), `summingLong` a `long`, and the
+        // `double` forms the compensated sum. An average of nothing is `0.0`.
+        "summingInt" | "summingLong" | "summingDouble" | "averagingInt" | "averagingLong"
+        | "averagingDouble" => {
+            let mut mapped = Vec::with_capacity(items.len());
+            for v in items {
+                mapped.push(invoke_closure(vm, &cargs[0], &[v]));
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+            }
+            match kind {
+                "summingInt" => Value::Int(i64::from(wrapping_sum(&mapped) as i32)),
+                "summingLong" => Value::Int(wrapping_sum(&mapped)),
+                "summingDouble" => Value::float(compensated_sum(&mapped)),
+                _ if mapped.is_empty() => Value::float(0.0),
+                "averagingDouble" => Value::float(stream_average(&mapped, StreamKind::Double)),
+                _ => Value::float(stream_average(&mapped, StreamKind::Long)),
+            }
+        }
+        // `minBy`/`maxBy` fold `BinaryOperator.minBy`/`maxBy` left to right, and
+        // both keep the earlier element on a tie (`cmp(a, b) <= 0 ? a : b` and
+        // `cmp(a, b) >= 0 ? a : b`).
+        "minBy" | "maxBy" => {
+            let mut best: Option<Value> = None;
+            for v in items {
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        let c = invoke_closure(vm, &cargs[0], &[b.clone(), v.clone()]).jint();
+                        if pending() {
+                            return Ok(Value::Undef);
+                        }
+                        let keep = if kind == "minBy" { c <= 0 } else { c >= 0 };
+                        if keep {
+                            b
+                        } else {
+                            v
+                        }
+                    }
+                });
+            }
+            optional(best)
+        }
+        // `reducing(op)` answers an `Optional`; `reducing(identity, op)` and
+        // `reducing(identity, mapper, op)` start from the identity.
+        "reducing" => {
+            let (identity, mapper, op) = match cargs.len() {
+                1 => (None, None, &cargs[0]),
+                2 => (Some(cargs[0].clone()), None, &cargs[1]),
+                _ => (Some(cargs[0].clone()), Some(&cargs[1]), &cargs[2]),
+            };
+            let seeded = identity.is_some();
+            let mut acc = identity;
+            for v in items {
+                let v = match mapper {
+                    Some(m) => invoke_closure(vm, m, &[v]),
+                    None => v,
+                };
+                acc = Some(match acc {
+                    None => v,
+                    Some(a) => invoke_closure(vm, op, &[a, v]),
+                });
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+            }
+            if seeded {
+                acc.unwrap_or(Value::Undef)
+            } else {
+                optional(acc)
+            }
+        }
+        // `toCollection(supplier)`: every element through the collection's
+        // own `add`, so a `TreeSet::new` sorts and de-duplicates.
+        "toCollection" => {
+            let target = invoke_closure(vm, &cargs[0], &[]);
+            for v in items {
+                coll_method(vm, &target, "add", &[v]);
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+            }
+            target
         }
         other => {
             return Err(Fault::internal(format!(
@@ -8201,10 +8424,29 @@ fn collection_static(
         }
         ("Collectors", "counting") if args.is_empty() => Ok(collector("counting", Vec::new())),
         ("Collectors", "joining") if args.len() <= 3 => Ok(collector("joining", args.to_vec())),
-        ("Collectors", "toMap") if args.len() == 2 => Ok(collector("toMap", args.to_vec())),
-        ("Collectors", "groupingBy") if args.len() == 1 => {
+        ("Collectors", "toMap") if (2..=4).contains(&args.len()) => {
+            Ok(collector("toMap", args.to_vec()))
+        }
+        ("Collectors", "groupingBy") if (1..=3).contains(&args.len()) => {
             Ok(collector("groupingBy", args.to_vec()))
         }
+        ("Collectors", "partitioningBy") if (1..=2).contains(&args.len()) => {
+            Ok(collector("partitioningBy", args.to_vec()))
+        }
+        ("Collectors", "reducing") if (1..=3).contains(&args.len()) => {
+            Ok(collector("reducing", args.to_vec()))
+        }
+        ("Collectors", "mapping" | "filtering" | "flatMapping" | "collectingAndThen")
+            if args.len() == 2 =>
+        {
+            Ok(collector(static_kind(method), args.to_vec()))
+        }
+        ("Collectors", "teeing") if args.len() == 3 => Ok(collector("teeing", args.to_vec())),
+        (
+            "Collectors",
+            "summingInt" | "summingLong" | "summingDouble" | "averagingInt" | "averagingLong"
+            | "averagingDouble" | "minBy" | "maxBy" | "toCollection",
+        ) if args.len() == 1 => Ok(collector(static_kind(method), args.to_vec())),
         // `java.util.Optional`'s factories. `of` rejects `null` — that is the
         // whole distinction from `ofNullable`, and accepting it would make an
         // `Optional` that claims to be present and is not.

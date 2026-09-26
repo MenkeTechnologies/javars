@@ -3693,6 +3693,18 @@ impl Compiler {
             }
         }
 
+        // `Map.Entry::getKey` — the nested interface, spelled through its
+        // owner. The type parser flattens `Map.Entry` to `Entry`, and so does
+        // this.
+        if let Expr::Field { recv: owner, name } = recv {
+            if name == "Entry"
+                && matches!(&**owner, Expr::Var(v) if v == "Map" && !self.is_declared_var(v))
+            {
+                if let Some(e) = self.type_method_ref("Entry", method, line, &mk, &vars, &lambda)? {
+                    return Ok(e);
+                }
+            }
+        }
         // A bare type name on the left: `Point::new`, `Point::area`,
         // `Integer::parseInt`, `String::length`.
         if let Expr::Var(name) = recv {
@@ -3821,6 +3833,24 @@ impl Compiler {
                 },
             )));
         }
+        // `List::stream`, `Map.Entry::getKey`, `Collection::size` — an unbound
+        // instance method of a modeled collection interface or class, the
+        // mapper a `flatMap`/`flatMapping` over nested collections is written
+        // with.
+        if !self.classes.contains_key(name) && collection_kind(name).is_some() {
+            if let Some(arity) = collection_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
         if !is_static_class(name) {
             return Ok(None);
         }
@@ -3843,6 +3873,24 @@ impl Compiler {
         // pipeline over boxed elements is written with.
         if crate::host::box_class_code(name).is_some() {
             if let Some(arity) = boxed_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
+        // `List::stream`, `Map.Entry::getKey`, `Collection::size` — an unbound
+        // instance method of a modeled collection interface or class, the
+        // mapper a `flatMap`/`flatMapping` over nested collections is written
+        // with.
+        if !self.classes.contains_key(name) && collection_kind(name).is_some() {
+            if let Some(arity) = collection_instance_ref_arity(method) {
                 let ps = mk(arity + 1);
                 return Ok(Some(lambda(
                     ps.clone(),
@@ -6062,11 +6110,35 @@ impl Compiler {
                         Some(slots) => i > 0 && slots.contains(&(i - 1)),
                         None => stringify,
                     };
+                    // Every lambda a `Collectors` factory takes answers a
+                    // reference (a key, a value, a mapped element, a merged
+                    // result) except its predicates, its `ToXFunction`s, and
+                    // its comparators — so a `char` body boxes to `Character`
+                    // as `groupingBy(s -> s.charAt(0))` does on the JDK.
+                    if class == "Collectors"
+                        && matches!(a, Expr::Lambda { .. })
+                        && !matches!(
+                            method,
+                            "partitioningBy"
+                                | "filtering"
+                                | "summingInt"
+                                | "summingLong"
+                                | "summingDouble"
+                                | "averagingInt"
+                                | "averagingLong"
+                                | "averagingDouble"
+                                | "minBy"
+                                | "maxBy"
+                        )
+                    {
+                        self.lambda_ret_hint = Some("Object".to_string());
+                    }
                     if stringify {
                         self.emit_converted_arg(a, floats)?;
                     } else {
                         self.expr(a)?;
                     }
+                    self.lambda_ret_hint = None;
                     if box_args {
                         // `autobox_code` has no `char` arm — a `char` is a code
                         // point, not one of the numeric boxes — so the
@@ -8369,6 +8441,20 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
 /// `String.valueOf` take one *or* two arguments in Java, and a method reference
 /// to an overloaded name has no arity until it is target-typed — which javars
 /// does not do — so naming one is an error rather than a guess.
+/// The argument count (receiver excluded) of a collection instance method an
+/// unbound reference can name. Only names with one arity across `List`, `Set`,
+/// `Map`, and `Map.Entry` are listed: `remove` and `add` are overloaded on
+/// arity in `List`, so `javac` would need the target type to choose.
+fn collection_instance_ref_arity(method: &str) -> Option<usize> {
+    Some(match method {
+        "stream" | "size" | "isEmpty" | "iterator" | "keySet" | "values" | "entrySet"
+        | "getKey" | "getValue" | "clear" | "toString" | "hashCode" => 0,
+        "contains" | "containsKey" | "containsValue" | "get" | "addAll" | "equals" => 1,
+        "put" => 2,
+        _ => return None,
+    })
+}
+
 fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
     Some(match (class, method) {
         ("Integer", "parseInt")

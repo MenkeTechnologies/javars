@@ -5863,3 +5863,56 @@ fn stream_concat_and_while_stages_stay_lazy() {
     assert!(ok, "{out}");
     assert_eq!(out, "[1, 2, 3]\n12\n0 0.0 OptionalDouble.empty\n[5] [1, 4]\n[1, 2, 3, 4]\n[1, 2, 3]\n1,2,4,8,[1, 2, 4, 8]\n");
 }
+
+/// The `Collectors` surface: `toMap` refuses a repeated key with the JDK's
+/// message and merges with a third argument into the map a fourth supplies;
+/// `groupingBy` takes a downstream collector and a map factory;
+/// `partitioningBy`, `mapping`/`filtering`/`flatMapping`, `collectingAndThen`,
+/// the numeric reducers, `minBy`/`maxBy`, `reducing`, `toCollection`, and
+/// `teeing`. A `char` key a lambda answers boxes to `Character`, and
+/// `List::stream` names the unbound collection method. Measured on `openjdk 27`.
+#[test]
+fn collectors_cover_the_jdk_factories() {
+    let (out, ok) = run(r#"
+import java.util.*; import java.util.stream.*; import java.util.function.*;
+public class T { static void p(Object o) { System.out.println(o); } public static void main(String[] a) {
+  try { Stream.of("a","bb","cc").collect(Collectors.toMap(String::length, s -> s)); } catch (IllegalStateException e) { p(e.getMessage()); }
+  p(Stream.of("a","bb","cc","ddd").collect(Collectors.toMap(String::length, s -> s, (x, y) -> x + y)));
+  Map<Integer,Integer> m = Stream.of(1,2,3,4,5).collect(Collectors.toMap(x -> x % 2, x -> x, Integer::sum)); p(m);
+  TreeMap<String,Integer> t = Stream.of("b","a","b").collect(Collectors.toMap(s -> s, s -> 1, Integer::sum, TreeMap::new)); p(t + " " + t.firstKey());
+  p(Stream.of("x","yy","zz").collect(Collectors.groupingBy(String::length, Collectors.counting())));
+  Map<Integer, List<String>> g = Stream.of("x","yy","z").collect(Collectors.groupingBy(String::length, TreeMap::new, Collectors.toList())); p(g);
+  p(Stream.of(1,2,3,4).collect(Collectors.partitioningBy(x -> x > 2)));
+  p(Stream.of(1,2,3,4).collect(Collectors.partitioningBy(x -> x > 5, Collectors.counting())));
+  p(Stream.of("a","b").collect(Collectors.mapping(String::toUpperCase, Collectors.joining("-"))));
+  p(Stream.of(1,2,3,4).collect(Collectors.filtering(x -> x % 2 == 0, Collectors.toList())));
+  p(Stream.of(List.of(1,2), List.of(3)).collect(Collectors.flatMapping(List::stream, Collectors.toList())));
+  p(Stream.of(1,2,3).collect(Collectors.collectingAndThen(Collectors.toList(), List::size)));
+  p(Stream.of(1,2,3).collect(Collectors.summingInt(x -> x)) + " " + Stream.of(1,2,3).collect(Collectors.averagingInt(x -> x)));
+  p(Stream.of(0.1,0.2,0.3).collect(Collectors.summingDouble(x -> x)) + " " + Stream.<Integer>empty().collect(Collectors.averagingDouble(x -> x)));
+  p(Stream.of("bb","a","cc").collect(Collectors.maxBy(Comparator.comparing(String::length))) + " " + Stream.of("bb","a","cc").collect(Collectors.minBy(Comparator.comparing(String::length))));
+  p(Stream.of(1,2,3).collect(Collectors.reducing(0, Integer::sum)) + " " + Stream.of(1,2,3).collect(Collectors.reducing(Integer::max)) + " " + Stream.of("a","bb").collect(Collectors.reducing(0, String::length, Integer::sum)));
+  p(Stream.of(3,1,3,2).collect(Collectors.toCollection(TreeSet::new)));
+  p(Stream.of(1,2,3).collect(Collectors.teeing(Collectors.counting(), Collectors.summingInt(x -> x), (n, s) -> s + "/" + n)));
+  p(Stream.of("apple","avocado","banana").collect(Collectors.groupingBy(s -> s.charAt(0), Collectors.mapping(String::length, Collectors.toList()))));
+}}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "Duplicate key 2 (attempted merging values bb and cc)\n{1=a, 2=bbcc, 3=ddd}\n{0=6, 1=9}\n{a=1, b=2} a\n{1=1, 2=2}\n{1=[x, z], 2=[yy]}\n{false=[1, 2], true=[3, 4]}\n{false=4, true=0}\nA-B\n[2, 4]\n[1, 2, 3]\n3\n6 2.0\n0.6 0.0\nOptional[bb] Optional[a]\n6 Optional[3] 3\n[1, 2, 3]\n6/3\n{a=[5, 7], b=[6]}\n"
+    );
+}
+
+/// Unbound references to collection methods — through an interface
+/// (`Set::size`, `Collection::isEmpty`) and through the nested `Map.Entry`.
+#[test]
+fn unbound_collection_method_references() {
+    let (out, ok) = run("import java.util.*; import java.util.stream.*; public class T { public static void main(String[] a) {\
+         Map<String, Integer> m = new TreeMap<>(Map.of(\"a\", 2, \"b\", 1));\
+         System.out.println(m.entrySet().stream().map(Map.Entry::getKey).collect(Collectors.joining()));\
+         System.out.println(Stream.of(Set.of(1), Set.of(2, 3)).mapToInt(Set::size).sum());\
+         System.out.println(Stream.of(List.of(1), List.of()).map(Collection::isEmpty).toList()); } }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "ab\n3\n[false, true]\n");
+}
