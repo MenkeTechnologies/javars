@@ -5638,3 +5638,28 @@ fn map_entry_detaches_even_when_nothing_reads_it_in_between() {
     assert!(ok, "{out}");
     assert_eq!(out, "false 1 7\n1 9\n");
 }
+
+/// An assignment is an expression whose value is the target's value after the
+/// store (JLS 15.26): `(b += 120)` on a `byte` yields the narrowed -126, a
+/// chained `x = y = 7` stores right to left, and the array index in
+/// `a[idx()] = 9` runs exactly once. The last line is the loop-condition idiom
+/// that used to stop at `expected RParen but found Assign`. A non-lvalue on the
+/// left is still refused. Measured on `openjdk 27`.
+#[test]
+fn assignment_is_an_expression() {
+    let (out, ok) = run(
+        "import java.util.*;\
+         public class T { static int k = 0; static int idx() { return k++; }\
+         public static void main(String[] args) {\
+         int x, y; x = y = 7; System.out.println(x + y);\
+         byte b = 10; System.out.println(b += 120);\
+         int[] a = {1, 2, 3};\
+         System.out.println((a[idx()] = 9) + \" \" + k + \" \" + Arrays.toString(a));\
+         int c, i = 0; while ((c = a[i++]) != 3) System.out.print(c + \";\");\
+         System.out.println(); } }",
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out, "14\n-126\n9 1 [9, 2, 3]\n9;2;\n");
+    let (_, ok) = run(&wrap("int a = 1, b = 2; int c = (a + b = 3);"));
+    assert!(!ok);
+}

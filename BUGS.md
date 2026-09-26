@@ -53,6 +53,14 @@ at the bottom, and are summarized in the section right after this one.
   assignment carries, so they share that lowering: `byte b = 127; b++` is -128,
   and the array, index, or receiver is evaluated exactly once
   (`a[idx()]++` calls `idx()` a single time).
+- **Assignment as an expression.** `=` and every compound form are
+  expressions whose value is the target's value after the store (JLS 15.26), so
+  `while ((c = next()) != -1)`, `a = b = 0`, `if (f && (n = 5) > 0)`, and
+  `return this.n = v;` all run. Assignment binds loosest and is
+  right-associative; the value is read back from the target, so `byte b;
+  (b += 120)` yields the narrowed value; and an array, index, or receiver on the
+  left is evaluated exactly once (`(a[idx()] = 9)` calls `idx()` once). An
+  assignment in statement position keeps the statement lowering unchanged.
 - **Unary `+`.** It changes no bits, but it is not a no-op: JLS 5.6.1 applies
   unary numeric promotion, so `+aChar` is an `int`. That is visible wherever the
   static type picks the rendering — `"" + +'A'` is `"65"`, not `"A"` — and in
@@ -1389,16 +1397,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   This entry previously said anonymous classes were unimplemented outside the
   enum-constant body form, which understated it: the one-method interface form
   has been working and is now pinned in the frozen corpus.
-- **Assignment as an *expression*.** `n = 5` is a statement here, not a value, so
-  the idioms that read the assigned value back — `if (f && (n = 5) > 0)`,
-  `while ((c = next()) != -1)`, `a = b = 0` — stop at
-  ``javars: expected RParen but found Assign``. The AST has no value-producing
-  assignment node: `Assign`/`IndexAssign`/`FieldAssign` are all `StmtKind`, and
-  each of the four target kinds (local, `static`, field, array element) has its
-  own lowering that stores without leaving the value. Compound forms, the
-  narrowing cast above, and the once-only evaluation of a target's subexpressions
-  all have to survive the addition, so it is a real change rather than a parser
-  tweak.
 - **A type *parameter* that shadows a class name.** `class Box<T>` inside a
   program that also declares a class `T` reads the declared return type `T` as
   that class, so `box.get().length()` is rejected as ``class `T` has no method

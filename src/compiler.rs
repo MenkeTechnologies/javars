@@ -1671,6 +1671,8 @@ impl Compiler {
             // `a[i]++` is the element's type, `p.n++` the field's — the update
             // never changes it (`char c; c++` stays a `char`).
             Expr::IncDec { target, .. } => self.expr_java_type(target),
+            // An assignment's value has the target's type (JLS 15.26).
+            Expr::Assign { target, .. } => self.expr_java_type(target),
             Expr::Call { name, args, .. } => {
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -3214,6 +3216,7 @@ impl Compiler {
             // `a[i]++` has the element's type, `p.n++` the field's — whichever
             // the target expression already reports.
             Expr::IncDec { target, .. } => self.expr_type(target),
+            Expr::Assign { target, .. } => self.expr_type(target),
             Expr::Println { .. } => NumType::Other,
             // A conditional expression's numeric category is the promotion of
             // its two result branches (Java's conditional-expression typing).
@@ -5257,6 +5260,86 @@ impl Compiler {
         }
     }
 
+    /// Lower an assignment in value position — `(n = next()) != -1`,
+    /// `a = b = 0`, `(a[i] += 2) > 5` — leaving the value the target holds
+    /// after the store (JLS 15.26). A compound form reuses the `++`/`--`
+    /// read/modify/write with `Yield::New`; a plain `=` stashes the converted
+    /// right-hand side, so the array, index, or receiver is evaluated once.
+    fn assign_value(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), String> {
+        match target {
+            // A bare name — local, implicit `this` field, or static — stores
+            // through the statement lowering and is read back by name; the name
+            // has no subexpression that a second read could re-run.
+            Expr::Var(name) => {
+                self.stmt(&Stmt {
+                    line: 0,
+                    kind: StmtKind::Assign {
+                        name: name.clone(),
+                        op,
+                        value: value.clone(),
+                    },
+                })?;
+                self.emit_named_read(name);
+                Ok(())
+            }
+            Expr::Index { array, index } if op != AssignOp::Assign => {
+                self.index_update(array, index, op, value, Yield::New, line)
+            }
+            Expr::Field { recv, name } if op != AssignOp::Assign => {
+                self.field_update(recv, name, op, value, Yield::New, line)
+            }
+            Expr::Index { array, index } => {
+                let elem_ty = self
+                    .expr_array_type(array)
+                    .and_then(|t| t.strip_suffix("[]").map(str::to_string));
+                let (arr_t, idx_t, val_t) = (self.temp(), self.temp(), self.temp());
+                self.expr(array)?;
+                self.emit_set(&arr_t, line);
+                self.expr(index)?;
+                self.emit_set(&idx_t, line);
+                self.expr_targeted(value, elem_ty.as_deref())?;
+                self.emit_set(&val_t, line);
+                self.emit_get(&arr_t, line);
+                self.emit_get(&idx_t, line);
+                self.emit_get(&val_t, line);
+                self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
+                self.b.emit(Op::Pop, line);
+                self.emit_get(&val_t, line);
+                Ok(())
+            }
+            Expr::Field { recv, name } => {
+                if let Some((class, ty)) = self.static_target(recv, name) {
+                    self.static_assign(&class, &ty, name, op, value, line)?;
+                    self.emit_global_get(&static_global(&class, name), line);
+                    return Ok(());
+                }
+                let field_ty_name = self.field_type_name(recv, name);
+                let (obj_t, val_t) = (self.temp(), self.temp());
+                self.expr(recv)?;
+                self.emit_set(&obj_t, line);
+                self.expr_targeted(value, field_ty_name.as_deref())?;
+                self.emit_set(&val_t, line);
+                self.emit_get(&obj_t, line);
+                let name_c = self.b.add_constant(Value::str(name.to_string()));
+                self.b.emit(Op::LoadConst(name_c), line);
+                self.emit_get(&val_t, line);
+                self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
+                self.b.emit(Op::Pop, line);
+                self.emit_get(&val_t, line);
+                Ok(())
+            }
+            _ => Err(format!(
+                "javars: the left-hand side of an assignment must be a variable (line {line})"
+            )),
+        }
+    }
+
     /// Lower `name++` / `name--` as a statement (result discarded), mutating a
     /// local/global or — when `name` is an implicit `this` field — that field.
     fn post_inc_dec(&mut self, name: &str, inc: bool) -> Result<(), String> {
@@ -5698,6 +5781,12 @@ impl Compiler {
                 if *post { Yield::Old } else { Yield::New },
                 *line,
             )?,
+            Expr::Assign {
+                target,
+                op,
+                value,
+                line,
+            } => self.assign_value(target, *op, value, *line)?,
             Expr::Call { name, args, line } => self.call(name, args, *line)?,
             Expr::MethodCall {
                 recv,
@@ -7447,6 +7536,7 @@ fn expr_has_ffi(e: &Expr) -> bool {
         // The target is an lvalue — an index or a field chain — whose
         // subexpressions can still carry a `rust { … }` call.
         Expr::IncDec { target, .. } => expr_has_ffi(target),
+        Expr::Assign { target, value, .. } => expr_has_ffi(target) || expr_has_ffi(value),
         Expr::Binary { lhs, rhs, .. } => expr_has_ffi(lhs) || expr_has_ffi(rhs),
         Expr::Ternary { cond, then, els } => {
             expr_has_ffi(cond) || expr_has_ffi(then) || expr_has_ffi(els)

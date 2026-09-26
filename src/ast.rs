@@ -487,6 +487,20 @@ pub enum Expr {
         post: bool,
         line: u32,
     },
+    /// An assignment in *value* position: `(n = next()) != -1`, `a = b = 0`,
+    /// `if ((x += 2) > 5)`. Java's assignment is an expression whose value is
+    /// the variable's value after the store (JLS 15.26), so the result is read
+    /// back from the target rather than taken from the right-hand side — which
+    /// is what makes `byte b; (b += 200)` yield the narrowed value. `target` is
+    /// a [`Expr::Var`], [`Expr::Index`], or [`Expr::Field`]; its array, index,
+    /// or receiver is evaluated exactly once. An assignment in *statement*
+    /// position still parses to [`StmtKind::Assign`] and its siblings.
+    Assign {
+        target: Box<Expr>,
+        op: AssignOp,
+        value: Box<Expr>,
+        line: u32,
+    },
     /// A cast, `(ty) expr`. Java's narrowing primitive conversions are real
     /// value changes (`(int) 3.9` is 3, `(byte) 200` is -56), so the target type
     /// is kept rather than erased; a reference cast is a no-op at runtime here,

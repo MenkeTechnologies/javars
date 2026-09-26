@@ -1684,6 +1684,15 @@ impl Parser {
         // `a[i] = …` / `obj.f = …` assignment, an `a[i]++` post-inc, or a plain
         // expression statement (`System.out.println(...)`, a call, `new C(...)`).
         let lhs = self.expression()?;
+        // A top-level assignment is a statement, and keeps the statement
+        // lowering (which leaves nothing on the stack) rather than the value
+        // form's read-back.
+        if let Expr::Assign { target, op, value, .. } = lhs {
+            if expect_semi {
+                self.eat(&Tok::Semi)?;
+            }
+            return self.make_assign(*target, op, *value);
+        }
         if let Some(op) = assign_op(self.peek()) {
             self.advance();
             let value = self.expression()?;
@@ -2533,6 +2542,22 @@ impl Parser {
                 then: Box::new(then),
                 els: Box::new(els),
             });
+        }
+        // Assignment binds loosest of all and is right-associative, so
+        // `a = b = 0` is `a = (b = 0)`. Only an lvalue takes it; anything else
+        // leaves the operator for the caller to reject.
+        if let Some(op) = assign_op(self.peek()) {
+            if matches!(cond, Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. }) {
+                let line = self.line();
+                self.advance();
+                let value = self.expression()?;
+                return Ok(Expr::Assign {
+                    target: Box::new(cond),
+                    op,
+                    value: Box::new(value),
+                    line,
+                });
+            }
         }
         Ok(cond)
     }
