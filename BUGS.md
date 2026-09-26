@@ -1306,7 +1306,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
   the `Objects` members, the `String` instance methods, and the `java.util`
   collections are the whole
-  library surface — no `entrySet`, no I/O. A stream is evaluated
+  library surface — no I/O. A stream is evaluated
   in one thread whatever `parallel()` would ask for, which is observable only
   through a side-effecting pipeline's *ordering* — Java makes no ordering
   promise for one either. An iterator over a `Set` is not fail-fast, because a `Set` carries no
@@ -1346,19 +1346,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   every pair drawn from the boundary values (both zeros, both infinities, NaN,
   `MIN_VALUE`, `MAX_VALUE`, the ties `rint` rounds to even, the subnormals) is
   byte-identical to openjdk 26.0.2.
-- **The bit-twiddling statics.** `Integer`/`Long`'s
+- ~~**The bit-twiddling and wrapper statics**~~ — implemented. `Integer`/`Long`'s
   `bitCount`, `highestOneBit`/`lowestOneBit`, `numberOfLeadingZeros`/
   `numberOfTrailingZeros`, `reverse`/`reverseBytes`, `rotateLeft`/`rotateRight`,
   and the unsigned family (`divideUnsigned`, `remainderUnsigned`,
-  `toUnsignedLong`, `toUnsignedString`); `Double.isFinite`/`max`/`min`;
-  `Character.compare` and `isAlphabetic`. Each is an unregistered static, so a
-  call is a compile error naming the method rather than a wrong answer.
-  `copySign`, `rint`, `ulp`, `nextUp`/`nextDown`/`nextAfter`, `fma`, and the
-  `Exact` family with `clamp` were on this list and are now implemented — see
-  the `Math` entries above. `Short` and `Byte` are further
-  along that scale: their `MAX_VALUE`/`MIN_VALUE` constants resolve, but the
-  types carry no statics at all, so `Short.compare(a, b)` is
-  ``javars: cannot find symbol: `Short` ``.
+  `compareUnsigned`, `toUnsignedLong`, `toUnsignedString`, `parseUnsignedInt`);
+  `Integer.decode` and `valueOf(String, radix)`; `Double`/`Float`'s
+  `isFinite`/`max`/`min`/`sum`; `Boolean.logicalAnd`/`Or`/`Xor`; `Short`/`Byte`'s
+  `parseShort`/`parseByte`/`valueOf`/`compare`/`toUnsignedInt`/`toString`/
+  `hashCode`, with the JDK's `Value out of range` message. `Character`'s
+  predicates follow Unicode's general categories rather than ASCII or Rust's
+  properties — `isDigit`/`digit` take every script's decimal digits,
+  `isLetter`/`isLetterOrDigit` exclude the `Other_Alphabetic` marks and letter
+  numbers that `isAlphabetic` includes — and `isSpaceChar`, `isISOControl`,
+  `forDigit`, `compare` and `charCount` are there too. A sweep of all 65,536
+  `char` values through six predicates and `digit(c, 36)` is byte-identical to
+  openjdk 27. `Character.toChars` and the `isJavaIdentifier*` pair are still
+  unregistered, so a call stops the run with an error naming the method.
 - **The regular-expression constructs with no faithful translation.** Regular
   expressions themselves are implemented (see the entry under "Implemented");
   what is refused — as a `PatternSyntaxException` naming the construct — is the
@@ -1378,10 +1382,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   map's entries (see the `keySet()`/`values()`/`entrySet()` entry above for the
   one way it still falls short of Java's). This one is not implemented, and an
   unsupported-method error is the honest answer until it is.
-- **`Map.of`.** `List.of` and `Set.of` are implemented, each as the immutable
-  collection Java returns rather than as a mutable one wearing the same name;
-  the map factory is not, so there is no `HashMap`-vs-`Map.of` pair for the type
-  test or the reference cast to tell apart yet.
+- ~~**`Map.of`**~~ — implemented, as the immutable map Java returns: a
+  `put` is `UnsupportedOperationException` and `Map.of(…) instanceof HashMap` is
+  `false`.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
