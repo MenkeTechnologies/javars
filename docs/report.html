@@ -124,7 +124,7 @@
           <tbody>
             <tr><td>lexer / parser → AST</td><td>Implemented</td><td>Hand-written tokenizer + recursive-descent parser with precedence climbing (<code>src/lexer.rs</code>, <code>src/parser.rs</code>).</td></tr>
             <tr><td>AST → fusevm bytecode</td><td>Implemented</td><td>Native arithmetic + <code>CallBuiltin</code> print dispatch, backpatched control flow; no local VM (<code>src/compiler.rs</code>).</td></tr>
-            <tr><td>entry class + <code>main</code> body</td><td>Implemented</td><td>Single-class, single-<code>main</code> subset; other members skipped by brace matching (<code>src/parser.rs</code>).</td></tr>
+            <tr><td>entry class + <code>main</code> body</td><td>Implemented</td><td>Every class in the compilation unit is compiled; the <code>main</code> of whichever class declares one runs (<code>src/parser.rs</code>).</td></tr>
             <tr><td>locals / assignment / compound</td><td>Implemented</td><td><code>int x = e;</code>, <code>x += e;</code>, post-inc/dec; declared type retained for diagnostics.</td></tr>
             <tr><td>control flow</td><td>Implemented</td><td><code>if</code>/<code>else</code>, <code>while</code>, C-style <code>for</code>, <code>break</code>/<code>continue</code>, short-circuiting <code>&amp;&amp;</code>/<code>||</code>.</td></tr>
             <tr><td><code>String</code> <code>+</code> &amp; Java formatting</td><td>Implemented</td><td>Host numeric hook concat; <code>true</code>/<code>false</code>, <code>3.0</code>, <code>null</code> (<code>src/host.rs</code>).</td></tr>
@@ -133,9 +133,9 @@
             <tr><td>DAP debugger (<code>--dap</code>)</td><td>Implemented</td><td>Line breakpoints, stepping, stack trace, <code>main</code>-locals inspection via per-statement debug line markers (<code>src/dap.rs</code>).</td></tr>
             <tr><td>reference doc generator</td><td>Implemented</td><td><code>gen-docs</code> renders <code>docs/reference.html</code> from the LSP corpus (<code>src/bin/gen_docs.rs</code>).</td></tr>
             <tr><td>dumps (<code>--dump-tokens</code>/<code>--dump-ast</code>/<code>--disasm</code>)</td><td>Implemented</td><td>Print an artifact and exit (<code>src/main.rs</code>).</td></tr>
-            <tr><td>user methods / classes / objects / arrays</td><td>Planned</td><td>Multiple classes, instance state, method calls, arrays, and a String/object heap are future waves (see BUGS.md).</td></tr>
-            <tr><td>standard library / generics / exceptions</td><td>Planned</td><td>generics, <code>try</code>/<code>catch</code>, lambdas, and the <code>java.util</code> collections run today; streams and the wider <code>java.util</code> surface pending.</td></tr>
-            <tr><td>inline <code>rust { }</code> FFI</td><td>Planned</td><td>Requires general call-expression support the current single-<code>main</code> parser does not yet have.</td></tr>
+            <tr><td>user methods / classes / objects / arrays</td><td>Implemented</td><td><code>static</code> and instance methods on the <code>Op::Call</code> frame ABI, constructors, inheritance, interfaces, overloading, virtual dispatch, and arrays on a host object heap (<code>src/host.rs</code>).</td></tr>
+            <tr><td>standard library / generics / exceptions</td><td>In progress</td><td>Type-erased generics, <code>throw</code>/<code>try</code>/<code>catch</code>/<code>finally</code>, lambdas, streams, and the <code>java.util</code> collections run today; the library surface is a subset of the JDK&rsquo;s, and every gap is listed in BUGS.md.</td></tr>
+            <tr><td>inline <code>rust { }</code> FFI</td><td>Implemented</td><td>A <code>rust { }</code> block compiles to a cached cdylib whose exports are callable by name (<code>src/rust_ffi.rs</code>).</td></tr>
           </tbody>
         </table>
       </section>
