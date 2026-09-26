@@ -5896,9 +5896,7 @@ impl Compiler {
             };
             match args {
                 [] => return self.expr(&natural),
-                [c] if matches!(c, Expr::Var(n) if n == NULL_LITERAL) => {
-                    return self.expr(&natural)
-                }
+                [Expr::Var(n)] if n == NULL_LITERAL => return self.expr(&natural),
                 [c] => {
                     return self.expr(&Expr::MethodCall {
                         recv: Box::new(c.clone()),
