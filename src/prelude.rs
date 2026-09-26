@@ -81,6 +81,24 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("MissingFormatWidthException", "IllegalFormatException"),
 ];
 
+/// The modeled throwables below `Throwable` that also declare Java's two
+/// cause-chaining constructors, `(String, Throwable)` and `(Throwable)`. Read off
+/// `javap -public` on openjdk 27: `NumberFormatException`,
+/// `ArithmeticException`, `NullPointerException`, `ClassCastException`,
+/// `IndexOutOfBoundsException` and the rest declare only `()` and `(String)`,
+/// so `new ArithmeticException("x", e)` stays the compile error `javac` makes
+/// it.
+const CAUSE_CTORS: &[&str] = &[
+    "Error",
+    "Exception",
+    "RuntimeException",
+    "IllegalArgumentException",
+    "IllegalStateException",
+    "UnsupportedOperationException",
+    "ConcurrentModificationException",
+    "NoSuchElementException",
+];
+
 /// True when `name` is one of the modeled JDK throwables.
 pub fn is_throwable(name: &str) -> bool {
     THROWABLES.iter().any(|(n, _)| *n == name)
@@ -331,8 +349,40 @@ fn prelude_source(declared: &[String]) -> String {
             // the field's default (`null`), which is exactly what Java's
             // `getMessage()` returns for the no-arg constructor.
             src.push_str("  String detailMessage;\n");
+            // Java marks a cause that was never set by pointing the field at
+            // the throwable itself; `causeSet` is that sentinel, since a field
+            // initializer cannot name `this` here. It is what lets `initCause`
+            // succeed once on a `(String)` throwable and refuse on one
+            // constructed with a cause.
+            src.push_str("  Throwable cause;\n  boolean causeSet;\n");
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ detailMessage = m; }}\n"));
+            src.push_str(&format!(
+                "  {name}(String m, Throwable c) {{ detailMessage = m; cause = c; causeSet = true; }}\n"
+            ));
+            // `Throwable(Throwable)` takes the cause's `toString()` as its own
+            // message, so `new RuntimeException(e)` prints
+            // `java.lang.RuntimeException: java.lang.Exception: inner`.
+            src.push_str(&format!(
+                "  {name}(Throwable c) {{ detailMessage = (c == null ? null : c.toString()); \
+                 cause = c; causeSet = true; }}\n"
+            ));
+            src.push_str("  Throwable getCause() { return cause; }\n");
+            // `initCause`'s two refusals, with the JDK's messages. Both name
+            // prelude throwables, so the method is left out when the program
+            // declares its own class under either name.
+            if !declared
+                .iter()
+                .any(|d| d == "IllegalStateException" || d == "IllegalArgumentException")
+            {
+                src.push_str(
+                    "  Throwable initCause(Throwable c) { \
+                     if (causeSet) { throw new IllegalStateException(\"Can't overwrite cause with \" \
+                     + (c == null ? \"a null\" : c.toString()), this); } \
+                     if (c == this) { throw new IllegalArgumentException(\"Self-causation not permitted\", this); } \
+                     cause = c; causeSet = true; return this; }\n",
+                );
+            }
             src.push_str("  String getMessage() { return detailMessage; }\n");
             // `getLocalizedMessage()` is `Throwable`'s own one-liner
             // (`return getMessage();`), overridable but never overridden here.
@@ -348,6 +398,11 @@ fn prelude_source(declared: &[String]) -> String {
         } else {
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ super(m); }}\n"));
+            if CAUSE_CTORS.contains(name) {
+                src.push_str(&format!(
+                    "  {name}(String m, Throwable c) {{ super(m, c); }}\n  {name}(Throwable c) {{ super(c); }}\n"
+                ));
+            }
         }
         src.push_str("}\n");
     }

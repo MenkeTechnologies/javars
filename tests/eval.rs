@@ -5663,3 +5663,23 @@ fn assignment_is_an_expression() {
     let (_, ok) = run(&wrap("int a = 1, b = 2; int c = (a + b = 3);"));
     assert!(!ok);
 }
+
+/// Cause chaining exists only on the throwables that declare it in the JDK:
+/// `RuntimeException(Throwable)` takes the cause's `toString()` as its message,
+/// while `ArithmeticException` has no `(String, Throwable)` constructor, so
+/// javars refuses it the way `javac` does. Measured on `openjdk 27`.
+#[test]
+fn throwable_cause_constructors_follow_the_jdk_set() {
+    let (out, ok) = run(&wrap(
+        "RuntimeException r = new RuntimeException(new IllegalStateException(\"s\"));\
+         System.out.println(r.getMessage() + \" | \" + r.getCause().getMessage());\
+         System.out.println(new NoSuchElementException(\"n\", r).getCause() == r);",
+    )
+    .replace("public class", "import java.util.*; public class"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "java.lang.IllegalStateException: s | s\ntrue\n");
+    let (_, ok) = run(&wrap(
+        "Exception e = new ArithmeticException(\"x\", new Exception());",
+    ));
+    assert!(!ok);
+}

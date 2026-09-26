@@ -1186,17 +1186,20 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   stores and continues, where the JDK throws `ArrayStoreException:
   java.lang.Integer`. Measured on `openjdk 21.0.12`. The array's element type
   would have to be recorded on the host object and checked on every store.
-- **`Throwable.getCause()`, `getSuppressed()`, `initCause`, `addSuppressed`,
-  `printStackTrace()`, and `getStackTrace()`** — and with them the two-argument
-  `(String, Throwable)` constructor every modeled throwable lacks, so
-  `new RuntimeException("wrap", cause)` is ``javars: class `RuntimeException` has
-  no constructor taking 2 argument(s) (declared arities: [0, 1])``. Cause
-  chaining and suppression are a *structural* part of a Java throwable, not
-  decoration: try-with-resources suppression and `e.getCause()` unwrapping are
-  ordinary idioms. javars keeps no call-site table (see the uncaught-report entry
-  above), so a stack trace has nothing to print, but the cause and suppressed
-  lists have no such obstacle and are simply not built. `getLocalizedMessage()`
-  *is* supplied, being `getMessage()` verbatim.
+- **`Throwable.getSuppressed()`, `addSuppressed`, `printStackTrace()`, and
+  `getStackTrace()`.** javars keeps no call-site table (see the uncaught-report
+  entry above), so a stack trace has nothing to print; the suppressed list has
+  no such obstacle and is simply not built, so try-with-resources suppression is
+  not observable. Cause chaining *is* implemented: `getCause()`, `initCause`
+  (with the JDK's `Can't overwrite cause with …` and `Self-causation not
+  permitted` refusals), and the `(String, Throwable)` and `(Throwable)`
+  constructors on exactly the modeled throwables that declare them in the JDK —
+  `Throwable`, `Error`, `Exception`, `RuntimeException`,
+  `IllegalArgumentException`, `IllegalStateException`,
+  `UnsupportedOperationException`, `ConcurrentModificationException`,
+  `NoSuchElementException` — so `new ArithmeticException("x", e)` stays a compile
+  error. `(Throwable)` takes the cause's `toString()` as its message.
+  `getLocalizedMessage()` is supplied, being `getMessage()` verbatim.
 - **An unmodeled `catch` type is a compile error.** javars models the throwable
   subset in `src/prelude.rs`; a `catch` naming anything else — a name that does
   not exist (`catch (TotallyBogusException e)`), or a real JDK throwable outside
