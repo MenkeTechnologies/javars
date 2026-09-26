@@ -253,6 +253,9 @@ at the bottom, and are summarized in the section right after this one.
   `comparingInt`/`comparingLong`/`comparingDouble`, `reversed`,
   `thenComparing`, `thenComparingInt`/`Long`/`Double`. They are written in Java
   in the prelude, the way the other functional interfaces' defaults are.
+  `Collections.reverseOrder()` and `reverseOrder(cmp)` lower to
+  `Comparator.reverseOrder()` and `cmp.reversed()`, a `null` argument meaning
+  natural order as the JDK specifies.
 
   `thenComparing` is overloaded in Java on a `Comparator` *and* on a key
   extractor, told apart by the target type — which javars has no pass for. They
@@ -1273,7 +1276,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   on the runtime class they are the JDK's own bodies, transliterated
   (`(a, b) -> a.compareTo(b)` and so on). The same lambda is what the compiler
   supplies for a sort that names no comparator — `Collections.sort(l)`,
-  `l.sort(null)` — because the host's natural order knows numbers and strings
+  `l.sort(null)`, and `Arrays.sort` on a reference array with no comparator or a
+  `null` one — because the host's natural order knows numbers and strings
   and answered "equal" for everything else, so a `List` of a user `Comparable`
   came back in insertion order.
 - ~~**Class literals** (`C.class`, `int.class`)~~ — implemented. A class is its

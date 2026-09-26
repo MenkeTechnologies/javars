@@ -5881,15 +5881,64 @@ impl Compiler {
         // a `List` of a user `Comparable` came back in its original order. The
         // missing comparator is supplied here instead, as the same
         // `(a, b) -> a.compareTo(b)` lambda `Comparator.naturalOrder()` is.
+        // `Collections.reverseOrder()` is the comparator `Comparator.reverseOrder()`
+        // is, and `reverseOrder(cmp)` is `cmp.reversed()` — `null` meaning the
+        // natural order, as the JDK specifies. Both already exist in the prelude.
+        if method == "reverseOrder"
+            && matches!(recv, Expr::Var(c) if c == "Collections")
+            && !self.is_declared_var("Collections")
+        {
+            let natural = Expr::MethodCall {
+                recv: Box::new(Expr::Var("Comparator".to_string())),
+                method: "reverseOrder".to_string(),
+                args: vec![],
+                line,
+            };
+            match args {
+                [] => return self.expr(&natural),
+                [c] if matches!(c, Expr::Var(n) if n == NULL_LITERAL) => {
+                    return self.expr(&natural)
+                }
+                [c] => {
+                    return self.expr(&Expr::MethodCall {
+                        recv: Box::new(c.clone()),
+                        method: "reversed".to_string(),
+                        args: vec![],
+                        line,
+                    })
+                }
+                _ => {}
+            }
+        }
         if method == "sort" {
             let collections_sort = matches!(recv, Expr::Var(c) if c == "Collections")
                 && !self.is_declared_var("Collections");
+            let arrays_sort =
+                matches!(recv, Expr::Var(c) if c == "Arrays") && !self.is_declared_var("Arrays");
             let explicit_null = |e: &Expr| matches!(e, Expr::Var(n) if n == NULL_LITERAL);
             let natural = if collections_sort {
                 match args {
                     [l] => Some(vec![l.clone(), natural_order_comparator(line)]),
                     [l, c] if explicit_null(c) => {
                         Some(vec![l.clone(), natural_order_comparator(line)])
+                    }
+                    _ => None,
+                }
+            } else if arrays_sort {
+                // Only a reference array: an `int[]` sorts numerically on the host,
+                // and an array whose type is unknown keeps the host's order too.
+                let reference = args
+                    .first()
+                    .and_then(|a| self.expr_java_type(a))
+                    .is_some_and(|t| t.strip_suffix("[]").is_some_and(is_reference_type));
+                let nat = || natural_order_comparator(line);
+                match args {
+                    _ if !reference => None,
+                    [a] => Some(vec![a.clone(), nat()]),
+                    [a, c] if explicit_null(c) => Some(vec![a.clone(), nat()]),
+                    [a, f, t] => Some(vec![a.clone(), f.clone(), t.clone(), nat()]),
+                    [a, f, t, c] if explicit_null(c) => {
+                        Some(vec![a.clone(), f.clone(), t.clone(), nat()])
                     }
                     _ => None,
                 }

@@ -7429,6 +7429,43 @@ fn collection_static(
             (Value::Undef, d) => Ok(d.clone()),
             (v, _) => Ok(v.clone()),
         },
+        // `Arrays.sort(a, cmp)`, `Arrays.sort(a, from, to)` and
+        // `Arrays.sort(a, from, to, cmp)`. A comparator re-enters the VM, which is
+        // why these live here and the one-argument form does not. The range is
+        // checked the way `Arrays.rangeCheck` does, message for message, before
+        // anything is read; a `null` comparator is natural order.
+        ("Arrays", "sort") if matches!(args.len(), 2..=4) => {
+            let Some(mut items) = array_items(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            let (from, to, cmp) = match args.len() {
+                2 => (0, items.len() as i64, &args[1]),
+                3 => (args[1].jint(), args[2].jint(), &Value::Undef),
+                _ => (args[1].jint(), args[2].jint(), &args[3]),
+            };
+            if from > to {
+                return Some(Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("fromIndex({from}) > toIndex({to})"),
+                )));
+            }
+            for bad in [from, to] {
+                if bad < 0 || bad > items.len() as i64 {
+                    return Some(Err(Fault::java(
+                        "ArrayIndexOutOfBoundsException",
+                        format!("Array index out of range: {bad}"),
+                    )));
+                }
+            }
+            let (from, to) = (from as usize, to as usize);
+            let window = items[from..to].to_vec();
+            sort_with(vm, window, cmp).map(|sorted| {
+                items.splice(from..to, sorted);
+                // The write-back cannot miss: the handle was an array a moment ago.
+                let _ = array_mutate(&args[0], |a| *a = items);
+                Value::Undef
+            })
+        }
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
                 Some(i) => i,

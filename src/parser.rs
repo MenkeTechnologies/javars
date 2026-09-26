@@ -3074,6 +3074,14 @@ impl Parser {
                 if crate::prelude::is_functional(&name) {
                     self.uses_functional = true;
                 }
+                // `Collections.reverseOrder` is lowered to `Comparator`'s own, so it
+                // needs the prelude that declares `Comparator` too.
+                if name == "Collections"
+                    && self.is(&Tok::Dot)
+                    && matches!(&self.toks[self.pos + 1].kind, Tok::Ident(m) if m == "reverseOrder")
+                {
+                    self.uses_functional = true;
+                }
                 // A trailing `.` (method/field access) is consumed by the
                 // postfix layer above; a bare identifier is a variable read.
                 Ok(Expr::Var(name))

@@ -392,7 +392,10 @@ Implemented and checked against the reference `java`:
   `forEach` take a lambda. A sort is a stable merge sort driven by the
   comparator; naming none (`Collections.sort(l)`, `l.sort(null)`) orders by the
   element's own `compareTo`, and `Comparator.naturalOrder`/`reverseOrder`/
-  `comparing` build that comparator explicitly. `HashMap`/`HashSet` iterate in Java's **real bucket
+  `comparing` build that comparator explicitly. `Arrays.sort` takes the same comparator,
+  over the whole array or a `from`/`to` range checked with the JDK's own
+  exceptions and messages, and a reference array sorted with none orders by
+  `compareTo` too. `HashMap`/`HashSet` iterate in Java's **real bucket
   order** — `(capacity - 1) & (h ^ (h >>> 16))` over a power-of-two table,
   reproduced exactly rather than approximated with insertion order. A membership
   test compares with the element's own `equals()`, not with identity, so
