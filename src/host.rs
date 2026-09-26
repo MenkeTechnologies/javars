@@ -706,6 +706,8 @@ enum Source {
     Items(Vec<Value>),
     Iterate { seed: Value, f: Value },
     Generate(Value),
+    /// `Stream.concat(a, b)`: the two stream handles, driven in order.
+    Concat(Box<(Value, Value)>),
 }
 
 impl Source {
@@ -718,6 +720,7 @@ impl Source {
                 f,
             },
             Source::Generate(s) => SourceCursor::Generate(s),
+            Source::Concat(_) => unreachable!("`stream_drive` expands a concatenation"),
         }
     }
 }
@@ -779,6 +782,12 @@ enum Stage {
     Limit(i64),
     /// `skip(n)` — drop the first `n`.
     Skip(i64),
+    /// `takeWhile(p)` — pass elements while `p` accepts them; the first one
+    /// it rejects ends the pipeline.
+    TakeWhile(Value),
+    /// `dropWhile(p)` — drop elements while `p` accepts them, then pass
+    /// everything; the stage's counter records that the prefix is over.
+    DropWhile(Value),
     /// `distinct()` — a barrier.
     Distinct,
     /// `sorted()` / `sorted(cmp)` — a barrier.
@@ -5713,20 +5722,18 @@ fn stream_push(
             let inner = invoke_closure(vm, f, &[v]);
             // The mapper answers a stream (or, tolerantly, a collection): its
             // elements are pushed on in place of the one that produced them.
+            // A mapped stream is pulled one element at a time straight into the
+            // rest of the pipeline, so a downstream `limit` or short-circuiting
+            // terminal stops it — which is what lets the mapper answer an
+            // unbounded stream, as it may since JDK 10.
             let elems = match as_stream(&inner) {
                 Some((src, st, _)) => {
-                    let mut out = Vec::new();
-                    let mut cs = vec![0i64; st.len()];
-                    let mut src = src.cursor();
-                    while let Some(e) = src.pull(vm) {
-                        if !stream_push(vm, e, &st, &mut cs, &mut |_vm, x| {
-                            out.push(x);
-                            true
-                        }) {
-                            break;
-                        }
-                    }
-                    out
+                    let mut go = true;
+                    stream_drive(vm, src, &st, &mut |vm, x| {
+                        go = stream_push(vm, x, rest, rest_counts, sink);
+                        go
+                    });
+                    return go;
                 }
                 None => sequence_items(&inner).unwrap_or_default(),
             };
@@ -5739,6 +5746,28 @@ fn stream_push(
         }
         Stage::Peek(f) => {
             invoke_closure(vm, f, std::slice::from_ref(&v));
+            stream_push(vm, v, rest, rest_counts, sink)
+        }
+        Stage::TakeWhile(p) => {
+            if matches!(
+                invoke_closure(vm, p, std::slice::from_ref(&v)),
+                Value::Bool(true)
+            ) {
+                stream_push(vm, v, rest, rest_counts, sink)
+            } else {
+                false
+            }
+        }
+        Stage::DropWhile(p) => {
+            if *count == 0
+                && matches!(
+                    invoke_closure(vm, p, std::slice::from_ref(&v)),
+                    Value::Bool(true)
+                )
+            {
+                return true;
+            }
+            *count = 1;
             stream_push(vm, v, rest, rest_counts, sink)
         }
         Stage::Skip(n) => {
@@ -5804,6 +5833,24 @@ fn stream_drive(
         return stream_drive(vm, Source::Items(buf), &stages[i + 1..], sink);
     }
     let mut counters = vec![0i64; stages.len()];
+    // `Stream.concat(a, b)`: drive `a`'s whole pipeline into this one, then
+    // `b`'s — each part is pulled only as far as this pipeline still wants.
+    if let Source::Concat(parts) = source {
+        for part in [&parts.0, &parts.1] {
+            let Some((src, st, _)) = as_stream(part) else {
+                continue;
+            };
+            let mut go = true;
+            stream_drive(vm, src, &st, &mut |vm, x| {
+                go = stream_push(vm, x, stages, &mut counters, sink);
+                go
+            });
+            if !go {
+                return;
+            }
+        }
+        return;
+    }
     let mut source = source.cursor();
     while let Some(v) = source.pull(vm) {
         if !stream_push(vm, v, stages, &mut counters, sink) {
@@ -5877,6 +5924,8 @@ fn stream_method(
         ("peek", 1) => stage(Stage::Peek(args[0].clone())),
         ("limit", 1) => stage(Stage::Limit(args[0].jint())),
         ("skip", 1) => stage(Stage::Skip(args[0].jint())),
+        ("takeWhile", 1) => stage(Stage::TakeWhile(args[0].clone())),
+        ("dropWhile", 1) => stage(Stage::DropWhile(args[0].clone())),
         ("distinct", 0) => stage(Stage::Distinct),
         ("sorted", 0) => stage(Stage::Sorted(None)),
         ("sorted", 1) => stage(Stage::Sorted(Some(args[0].clone()))),
@@ -8054,6 +8103,36 @@ fn collection_static(
                     primitive_stream_kind(class)
                 },
             ))
+        }
+        ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "empty") if args.is_empty() => {
+            Ok(stream_of(
+                Vec::new(),
+                if class == "Stream" {
+                    StreamKind::Ref
+                } else {
+                    primitive_stream_kind(class)
+                },
+            ))
+        }
+        ("Stream", "ofNullable") if args.len() == 1 => Ok(stream_of(
+            args.iter().filter(|v| !matches!(v, Value::Undef)).cloned().collect(),
+            StreamKind::Ref,
+        )),
+        // `concat(a, b)` takes its shape from `a` — `IntStream.concat` answers
+        // an `IntStream` — and a `null` part is the NPE `Objects.requireNonNull`
+        // raises.
+        ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "concat") if args.len() == 2 => {
+            let Some((_, _, kind)) = as_stream(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            if as_stream(&args[1]).is_none() {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Stream {
+                source: Source::Concat(Box::new((args[0].clone(), args[1].clone()))),
+                stages: Vec::new(),
+                kind,
+            })))
         }
         ("Stream" | "IntStream" | "LongStream" | "DoubleStream", "iterate" | "generate")
             if args.len() == if method == "iterate" { 2 } else { 1 } =>

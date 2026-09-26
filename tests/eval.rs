@@ -5844,3 +5844,22 @@ fn primitive_stream_sums_match_the_jdk_accumulators() {
     assert!(ok, "{out}");
     assert_eq!(out, "0.6\n0.19999999999999998\n-2147483648\n1.073741824E9\n-9223372036854775808\n0.0\nInfinity\n10000.0\n");
 }
+
+/// `Stream.concat`, `empty`, `ofNullable`, `takeWhile`/`dropWhile`, and a
+/// `flatMap` whose mapper answers an unbounded stream: every part is pulled
+/// only as far as the downstream `limit` wants, so the `peek` fires four times
+/// and the infinite inner streams end. Measured on `openjdk 27`.
+#[test]
+fn stream_concat_and_while_stages_stay_lazy() {
+    let (out, ok) = run(&wrap(
+        "System.out.println(java.util.stream.Stream.concat(java.util.stream.Stream.of(1), java.util.stream.Stream.of(2, 3)).toList());\
+         System.out.println(java.util.stream.IntStream.concat(java.util.stream.IntStream.of(1), java.util.stream.IntStream.range(5, 7)).sum());\
+         System.out.println(java.util.stream.Stream.ofNullable(null).count() + \" \" + java.util.stream.DoubleStream.empty().sum() + \" \" + java.util.stream.IntStream.empty().average());\
+         System.out.println(java.util.stream.Stream.of(5, 1, 4).takeWhile(x -> x > 2).toList() + \" \" + java.util.stream.Stream.of(5, 1, 4).dropWhile(x -> x > 2).toList());\
+         System.out.println(java.util.stream.Stream.iterate(1, x -> x + 1).takeWhile(x -> x < 5).toList());\
+         System.out.println(java.util.stream.Stream.of(1, 2).flatMap(x -> java.util.stream.Stream.iterate(x, y -> y + 1)).limit(3).toList());\
+         System.out.println(java.util.stream.Stream.concat(java.util.stream.Stream.iterate(1, x -> x * 2), java.util.stream.Stream.of(0)).peek(x -> System.out.print(x + \",\")).limit(4).toList());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[1, 2, 3]\n12\n0 0.0 OptionalDouble.empty\n[5] [1, 4]\n[1, 2, 3, 4]\n[1, 2, 3]\n1,2,4,8,[1, 2, 4, 8]\n");
+}
