@@ -6725,11 +6725,17 @@ impl Compiler {
                     self.b.emit(Op::LoadConst(empty), line);
                 }
             }
+            // `new String(chars, offset, count)` is `String.valueOf` with the
+            // same three arguments.
+            if args.len() == 3 {
+                self.expr(&args[1])?;
+                self.expr(&args[2])?;
+            }
             let class_c = self.b.add_constant(Value::str("String".to_string()));
             self.b.emit(Op::LoadConst(class_c), line);
             let method_c = self.b.add_constant(Value::str("valueOf".to_string()));
             self.b.emit(Op::LoadConst(method_c), line);
-            self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 3, line);
+            self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, if args.len() == 3 { 5 } else { 3 }, line);
             // `new String(…)` is specified to produce a *fresh* object, which is
             // the only reason the expression is ever written — so the text gets
             // an identity of its own here. Without it `new String("ab") == "ab"`
@@ -8133,8 +8139,11 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         (
             "Character",
             "isDigit" | "isLetter" | "isLetterOrDigit" | "isWhitespace" | "isUpperCase"
-            | "isLowerCase" | "isAlphabetic" | "isSpaceChar" | "isISOControl",
+            | "isLowerCase" | "isAlphabetic" | "isSpaceChar" | "isISOControl"
+            | "isJavaIdentifierStart" | "isJavaIdentifierPart",
         ) => "boolean",
+        ("Character", "toChars") => "char[]",
+        ("String", "copyValueOf") => "String",
         ("Character", "forDigit") => "char",
         ("Character", "digit" | "compare" | "charCount") => "int",
         ("Double" | "Float", "isFinite") => "boolean",

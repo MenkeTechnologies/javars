@@ -5916,3 +5916,31 @@ fn unbound_collection_method_references() {
     assert!(ok, "{out}");
     assert_eq!(out, "ab\n3\n[false, true]\n");
 }
+
+/// `String.valueOf(char[], offset, count)`, `copyValueOf`, and
+/// `new String(char[], offset, count)` with the JDK's range message;
+/// `Character.toChars` (a surrogate pair above the BMP, the
+/// `IllegalArgumentException` outside Unicode); and the Java identifier
+/// predicates, read as code points so a lone surrogate is not U+0000.
+/// Measured on `openjdk 27`.
+#[test]
+fn char_array_ranges_to_chars_and_identifier_predicates() {
+    let (out, ok) = run(r#"
+public class T { public static void main(String[] a) {
+  char[] cs = {'h','e','l','l','o'};
+  try { String.valueOf(cs, 1, 9); } catch (Exception e) { System.out.println(e); }
+  try { new String(cs, -1, 2); } catch (Exception e) { System.out.println(e); }
+  try { String.copyValueOf(cs, 3, -1); } catch (Exception e) { System.out.println(e); }
+  try { Character.toChars(-5); } catch (Exception e) { System.out.println(e); }
+  try { Character.toChars(0x110000); } catch (Exception e) { System.out.println(e); }
+  char[] s = Character.toChars(0x1F600); System.out.println((int) s[0] + " " + (int) s[1] + " " + new String(s).length());
+  System.out.println(String.valueOf(cs, 5, 0).isEmpty() + new String(cs, 0, 5));
+  System.out.println(Character.isJavaIdentifierPart(0) + " " + Character.isJavaIdentifierPart(0xD800) + " " + Character.isJavaIdentifierStart(0x20AC) + " " + Character.isJavaIdentifierPart((char) 0x0301) + " " + Character.isJavaIdentifierStart('́') + " " + Character.isJavaIdentifierPart(0x1D7CE) + " " + Character.isJavaIdentifierStart(0x2160));
+}}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "java.lang.StringIndexOutOfBoundsException: Range [1, 1 + 9) out of bounds for length 5\njava.lang.StringIndexOutOfBoundsException: Range [-1, -1 + 2) out of bounds for length 5\njava.lang.StringIndexOutOfBoundsException: Range [3, 3 + -1) out of bounds for length 5\njava.lang.IllegalArgumentException: Not a valid Unicode code point: 0xFFFFFFFB\njava.lang.IllegalArgumentException: Not a valid Unicode code point: 0x110000\n55357 56832 2\ntruehello\ntrue false true true false true true\n"
+    );
+}
