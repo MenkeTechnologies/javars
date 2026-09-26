@@ -7877,15 +7877,153 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ))),
         ("Double", "isNaN", 1) => Ok(Value::bool(args[0].jfloat().is_nan())),
         ("Double", "isInfinite", 1) => Ok(Value::bool(args[0].jfloat().is_infinite())),
+        ("Double" | "Float", "isFinite", 1) => Ok(Value::bool(args[0].jfloat().is_finite())),
+        // `Double.max`/`min` are `Math.max`/`min` — NaN wins and -0.0 is below
+        // 0.0 — and `sum` is `+`. The `Float` trio answers at 32 bits.
+        ("Double", "max", 2) => Ok(Value::float(max_double(args[0].jfloat(), args[1].jfloat()))),
+        ("Double", "min", 2) => Ok(Value::float(min_double(args[0].jfloat(), args[1].jfloat()))),
+        ("Double", "sum", 2) => Ok(Value::float(args[0].jfloat() + args[1].jfloat())),
+        ("Float", "max", 2) => Ok(Value::float(max_double(args[0].jfloat(), args[1].jfloat()))),
+        ("Float", "min", 2) => Ok(Value::float(min_double(args[0].jfloat(), args[1].jfloat()))),
+        ("Float", "sum", 2) => Ok(Value::float(f64::from(
+            args[0].jfloat() as f32 + args[1].jfloat() as f32,
+        ))),
+
+        // ── java.lang.Integer / Long: radix parsing and the unsigned family ──
+        ("Integer", "valueOf", 2) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
+        ("Integer", "valueOf", 2) => parse_int_radix(&args[0].as_str_cow(), args[1].jint(), true),
+        ("Long", "parseLong" | "valueOf", 2) if matches!(args[0], Value::Undef) => {
+            Err(null_number_fault())
+        }
+        ("Long", "parseLong" | "valueOf", 2) => {
+            parse_int_radix(&args[0].as_str_cow(), args[1].jint(), false)
+        }
+        ("Integer", "decode", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
+        ("Integer", "decode", 1) => java_decode(&args[0].as_str_cow()),
+        ("Integer", "parseUnsignedInt", 1 | 2) if matches!(args[0], Value::Undef) => {
+            Err(null_number_fault())
+        }
+        ("Integer", "parseUnsignedInt", n @ (1 | 2)) => {
+            let radix = if n == 2 { args[1].jint() } else { 10 };
+            parse_unsigned_int(&args[0].as_str_cow(), radix)
+        }
+        ("Integer", "toUnsignedLong", 1) => Ok(Value::Int(args[0].jint() as u32 as i64)),
+        ("Integer", "toUnsignedString", 1) => Ok(Value::str((args[0].jint() as u32).to_string())),
+        ("Integer", "toUnsignedString", 2) => Ok(Value::str(int_to_radix_string(
+            args[0].jint() as u32 as i64,
+            args[1].jint(),
+        ))),
+        ("Long", "toUnsignedString", 1) => Ok(Value::str((args[0].jint() as u64).to_string())),
+        ("Integer", "compareUnsigned", 2) => Ok(Value::Int(cmp_to_int(
+            (args[0].jint() as u32).cmp(&(args[1].jint() as u32)),
+        ))),
+        ("Long", "compareUnsigned", 2) => Ok(Value::Int(cmp_to_int(
+            (args[0].jint() as u64).cmp(&(args[1].jint() as u64)),
+        ))),
+        ("Integer", "divideUnsigned" | "remainderUnsigned", 2) => {
+            let (a, b) = (args[0].jint() as u32, args[1].jint() as u32);
+            if b == 0 {
+                return Err(Fault::java("ArithmeticException", "/ by zero"));
+            }
+            let r = if method == "divideUnsigned" {
+                a / b
+            } else {
+                a % b
+            };
+            Ok(Value::Int(i64::from(r as i32)))
+        }
+        ("Long", "divideUnsigned" | "remainderUnsigned", 2) => {
+            let (a, b) = (args[0].jint() as u64, args[1].jint() as u64);
+            if b == 0 {
+                return Err(Fault::java("ArithmeticException", "/ by zero"));
+            }
+            let r = if method == "divideUnsigned" {
+                a / b
+            } else {
+                a % b
+            };
+            Ok(Value::Int(r as i64))
+        }
+
+        // ── java.lang.Short / Byte ──
+        // Parsed at `int` width, then range-checked with the JDK's own message.
+        ("Short", "parseShort", 1 | 2) | ("Byte", "parseByte", 1 | 2) => parse_narrow(class, args),
+        ("Short" | "Byte", "valueOf", 1 | 2) if matches!(args[0], Value::Str(_) | Value::Undef) => {
+            parse_narrow(class, args)
+        }
+        ("Short" | "Byte", "valueOf", 1) => Ok(Value::Int(args[0].jint())),
+        // `Short.compare`/`Byte.compare` are `x - y`, not a sign.
+        ("Short" | "Byte", "compare", 2) => Ok(Value::Int(args[0].jint() - args[1].jint())),
+        ("Short" | "Byte", "toString", 1) => Ok(Value::str(args[0].jint().to_string())),
+        ("Short" | "Byte", "hashCode", 1) => Ok(Value::Int(args[0].jint())),
+        ("Short", "toUnsignedInt", 1) => Ok(Value::Int(args[0].jint() & 0xFFFF)),
+        ("Byte", "toUnsignedInt", 1) => Ok(Value::Int(args[0].jint() & 0xFF)),
+
+        // ── java.lang.Boolean's logical statics ──
+        ("Boolean", "logicalAnd", 2) => Ok(Value::bool(args[0].is_truthy() & args[1].is_truthy())),
+        ("Boolean", "logicalOr", 2) => Ok(Value::bool(args[0].is_truthy() | args[1].is_truthy())),
+        ("Boolean", "logicalXor", 2) => Ok(Value::bool(args[0].is_truthy() ^ args[1].is_truthy())),
 
         // ── java.lang.Character ──
         // The argument is a `char` code point (`char_arg` also accepts the
         // one-character String a boxed `Character` is). `toUpperCase`/
         // `toLowerCase` return a `char`, so they return a code point too.
-        ("Character", "isDigit", 1) => Ok(Value::bool(char_arg(&args[0]).is_ascii_digit())),
-        ("Character", "isLetter", 1) => Ok(Value::bool(char_arg(&args[0]).is_alphabetic())),
+        // `isDigit` is Unicode's DECIMAL_DIGIT_NUMBER, not ASCII: Java answers
+        // `true` for `'٣'` (U+0663) and every other script's decimal digits.
+        ("Character", "isDigit", 1) => Ok(Value::bool(
+            decimal_digit_value(char_arg(&args[0]) as u32).is_some(),
+        )),
+        ("Character", "digit", 2) => Ok(Value::Int(java_digit(
+            char_arg(&args[0]) as u32,
+            args[1].jint(),
+        ))),
+        // `forDigit` is `digit`'s inverse over the ASCII lowercase alphabet, and
+        // the NUL `char` for a digit or radix out of range.
+        ("Character", "forDigit", 2) => {
+            let (d, radix) = (args[0].jint(), args[1].jint());
+            Ok(Value::Int(
+                if (2..=36).contains(&radix) && (0..radix).contains(&d) {
+                    std::char::from_digit(d as u32, radix as u32).map_or(0, |c| c as i64)
+                } else {
+                    0
+                },
+            ))
+        }
+        // Unicode's `Alphabetic` property — letters, letter numbers, and the
+        // `Other_Alphabetic` marks — which is exactly Rust's `is_alphabetic`.
+        ("Character", "isAlphabetic", 1) => Ok(Value::bool(char_arg(&args[0]).is_alphabetic())),
+        // SPACE_SEPARATOR, LINE_SEPARATOR, PARAGRAPH_SEPARATOR — unlike
+        // `isWhitespace`, the no-break spaces count and the ASCII controls do not.
+        ("Character", "isSpaceChar", 1) => Ok(Value::bool(matches!(
+            char_arg(&args[0]),
+            '\u{20}' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{2028}' | '\u{2029}'
+        ))),
+        // Read as a code point, not through `char_arg`: a surrogate has no
+        // `char`, and `char_arg` would answer it as NUL — a control.
+        ("Character", "isISOControl", 1) => Ok(Value::bool(matches!(
+            match deboxed(&args[0]) {
+                Value::Int(n) => n,
+                _ => char_arg(&args[0]) as i64,
+            },
+            0..=0x1F | 0x7F..=0x9F
+        ))),
+        // `Character.compare(x, y)` is `x - y`, not a sign.
+        ("Character", "compare", 2) => Ok(Value::Int(
+            char_arg(&args[0]) as i64 - char_arg(&args[1]) as i64,
+        )),
+        ("Character", "charCount", 1) => {
+            Ok(Value::Int(if args[0].jint() >= 0x10000 { 2 } else { 1 }))
+        }
+        ("Character", "valueOf", 1) => Ok(Value::Int(char_arg(&args[0]) as i64)),
+        ("Character", "isLetter", 1) => Ok(Value::bool(java_is_letter(char_arg(&args[0])))),
+        // A letter or a DECIMAL digit: `is_alphanumeric` also takes the
+        // OTHER_NUMBER characters (`'²'`, `'½'`), which Java's does not.
         ("Character", "isLetterOrDigit", 1) => {
-            Ok(Value::bool(char_arg(&args[0]).is_alphanumeric()))
+            let c = char_arg(&args[0]);
+            Ok(Value::bool(
+                java_is_letter(c) || decimal_digit_value(c as u32).is_some(),
+            ))
         }
         ("Character", "isWhitespace", 1) => Ok(Value::bool(java_is_whitespace(char_arg(&args[0])))),
         ("Character", "isUpperCase", 1) => Ok(Value::bool(char_arg(&args[0]).is_uppercase())),
@@ -8330,6 +8468,334 @@ fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
     } else {
         q
     })
+}
+
+/// The code points Unicode calls `Alphabetic` that Java's `Character.isLetter`
+/// does not: the LETTER_NUMBER characters and the `Other_Alphabetic` marks
+/// (`U+0345`, the Hebrew and Arabic vowel points, Indic vowel signs, …). Rust's
+/// `is_alphabetic` is the Unicode property, so `isLetter` is that property
+/// minus these inclusive ranges. Enumerated from openjdk 27
+/// (`Character.isAlphabetic(c) && !Character.isLetter(c)` over
+/// U+0000..U+10FFFF), because Rust exposes no general-category table.
+const ALPHABETIC_NON_LETTERS: &[(u32, u32)] = &[
+    (0x345, 0x345),
+    (0x363, 0x36F),
+    (0x5B0, 0x5BD),
+    (0x5BF, 0x5BF),
+    (0x5C1, 0x5C2),
+    (0x5C4, 0x5C5),
+    (0x5C7, 0x5C7),
+    (0x610, 0x61A),
+    (0x64B, 0x657),
+    (0x659, 0x65F),
+    (0x670, 0x670),
+    (0x6D6, 0x6DC),
+    (0x6E1, 0x6E4),
+    (0x6E7, 0x6E8),
+    (0x6ED, 0x6ED),
+    (0x711, 0x711),
+    (0x730, 0x73F),
+    (0x7A6, 0x7B0),
+    (0x816, 0x817),
+    (0x81B, 0x823),
+    (0x825, 0x827),
+    (0x829, 0x82C),
+    (0x897, 0x897),
+    (0x8D4, 0x8DF),
+    (0x8E3, 0x8E9),
+    (0x8F0, 0x903),
+    (0x93A, 0x93B),
+    (0x93E, 0x94C),
+    (0x94E, 0x94F),
+    (0x955, 0x957),
+    (0x962, 0x963),
+    (0x981, 0x983),
+    (0x9BE, 0x9C4),
+    (0x9C7, 0x9C8),
+    (0x9CB, 0x9CC),
+    (0x9D7, 0x9D7),
+    (0x9E2, 0x9E3),
+    (0xA01, 0xA03),
+    (0xA3E, 0xA42),
+    (0xA47, 0xA48),
+    (0xA4B, 0xA4C),
+    (0xA51, 0xA51),
+    (0xA70, 0xA71),
+    (0xA75, 0xA75),
+    (0xA81, 0xA83),
+    (0xABE, 0xAC5),
+    (0xAC7, 0xAC9),
+    (0xACB, 0xACC),
+    (0xAE2, 0xAE3),
+    (0xAFA, 0xAFC),
+    (0xB01, 0xB03),
+    (0xB3E, 0xB44),
+    (0xB47, 0xB48),
+    (0xB4B, 0xB4C),
+    (0xB56, 0xB57),
+    (0xB62, 0xB63),
+    (0xB82, 0xB82),
+    (0xBBE, 0xBC2),
+    (0xBC6, 0xBC8),
+    (0xBCA, 0xBCC),
+    (0xBD7, 0xBD7),
+    (0xC00, 0xC04),
+    (0xC3E, 0xC44),
+    (0xC46, 0xC48),
+    (0xC4A, 0xC4C),
+    (0xC55, 0xC56),
+    (0xC62, 0xC63),
+    (0xC81, 0xC83),
+    (0xCBE, 0xCC4),
+    (0xCC6, 0xCC8),
+    (0xCCA, 0xCCC),
+    (0xCD5, 0xCD6),
+    (0xCE2, 0xCE3),
+    (0xCF3, 0xCF3),
+    (0xD00, 0xD03),
+    (0xD3E, 0xD44),
+    (0xD46, 0xD48),
+    (0xD4A, 0xD4C),
+    (0xD57, 0xD57),
+    (0xD62, 0xD63),
+    (0xD81, 0xD83),
+    (0xDCF, 0xDD4),
+    (0xDD6, 0xDD6),
+    (0xDD8, 0xDDF),
+    (0xDF2, 0xDF3),
+    (0xE31, 0xE31),
+    (0xE34, 0xE3A),
+    (0xE4D, 0xE4D),
+    (0xEB1, 0xEB1),
+    (0xEB4, 0xEB9),
+    (0xEBB, 0xEBC),
+    (0xECD, 0xECD),
+    (0xF71, 0xF83),
+    (0xF8D, 0xF97),
+    (0xF99, 0xFBC),
+    (0x102B, 0x1036),
+    (0x1038, 0x1038),
+    (0x103B, 0x103E),
+    (0x1056, 0x1059),
+    (0x105E, 0x1060),
+    (0x1062, 0x1064),
+    (0x1067, 0x106D),
+    (0x1071, 0x1074),
+    (0x1082, 0x108D),
+    (0x108F, 0x108F),
+    (0x109A, 0x109D),
+    (0x16EE, 0x16F0),
+    (0x1712, 0x1713),
+    (0x1732, 0x1733),
+    (0x1752, 0x1753),
+    (0x1772, 0x1773),
+    (0x17B6, 0x17C8),
+    (0x1885, 0x1886),
+    (0x18A9, 0x18A9),
+    (0x1920, 0x192B),
+    (0x1930, 0x1938),
+    (0x1A17, 0x1A1B),
+    (0x1A55, 0x1A5E),
+    (0x1A61, 0x1A74),
+    (0x1ABF, 0x1AC0),
+    (0x1ACC, 0x1ACE),
+    (0x1B00, 0x1B04),
+    (0x1B35, 0x1B43),
+    (0x1B80, 0x1B82),
+    (0x1BA1, 0x1BA9),
+    (0x1BAC, 0x1BAD),
+    (0x1BE7, 0x1BF1),
+    (0x1C24, 0x1C36),
+    (0x1DD3, 0x1DF4),
+    (0x2160, 0x2182),
+    (0x2185, 0x2188),
+    (0x24B6, 0x24E9),
+    (0x2DE0, 0x2DFF),
+    (0x3007, 0x3007),
+    (0x3021, 0x3029),
+    (0x3038, 0x303A),
+    (0xA674, 0xA67B),
+    (0xA69E, 0xA69F),
+    (0xA6E6, 0xA6EF),
+    (0xA802, 0xA802),
+    (0xA80B, 0xA80B),
+    (0xA823, 0xA827),
+    (0xA880, 0xA881),
+    (0xA8B4, 0xA8C3),
+    (0xA8C5, 0xA8C5),
+    (0xA8FF, 0xA8FF),
+    (0xA926, 0xA92A),
+    (0xA947, 0xA952),
+    (0xA980, 0xA983),
+    (0xA9B4, 0xA9BF),
+    (0xA9E5, 0xA9E5),
+    (0xAA29, 0xAA36),
+    (0xAA43, 0xAA43),
+    (0xAA4C, 0xAA4D),
+    (0xAA7B, 0xAA7D),
+    (0xAAB0, 0xAAB0),
+    (0xAAB2, 0xAAB4),
+    (0xAAB7, 0xAAB8),
+    (0xAABE, 0xAABE),
+    (0xAAEB, 0xAAEF),
+    (0xAAF5, 0xAAF5),
+    (0xABE3, 0xABEA),
+    (0xFB1E, 0xFB1E),
+    (0x10140, 0x10174),
+    (0x10341, 0x10341),
+    (0x1034A, 0x1034A),
+    (0x10376, 0x1037A),
+    (0x103D1, 0x103D5),
+    (0x10A01, 0x10A03),
+    (0x10A05, 0x10A06),
+    (0x10A0C, 0x10A0F),
+    (0x10D24, 0x10D27),
+    (0x10D69, 0x10D69),
+    (0x10EAB, 0x10EAC),
+    (0x10EFA, 0x10EFC),
+    (0x11000, 0x11002),
+    (0x11038, 0x11045),
+    (0x11073, 0x11074),
+    (0x11080, 0x11082),
+    (0x110B0, 0x110B8),
+    (0x110C2, 0x110C2),
+    (0x11100, 0x11102),
+    (0x11127, 0x11132),
+    (0x11145, 0x11146),
+    (0x11180, 0x11182),
+    (0x111B3, 0x111BF),
+    (0x111CE, 0x111CF),
+    (0x1122C, 0x11234),
+    (0x11237, 0x11237),
+    (0x1123E, 0x1123E),
+    (0x11241, 0x11241),
+    (0x112DF, 0x112E8),
+    (0x11300, 0x11303),
+    (0x1133E, 0x11344),
+    (0x11347, 0x11348),
+    (0x1134B, 0x1134C),
+    (0x11357, 0x11357),
+    (0x11362, 0x11363),
+    (0x113B8, 0x113C0),
+    (0x113C2, 0x113C2),
+    (0x113C5, 0x113C5),
+    (0x113C7, 0x113CA),
+    (0x113CC, 0x113CD),
+    (0x11435, 0x11441),
+    (0x11443, 0x11445),
+    (0x114B0, 0x114C1),
+    (0x115AF, 0x115B5),
+    (0x115B8, 0x115BE),
+    (0x115DC, 0x115DD),
+    (0x11630, 0x1163E),
+    (0x11640, 0x11640),
+    (0x116AB, 0x116B5),
+    (0x1171D, 0x1172A),
+    (0x1182C, 0x11838),
+    (0x11930, 0x11935),
+    (0x11937, 0x11938),
+    (0x1193B, 0x1193C),
+    (0x11940, 0x11940),
+    (0x11942, 0x11942),
+    (0x119D1, 0x119D7),
+    (0x119DA, 0x119DF),
+    (0x119E4, 0x119E4),
+    (0x11A01, 0x11A0A),
+    (0x11A35, 0x11A39),
+    (0x11A3B, 0x11A3E),
+    (0x11A51, 0x11A5B),
+    (0x11A8A, 0x11A97),
+    (0x11B60, 0x11B67),
+    (0x11C2F, 0x11C36),
+    (0x11C38, 0x11C3E),
+    (0x11C92, 0x11CA7),
+    (0x11CA9, 0x11CB6),
+    (0x11D31, 0x11D36),
+    (0x11D3A, 0x11D3A),
+    (0x11D3C, 0x11D3D),
+    (0x11D3F, 0x11D41),
+    (0x11D43, 0x11D43),
+    (0x11D47, 0x11D47),
+    (0x11D8A, 0x11D8E),
+    (0x11D90, 0x11D91),
+    (0x11D93, 0x11D96),
+    (0x11EF3, 0x11EF6),
+    (0x11F00, 0x11F01),
+    (0x11F03, 0x11F03),
+    (0x11F34, 0x11F3A),
+    (0x11F3E, 0x11F40),
+    (0x12400, 0x1246E),
+    (0x1611E, 0x1612E),
+    (0x16F4F, 0x16F4F),
+    (0x16F51, 0x16F87),
+    (0x16F8F, 0x16F92),
+    (0x16FF0, 0x16FF1),
+    (0x16FF4, 0x16FF6),
+    (0x1BC9E, 0x1BC9E),
+    (0x1E000, 0x1E006),
+    (0x1E008, 0x1E018),
+    (0x1E01B, 0x1E021),
+    (0x1E023, 0x1E024),
+    (0x1E026, 0x1E02A),
+    (0x1E08F, 0x1E08F),
+    (0x1E6E3, 0x1E6E3),
+    (0x1E6E6, 0x1E6E6),
+    (0x1E6EE, 0x1E6EF),
+    (0x1E6F5, 0x1E6F5),
+    (0x1E947, 0x1E947),
+    (0x1F130, 0x1F149),
+    (0x1F150, 0x1F169),
+    (0x1F170, 0x1F189),
+];
+
+/// Java's `Character.isLetter`: general category Lu, Ll, Lt, Lm, or Lo.
+fn java_is_letter(c: char) -> bool {
+    let c32 = c as u32;
+    let i = ALPHABETIC_NON_LETTERS.partition_point(|&(lo, _)| lo <= c32);
+    c.is_alphabetic() && !(i > 0 && c32 <= ALPHABETIC_NON_LETTERS[i - 1].1)
+}
+
+/// The first code point (the digit zero) of every run of Unicode
+/// DECIMAL_DIGIT_NUMBER characters. Unicode guarantees each run is ten
+/// contiguous code points, zero through nine, so a code point's digit value is
+/// its distance from the zero below it. Enumerated from openjdk 27
+/// (`Character.getType(c) == DECIMAL_DIGIT_NUMBER && Character.digit(c, 10) ==
+/// 0` over U+0000..U+10FFFF), because Rust exposes no general-category table.
+const DECIMAL_DIGIT_ZEROS: &[u32] = &[
+    0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66,
+    0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90,
+    0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+    0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50, 0x11D50,
+    0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE,
+    0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
+];
+
+/// The value of a DECIMAL_DIGIT_NUMBER code point, or `None` for any other.
+fn decimal_digit_value(c: u32) -> Option<u32> {
+    let i = DECIMAL_DIGIT_ZEROS.partition_point(|&z| z <= c);
+    let zero = *DECIMAL_DIGIT_ZEROS.get(i.checked_sub(1)?)?;
+    (c - zero < 10).then_some(c - zero)
+}
+
+/// `Character.digit(c, radix)`: a decimal digit of any script, or a Latin
+/// letter (ASCII or fullwidth) standing for 10..35, when that value is below
+/// `radix`; -1 otherwise, and for a radix outside 2..=36.
+fn java_digit(c: u32, radix: i64) -> i64 {
+    if !(2..=36).contains(&radix) {
+        return -1;
+    }
+    let value = decimal_digit_value(c).or(match c {
+        0x41..=0x5A => Some(c - 0x41 + 10),
+        0x61..=0x7A => Some(c - 0x61 + 10),
+        0xFF21..=0xFF3A => Some(c - 0xFF21 + 10),
+        0xFF41..=0xFF5A => Some(c - 0xFF41 + 10),
+        _ => None,
+    });
+    match value {
+        Some(v) if i64::from(v) < radix => i64::from(v),
+        _ => -1,
+    }
 }
 
 /// Java's `Character.isWhitespace(int)`.
@@ -10090,6 +10556,85 @@ fn parse_int_radix(s: &str, radix: i64, int_width: bool) -> Result<Value, Fault>
         return Err(bad());
     }
     Ok(Value::Int(n))
+}
+
+/// `Short.parseShort`/`Byte.parseByte` (and their `valueOf(String[, radix])`):
+/// `Integer.parseInt` at the given radix, then the JDK's range check and its
+/// `Value out of range. Value:"…" Radix:…` message.
+fn parse_narrow(class: &str, args: &[Value]) -> Result<Value, Fault> {
+    if matches!(args[0], Value::Undef) {
+        return Err(null_number_fault());
+    }
+    let s = args[0].as_str_cow();
+    let radix = args.get(1).map_or(10, Value::jint);
+    let n = parse_int_radix(&s, radix, true)?.jint();
+    let fits = if class == "Short" {
+        i16::try_from(n).is_ok()
+    } else {
+        i8::try_from(n).is_ok()
+    };
+    if !fits {
+        return Err(Fault::java(
+            "NumberFormatException",
+            format!("Value out of range. Value:\"{s}\" Radix:{radix}"),
+        ));
+    }
+    Ok(Value::Int(n))
+}
+
+/// `Integer.parseUnsignedInt(s, radix)`: a non-negative number up to 2^32 - 1,
+/// answered as the `int` with that bit pattern. A leading `-` and a value past
+/// the range each carry the JDK's own message.
+fn parse_unsigned_int(s: &str, radix: i64) -> Result<Value, Fault> {
+    let nfe = |m: String| Fault::java("NumberFormatException", m);
+    if s.starts_with('-') {
+        return Err(nfe(format!(
+            "Illegal leading minus sign on unsigned string {s}."
+        )));
+    }
+    let n = parse_int_radix(s, radix, false)?.jint();
+    if n > i64::from(u32::MAX) {
+        return Err(nfe(format!(
+            "String value {s} exceeds range of unsigned int."
+        )));
+    }
+    Ok(Value::Int(i64::from(n as u32 as i32)))
+}
+
+/// `Integer.decode`: an optional sign, then a `0x`/`0X`/`#` hexadecimal or a
+/// leading-`0` octal prefix, then digits — ported from `java.lang.Integer`,
+/// including where each of its messages comes from.
+fn java_decode(s: &str) -> Result<Value, Fault> {
+    let nfe = |m: &str| Fault::java("NumberFormatException", m.to_string());
+    if s.is_empty() {
+        return Err(nfe("Zero length string"));
+    }
+    let (neg, rest) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (radix, digits) = if let Some(d) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+        (16, d)
+    } else if let Some(d) = rest.strip_prefix('#') {
+        (16, d)
+    } else if rest.len() > 1 && rest.starts_with('0') {
+        (8, &rest[1..])
+    } else {
+        (10, rest)
+    };
+    if digits.starts_with('-') || digits.starts_with('+') {
+        return Err(nfe("Sign character in wrong position"));
+    }
+    // The JDK parses the digits, negates, and on failure re-parses the signed
+    // text — so a failure, and `-0x80000000`, are both decided on the signed
+    // text, which is what this parses directly.
+    let signed = if neg {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    };
+    parse_int_radix(&signed, radix, true)
 }
 
 /// Render `n` in the given radix (2..=36), matching `Integer.toString(i, radix)`.

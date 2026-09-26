@@ -7719,6 +7719,8 @@ fn is_static_class(name: &str) -> bool {
         "Math"
             | "Integer"
             | "Long"
+            | "Short"
+            | "Byte"
             | "Double"
             | "Float"
             | "Boolean"
@@ -7896,8 +7898,27 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         (
             "Character",
             "isDigit" | "isLetter" | "isLetterOrDigit" | "isWhitespace" | "isUpperCase"
-            | "isLowerCase",
+            | "isLowerCase" | "isAlphabetic" | "isSpaceChar" | "isISOControl",
         ) => "boolean",
+        ("Character", "forDigit") => "char",
+        ("Character", "digit" | "compare" | "charCount") => "int",
+        ("Double" | "Float", "isFinite") => "boolean",
+        ("Double", "max" | "min" | "sum") => "double",
+        ("Float", "max" | "min" | "sum") => "float",
+        ("Boolean", "logicalAnd" | "logicalOr" | "logicalXor") => "boolean",
+        (
+            "Integer",
+            "decode" | "parseUnsignedInt" | "compareUnsigned" | "divideUnsigned"
+            | "remainderUnsigned",
+        ) => "int",
+        ("Integer", "toUnsignedLong") => "long",
+        ("Long", "divideUnsigned" | "remainderUnsigned") => "long",
+        ("Long", "compareUnsigned") => "int",
+        ("Integer" | "Long", "toUnsignedString") => "String",
+        ("Short", "parseShort") => "short",
+        ("Byte", "parseByte") => "byte",
+        ("Short" | "Byte", "compare" | "hashCode" | "toUnsignedInt") => "int",
+        ("Short" | "Byte", "toString") => "String",
         _ => return None,
     })
 }
