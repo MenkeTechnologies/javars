@@ -270,19 +270,32 @@ at the bottom, and are summarized in the section right after this one.
   The four `comparingXxx` statics differ only in the width they promise, which
   javars does not track, so they share one body.
 - **`java.util.stream`.** Sources: `Collection.stream()`, `Stream.of`,
-  `Arrays.stream`, `IntStream`/`LongStream`/`DoubleStream`'s `of`/`range`/
-  `rangeClosed`. Intermediate: `filter`, `map`, `flatMap`, `peek`, `limit`,
-  `skip`, `distinct`, `sorted` (natural or with a comparator), `mapToInt`/
-  `mapToLong`/`mapToDouble`/`mapToObj`/`boxed`/`asLongStream`/`asDoubleStream`.
-  `Stream.iterate(seed, hasNext, next)` is supported and the *infinite* forms
-  (`iterate(seed, next)`, `generate(s)`) are not: a stream source here is a
-  materialized sequence, and producing some arbitrary prefix in the hope that a
-  later `limit` bounds it would answer a truncated stream as though it were the
-  whole one.
-  Terminal: `toList`, `toArray`, `collect`, `count`, `forEach`, `sum`,
-  `average`, `min`, `max`, `reduce` (both arities), `anyMatch`, `allMatch`,
-  `noneMatch`, `findFirst`, `findAny`. Collectors: `toList`, `toSet`,
-  `joining` (all three arities), `counting`, `toMap`, `groupingBy`.
+  `Stream.empty`/`ofNullable`/`concat`, `Arrays.stream`,
+  `IntStream`/`LongStream`/`DoubleStream`'s `of`/`range`/`rangeClosed`/`empty`/
+  `concat`, and `iterate` in both arities plus `generate`. The unbounded
+  `iterate(seed, next)` and `generate(s)` are pulled one element at a time by
+  the terminal, so `next`/`s` run only as often as an element is demanded and a
+  `limit` or short-circuiting terminal ends them; `concat` drives its two parts
+  the same way, and a `flatMap` pulls its inner stream straight into the rest of
+  the pipeline, so a mapper may answer an unbounded stream as it may since
+  JDK 10. Intermediate: `filter`, `map`, `flatMap`, `peek`, `limit`, `skip`,
+  `takeWhile`, `dropWhile`, `distinct`, `sorted` (natural or with a
+  comparator), `mapToInt`/`mapToLong`/`mapToDouble`/`mapToObj`/`boxed`/
+  `asLongStream`/`asDoubleStream`.
+  Terminal: `toList`, `toArray` (and `toArray(generator)`), `collect`, `count`,
+  `forEach`, `sum`, `average`, `min`, `max`, `reduce` (both arities),
+  `anyMatch`, `allMatch`, `noneMatch`, `findFirst`, `findAny`. A `double`
+  stream's `sum`/`average` use the JDK's compensated (Kahan) summation, so
+  `DoubleStream.of(0.1, 0.2, 0.3).sum()` is `0.6`; an `int` stream's `sum`
+  wraps at 32 bits and an integral `average` divides a `long` total.
+  Collectors: `toList`, `toSet`, `joining` (all three arities), `counting`,
+  `toMap` (two, three, and four arguments — a repeated key without a merge
+  function is the JDK's `IllegalStateException: Duplicate key k (attempted
+  merging values a and b)`), `groupingBy` (with a downstream collector and a
+  map factory), `partitioningBy`, `mapping`, `filtering`, `flatMapping`,
+  `collectingAndThen`, `summingInt`/`Long`/`Double`,
+  `averagingInt`/`Long`/`Double`, `minBy`, `maxBy`, `reducing` (all three
+  arities), `toCollection`, and `teeing`.
 
   Nothing is evaluated until a terminal runs, and the short-circuiting ones stop
   the source — so `l.stream().peek(p).limit(2).toList()` calls `p` twice, not
@@ -868,8 +881,10 @@ at the bottom, and are summarized in the section right after this one.
   receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
   `this::method` (bound — the receiver is captured), `Point::new`,
   `ArrayList::new`/`HashMap::new`/`StringBuilder::new`/`String::new`/
-  `Object::new` (the no-argument constructor of a modeled stdlib type), and
-  `System.out::println`. Java infers the reference's arity from its *target*
+  `Object::new` (the no-argument constructor of a modeled stdlib type),
+  `String[]::new`/`int[][]::new` (an array constructor, the generator
+  `toArray` takes), `List::stream`/`Set::size`/`Map.Entry::getKey` (an
+  unbound collection method), and `System.out::println`. Java infers the reference's arity from its *target*
   type; javars has no target-typing pass, so the arity comes from the referenced
   member's own declaration — which resolves every unambiguous form and rejects
   an overloaded name with a diagnostic rather than guessing an overload.
@@ -902,6 +917,19 @@ at the bottom, and are summarized in the section right after this one.
   is `java.util.KeyValueHolder` rather than Java's
   `java.util.AbstractMap$SimpleImmutableEntry`. The range views (`headMap`,
   `tailMap`, `subSet`, `descendingMap`, …) are not implemented.
+  `PriorityQueue` is the JDK's binary heap, laid out by its own `siftUp`/
+  `siftDown`/`heapify`, so `toString` and iteration show the heap array's order
+  rather than a sorted one; every constructor (capacity, comparator, a
+  collection — a `PriorityQueue` seed hands over its comparator — or both) runs,
+  as do `add`/`offer`/`poll`/`peek`/`element`/`remove`/`removeIf`/`contains`,
+  `comparator()` (`null` for natural order), and an iterator whose `remove()`
+  follows `PriorityQueue.Itr`, including the elements it defers to the end of
+  the walk. `List.listIterator` walks both ways and writes at its cursor.
+  `Collection.toArray()`/`toArray(T[])`/`toArray(generator)` follow
+  `AbstractCollection`: a long-enough array is filled in place and
+  `null`-terminated. `remove(int)` is by index only on a `List` static type; on
+  a `Collection`/`Queue`/`Deque` it removes the element, since those declare
+  no index overload.
   `Arrays.asList` is fixed-size and `List.of`/`Set.of` immutable, so a structural
   write to any of them throws `UnsupportedOperationException` exactly as Java's
   does — including `Set.of(1).remove(9)`, which Java refuses before deciding the
@@ -1095,11 +1123,11 @@ storage-model differences:
   compiler can read as a `Stream` (`"abc".chars().mapToObj(c -> (char) c)` is
   `[a, b, c]`, and `IntStream.map` still widens the same body to `97`). The
   other JDK methods that take an untargeted lambda do not convert yet, measured
-  on `openjdk 27`:
+  on `openjdk 27`. The `Collectors` factories convert: every lambda one takes
+  answers a reference except its predicates, `ToXFunction`s, and comparators,
+  so `groupingBy(s -> s.charAt(0))` keys by `Character`.
 
   ```java
-  System.out.println(Stream.of("ab").collect(Collectors.toMap(s -> s.charAt(0), s -> 1)));
-  // Java: {a=1}     javars: {97=1}
   System.out.println(Optional.of("q").map(s -> s.charAt(0)).get());
   // Java: q         javars: 113
   ```
@@ -1361,8 +1389,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   numbers that `isAlphabetic` includes — and `isSpaceChar`, `isISOControl`,
   `forDigit`, `compare` and `charCount` are there too. A sweep of all 65,536
   `char` values through six predicates and `digit(c, 36)` is byte-identical to
-  openjdk 27. `Character.toChars` and the `isJavaIdentifier*` pair are still
-  unregistered, so a call stops the run with an error naming the method.
+  openjdk 27. `Character.toChars` and the `isJavaIdentifierStart`/`Part` pair are
+  implemented too, read as code points (a lone surrogate is not U+0000) from
+  tables enumerated from openjdk 27.
 - **The regular-expression constructs with no faithful translation.** Regular
   expressions themselves are implemented (see the entry under "Implemented");
   what is refused — as a `PatternSyntaxException` naming the construct — is the
@@ -1377,11 +1406,19 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   Java but not in the engine), and a named error beats a silently different
   answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
   four `String` methods are the whole surface.
-- **`List.listIterator`.** The other two collection view methods now run:
-  `List.subList` as a real aliasing view, and `Map.entrySet` as a set of the
-  map's entries (see the `keySet()`/`values()`/`entrySet()` entry above for the
-  one way it still falls short of Java's). This one is not implemented, and an
-  unsupported-method error is the honest answer until it is.
+- ~~**`List.listIterator`**~~ — implemented, on `ArrayList.ListItr`'s cursor
+  model: `previous`/`hasPrevious`, `nextIndex`/`previousIndex`, and `set`/`add`
+  at the cursor, with `IllegalStateException` after an `add` and a
+  `ConcurrentModificationException` when the list moved underneath.
+- **Two local types with the same simple name in one program.** Local
+  `record`/`enum`/`interface`/`class` declarations are hoisted to the
+  program's type list under `javac`'s binary name (`T$1P`, `T$2P`), but the
+  flat namespace javars resolves types in is keyed by the *simple* name, so a
+  second local `P` in another method is refused as `duplicate class: P`.
+- **A local class that reads an enclosing local.** Local records, enums, and
+  interfaces are implicitly `static` in Java and never capture; a local
+  *class* can, and javars does not model the capture. Such a class is refused
+  (`cannot find symbol`) rather than run without its captured value.
 - ~~**`Map.of`**~~ — implemented, as the immutable map Java returns: a
   `put` is `UnsupportedOperationException` and `Map.of(…) instanceof HashMap` is
   `false`.

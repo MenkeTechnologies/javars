@@ -415,6 +415,16 @@ Implemented and checked against the reference `java`:
   is linked at the **head** of its hash bin where `put` links it at the tail, so
   the same map filled two ways iterates in two different orders, exactly as
   Java's does.
+  `PriorityQueue` is the JDK's own binary heap (so it prints in heap order, not
+  sorted), `List.listIterator` walks both ways and writes at its cursor, and a
+  local `record`/`enum`/`interface`/`class` declared in a method body runs
+  under `javac`'s binary name (`T$1Point`).
+- **Streams** — `Collection.stream()`, `Stream.of`/`iterate`/`generate`/
+  `concat`/`empty`, `IntStream.range`, the intermediate stages with Java's
+  laziness (an unbounded `iterate`/`generate` is pulled only as far as a
+  `limit` or short-circuiting terminal wants), the terminals, and the
+  `Collectors` factories (`toMap`, `groupingBy`, `partitioningBy`, `mapping`,
+  `teeing`, …); a `double` stream sums with the JDK's compensated summation.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
@@ -568,23 +578,14 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **Streams** — `.stream().map(…).filter(…)`, `IntStream.range`, the
-   `collect`/`reduce`/`findFirst` terminals. The lambdas they take already work,
-   as do the functional interfaces' `default` composition methods and statics
-   (`Function.andThen`, `Predicate.negate`, `Comparator.reversed`/
-   `naturalOrder`/`comparing`). What is missing is the surface itself — the
-   sources, the intermediate operations with Java's laziness, the terminals, and
-   `Optional`. A host builtin holds `&mut VM` and can re-enter it (that is how
-   `forEach`, `sort` with a comparator, and a user `toString()` already run user
-   code), so a stream can be a host object driving each stage's closure per
-   element; compile-time pipeline fusion is one way to build it, not a
-   prerequisite. See [`BUGS.md`](BUGS.md) for which callback shapes can re-enter
-   and which cannot.
-2. **The remaining collection view** (`List.listIterator`), plus wider stdlib
-   coverage (a `record`'s derived `hashCode`, `Collectors.toCollection`). The
-   pattern forms this line used to list — `case Integer i ->`, `case null`,
-   `when` guards — and `Iterator` and `Map.entrySet` all run; measured against
-   the reference on openjdk 21.0.12.1.
+1. **The remaining stream surface** — `mapMulti`, `summaryStatistics` and
+   the `summarizing*` collectors, and the unmodifiable-map collectors, whose
+   iteration order the JDK randomizes per run. See [`BUGS.md`](BUGS.md) for the
+   stages and collectors that do run.
+2. **Inner classes** — a non-`static` member class that reads its enclosing
+   instance, and a local class that captures an enclosing local; both are
+   refused today (`cannot find symbol`) rather than run without the enclosing
+   instance or the captured value.
 3. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 
