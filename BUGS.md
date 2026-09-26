@@ -892,6 +892,16 @@ at the bottom, and are summarized in the section right after this one.
   exactly, and checked against OpenJDK for `String` and `Integer` keys including
   across the resize at 13 entries. `LinkedHashMap`/`LinkedHashSet` keep insertion
   order and `TreeMap`/`TreeSet` sort, each because Java does, not by default.
+  A `TreeMap` navigates by key — `firstKey`/`lastKey`, `floorKey`/`ceilingKey`/
+  `lowerKey`/`higherKey`, the matching `…Entry` forms and
+  `pollFirstEntry`/`pollLastEntry` — and a `TreeSet` by element (`first`/`last`,
+  `floor`/`ceiling`/`lower`/`higher`, `pollFirst`/`pollLast`), each with the JDK's
+  empty-collection split (`firstKey`/`first` throw `NoSuchElementException`,
+  everything else answers `null`) and its `null`-probe `NullPointerException`.
+  An `…Entry` answer is an immutable snapshot pair, as Java's is, whose class
+  is `java.util.KeyValueHolder` rather than Java's
+  `java.util.AbstractMap$SimpleImmutableEntry`. The range views (`headMap`,
+  `tailMap`, `subSet`, `descendingMap`, …) are not implemented.
   `Arrays.asList` is fixed-size and `List.of`/`Set.of` immutable, so a structural
   write to any of them throws `UnsupportedOperationException` exactly as Java's
   does — including `Set.of(1).remove(9)`, which Java refuses before deciding the

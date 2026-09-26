@@ -368,7 +368,9 @@ Implemented and checked against the reference `java`:
   `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
   constructors, `Arrays.asList`, `List.of`/`Set.of`, and
-  `Collections.sort`/`reverse`/`max`/`min`. A deque reads and writes at both
+  `Collections.sort`/`reverse`/`max`/`min`. A `TreeMap` navigates by key
+  (`firstKey`, `floorKey`, `ceilingEntry`, `pollFirstEntry`, …) and a `TreeSet`
+  by element (`first`, `floor`, `higher`, `pollLast`, …). A deque reads and writes at both
   ends (`push`/`pop`/`peek`, `addFirst`/`addLast`, `offer*`, `poll*`,
   `get*`/`remove*`/`element`) and distinguishes the two empty-receiver
   families: the `get`/`remove`/`element`/`pop` spellings throw

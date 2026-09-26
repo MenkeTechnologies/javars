@@ -4247,6 +4247,130 @@ fn b_coll_dispatch(vm: &mut VM, argc: u8) -> Value {
     coll_method(vm, &recv, &method, &args)
 }
 
+/// Which key a `NavigableMap`/`NavigableSet` navigation method names.
+#[derive(Clone, Copy)]
+enum Nav {
+    First,
+    Last,
+    /// The greatest key `<=` the probe.
+    Floor,
+    /// The least key `>=` the probe.
+    Ceiling,
+    /// The greatest key `<` the probe.
+    Lower,
+    /// The least key `>` the probe.
+    Higher,
+}
+
+/// The `TreeMap`/`TreeSet` navigation methods: `firstKey`/`floorKey`/…,
+/// `firstEntry`/`ceilingEntry`/…, `pollFirstEntry`/`pollLastEntry` on a map and
+/// `first`/`floor`/…/`pollFirst`/`pollLast` on a set. `None` for any other
+/// method or any receiver that is not a sorted collection of its own, so a
+/// `Deque`'s `pollFirst` never reaches here.
+///
+/// A sorted collection keeps its keys in insertion order and presents them
+/// through [`natural_cmp`], so the answer is found in that same order. The
+/// JDK's contract, measured on openjdk 27: `firstKey`/`lastKey` and a set's
+/// `first`/`last` throw `NoSuchElementException` on an empty collection where
+/// every other method answers `null`; a `null` probe is a
+/// `NullPointerException` once there is a key to compare it with, and `null` on
+/// an empty collection, which compares nothing. An `…Entry` answer is a
+/// snapshot pair whose `setValue` is refused, as Java's is.
+fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let (nav, map_form, entry, poll) = match (method, args.len()) {
+        ("firstKey", 0) => (Nav::First, true, false, false),
+        ("lastKey", 0) => (Nav::Last, true, false, false),
+        ("floorKey", 1) => (Nav::Floor, true, false, false),
+        ("ceilingKey", 1) => (Nav::Ceiling, true, false, false),
+        ("lowerKey", 1) => (Nav::Lower, true, false, false),
+        ("higherKey", 1) => (Nav::Higher, true, false, false),
+        ("firstEntry", 0) => (Nav::First, true, true, false),
+        ("lastEntry", 0) => (Nav::Last, true, true, false),
+        ("floorEntry", 1) => (Nav::Floor, true, true, false),
+        ("ceilingEntry", 1) => (Nav::Ceiling, true, true, false),
+        ("lowerEntry", 1) => (Nav::Lower, true, true, false),
+        ("higherEntry", 1) => (Nav::Higher, true, true, false),
+        ("pollFirstEntry", 0) => (Nav::First, true, true, true),
+        ("pollLastEntry", 0) => (Nav::Last, true, true, true),
+        ("first", 0) => (Nav::First, false, false, false),
+        ("last", 0) => (Nav::Last, false, false, false),
+        ("floor", 1) => (Nav::Floor, false, false, false),
+        ("ceiling", 1) => (Nav::Ceiling, false, false, false),
+        ("lower", 1) => (Nav::Lower, false, false, false),
+        ("higher", 1) => (Nav::Higher, false, false, false),
+        ("pollFirst", 0) => (Nav::First, false, false, true),
+        ("pollLast", 0) => (Nav::Last, false, false, true),
+        _ => return None,
+    };
+    let pairs: Vec<(Value, Value)> = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map {
+            entries,
+            order: Order::Sorted,
+            ..
+        }) if map_form => Some(entries.clone()),
+        Some(HostObj::Set {
+            items,
+            order: Order::Sorted,
+            view: SetView::Own,
+            ..
+        }) if !map_form => Some(items.iter().map(|k| (k.clone(), Value::Undef)).collect()),
+        _ => None,
+    })?;
+    use std::cmp::Ordering::{Greater, Less};
+    let cmp_probe = |k: &Value| natural_cmp(k, &args[0]);
+    if !args.is_empty() && matches!(deboxed(&args[0]), Value::Undef) && !pairs.is_empty() {
+        return Some(raise(
+            vm,
+            Fault::java(
+                "NullPointerException",
+                "Cannot invoke \"java.lang.Comparable.compareTo(Object)\" because \"k1\" is null"
+                    .to_string(),
+            ),
+        ));
+    }
+    let better = |cand: &(Value, Value), best: &(Value, Value), want_max: bool| {
+        let o = natural_cmp(&cand.0, &best.0);
+        if want_max {
+            o == Greater
+        } else {
+            o == Less
+        }
+    };
+    let mut found: Option<&(Value, Value)> = None;
+    for p in &pairs {
+        let (fits, want_max) = match nav {
+            Nav::First => (true, false),
+            Nav::Last => (true, true),
+            Nav::Floor => (cmp_probe(&p.0) != Greater, true),
+            Nav::Ceiling => (cmp_probe(&p.0) != Less, false),
+            Nav::Lower => (cmp_probe(&p.0) == Less, true),
+            Nav::Higher => (cmp_probe(&p.0) == Greater, false),
+        };
+        if fits && found.is_none_or(|b| better(p, b, want_max)) {
+            found = Some(p);
+        }
+    }
+    let Some((key, value)) = found.cloned() else {
+        let throws = !entry && !poll && matches!(nav, Nav::First | Nav::Last);
+        return Some(if throws {
+            raise(vm, Fault::java("NoSuchElementException", String::new()))
+        } else {
+            Value::Undef
+        });
+    };
+    if poll {
+        coll_method(vm, recv, "remove", std::slice::from_ref(&key));
+    }
+    Some(if entry {
+        alloc_entry(key, value, None)
+    } else {
+        key
+    })
+}
+
 /// Evaluate `recv.method(args)` on a collection.
 ///
 /// Every method that mutates takes the heap borrow, edits, and drops it before
@@ -4287,6 +4411,9 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             Ok(v) => v,
             Err(f) => raise(vm, f),
         };
+    }
+    if let Some(v) = navigate(vm, recv, method, args) {
+        return v;
     }
     // The two VM-re-entering methods are handled before any borrow is taken.
     match (method, args.len()) {
