@@ -5711,3 +5711,96 @@ fn list_iterator_walks_both_ways_and_writes_through() {
         "0 1 true\naab\nISE null\nx\n[a, b, Z, c]\ntrue\nIndex: 9, Size: 4\nCME\nNSE\n[1, 20, 40]\n"
     );
 }
+
+/// `PriorityQueue` is the JDK's binary heap, not a sorted list: `toString`,
+/// iteration, and the collection constructor's `heapify` expose the heap
+/// array's order, `remove(Object)` refills the hole by `removeAt`'s
+/// sift-down-then-up, and the comparator (explicit, inherited from a
+/// `PriorityQueue` seed, or a `Comparable`'s own `compareTo`) orders `poll`.
+/// Measured on `openjdk 17`.
+#[test]
+fn priority_queue_keeps_the_jdk_heap_layout() {
+    let (out, ok) = run(r#"
+import java.util.*; import java.util.stream.*;
+public class T {
+  record Job(String n, int p) implements Comparable<Job> { public int compareTo(Job o) { return Integer.compare(p, o.p); } }
+  public static void main(String[] a) {
+  PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(9, 4, 7, 1, 8, 2, 6, 3, 5));
+  System.out.println(pq);
+  pq.remove(7); System.out.println(pq + " " + pq.remove(42));
+  pq.removeIf(x -> x % 2 == 0); System.out.println(pq);
+  for (int x : pq) System.out.print(x + ";");
+  System.out.println();
+  System.out.println(pq.stream().sorted().collect(Collectors.toList()));
+  PriorityQueue<Job> jobs = new PriorityQueue<>();
+  jobs.add(new Job("c", 3)); jobs.add(new Job("a", 1)); jobs.add(new Job("b", 2));
+  System.out.println(jobs.poll().n() + jobs.peek().n() + " " + jobs.size());
+  System.out.println(jobs.comparator() == null);
+  PriorityQueue<String> byLen = new PriorityQueue<>(10, Comparator.comparing(String::length));
+  byLen.addAll(List.of("ccc", "a", "bb")); System.out.println(byLen.poll() + " " + (byLen.comparator() != null));
+  PriorityQueue<String> copy = new PriorityQueue<>(byLen); System.out.println(copy.poll());
+  Queue<Integer> q = new PriorityQueue<>(Collections.reverseOrder());
+  q.offer(3); q.offer(10); q.offer(1);
+  System.out.println(q.remove() + " " + q.element() + " " + (q instanceof PriorityQueue) + " " + (q instanceof AbstractQueue) + " " + q.getClass().getName());
+  try { new PriorityQueue<Integer>().remove(); } catch (NoSuchElementException e) { System.out.println("NSE"); }
+  try { new PriorityQueue<Integer>().add(null); } catch (NullPointerException e) { System.out.println("NPE"); }
+  PriorityQueue<Integer> e1 = new PriorityQueue<>(); System.out.println(e1.equals(new PriorityQueue<Integer>()) + " " + e1.poll() + " " + e1.peek());
+  Iterator<Integer> it = pq.iterator(); System.out.println(it.next());
+  PriorityQueue<Integer> big = new PriorityQueue<>();
+  for (int i = 20; i > 0; i--) big.add(i * 7 % 23);
+  System.out.println(big);
+  StringBuilder sb = new StringBuilder(); while (!big.isEmpty()) sb.append(big.poll()).append(' ');
+  System.out.println(sb.toString().trim());
+  PriorityQueue<Integer> ts = new PriorityQueue<>(new TreeSet<>(List.of(5, 3, 9)));
+  System.out.println(ts + " " + ts.contains(9));
+  Object o = ts; PriorityQueue<Integer> back = (PriorityQueue<Integer>) o; back.clear(); System.out.println(ts.isEmpty());
+}}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[1, 3, 2, 4, 8, 7, 6, 9, 5]\n[1, 3, 2, 4, 8, 5, 6, 9] false\n[1, 3, 5, 9]\n1;3;5;9;\n[1, 3, 5, 9]\nab 2\ntrue\na true\nbb\n10 3 true true java.util.PriorityQueue\nNSE\nNPE\nfalse null null\n1\n[1, 2, 3, 5, 4, 10, 6, 12, 14, 7, 8, 17, 13, 11, 19, 22, 15, 21, 18, 20]\n1 2 3 4 5 6 7 8 10 11 12 13 14 15 17 18 19 20 21 22\n[3, 5, 9] true\ntrue\n"
+    );
+}
+
+/// `PriorityQueue.Itr.remove` can lift the heap's last element into a slot the
+/// walk already passed; the JDK hands that element out after the array walk
+/// (`forgetMeNot`), so every element is still visited exactly once.
+#[test]
+fn priority_queue_iterator_remove_visits_every_element_once() {
+    let (out, ok) = run(r#"import java.util.*;
+public class T { public static void main(String[] a) {
+  PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(1, 9, 2, 10, 11, 3, 4));
+  Iterator<Integer> it = pq.iterator(); StringBuilder seen = new StringBuilder();
+  while (it.hasNext()) { int v = it.next(); seen.append(v).append(' '); if (v == 10) it.remove(); }
+  System.out.println(seen + "| " + pq);
+  Iterator<Integer> twice = pq.iterator(); twice.next(); twice.remove();
+  try { twice.remove(); } catch (IllegalStateException e) { System.out.println("ISE"); }
+  Iterator<Integer> stale = pq.iterator(); pq.add(0);
+  try { stale.next(); } catch (ConcurrentModificationException e) { System.out.println("CME"); }
+}}"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1 9 2 10 11 3 4 | [1, 4, 2, 9, 11, 3]\nISE\nCME\n");
+}
+
+/// `Collection.toArray()` and `toArray(T[])`: a long-enough argument is filled
+/// in place with a `null` terminator, a short one only names the type.
+#[test]
+fn collection_to_array_fills_or_allocates() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T { public static void main(String[] a) {
+  List<String> l = new ArrayList<>(List.of("x","y"));
+  String[] s = l.toArray(new String[0]); System.out.println(Arrays.toString(s) + s.length);
+  String[] big = {"a","b","c","d"}; String[] r = l.toArray(big); System.out.println((r == big) + Arrays.toString(big));
+  Object[] o = new TreeSet<>(Set.of(3,1,2)).toArray(); System.out.println(Arrays.toString(o));
+  Integer[] ints = new ArrayDeque<>(List.of(4,5)).toArray(new Integer[2]); System.out.println(ints[0] + ints[1]);
+  System.out.println(Arrays.toString(new LinkedHashMap<>(Map.of("k", 1)).keySet().toArray()));
+}}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[x, y]2\ntrue[x, y, null, d]\n[1, 2, 3]\n9\n[k]\n"
+    );
+}

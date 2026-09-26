@@ -6713,6 +6713,31 @@ impl Compiler {
             self.emit_raising_builtin(crate::host::JSB_NEW, 2, line);
             return Ok(());
         }
+        // `new PriorityQueue<>(…)` — every JDK overload but the `SortedSet` one:
+        // `()`, `(int)`, `(Comparator)`, `(int, Comparator)`, `(Collection)`.
+        // The host tells them apart by runtime shape; the natural-order
+        // comparator rides along for the ones that name none, so an element's
+        // own `compareTo` orders the heap exactly as `Comparable` does.
+        if !self.classes.contains_key(class) && class == "PriorityQueue" {
+            if args.len() > 2 {
+                return Err(format!(
+                    "javars: `new PriorityQueue<>(…)` takes at most two arguments (line {line})"
+                ));
+            }
+            let kind_c = self.b.add_constant(Value::str(class.to_string()));
+            self.b.emit(Op::LoadConst(kind_c), line);
+            for i in 0..2 {
+                match args.get(i) {
+                    Some(a) => self.expr(a)?,
+                    None => {
+                        self.b.emit(Op::LoadUndef, line);
+                    }
+                }
+            }
+            self.expr(&natural_order_comparator(line))?;
+            self.emit_raising_builtin(crate::host::JCOLL_NEW, 4, line);
+            return Ok(());
+        }
         // `new ArrayList<>()` / `new HashMap<>(other)` — a `java.util`
         // collection, allocated by the host rather than laid out as an instance.
         // A user class of the same name wins, because `self.classes` is checked
@@ -8274,6 +8299,9 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
         "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
         "HashMap" | "LinkedHashMap" | "TreeMap" | "Map" => "map",
         "HashSet" | "LinkedHashSet" | "TreeSet" | "Set" => "set",
+        // Not a `List`: it has no `remove(int)`, so an integral argument is an
+        // element there, never an index.
+        "PriorityQueue" => "pq",
         // `Map.Entry`, which the type parser flattens to its simple name. It is
         // not a collection, but it reaches the host down the same route: the
         // dispatch builtin takes any receiver whose methods the host models,
@@ -8290,7 +8318,7 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
 /// programs default-construct.
 fn has_no_arg_constructor(ty: &str) -> bool {
     is_concrete_collection(ty)
-        || matches!(ty, "String" | "StringBuilder" | "StringBuffer" | "Object")
+        || matches!(ty, "String" | "StringBuilder" | "StringBuffer" | "Object" | "PriorityQueue")
 }
 
 fn is_concrete_collection(ty: &str) -> bool {
@@ -8316,7 +8344,7 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         ("size", 0) | ("indexOf", 1) | ("lastIndexOf", 1) => "int",
         ("isEmpty", 0) | ("contains", 1) | ("containsKey", 1) | ("containsValue", 1) => "boolean",
         ("add", 1) | ("addAll", 1) | ("equals", 1) => "boolean",
-        ("remove", 1) if kind == "set" => "boolean",
+        ("remove", 1) if kind == "set" || kind == "pq" => "boolean",
         // The compiler-selected `List.remove(Object)` overload.
         ("removeObject", 1) => "boolean",
         ("toString", 0) => "String",

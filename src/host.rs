@@ -623,6 +623,34 @@ enum HostObj {
         /// none of them, exactly as `java.util.Iterator` declares none.
         bidi: bool,
     },
+    /// A `java.util.PriorityQueue`: the binary heap array itself, laid out by
+    /// the JDK's own `siftUp`/`siftDown`, so iteration and `toString` show the
+    /// same (heap, not sorted) order the reference does.
+    PQueue {
+        items: Vec<Value>,
+        /// The ordering closure — the one the program passed, or the
+        /// `(a, b) -> a.compareTo(b)` the compiler supplies for natural order.
+        cmp: Value,
+        /// `true` when `cmp` is that supplied natural order, which is what
+        /// makes `comparator()` answer `null`.
+        natural: bool,
+        /// `AbstractList`-style `modCount`: bumped by every structural change,
+        /// read by [`HostObj::PQIter`] to report a concurrent modification.
+        mods: u64,
+    },
+    /// `PriorityQueue.Itr`. Walking the heap array is plain, but `remove()` is
+    /// not: deleting slot `last` may lift the heap's last element into an
+    /// already-visited slot, and the JDK then remembers that element in
+    /// `forgetMeNot` and hands it out after the array walk ends. This carries
+    /// the same state so the sequence of `next()` results is the reference's.
+    PQIter {
+        source: u32,
+        cursor: usize,
+        last: Option<usize>,
+        forget: std::collections::VecDeque<Value>,
+        last_elt: Option<Value>,
+        exp_mods: u64,
+    },
     /// A `java.util.Optional` — present with a value, or empty.
     ///
     /// A *value* in Java (`Optional.of("x").equals(Optional.of("x"))` is
@@ -1500,6 +1528,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         "HashSet" => &["AbstractSet", "Cloneable", "Serializable"],
         "LinkedHashSet" => &["HashSet", "SequencedSet"],
         "TreeSet" => &["AbstractSet", "NavigableSet", "Cloneable", "Serializable"],
+        "PriorityQueue" => &["AbstractQueue", "Serializable"],
+        "AbstractQueue" => &["AbstractCollection", "Queue"],
+        "Queue" => &["Collection"],
         // The internal names [`value_class`] gives the shapes Java spells with
         // syntax, or with a class the JDK does not export, so no user type can
         // collide with one. An array is `Cloneable` and `Serializable` and
@@ -2604,6 +2635,413 @@ fn set_cursor(id: u32, to: usize, ret: Option<usize>, mods: u64) {
     });
 }
 
+/// `Collection.toArray()`, `toArray(T[])`, and `toArray(IntFunction<T[]>)`.
+///
+/// The array form follows `AbstractCollection.toArray(T[])`: an array at least
+/// as long as the collection is filled in place and returned, with the slot
+/// just past the last element set to `null` when there is room; a shorter one
+/// only names the type, and a fresh array is returned. The generator form is
+/// `toArray(generator.apply(0))`, as `Collection`'s default declares it.
+fn collection_to_array(vm: &mut VM, items: Vec<Value>, arg: Option<&Value>) -> Result<Value, Fault> {
+    let fresh = |items: Vec<Value>| Ok(Value::Obj(heap_alloc(HostObj::Array(items))));
+    let target = match arg {
+        None => return fresh(items),
+        Some(Value::Undef) => return Err(Fault::java("NullPointerException", String::new())),
+        Some(g) if closure_meta(g).is_some() => {
+            let a = invoke_closure(vm, g, &[Value::Int(0)]);
+            if pending() {
+                return Ok(Value::Undef);
+            }
+            a
+        }
+        Some(a) => a.clone(),
+    };
+    let Value::Obj(aid) = target else {
+        return Err(Fault::internal("javars: `toArray` needs an array argument"));
+    };
+    let filled = HEAP.with(|h| match h.borrow_mut().get_mut(aid as usize) {
+        Some(HostObj::Array(slots)) if slots.len() >= items.len() => {
+            let n = items.len();
+            for (slot, v) in slots.iter_mut().zip(&items) {
+                *slot = v.clone();
+            }
+            if let Some(after) = slots.get_mut(n) {
+                *after = Value::Undef;
+            }
+            true
+        }
+        _ => false,
+    });
+    if filled {
+        Ok(target)
+    } else {
+        fresh(items)
+    }
+}
+
+/// Whether a user closure raised, leaving a throwable pending.
+fn pending() -> bool {
+    PENDING.with(|p| p.borrow().is_some())
+}
+
+/// A `java.util.PriorityQueue`'s heap array, comparator, natural-order flag,
+/// and modification count, cloned out from under the heap borrow so the
+/// comparator can re-enter the VM.
+fn pq_state(id: u32) -> Option<(Vec<Value>, Value, bool, u64)> {
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::PQueue {
+            items,
+            cmp,
+            natural,
+            mods,
+        }) => Some((items.clone(), cmp.clone(), *natural, *mods)),
+        _ => None,
+    })
+}
+
+/// Store a heap array back after an operation rearranged it; `structural`
+/// bumps the modification count the way `PriorityQueue.modCount++` does.
+fn pq_store(id: u32, heap: Vec<Value>, structural: bool) {
+    HEAP.with(|h| {
+        if let Some(HostObj::PQueue { items, mods, .. }) = h.borrow_mut().get_mut(id as usize) {
+            *items = heap;
+            if structural {
+                *mods += 1;
+            }
+        }
+    });
+}
+
+/// `PriorityQueue.siftUp`: place `x` at `k` and bubble it toward the root
+/// while it compares strictly below its parent.
+fn pq_sift_up(vm: &mut VM, heap: &mut [Value], mut k: usize, x: Value, cmp: &Value) {
+    while k > 0 {
+        let parent = (k - 1) >> 1;
+        if invoke_closure(vm, cmp, &[x.clone(), heap[parent].clone()]).jint() >= 0 {
+            break;
+        }
+        heap[k] = heap[parent].clone();
+        k = parent;
+    }
+    heap[k] = x;
+}
+
+/// `PriorityQueue.siftDown` over the first `n` slots: place `x` at `k` and
+/// sink it below the smaller child (the right one only when it compares
+/// strictly smaller) while that child compares strictly below `x`. Returns
+/// the slot `x` came to rest in.
+fn pq_sift_down(vm: &mut VM, heap: &mut [Value], mut k: usize, x: Value, n: usize, cmp: &Value) -> usize {
+    let half = n >> 1;
+    while k < half {
+        let mut child = 2 * k + 1;
+        let right = child + 1;
+        if right < n
+            && invoke_closure(vm, cmp, &[heap[child].clone(), heap[right].clone()]).jint() > 0
+        {
+            child = right;
+        }
+        if invoke_closure(vm, cmp, &[x.clone(), heap[child].clone()]).jint() <= 0 {
+            break;
+        }
+        heap[k] = heap[child].clone();
+        k = child;
+    }
+    heap[k] = x;
+    k
+}
+
+/// `PriorityQueue.heapify`: sift down every parent, last one first — the
+/// layout the collection constructor and a bulk removal leave behind.
+fn pq_heapify(vm: &mut VM, heap: &mut [Value], cmp: &Value) {
+    let n = heap.len();
+    for i in (0..n / 2).rev() {
+        let x = heap[i].clone();
+        pq_sift_down(vm, heap, i, x, n, cmp);
+    }
+}
+
+/// `PriorityQueue.removeAt`: fill slot `i` with the last element and restore
+/// the heap, sinking it and — when it did not move — floating it instead.
+///
+/// Returns the moved element when it floated *above* `i`, which is the one
+/// case an iterator standing at `i` would otherwise never visit it; `None`
+/// otherwise, exactly as the JDK's `removeAt` does.
+fn pq_remove_at(vm: &mut VM, heap: &mut Vec<Value>, i: usize, cmp: &Value) -> Option<Value> {
+    let moved = heap.pop()?;
+    if i == heap.len() {
+        return None;
+    }
+    let n = heap.len();
+    if pq_sift_down(vm, heap, i, moved.clone(), n, cmp) != i {
+        return None;
+    }
+    pq_sift_up(vm, heap, i, moved.clone(), cmp);
+    // `siftUp` either left it in slot `i` or moved it toward the root.
+    if matches!(&heap[i], Value::Obj(a) if matches!(&moved, Value::Obj(b) if a == b))
+        || (!matches!(moved, Value::Obj(_)) && value_eq(&heap[i], &moved))
+    {
+        None
+    } else {
+        Some(moved)
+    }
+}
+
+/// Build a `PriorityQueue` from the constructor's arguments.
+///
+/// The compiler passes up to two source arguments plus the natural-order
+/// comparator it synthesizes. The JDK's overloads are told apart by their
+/// runtime shape: a closure is the comparator (`(Comparator)` or
+/// `(int, Comparator)`), an integer is a capacity with no observable effect,
+/// and a collection seeds the queue. A `PriorityQueue` seed hands over its heap
+/// array and its comparator unchanged, a sorted set its ascending order (a
+/// valid heap already); any other collection is copied and heapified.
+fn new_priority_queue(vm: &mut VM, a0: &Value, a1: &Value, natural_cmp: &Value) -> Result<Value, Fault> {
+    let explicit = [a1, a0].into_iter().find(|v| closure_meta(v).is_some()).cloned();
+    let seed = match a0 {
+        Value::Obj(sid) if closure_meta(a0).is_none() => Some(*sid),
+        _ => None,
+    };
+    let (mut cmp, mut natural) = match explicit {
+        Some(c) => (c, false),
+        None => (natural_cmp.clone(), true),
+    };
+    let mut heap = Vec::new();
+    if let Some(sid) = seed {
+        if let Some((items, c, nat, _)) = pq_state(sid) {
+            heap = items;
+            cmp = c;
+            natural = nat;
+        } else {
+            let sorted = HEAP.with(|h| {
+                matches!(
+                    h.borrow().get(sid as usize),
+                    Some(HostObj::Set {
+                        order: Order::Sorted,
+                        ..
+                    })
+                )
+            });
+            heap = sequence_items(a0).ok_or_else(|| {
+                Fault::internal("javars: `new PriorityQueue<>(…)` needs a collection")
+            })?;
+            if heap.iter().any(|v| matches!(v, Value::Undef)) {
+                return Err(Fault::java("NullPointerException", String::new()));
+            }
+            if !sorted {
+                pq_heapify(vm, &mut heap, &cmp);
+            }
+        }
+    }
+    Ok(Value::Obj(heap_alloc(HostObj::PQueue {
+        items: heap,
+        cmp,
+        natural,
+        mods: 0,
+    })))
+}
+
+/// The methods of a `java.util.PriorityQueue` receiver.
+///
+/// `None` for any other receiver, and for the methods the generic collection
+/// path already answers from [`sequence_items`] in heap-array order
+/// (`stream`, `forEach`, `toString`, `toArray`) — which is the order
+/// `PriorityQueue`'s own iterator and `toString` present.
+fn pq_method(vm: &mut VM, id: u32, method: &str, args: &[Value]) -> Option<Value> {
+    let (mut heap, cmp, natural, mods) = pq_state(id)?;
+    let fail = |vm: &mut VM, class: &'static str| Some(raise(vm, Fault::java(class, String::new())));
+    let result = match (method, args.len()) {
+        ("add" | "offer", 1) => {
+            if matches!(args[0], Value::Undef) {
+                return fail(vm, "NullPointerException");
+            }
+            let k = heap.len();
+            heap.push(Value::Undef);
+            pq_sift_up(vm, &mut heap, k, args[0].clone(), &cmp);
+            Value::bool(true)
+        }
+        ("addAll", 1) => {
+            if matches!(&args[0], Value::Obj(o) if *o == id) {
+                return fail(vm, "IllegalArgumentException");
+            }
+            let items = sequence_items(&args[0]).unwrap_or_default();
+            for v in &items {
+                if matches!(v, Value::Undef) {
+                    pq_store(id, heap, true);
+                    return fail(vm, "NullPointerException");
+                }
+                let k = heap.len();
+                heap.push(Value::Undef);
+                pq_sift_up(vm, &mut heap, k, v.clone(), &cmp);
+            }
+            Value::bool(!items.is_empty())
+        }
+        ("peek", 0) => return Some(heap.first().cloned().unwrap_or(Value::Undef)),
+        ("element", 0) => match heap.first() {
+            Some(v) => return Some(v.clone()),
+            None => return fail(vm, "NoSuchElementException"),
+        },
+        ("poll" | "remove", 0) => {
+            if heap.is_empty() {
+                return if method == "poll" {
+                    Some(Value::Undef)
+                } else {
+                    fail(vm, "NoSuchElementException")
+                };
+            }
+            let top = heap[0].clone();
+            pq_remove_at(vm, &mut heap, 0, &cmp);
+            top
+        }
+        ("remove", 1) => match (0..heap.len()).find(|&i| eq_call(vm, &args[0], &heap[i])) {
+            Some(i) => {
+                pq_remove_at(vm, &mut heap, i, &cmp);
+                Value::bool(true)
+            }
+            None => return Some(Value::bool(false)),
+        },
+        ("contains", 1) => {
+            return Some(Value::bool(
+                (0..heap.len()).any(|i| eq_call(vm, &args[0], &heap[i])),
+            ))
+        }
+        ("size", 0) => return Some(Value::Int(heap.len() as i64)),
+        ("isEmpty", 0) => return Some(Value::bool(heap.is_empty())),
+        ("clear", 0) => {
+            heap.clear();
+            Value::Undef
+        }
+        // `bulkRemove`: drop every element the predicate accepts, then
+        // re-heapify what is left.
+        ("removeIf", 1) => {
+            let mut kept = Vec::with_capacity(heap.len());
+            for v in &heap {
+                let drop = invoke_closure(vm, &args[0], std::slice::from_ref(v));
+                if pending() {
+                    return Some(Value::Undef);
+                }
+                if !matches!(drop, Value::Bool(true)) {
+                    kept.push(v.clone());
+                }
+            }
+            if kept.len() == heap.len() {
+                return Some(Value::bool(false));
+            }
+            heap = kept;
+            pq_heapify(vm, &mut heap, &cmp);
+            Value::bool(true)
+        }
+        ("iterator", 0) => {
+            return Some(Value::Obj(heap_alloc(HostObj::PQIter {
+                source: id,
+                cursor: 0,
+                last: None,
+                forget: std::collections::VecDeque::new(),
+                last_elt: None,
+                exp_mods: mods,
+            })))
+        }
+        ("comparator", 0) => return Some(if natural { Value::Undef } else { cmp }),
+        // `PriorityQueue` inherits `Object`'s identity `equals`/`hashCode`.
+        ("equals", 1) => return Some(Value::bool(matches!(&args[0], Value::Obj(o) if *o == id))),
+        ("hashCode", 0) => return Some(Value::Int(i64::from(id))),
+        _ => return None,
+    };
+    if pending() {
+        return Some(Value::Undef);
+    }
+    pq_store(id, heap, true);
+    Some(result)
+}
+
+/// `hasNext` / `next` / `remove` on a [`HostObj::PQIter`], following
+/// `PriorityQueue.Itr` line for line — including the `forgetMeNot` elements a
+/// `remove()` lifted into already-visited slots, which `next()` returns once
+/// the array walk is done.
+fn pq_iter_method(vm: &mut VM, recv: &Value, method: &str, argc: usize) -> Option<Result<Value, Fault>> {
+    let Value::Obj(it) = recv else {
+        return None;
+    };
+    let it = *it;
+    let (source, mut cursor, mut last, mut forget, mut last_elt, mut exp_mods) =
+        HEAP.with(|h| match h.borrow().get(it as usize) {
+            Some(HostObj::PQIter {
+                source,
+                cursor,
+                last,
+                forget,
+                last_elt,
+                exp_mods,
+            }) => Some((*source, *cursor, *last, forget.clone(), last_elt.clone(), *exp_mods)),
+            _ => None,
+        })?;
+    let (mut heap, cmp, _, mods) = pq_state(source)?;
+    let result = match (method, argc) {
+        ("hasNext", 0) => Ok(Value::bool(cursor < heap.len() || !forget.is_empty())),
+        ("next", 0) => {
+            if exp_mods != mods {
+                return Some(Err(comodification()));
+            }
+            if cursor < heap.len() {
+                last = Some(cursor);
+                cursor += 1;
+                Ok(heap[cursor - 1].clone())
+            } else {
+                last = None;
+                last_elt = forget.pop_front();
+                match &last_elt {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(Fault::java("NoSuchElementException", String::new())),
+                }
+            }
+        }
+        ("remove", 0) => {
+            if exp_mods != mods {
+                return Some(Err(comodification()));
+            }
+            if let Some(at) = last.take() {
+                match pq_remove_at(vm, &mut heap, at, &cmp) {
+                    None => cursor -= 1,
+                    Some(moved) => forget.push_back(moved),
+                }
+            } else if let Some(v) = last_elt.take() {
+                // `removeEq`: the first slot holding this very element.
+                if let Some(i) = heap.iter().position(|x| match (x, &v) {
+                    (Value::Obj(a), Value::Obj(b)) => a == b,
+                    _ => value_eq(x, &v),
+                }) {
+                    pq_remove_at(vm, &mut heap, i, &cmp);
+                }
+            } else {
+                return Some(Err(Fault::java("IllegalStateException", String::new())));
+            }
+            pq_store(source, heap, true);
+            exp_mods = mods + 1;
+            Ok(Value::Undef)
+        }
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Iterator method `{method}` with {argc} argument(s)"
+        ))),
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::PQIter {
+            cursor: c,
+            last: l,
+            forget: f,
+            last_elt: e,
+            exp_mods: m,
+            ..
+        }) = h.borrow_mut().get_mut(it as usize)
+        {
+            *c = cursor;
+            *l = last;
+            *f = forget;
+            *e = last_elt;
+            *m = exp_mods;
+        }
+    });
+    Some(result)
+}
+
 /// `AbstractList.hashCode` — `31 * result + e.hashCode()`, seeded at 1.
 fn list_hash(items: &[Value]) -> i64 {
     items.iter().fold(1i32, |acc, e| {
@@ -3312,6 +3750,7 @@ fn sequence_items(v: &Value) -> Option<Vec<Value>> {
         let h = h.borrow();
         match h.get(*id as usize) {
             Some(HostObj::Array(items)) | Some(HostObj::List { items, .. }) => Some(items.clone()),
+            Some(HostObj::PQueue { items, .. }) => Some(items.clone()),
             Some(HostObj::Set { items, order, .. }) => Some(
                 present_order(items, *order)
                     .into_iter()
@@ -3362,6 +3801,7 @@ fn is_collection(v: &Value) -> bool {
                     | HostObj::Map { .. }
                     | HostObj::Set { .. }
                     | HostObj::SubList { .. }
+                    | HostObj::PQueue { .. }
             )
         )
     })
@@ -3770,6 +4210,15 @@ fn b_coll_new(vm: &mut VM, argc: u8) -> Value {
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
     let seed = args.get(1).cloned().unwrap_or(Value::Undef);
+    // `new PriorityQueue<>(…)` arrives with its two constructor slots and the
+    // natural-order comparator the compiler synthesized.
+    if kind == "PriorityQueue" {
+        let at = |i: usize| args.get(i).cloned().unwrap_or(Value::Undef);
+        return match new_priority_queue(vm, &seed, &at(2), &at(3)) {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     match new_collection(vm, &kind, &seed) {
         Ok(v) => v,
         Err(f) => raise(vm, f),
@@ -4154,6 +4603,7 @@ fn value_class(v: &Value) -> Option<String> {
                     // Not a name a program can write, like the other internal
                     // shapes — it exists so an iterator carries supertypes.
                     HostObj::Iterator { bidi: false, .. } => "Iterator$of".to_string(),
+                    HostObj::PQIter { .. } => "Iterator$of".to_string(),
                     HostObj::Iterator { bidi: true, .. } => "ListIterator$of".to_string(),
                     HostObj::Optional { class, .. } => (*class).to_string(),
                     HostObj::Stream { .. } => "Stream$of".to_string(),
@@ -4172,6 +4622,7 @@ fn value_class(v: &Value) -> Option<String> {
                         Fixity::Immutable => "List$immutable".to_string(),
                     },
                     HostObj::SubList { .. } => "List$sub".to_string(),
+                    HostObj::PQueue { .. } => "PriorityQueue".to_string(),
                     HostObj::Map { order, fixed, .. } => match (fixed, order) {
                         (Fixity::Immutable, _) => "Map$immutable".to_string(),
                         (_, Order::Hash) => "HashMap".to_string(),
@@ -4456,6 +4907,17 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
             ),
         );
     };
+    if let Some(v) = pq_method(vm, *id, method, args) {
+        return v;
+    }
+    if method == "toArray" && args.len() <= 1 {
+        if let Some(items) = sequence_items(recv) {
+            return match collection_to_array(vm, items, args.first()) {
+                Ok(v) => v,
+                Err(f) => raise(vm, f),
+            };
+        }
+    }
     let id = *id as usize;
     // Every method on a view checks it against its backing list first, exactly
     // as Java's `checkForComodification` does. `sublist_method` repeats the
@@ -6579,6 +7041,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // through to the `String` table and `it.hasNext()` was
     // ``unsupported String method `hasNext` ``.
     if let Some(r) = iterator_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
+    if let Some(r) = pq_iter_method(vm, &recv, &method, args.len()) {
         return match r {
             Ok(v) => v,
             Err(f) => raise(vm, f),
@@ -11224,6 +11692,7 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
                     .map(|n| n.as_str_cow().into_owned()),
             ),
             Some(HostObj::List { items, .. }) => RenderShape::Sequence(items.clone()),
+            Some(HostObj::PQueue { items, .. }) => RenderShape::Sequence(items.clone()),
             Some(HostObj::Set { items, order, .. }) => RenderShape::Sequence(
                 present_order(items, *order)
                     .into_iter()
@@ -11346,6 +11815,7 @@ fn obj_default_str(id: u32) -> String {
             // the text rather than a handle.
             Some(HostObj::Builder { s, .. }) => s.clone(),
             Some(HostObj::List { items, .. }) => render_sequence(items),
+            Some(HostObj::PQueue { items, .. }) => render_sequence(items),
             // A view renders its window of the backing list. Rendering cannot
             // raise, so a view whose backing list moved prints as though it
             // were empty rather than reporting the comodification the next
@@ -11370,6 +11840,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
+            Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),
             // `Optional[x]` / `Optional.empty` — the JDK's own rendering, and
             // the same shape for the three primitive specializations.
             Some(HostObj::Optional { class, value }) => match value {
@@ -12387,6 +12858,9 @@ const CHECKABLE_CAST_TARGETS: &[&str] = &[
     "HashSet",
     "LinkedHashSet",
     "TreeSet",
+    "PriorityQueue",
+    "AbstractQueue",
+    "Queue",
     "SortedSet",
     "NavigableSet",
     "SequencedSet",
@@ -12456,6 +12930,9 @@ fn jdk_name(n: &str) -> String {
         | "HashSet"
         | "LinkedHashSet"
         | "TreeSet"
+        | "PriorityQueue"
+        | "AbstractQueue"
+        | "Queue"
         | "SortedSet"
         | "NavigableSet"
         | "SequencedSet"
