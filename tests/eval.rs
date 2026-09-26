@@ -5681,3 +5681,33 @@ fn throwable_cause_constructors_follow_the_jdk_set() {
     ));
     assert!(!ok);
 }
+
+/// `List.listIterator` follows `ArrayList.ListItr`'s cursor: `previous()` and
+/// `next()` both arm `set`/`remove`, `add` inserts at the cursor and disarms
+/// them, a start past the size is `"Index: n, Size: s"`, and a structural change
+/// behind the iterator is a `ConcurrentModificationException`. Measured on
+/// `openjdk 17`.
+#[test]
+fn list_iterator_walks_both_ways_and_writes_through() {
+    let (out, ok) = run("import java.util.*; public class T { public static void main(String[] a) {\
+         List<String> l = new ArrayList<>(List.of(\"a\",\"b\",\"c\"));\
+         ListIterator<String> it = l.listIterator(1);\
+         System.out.println(it.previousIndex() + \" \" + it.nextIndex() + \" \" + it.hasPrevious());\
+         System.out.println(it.previous() + it.next() + it.next());\
+         it.add(\"x\");\
+         try { it.set(\"y\"); } catch (IllegalStateException e) { System.out.println(\"ISE \" + e.getMessage()); }\
+         System.out.println(it.previous()); it.set(\"Z\"); System.out.println(l);\
+         System.out.println(it instanceof Iterator);\
+         try { l.listIterator(9); } catch (IndexOutOfBoundsException e) { System.out.println(e.getMessage()); }\
+         ListIterator<String> c = l.listIterator(); l.add(\"q\");\
+         try { c.next(); } catch (ConcurrentModificationException e) { System.out.println(\"CME\"); }\
+         try { new ArrayList<String>().listIterator().previous(); } catch (NoSuchElementException e) { System.out.println(\"NSE\"); }\
+         List<Integer> n = new ArrayList<>(List.of(1, 2, 3, 4));\
+         for (ListIterator<Integer> r = n.listIterator(); r.hasNext(); ) { int v = r.next(); if (v % 2 == 0) r.set(v * 10); else if (v == 3) r.remove(); }\
+         System.out.println(n); } }");
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "0 1 true\naab\nISE null\nx\n[a, b, Z, c]\ntrue\nIndex: 9, Size: 4\nCME\nNSE\n[1, 20, 40]\n"
+    );
+}

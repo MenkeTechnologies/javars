@@ -617,6 +617,11 @@ enum HostObj {
         /// its own `remove()`. Always 0 for a `Set`, which has no counter — see
         /// the note in `iterator_method`.
         exp_mods: u64,
+        /// `true` for the `ListIterator` `List.listIterator` hands out, which
+        /// adds the backward walk (`hasPrevious`/`previous`), the two index
+        /// queries, and the `set`/`add` writes. A plain `iterator()` answers
+        /// none of them, exactly as `java.util.Iterator` declares none.
+        bidi: bool,
     },
     /// A `java.util.Optional` — present with a value, or empty.
     ///
@@ -1514,6 +1519,8 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // line above (which does carry `RandomAccess`; a set does not).
         "Set$immutable" => &["AbstractCollection", "Set", "Serializable"],
         "Iterator$of" => &["Iterator"],
+        "ListIterator$of" => &["ListIterator"],
+        "ListIterator" => &["Iterator"],
         "Optional" | "OptionalInt" | "OptionalLong" | "OptionalDouble" => &["Serializable"],
         "Stream$of" => &["BaseStream"],
         "Collector$of" => &["Collector"],
@@ -2442,56 +2449,111 @@ fn write_pair(id: u32, pair: Pair) {
     });
 }
 
-/// `hasNext` / `next` / `remove` on an [`HostObj::Iterator`] receiver.
+/// `hasNext` / `next` / `remove` on an [`HostObj::Iterator`] receiver, plus the
+/// `ListIterator` methods when the iterator came from `listIterator`.
 ///
-/// `None` for any other receiver or method, which leaves the call to the
-/// dispatch that follows.
-fn iterator_method(recv: &Value, method: &str, argc: usize) -> Option<Result<Value, Fault>> {
+/// `None` for any other receiver, which leaves the call to the dispatch that
+/// follows.
+///
+/// The cursor model is `java.util.ArrayList.ListItr`'s: `pos` is the index the
+/// next `next()` returns (its `cursor`) and `last` is `lastRet`. `next()` and
+/// `previous()` both set `last`; `remove()` deletes it and moves the cursor
+/// onto the gap; `set()` overwrites it without touching the modification
+/// count; `add()` inserts at the cursor, steps past the new element, and
+/// forgets `last`, so a following `set`/`remove` is `IllegalStateException`.
+fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
     let Value::Obj(id) = recv else {
         return None;
     };
-    let state = HEAP.with(|h| match h.borrow().get(*id as usize) {
+    let id = *id;
+    let state = HEAP.with(|h| match h.borrow().get(id as usize) {
         Some(HostObj::Iterator {
             source,
             pos,
             last,
             exp_mods,
-        }) => Some((*source, *pos, *last, *exp_mods)),
+            bidi,
+        }) => Some((*source, *pos, *last, *exp_mods, *bidi)),
         _ => None,
     })?;
-    let (source, pos, last, exp_mods) = state;
+    let (source, pos, last, exp_mods, bidi) = state;
+    let argc = args.len();
     let items = sequence_items(&Value::Obj(source)).unwrap_or_default();
-    Some(match (method, argc) {
-        ("hasNext", 0) => Ok(Value::bool(pos < items.len())),
-        ("next", 0) => {
-            if iter_mods(source) != exp_mods {
+    let stale = || iter_mods(source) != exp_mods;
+    Some(match (method, argc, bidi) {
+        ("hasNext", 0, _) => Ok(Value::bool(pos < items.len())),
+        ("next", 0, _) => {
+            if stale() {
                 return Some(Err(comodification()));
             }
             match items.get(pos) {
                 Some(v) => {
-                    let v = v.clone();
-                    HEAP.with(|h| {
-                        if let Some(HostObj::Iterator { pos, last, .. }) =
-                            h.borrow_mut().get_mut(*id as usize)
-                        {
-                            *last = Some(*pos);
-                            *pos += 1;
-                        }
-                    });
-                    Ok(v)
+                    set_cursor(id, pos + 1, Some(pos), exp_mods);
+                    Ok(v.clone())
                 }
                 None => Err(Fault::java("NoSuchElementException", String::new())),
             }
         }
-        // `remove()` deletes the element `next()` last returned and leaves the
-        // walk where it was, so the following `next()` sees the element that
-        // shifted into the gap. Calling it twice, or before any `next()`, is
-        // Java's `IllegalStateException`.
-        ("remove", 0) => {
+        ("hasPrevious", 0, true) => Ok(Value::bool(pos > 0)),
+        ("nextIndex", 0, true) => Ok(Value::Int(pos as i64)),
+        ("previousIndex", 0, true) => Ok(Value::Int(pos as i64 - 1)),
+        ("previous", 0, true) => {
+            if stale() {
+                return Some(Err(comodification()));
+            }
+            match pos.checked_sub(1).and_then(|at| items.get(at).map(|v| (at, v))) {
+                Some((at, v)) => {
+                    set_cursor(id, at, Some(at), exp_mods);
+                    Ok(v.clone())
+                }
+                None => Err(Fault::java("NoSuchElementException", String::new())),
+            }
+        }
+        ("set", 1, true) => {
             let Some(at) = last else {
                 return Some(Err(Fault::java("IllegalStateException", String::new())));
             };
-            if iter_mods(source) != exp_mods {
+            if stale() {
+                return Some(Err(comodification()));
+            }
+            HEAP.with(|h| {
+                if let Some(HostObj::List { items, .. }) = h.borrow_mut().get_mut(source as usize) {
+                    if let Some(slot) = items.get_mut(at) {
+                        *slot = args[0].clone();
+                    }
+                }
+            });
+            Ok(Value::Undef)
+        }
+        ("add", 1, true) => {
+            if stale() {
+                return Some(Err(comodification()));
+            }
+            let mods = HEAP.with(|h| match h.borrow_mut().get_mut(source as usize) {
+                Some(HostObj::List { items, mods, .. }) if pos <= items.len() => {
+                    items.insert(pos, args[0].clone());
+                    *mods += 1;
+                    Some(*mods)
+                }
+                _ => None,
+            });
+            match mods {
+                Some(mods) => {
+                    set_cursor(id, pos + 1, None, mods);
+                    Ok(Value::Undef)
+                }
+                None => Err(comodification()),
+            }
+        }
+        // `remove()` deletes the element `next()`/`previous()` last returned
+        // and leaves the cursor on the gap, so the following `next()` sees the
+        // element that shifted into it. Calling it twice, or before any move,
+        // is Java's `IllegalStateException`.
+        ("remove", 0, _) => {
+            let Some(at) = last else {
+                return Some(Err(Fault::java("IllegalStateException", String::new())));
+            };
+            if stale() {
                 return Some(Err(comodification()));
             }
             let removed = HEAP.with(|h| {
@@ -2512,28 +2574,34 @@ fn iterator_method(recv: &Value, method: &str, argc: usize) -> Option<Result<Val
             });
             match removed {
                 Some(mods) => {
-                    HEAP.with(|h| {
-                        if let Some(HostObj::Iterator {
-                            pos,
-                            last,
-                            exp_mods,
-                            ..
-                        }) = h.borrow_mut().get_mut(*id as usize)
-                        {
-                            *pos = at;
-                            *last = None;
-                            *exp_mods = mods;
-                        }
-                    });
+                    set_cursor(id, at, None, mods);
                     Ok(Value::Undef)
                 }
                 None => Err(Fault::java("IllegalStateException", String::new())),
             }
         }
         _ => Err(Fault::internal(format!(
-            "javars: unsupported Iterator method `{method}` with {argc} argument(s)"
+            "javars: unsupported {} method `{method}` with {argc} argument(s)",
+            if bidi { "ListIterator" } else { "Iterator" }
         ))),
     })
+}
+
+/// Store an iterator's cursor state after a move or a write.
+fn set_cursor(id: u32, to: usize, ret: Option<usize>, mods: u64) {
+    HEAP.with(|h| {
+        if let Some(HostObj::Iterator {
+            pos,
+            last,
+            exp_mods,
+            ..
+        }) = h.borrow_mut().get_mut(id as usize)
+        {
+            *pos = to;
+            *last = ret;
+            *exp_mods = mods;
+        }
+    });
 }
 
 /// `AbstractList.hashCode` — `31 * result + e.hashCode()`, seeded at 1.
@@ -4085,7 +4153,8 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Boxed => box_class(v)?.to_string(),
                     // Not a name a program can write, like the other internal
                     // shapes — it exists so an iterator carries supertypes.
-                    HostObj::Iterator { .. } => "Iterator$of".to_string(),
+                    HostObj::Iterator { bidi: false, .. } => "Iterator$of".to_string(),
+                    HostObj::Iterator { bidi: true, .. } => "ListIterator$of".to_string(),
                     HostObj::Optional { class, .. } => (*class).to_string(),
                     HostObj::Stream { .. } => "Stream$of".to_string(),
                     HostObj::Collector { .. } => "Collector$of".to_string(),
@@ -4721,6 +4790,28 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
                 pos: 0,
                 last: None,
                 exp_mods: iter_mods(*id),
+                bidi: false,
+            }));
+        }
+    }
+    // `listIterator()` / `listIterator(n)` — the same second object, starting
+    // its cursor at `n`. `ArrayList.listIterator` rejects a start outside
+    // `[0, size]` with its own `"Index: n, Size: s"` message.
+    if method == "listIterator" && args.len() <= 1 {
+        if let Some(size) = list_size(id) {
+            let start = args.first().map_or(0, |a| a.jint());
+            if start < 0 || start as usize > size {
+                return raise(
+                    vm,
+                    Fault::java("IndexOutOfBoundsException", format!("Index: {start}, Size: {size}")),
+                );
+            }
+            return Value::Obj(heap_alloc(HostObj::Iterator {
+                source: id as u32,
+                pos: start as usize,
+                last: None,
+                exp_mods: iter_mods(id as u32),
+                bidi: true,
             }));
         }
     }
@@ -4962,6 +5053,14 @@ fn resolve_window(id: usize) -> Option<(usize, usize, usize)> {
 fn list_mods(id: usize) -> Option<u64> {
     HEAP.with(|h| match h.borrow().get(id) {
         Some(HostObj::List { mods, .. }) => Some(*mods),
+        _ => None,
+    })
+}
+
+/// The length of a plain `List` (not a view), or `None` for anything else.
+fn list_size(id: usize) -> Option<usize> {
+    HEAP.with(|h| match h.borrow().get(id) {
+        Some(HostObj::List { items, .. }) => Some(items.len()),
         _ => None,
     })
 }
@@ -6479,7 +6578,7 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // An `Iterator` receiver. It is not a collection, so without this it fell
     // through to the `String` table and `it.hasNext()` was
     // ``unsupported String method `hasNext` ``.
-    if let Some(r) = iterator_method(&recv, &method, args.len()) {
+    if let Some(r) = iterator_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
             Err(f) => raise(vm, f),
@@ -12476,6 +12575,7 @@ mod cast_target_tables {
             "Set$immutable",
             "Map$immutable",
             "Iterator$of",
+            "ListIterator$of",
             "Stream$of",
             "Collector$of",
         ] {
