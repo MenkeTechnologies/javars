@@ -5926,10 +5926,10 @@ fn stream_method(
         }
         ("sum", 0) => {
             let items = all(vm);
-            Ok(if kind == StreamKind::Double {
-                Value::float(items.iter().map(|v| v.jfloat()).sum())
-            } else {
-                Value::Int(items.iter().map(|v| v.jint()).sum())
+            Ok(match kind {
+                StreamKind::Double => Value::float(compensated_sum(&items)),
+                StreamKind::Int => Value::Int(i64::from(wrapping_sum(&items) as i32)),
+                _ => Value::Int(wrapping_sum(&items)),
             })
         }
         // `average` answers an `OptionalDouble` whatever the stream's width,
@@ -5938,9 +5938,7 @@ fn stream_method(
             let items = all(vm);
             Ok(optional_of(
                 "OptionalDouble",
-                (!items.is_empty()).then(|| {
-                    Value::float(items.iter().map(|v| v.jfloat()).sum::<f64>() / items.len() as f64)
-                }),
+                (!items.is_empty()).then(|| Value::float(stream_average(&items, kind))),
             ))
         }
         ("min" | "max", 0 | 1) => {
@@ -6012,6 +6010,51 @@ fn stream_method(
             args.len()
         ))),
     })
+}
+
+/// `Collectors.sumWithCompensation` folded over `items`, finished by
+/// `Collectors.computeFinalSum` — the Kahan summation `DoubleStream.sum`,
+/// `average`, and `summingDouble`/`averagingDouble` all share, so
+/// `DoubleStream.of(0.1, 0.2, 0.3).sum()` is `0.6` and not the naive
+/// `0.6000000000000001`. The simple sum rides along only to answer an
+/// infinite total that the compensation term turned into `NaN`.
+fn compensated_sum(items: &[Value]) -> f64 {
+    let (mut sum, mut comp, mut simple) = (0.0f64, 0.0f64, 0.0f64);
+    for v in items {
+        let d = deboxed(v).jfloat();
+        simple += d;
+        let tmp = d - comp;
+        let velvel = sum + tmp;
+        comp = (velvel - sum) - tmp;
+        sum = velvel;
+    }
+    let tmp = sum - comp;
+    if tmp.is_nan() && simple.is_infinite() {
+        simple
+    } else {
+        tmp
+    }
+}
+
+/// An integral sum with Java's two's-complement wrap at 64 bits; an `int`
+/// stream narrows the result to 32 bits afterwards, which is the same answer
+/// as wrapping at every step.
+fn wrapping_sum(items: &[Value]) -> i64 {
+    items
+        .iter()
+        .fold(0i64, |acc, v| acc.wrapping_add(deboxed(v).jint()))
+}
+
+/// `average()` of a non-empty primitive stream. `IntStream`/`LongStream`
+/// accumulate a `long` sum and divide it as a `double`; `DoubleStream` divides
+/// the compensated sum.
+fn stream_average(items: &[Value], kind: StreamKind) -> f64 {
+    let total = if kind == StreamKind::Double {
+        compensated_sum(items)
+    } else {
+        wrapping_sum(items) as f64
+    };
+    total / items.len() as f64
 }
 
 /// The stream shape a primitive stream class names.

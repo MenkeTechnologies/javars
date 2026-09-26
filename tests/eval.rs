@@ -5686,7 +5686,7 @@ fn throwable_cause_constructors_follow_the_jdk_set() {
 /// `next()` both arm `set`/`remove`, `add` inserts at the cursor and disarms
 /// them, a start past the size is `"Index: n, Size: s"`, and a structural change
 /// behind the iterator is a `ConcurrentModificationException`. Measured on
-/// `openjdk 17`.
+/// `openjdk 27`.
 #[test]
 fn list_iterator_walks_both_ways_and_writes_through() {
     let (out, ok) = run("import java.util.*; public class T { public static void main(String[] a) {\
@@ -5717,7 +5717,7 @@ fn list_iterator_walks_both_ways_and_writes_through() {
 /// array's order, `remove(Object)` refills the hole by `removeAt`'s
 /// sift-down-then-up, and the comparator (explicit, inherited from a
 /// `PriorityQueue` seed, or a `Comparable`'s own `compareTo`) orders `poll`.
-/// Measured on `openjdk 17`.
+/// Measured on `openjdk 27`.
 #[test]
 fn priority_queue_keeps_the_jdk_heap_layout() {
     let (out, ok) = run(r#"
@@ -5808,7 +5808,7 @@ public class T { public static void main(String[] a) {
 /// `Stream.iterate(seed, f)` and `Stream.generate(s)` are unbounded and lazy:
 /// `f`/`s` run only when the pipeline pulls another element, so a `limit`, a
 /// `findFirst`, or an `anyMatch` ends them, and a side-effecting generator is
-/// called exactly as often as on the JDK. Measured on `openjdk 17`.
+/// called exactly as often as on the JDK. Measured on `openjdk 27`.
 #[test]
 fn unbounded_stream_sources_are_pulled_lazily() {
     let (out, ok) = run(&wrap(
@@ -5823,4 +5823,24 @@ fn unbounded_stream_sources_are_pulled_lazily() {
     ));
     assert!(ok, "{out}");
     assert_eq!(out, "[1, 2, 4, 8, 16]\np1p2p33 2\n3 4\n40\ntrue\n[1, 10, 100, 2, 20, 200]\n");
+}
+
+/// A `double` stream sums with `Collectors.sumWithCompensation` (Kahan), an
+/// `int` stream's `sum` wraps at 32 bits, and an integral `average` divides a
+/// `long` total. Naive folding printed `0.6000000000000001` and `2147483648`.
+/// Measured on `openjdk 27`.
+#[test]
+fn primitive_stream_sums_match_the_jdk_accumulators() {
+    let (out, ok) = run(&wrap(
+        "System.out.println(java.util.stream.DoubleStream.of(0.1, 0.2, 0.3).sum());\
+         System.out.println(java.util.stream.DoubleStream.of(0.1, 0.2, 0.3).average().getAsDouble());\
+         System.out.println(java.util.stream.IntStream.of(Integer.MAX_VALUE, 1).sum());\
+         System.out.println(java.util.stream.IntStream.of(Integer.MAX_VALUE, 1).average().getAsDouble());\
+         System.out.println(java.util.stream.LongStream.of(Long.MAX_VALUE, 1).sum());\
+         System.out.println(java.util.stream.DoubleStream.of(1e100, 1.0, -1e100).sum());\
+         System.out.println(java.util.stream.DoubleStream.of(Double.POSITIVE_INFINITY, 1).sum());\
+         System.out.println(java.util.stream.IntStream.range(0, 100000).mapToDouble(i -> 0.1).sum());",
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "0.6\n0.19999999999999998\n-2147483648\n1.073741824E9\n-9223372036854775808\n0.0\nInfinity\n10000.0\n");
 }
