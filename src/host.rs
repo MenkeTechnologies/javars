@@ -6991,19 +6991,20 @@ fn list_method(
         }
         ("getFirst" | "element" | "peekFirst" | "peek", 0)
         | ("getLast" | "peekLast", 0)
-        | ("removeFirst" | "pop" | "pollFirst" | "poll", 0)
+        // `Queue.remove()` is `removeFirst()`.
+        | ("removeFirst" | "remove" | "pop" | "pollFirst" | "poll", 0)
         | ("removeLast" | "pollLast", 0) => {
             let from_tail = matches!(method, "getLast" | "peekLast" | "removeLast" | "pollLast");
             let removes = matches!(
                 method,
-                "removeFirst" | "pop" | "pollFirst" | "poll" | "removeLast" | "pollLast"
+                "removeFirst" | "remove" | "pop" | "pollFirst" | "poll" | "removeLast" | "pollLast"
             );
             // The `get`/`remove`/`element`/`pop` spellings throw on empty; the
             // `peek`/`poll` ones answer null. The JDK's
             // `NoSuchElementException` from a deque carries no detail message.
             let throws = matches!(
                 method,
-                "getFirst" | "getLast" | "element" | "removeFirst" | "removeLast" | "pop"
+                "getFirst" | "getLast" | "element" | "removeFirst" | "removeLast" | "pop" | "remove"
             );
             if items.is_empty() {
                 if throws {

@@ -6310,10 +6310,20 @@ impl Compiler {
             // by-index reading it has always had, so only a *known* reference
             // type switches overload. A boxed `Character` is a reference type in
             // Java and selects `remove(Object)` there too.
+            // `Collection`, `Queue`, `Deque`, and `ArrayDeque` declare no
+            // `remove(int)` at all, so on a receiver of one of those static types
+            // an integral argument is still the element `remove(Object)` boxes.
+            let no_index_overload = self.expr_java_type(recv).is_some_and(|t| {
+                matches!(
+                    t.split('<').next().unwrap_or_default(),
+                    "Collection" | "Queue" | "Deque" | "ArrayDeque" | "Iterable"
+                )
+            });
             let by_value = kind == "list"
                 && method == "remove"
                 && args.len() == 1
-                && (is_boxing_call(&args[0])
+                && (no_index_overload
+                    || is_boxing_call(&args[0])
                     || self
                         .expr_java_type(&args[0])
                         .is_some_and(|t| !matches!(t.as_str(), "int" | "short" | "byte" | "char")));

@@ -5984,3 +5984,23 @@ public class T {
     ));
     assert!(!ok);
 }
+
+/// `Collection`, `Queue`, `Deque`, and `ArrayDeque` declare no `remove(int)`,
+/// so an `int` argument there is the element `remove(Object)` looks for — the
+/// index overload exists only on `List`. `Queue.remove()` is `removeFirst()`,
+/// including its `NoSuchElementException` on empty. Measured on `openjdk 27`.
+#[test]
+fn remove_int_is_by_element_off_a_list_static_type() {
+    let (out, ok) = run("import java.util.*; public class T { public static void main(String[] a) {\
+         Queue<Integer> q = new ArrayDeque<>(List.of(5, 0, 7)); System.out.println(q.remove(0) + \" \" + q);\
+         Deque<Integer> d = new ArrayDeque<>(List.of(1, 2, 3)); System.out.println(d.remove(2) + \" \" + d);\
+         Collection<Integer> c = new ArrayList<>(List.of(4, 1, 9)); System.out.println(c.remove(1) + \" \" + c);\
+         List<Integer> l = new ArrayList<>(List.of(4, 1, 9)); System.out.println(l.remove(1) + \" \" + l);\
+         LinkedList<Integer> ll = new LinkedList<>(List.of(3, 4)); System.out.println(ll.remove(1) + \" \" + ll.remove() + ll);\
+         try { new ArrayDeque<Integer>().remove(); } catch (NoSuchElementException e) { System.out.println(\"NSE\"); } } }");
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "true [5, 7]\ntrue [1, 3]\ntrue [4, 9]\n1 [4, 9]\n4 3[]\nNSE\n"
+    );
+}
