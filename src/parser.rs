@@ -1536,6 +1536,10 @@ impl Parser {
             return Ok(out);
         }
         loop {
+            // `final` on a formal parameter only forbids assigning it.
+            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+                self.advance();
+            }
             let mut ty = self.type_name()?;
             // A varargs parameter (`String... args`) *is* an array parameter —
             // inside the body it is a `String[]`. The dots additionally admit

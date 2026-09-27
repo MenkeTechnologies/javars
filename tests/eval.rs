@@ -6276,3 +6276,26 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "t=4 t\n2 1 \n50\nT$Counter\n");
 }
+
+/// `final` on a constructor, method, `main`, lambda, catch, and enhanced-`for`
+/// parameter. Measured on `openjdk 27`.
+#[test]
+fn final_formal_parameters() {
+    let (out, ok) = run(r#"
+import java.util.function.*;
+public class T {
+    final int base;
+    T(final int b) { base = b; }
+    static int twice(final int x) { return x * 2; }
+    int add(final int a, final String... rest) { return a + base + rest.length; }
+    public static void main(final String[] args) {
+        BiFunction<Integer, Integer, Integer> f = (final Integer a, final Integer b) -> a * b;
+        try { throw new IllegalStateException("s"); } catch (final IllegalStateException e) { System.out.println(e.getMessage()); }
+        for (final int v : new int[]{1, 2}) System.out.print(v);
+        System.out.println(" " + twice(4) + " " + new T(10).add(1, "a", "b") + " " + f.apply(6, 7));
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "s\n12 8 13 42\n");
+}
