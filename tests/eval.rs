@@ -6403,3 +6403,26 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "105\n8 108 T8/108\n1\n");
 }
+
+/// Inside an enum body — its methods, a constant body, a nested class —
+/// `values()` and `valueOf(s)` are callable unqualified, and a `static` method
+/// the enum declares is callable as `Enum.m(…)`. Measured on `openjdk 27`.
+#[test]
+fn enum_statics_unqualified_and_declared() {
+    let (out, ok) = run(r#"
+public class T {
+    enum Suit {
+        CLUBS, HEARTS { Suit prev() { return values()[values().length - 1 - ordinal()]; } }, SPADES;
+        Suit next() { return values()[(ordinal() + 1) % values().length]; }
+        Suit prev() { return next(); }
+        static Suit parse(String s) { return valueOf(s.toUpperCase()); }
+        class Helper { int count() { return values().length; } }
+    }
+    public static void main(String[] args) {
+        System.out.println(Suit.SPADES.next() + " " + Suit.HEARTS.prev() + " " + Suit.parse("spades") + " " + Suit.CLUBS.new Helper().count());
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "CLUBS HEARTS SPADES 3\n");
+}

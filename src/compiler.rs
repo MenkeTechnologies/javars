@@ -6315,6 +6315,12 @@ impl Compiler {
                     return Ok(());
                 }
                 ("valueOf", 1) => return self.emit_enum_value_of(&class, &args[0], line),
+                // A `static` method the enum declares itself goes through the
+                // ordinary qualified-static path below.
+                _ if self
+                    .methods
+                    .get(method)
+                    .is_some_and(|ms| ms.iter().any(|s| s.owner == class)) => {}
                 _ => {
                     return Err(format!(
                         "javars: enum `{class}` has no static method `{method}` taking {} argument(s) (line {line})",

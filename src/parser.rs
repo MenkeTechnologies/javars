@@ -31,6 +31,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         inner_of: None,
         enclosing_names: Vec::new(),
         in_static: false,
+        enclosing_enum: None,
     };
     p.program()
 }
@@ -113,6 +114,9 @@ struct Parser {
     /// True while the cursor is in a `static` method body (or `main`), where a
     /// local class has no enclosing instance.
     in_static: bool,
+    /// The innermost enum whose body (constant bodies included) the cursor
+    /// is in.
+    enclosing_enum: Option<String>,
 }
 
 impl Parser {
@@ -236,6 +240,10 @@ impl Parser {
         };
         self.enclosing.push(binary.clone());
         self.enclosing_names.push(name.clone());
+        let saved_enum = self.enclosing_enum.clone();
+        if is_enum {
+            self.enclosing_enum = Some(name.clone());
+        }
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
         // `<K, V>` — erased, but the names stay in scope for the body so a
         // parameter that shadows a class name is not read as that class.
@@ -370,6 +378,7 @@ impl Parser {
         }
         self.enclosing.pop();
         self.enclosing_names.pop();
+        self.enclosing_enum = saved_enum;
         self.eat(&Tok::RBrace)?;
         if is_enum {
             enum_members(line, &name, &mut fields, &mut inst_methods);
@@ -3399,6 +3408,20 @@ impl Parser {
                 // block present is an unresolved reference.
                 if self.is(&Tok::LParen) {
                     let args = self.call_args()?;
+                    // Inside an enum body the two statics every enum has are
+                    // callable unqualified; they are the enum's own.
+                    if let Some(en) = self.enclosing_enum.clone() {
+                        if (name == "values" && args.is_empty())
+                            || (name == "valueOf" && args.len() == 1)
+                        {
+                            return Ok(Expr::MethodCall {
+                                recv: Box::new(Expr::Var(en)),
+                                method: name,
+                                args,
+                                line,
+                            });
+                        }
+                    }
                     return Ok(Expr::Call { name, args, line });
                 }
                 // Naming a functional interface pulls in the prelude that
