@@ -69,6 +69,9 @@ pub enum Tok {
     Arrow,
     /// `::` — the method-reference separator (`String::length`).
     ColonColon,
+    /// `@` — the start of an annotation, which [`strip_annotations`] removes
+    /// before the parser sees it.
+    At,
     // operators
     Assign,
     PlusAssign,
@@ -523,6 +526,69 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
         kind: Tok::Eof,
         line,
     });
+    strip_annotations(out)
+}
+
+/// Drop every annotation (`@Override`, `@SuppressWarnings("unchecked")`,
+/// `@java.lang.Deprecated(since = "9")`) from the token stream.
+///
+/// javars has no reflection, so an annotation has nothing to be read by: the
+/// ones a program uses are compile-time checks (`@Override`,
+/// `@FunctionalInterface`) or warnings control, and none changes what the
+/// program prints. An annotation *type* declaration (`@interface`) is refused
+/// rather than dropped, since its body is a declaration javars would lose.
+fn strip_annotations(toks: Vec<Token>) -> Result<Vec<Token>, String> {
+    if !toks.iter().any(|t| t.kind == Tok::At) {
+        return Ok(toks);
+    }
+    let mut out = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].kind != Tok::At {
+            out.push(toks[i].clone());
+            i += 1;
+            continue;
+        }
+        let line = toks[i].line;
+        match toks.get(i + 1).map(|t| &t.kind) {
+            Some(Tok::Ident(w)) if w == "interface" => return Err(format!(
+                "javars: annotation type declarations (`@interface`) are not modeled (line {line})"
+            )),
+            Some(Tok::Ident(_)) => i += 2,
+            _ => {
+                return Err(format!(
+                    "javars: `@` must start an annotation (line {line})"
+                ))
+            }
+        }
+        // A qualified name: `@java.lang.Override`.
+        while matches!(toks.get(i).map(|t| &t.kind), Some(Tok::Dot))
+            && matches!(toks.get(i + 1).map(|t| &t.kind), Some(Tok::Ident(_)))
+        {
+            i += 2;
+        }
+        // The element values, `(…)`, skipped to the matching parenthesis.
+        if matches!(toks.get(i).map(|t| &t.kind), Some(Tok::LParen)) {
+            let mut depth = 0usize;
+            while i < toks.len() {
+                match toks[i].kind {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Tok::Eof => {
+                        return Err(format!("javars: unterminated annotation (line {line})"))
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -598,6 +664,7 @@ fn lex_short(c: char, next: Option<u8>, line: u32) -> Result<(Tok, usize), Strin
             '|' => (Tok::Pipe, 1),
             '^' => (Tok::Caret, 1),
             '~' => (Tok::Tilde, 1),
+            '@' => (Tok::At, 1),
             other => {
                 return Err(format!(
                     "javars: unexpected character `{other}` on line {line}"

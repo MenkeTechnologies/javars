@@ -6134,3 +6134,41 @@ public class T {
         "sq:3.0/3.0 9.0\nsq:1.5/3.0 2.25\nsq:6.75/3.0 45.5625\n50\nx100\n0 100 200 \n109\n200\n"
     );
 }
+
+/// Annotations are dropped: `@Override`, `@FunctionalInterface`,
+/// `@SafeVarargs`, a qualified `@java.lang.Deprecated(since = "9", …)`, an
+/// array-valued `@SuppressWarnings({…})`, and annotations on a parameter and
+/// on a local. None is observable without reflection. Measured on `openjdk 27`.
+#[test]
+fn annotations_are_dropped() {
+    let (out, ok) = run(r#"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    @FunctionalInterface
+    interface Op { int ap(int a, int b); }
+    static abstract class Shape {
+        abstract double area();
+        @Override
+        public String toString() { return getClass().getSimpleName() + "(" + area() + ")"; }
+    }
+    static final class Sq extends Shape {
+        private final double s;
+        Sq(double s) { this.s = s; }
+        @Override public double area() { return s * s; }
+    }
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    @java.lang.Deprecated(since = "9", forRemoval = false)
+    static List make() { return new ArrayList(); }
+    @SafeVarargs
+    static <X> int count(X... xs) { return xs.length; }
+    public static void main(@SuppressWarnings("unused") String[] args) {
+        @SuppressWarnings("unused") int unused = 3;
+        Op add = (a, b) -> a + b;
+        System.out.println(add.ap(2, 3) + " " + new Sq(3) + " " + make().size() + " " + count(1, 2, 3));
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "5 Sq(9.0) 0 3\n");
+}
