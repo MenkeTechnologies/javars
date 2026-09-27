@@ -6299,3 +6299,28 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "s\n12 8 13 42\n");
 }
+
+/// A value that reaches a boxing site already boxed — `Integer i = it.next()`
+/// through an erased `Iterator` — is not boxed a second time, so arithmetic on
+/// it unboxes to the number rather than concatenating. Measured on `openjdk 27`.
+#[test]
+fn boxing_an_already_boxed_value_is_identity() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+    static class It implements Iterator<Integer> {
+        int cur = 3;
+        public boolean hasNext() { return cur < 5; }
+        public Integer next() { return cur++; }
+    }
+    public static void main(String[] args) {
+        Iterator<Integer> a = new It();
+        Integer i = a.next();
+        int j = a.next();
+        Object o = i; System.out.println(o.getClass().getName()); System.out.println(i + 1); System.out.println(j + 1); System.out.println(i * j);
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "java.lang.Integer\n4\n5\n12\n");
+}

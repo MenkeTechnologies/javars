@@ -1935,6 +1935,14 @@ fn b_box(vm: &mut VM, argc: u8) -> Value {
     if matches!(v, Value::Undef) {
         return v;
     }
+    // Nor is a value that is already a wrapper: boxing converts a primitive,
+    // and a source the compiler could not type (`Integer i = it.next()`
+    // through an erased interface) arrives boxed already. Wrapping it again
+    // left a box inside a box, which arithmetic unwrapped only once, so
+    // `i + 1` concatenated.
+    if unboxed(&v).is_some() {
+        return v;
+    }
     box_value(code, v)
 }
 
