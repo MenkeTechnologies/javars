@@ -6019,3 +6019,41 @@ fn array_constructor_references() {
     assert!(ok, "{out}");
     assert_eq!(out, "2y\n[a, b, c]\n3 0\n2 null\n");
 }
+
+/// Two methods may each declare a local type of the same simple name, and a
+/// local type shadows a member type of that name for the rest of its block.
+/// Each keeps `javac`'s binary name (`T$1P`, `T$2P`), `getSimpleName()` drops
+/// the ordinal, and a local record's `toString()` uses the simple name.
+/// Measured on `openjdk 27`.
+#[test]
+fn local_types_sharing_a_simple_name() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+    static class P { public String toString() { return "member"; } }
+    static void a() {
+        record P(int x) {}
+        P[] ps = { new P(1), new P(2) };
+        List<P> l = new ArrayList<>();
+        l.add(ps[1]);
+        System.out.println(Arrays.toString(ps) + l);
+        System.out.println(new P(1).getClass().getName() + " " + new P(1).getClass().getSimpleName());
+        Object o = new P(3);
+        System.out.println(o instanceof P);
+    }
+    static void b() {
+        enum P { A, B }
+        System.out.println(P.A + " " + P.valueOf("B").ordinal() + " " + P.A.getClass().getName());
+    }
+    public static void main(String[] args) {
+        a(); b();
+        System.out.println(new P());
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[P[x=1], P[x=2]][P[x=2]]\nT$1P P\ntrue\nA 1 T$2P\nmember\n"
+    );
+}

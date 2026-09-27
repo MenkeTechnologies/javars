@@ -514,6 +514,21 @@ impl Parser {
 /// `sealed` and `non-sealed` are contextual keywords: a variable named `sealed`
 /// is still legal Java, so only the *declaration* position reads them as
 /// modifiers, which is exactly where this is asked.
+/// The index one past the last token of the block enclosing `from`: the
+/// first `}` that closes a brace opened before `from`, or the end of input.
+fn block_end(toks: &[Token], from: usize) -> usize {
+    let mut depth = 0usize;
+    for (k, t) in toks.iter().enumerate().skip(from) {
+        match t.kind {
+            Tok::LBrace => depth += 1,
+            Tok::RBrace if depth == 0 => return k,
+            Tok::RBrace => depth -= 1,
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
 fn class_modifier_len(toks: &[Token], j: usize) -> usize {
     if matches!(toks[j].kind, Tok::Public | Tok::Static) {
         return 1;
@@ -710,7 +725,11 @@ fn record_members(
         .iter()
         .any(|m| m.name == "toString" && m.params.is_empty())
     {
-        let mut text = Expr::Str(format!("{name}["));
+        // Java renders the *simple* name; a local record is declared under its
+        // binary name (`T$1Point`), so the prefix and ordinal are dropped.
+        let simple = name.rsplit('$').next().unwrap_or(name);
+        let simple = simple.trim_start_matches(|c: char| c.is_ascii_digit());
+        let mut text = Expr::Str(format!("{simple}["));
         for (i, c) in components.iter().enumerate() {
             let sep = if i == 0 { "" } else { ", " };
             text = concat(text, Expr::Str(format!("{sep}{}=", c.name)));
@@ -1128,7 +1147,22 @@ impl Parser {
         let top = outer.split('$').next().unwrap_or_default().to_string();
         let n = self.local_counts.entry((top, name.clone())).or_insert(0);
         *n += 1;
-        self.local_binary = Some(format!("{outer}${n}{name}"));
+        let binary = format!("{outer}${n}{name}");
+        // javars resolves types in one flat namespace, so the local type is
+        // declared under its binary name and every mention of the simple name
+        // from the declaration to the end of the enclosing block -- its scope,
+        // JLS 6.3 -- is renamed to match. Two methods may then each declare a
+        // local `P` (`T$1P`, `T$2P`), and a local type may shadow a member or
+        // top-level type of the same name. A name after `.` is a member
+        // selection, never the local type, so it is left alone.
+        let end = block_end(&self.toks, self.pos);
+        for k in self.pos..end {
+            let after_dot = k > 0 && matches!(self.toks[k - 1].kind, Tok::Dot);
+            if !after_dot && matches!(&self.toks[k].kind, Tok::Ident(w) if *w == name) {
+                self.toks[k].kind = Tok::Ident(binary.clone());
+            }
+        }
+        self.local_binary = Some(binary);
         let (mut entry, mut methods, mut classes) = (None, Vec::new(), Vec::new());
         self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
         self.local_methods.append(&mut methods);

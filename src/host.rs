@@ -2039,11 +2039,14 @@ fn simple_class_name(binary: &str) -> String {
         return simple_class_name(reference);
     }
     let after_package = binary.rsplit('.').next().unwrap_or(binary);
-    after_package
-        .rsplit('$')
-        .next()
-        .unwrap_or(after_package)
-        .to_string()
+    // A local type's binary name puts javac's ordinal between the `$` and
+    // the simple name (`T$1Point`); an anonymous class is the ordinal alone
+    // (`T$1`), whose simple name is empty.
+    match after_package.rsplit_once('$') {
+        Some((_, tail)) => tail.trim_start_matches(|c: char| c.is_ascii_digit()),
+        None => after_package,
+    }
+    .to_string()
 }
 
 /// The Java source name of a primitive field descriptor, for the array half of
