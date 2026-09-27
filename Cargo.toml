@@ -1,6 +1,6 @@
 [package]
 name = "javars"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 # The fdlibm `Math.pow` port (src/host.rs) builds its coefficients with
 # `f64::from_bits` in `const` position, const-stable since 1.83, and the
