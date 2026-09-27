@@ -568,8 +568,10 @@ single-abstract-method interface), and the **`java.util` collections**
 a backing list modified behind it raises `ConcurrentModificationException`),
 **arrow `switch` expressions** with `yield`, and **`java.lang.Object`**
 (`new Object()` as a lock or sentinel, plus the `equals`/`hashCode`/`toString`/
-`getClass` every class inherits from it) — all verified byte-for-byte against
-OpenJDK.
+`getClass` every class inherits from it), **inner classes** holding their
+enclosing instance (`Outer.this`, `o.new Inner()`), **local classes** capturing
+the enclosing locals they read, and the enhanced `for` over a user `Iterable` —
+all verified byte-for-byte against OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
@@ -582,11 +584,7 @@ Next waves, in priority order:
    the `summarizing*` collectors, and the unmodifiable-map collectors, whose
    iteration order the JDK randomizes per run. See [`BUGS.md`](BUGS.md) for the
    stages and collectors that do run.
-2. **Inner classes** — a non-`static` member class that reads its enclosing
-   instance, and a local class that captures an enclosing local; both are
-   refused today (`cannot find symbol`) rather than run without the enclosing
-   instance or the captured value.
-3. **Lazy class initialization** — javars runs every class's `static`
+2. **Lazy class initialization** — javars runs every class's `static`
    initializers before `main`; Java runs each class's on first use.
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.

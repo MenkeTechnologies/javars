@@ -241,14 +241,25 @@ at the bottom, and are summarized in the section right after this one.
   body that declares a field, a constructor, or a *second* method is a real
   class with state; it is refused by name rather than silently losing the
   members javars would not carry.
-- **Nested types named through their enclosers.** `new Outer.Nested()`,
-  `Outer.Nested.aStatic()`, and `outer.new Inner()` all parse. javars flattens
-  nested types into one namespace keyed by the simple name, so the qualifier
-  names the same class the bare form does and is dropped — which for
-  `outer.new Inner()` means a side-effecting qualifier is evaluated by Java and
-  not here. A nested class also sees its encloser's `static` fields by their
+- **Nested types named through their enclosers.** `new Outer.Nested()` and
+  `Outer.Nested.aStatic()` parse. javars flattens nested types into one
+  namespace keyed by the simple name, so a type qualifier names the same class
+  the bare form does and is dropped. A nested class also sees its encloser's `static` fields by their
   bare name, which no ancestry walk finds: a nested class is not a subclass of
   the class it sits in, so the enclosers are read off the binary name.
+- **Inner (non-`static`) member classes.** An inner class holds its enclosing
+  instance the way `javac` lowers it (`this$0`): an unqualified outer field or
+  method resolves through it, `Outer.this` names it, and `o.new Inner()` binds
+  `o`, a side-effecting qualifier evaluated exactly once. `private` and
+  `protected` are accepted on member classes.
+- **Annotations.** Dropped at lex time wherever they appear: `@Override`,
+  `@SuppressWarnings(…)`, qualified names, and parameter or local annotations.
+  An annotation type declaration (`@interface`) is refused by name.
+- **`final` on constructor and method parameters.** Parsed and dropped, like
+  `final` on a local.
+- **The enhanced `for` over a user `Iterable`.** A class implementing
+  `Iterable<T>` is walked through its own `iterator()` (`hasNext`/`next`), as
+  JLS 14.14.2 specifies.
 - **`Comparator`'s combinators.** `naturalOrder`, `reverseOrder`, `comparing`,
   `comparingInt`/`comparingLong`/`comparingDouble`, `reversed`,
   `thenComparing`, `thenComparingInt`/`Long`/`Double`. They are written in Java
@@ -830,7 +841,9 @@ at the bottom, and are summarized in the section right after this one.
   fresh array in declaration order and `valueOf(s)` raises Java's
   `IllegalArgumentException: No enum constant Color.PINK` on a miss.
   `switch (c) { case RED: … }` takes the unqualified label, and a bare constant
-  name resolves inside the enum's own body (`this == MUL`).
+  name resolves inside the enum's own body (`this == MUL`), as do unqualified
+  `values()`/`valueOf(s)`; a `static` method the enum declares is callable as
+  `Color.m()`.
 - **Enum constants with state and bodies.** `EARTH(5.97e24)` runs the enum's own
   constructor with those arguments, so each constant keeps its own field values.
   A constant with a body (`PLUS { int apply(int a, int b) { … } }`) is compiled
@@ -1410,15 +1423,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   model: `previous`/`hasPrevious`, `nextIndex`/`previousIndex`, and `set`/`add`
   at the cursor, with `IllegalStateException` after an `add` and a
   `ConcurrentModificationException` when the list moved underneath.
-- **Two local types with the same simple name in one program.** Local
-  `record`/`enum`/`interface`/`class` declarations are hoisted to the
-  program's type list under `javac`'s binary name (`T$1P`, `T$2P`), but the
-  flat namespace javars resolves types in is keyed by the *simple* name, so a
-  second local `P` in another method is refused as `duplicate class: P`.
-- **A local class that reads an enclosing local.** Local records, enums, and
-  interfaces are implicitly `static` in Java and never capture; a local
-  *class* can, and javars does not model the capture. Such a class is refused
-  (`cannot find symbol`) rather than run without its captured value.
+- ~~**Two local types with the same simple name in one program**~~ —
+  implemented: each local `record`/`enum`/`interface`/`class` is declared under
+  `javac`'s binary name (`T$1P`, `T$2P`) and renamed within its declaring
+  scope, so a second local `P` in another method is its own type;
+  `getSimpleName()` drops the local ordinal (`P`).
+- ~~**A local class that reads an enclosing local**~~ — implemented with
+  `javac`'s lowering: each captured local becomes a field plus a trailing
+  constructor parameter, threaded through `new`, `this(…)`, and `super(…)`. A
+  local class declared in an instance method is inner, so the outer instance's
+  fields and methods resolve through its enclosing instance.
 - ~~**`Map.of`**~~ — implemented, as the immutable map Java returns: a
   `put` is `UnsupportedOperationException` and `Map.of(…) instanceof HashMap` is
   `false`.
@@ -1431,7 +1445,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   Java and is the ordinal difference, so it is synthesized onto every enum
   alongside `name`/`ordinal`/`toString`/`equals`, which is also what makes
   `Collections.sort` of an enum list work.
-- **Sealed types** and **inner (non-`static`) classes.**
+- **Sealed types.**
 - **An anonymous class past one method.** The single-method form of an
   INTERFACE works — `new Greet() { public String name() { return "anon"; } }`
   runs, and its inherited `default` methods dispatch to that override — which is
@@ -1915,10 +1929,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   The second line is the sharper one: Java does not throw there either, so
   "always throw" would be as wrong as never throwing. Both answers follow from
   the snapshot, and matching Java needs a real iterator with `modCount`, which
-  is also what `List.iterator()` would need — that method is unimplemented
-  today, so no program can hold an iterator across a modification in the first
-  place. A `subList` view *does* raise `ConcurrentModificationException`,
-  because it holds a live window rather than a copy.
+  `List.iterator()` already has: an explicit `it.next()` after `l.add(…)` raises
+  `ConcurrentModificationException` as the JDK does. The enhanced `for` is
+  the one path still routed through the snapshot. A `subList` view also raises
+  it, because it holds a live window rather than a copy.
 - **Unboxing a `null` wrapper yields `null` instead of throwing.** `Integer a =
   null; int v = a;` prints `null` here and throws
   `NullPointerException: Cannot invoke "java.lang.Integer.intValue()" because
