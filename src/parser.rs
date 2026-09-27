@@ -1,4 +1,4 @@
-//! A recursive-descent parser with precedence-climbing for expressions.
+//! A recursive-descent arser with precedence-climbing for expressions.
 //!
 //! Grammar: a compilation unit is one or more `class`/`interface` declarations;
 //! javars locates `public static void main(String[] args) { <body> }` as the
@@ -26,6 +26,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
         local_counts: std::collections::HashMap::new(),
         local_methods: Vec::new(),
         local_classes: Vec::new(),
+        scope: Vec::new(),
+        local_captures: std::collections::HashMap::new(),
     };
     p.program()
 }
@@ -93,6 +95,12 @@ struct Parser {
     /// method bodies that declared them and added to the program at the end.
     local_methods: Vec<Method>,
     local_classes: Vec<Class>,
+    /// The locals and parameters in scope at the cursor, innermost last, as
+    /// `(name, declared type)` — what a local class declared here can capture.
+    scope: Vec<(String, String)>,
+    /// The captured locals of each local class parsed so far, by binary name,
+    /// so a local class extending another captures what its superclass does.
+    local_captures: std::collections::HashMap<String, Vec<Param>>,
 }
 
 impl Parser {
@@ -369,6 +377,7 @@ impl Parser {
             inst_init,
             ctors,
             methods: inst_methods,
+            captures: Vec::new(),
             line,
         });
         Ok(())
@@ -498,6 +507,7 @@ impl Parser {
             inst_init,
             ctors: Vec::new(),
             methods,
+            captures: Vec::new(),
             line,
         })
     }
@@ -1164,10 +1174,93 @@ impl Parser {
         }
         self.local_binary = Some(binary);
         let (mut entry, mut methods, mut classes) = (None, Vec::new(), Vec::new());
+        let start = self.pos;
         self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
+        // `parse_class` pushes the declaration itself after any member types.
+        if let Some(cl) = classes.last_mut() {
+            self.capture_locals(cl, start);
+        }
         self.local_methods.append(&mut methods);
         self.local_classes.append(&mut classes);
         Ok(())
+    }
+
+    /// Give a local class the enclosing locals its body reads (JLS 8.1.3).
+    ///
+    /// javac's lowering, which javars follows: each captured local becomes a
+    /// field of the class and a trailing parameter of every constructor, and
+    /// every `new`, `this(…)`, and `super(…)` naming the class passes the
+    /// value along (`Compiler::with_captures`). The name the body reads then
+    /// resolves to that field. Java requires a captured local to be
+    /// effectively final, so the copy taken at construction is the value.
+    ///
+    /// A local is captured when its name appears in the class's tokens other
+    /// than as a member selection (`x.name`) or a call (`name(…)`), and the
+    /// class declares no field of that name — a field shadows the local. A
+    /// superclass that is itself a capturing local class passes its captures
+    /// down. Records, enums, and interfaces are implicitly `static` and never
+    /// capture.
+    fn capture_locals(&mut self, cl: &mut Class, start: usize) {
+        if cl.is_record || cl.is_enum || cl.is_interface {
+            return;
+        }
+        let mut read = std::collections::HashSet::new();
+        for k in start..self.pos {
+            if let Tok::Ident(w) = &self.toks[k].kind {
+                let after_dot = matches!(self.toks[k - 1].kind, Tok::Dot);
+                let called = matches!(self.toks[k + 1].kind, Tok::LParen);
+                if !after_dot && !called {
+                    read.insert(w.as_str());
+                }
+            }
+        }
+        let inherited: Vec<Param> = cl
+            .superclass
+            .as_ref()
+            .and_then(|s| self.local_captures.get(s))
+            .cloned()
+            .unwrap_or_default();
+        let mut captures = inherited.clone();
+        for (i, (name, ty)) in self.scope.iter().enumerate() {
+            let shadowed = self.scope[i + 1..].iter().any(|(n, _)| n == name);
+            if shadowed
+                || !read.contains(name.as_str())
+                || cl.fields.iter().any(|f| f.name == *name)
+                || captures.iter().any(|c| c.name == *name)
+            {
+                continue;
+            }
+            captures.push(Param {
+                ty: ty.clone(),
+                name: name.clone(),
+                varargs: false,
+            });
+        }
+        if captures.is_empty() {
+            return;
+        }
+        for c in &captures[inherited.len()..] {
+            cl.fields.push(FieldDecl {
+                ty: c.ty.clone(),
+                name: c.name.clone(),
+                is_final: true,
+                init: None,
+                line: cl.line,
+            });
+        }
+        if cl.ctors.is_empty() {
+            cl.ctors.push(Ctor {
+                params: Vec::new(),
+                body: Vec::new(),
+                line: cl.line,
+            });
+        }
+        for ctor in &mut cl.ctors {
+            ctor.params.extend(captures.iter().cloned());
+        }
+        self.local_captures
+            .insert(cl.name.clone(), captures.clone());
+        cl.captures = captures;
     }
 
     /// True when the cursor is on a `record Name(` header. `record` is a
@@ -1228,7 +1321,7 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
-        let body = self.block()?;
+        let body = self.body_with_params(&params)?;
         Ok(Some(Ctor { params, body, line }))
     }
 
@@ -1348,7 +1441,7 @@ impl Parser {
             (Vec::new(), true)
         } else {
             self.eat(&Tok::LBrace)?;
-            (self.block()?, false)
+            (self.body_with_params(&params)?, false)
         };
         self.undeclare_generics(method_generics);
         Ok(Some((
@@ -1529,10 +1622,10 @@ impl Parser {
         // name is what the compiler binds the real program arguments to.
         let params = self.params()?;
         self.eat(&Tok::RParen)?;
-        let param = params.into_iter().next().map(|p| p.name);
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
-        let body = self.block()?;
+        let body = self.body_with_params(&params)?;
+        let param = params.into_iter().next().map(|p| p.name);
         Ok(Some(Entry {
             class_name: String::new(),
             body,
@@ -1575,12 +1668,25 @@ impl Parser {
 
     /// Parse a `{ ... }` body already past the opening brace; consumes the `}`.
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
+        let mark = self.scope.len();
         let mut out = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             out.push(self.statement()?);
         }
+        self.scope.truncate(mark);
         self.eat(&Tok::RBrace)?;
         Ok(out)
+    }
+
+    /// Parse a method or constructor body (the cursor just past its `{`) with
+    /// the formal parameters in [`Parser::scope`] for its duration.
+    fn body_with_params(&mut self, params: &[Param]) -> Result<Vec<Stmt>, String> {
+        let mark = self.scope.len();
+        self.scope
+            .extend(params.iter().map(|p| (p.name.clone(), p.ty.clone())));
+        let body = self.block();
+        self.scope.truncate(mark);
+        body
     }
 
     /// Parse a `{ ... }` or a single statement into a statement list.
@@ -1596,7 +1702,15 @@ impl Parser {
     /// Parse one statement, tagging it with the source line it starts on.
     fn statement(&mut self) -> Result<Stmt, String> {
         let line = self.line();
-        Ok(Stmt::new(line, self.statement_kind()?))
+        // A declaration adds its names to the enclosing block; every other
+        // statement's own declarations (a `for` init, a caught exception) end
+        // with it.
+        let mark = self.scope.len();
+        let kind = self.statement_kind()?;
+        if !matches!(kind, StmtKind::Local { .. } | StmtKind::Locals(_)) {
+            self.scope.truncate(mark);
+        }
+        Ok(Stmt::new(line, kind))
     }
 
     fn statement_kind(&mut self) -> Result<StmtKind, String> {
@@ -1723,6 +1837,7 @@ impl Parser {
                 } else {
                     None
                 };
+                self.scope.push((name.clone(), ty.clone()));
                 decls.push(Stmt::new(line, StmtKind::Local { ty, name, init }));
                 if !self.is(&Tok::Comma) {
                     break;
@@ -1951,6 +2066,7 @@ impl Parser {
         if let Some((ty, name)) = self.try_foreach_header()? {
             let iter = self.expression()?;
             self.eat(&Tok::RParen)?;
+            self.scope.push((name.clone(), ty.clone()));
             let body = self.braced_or_single()?;
             return Ok(StmtKind::ForEach {
                 ty,
@@ -2081,7 +2197,15 @@ impl Parser {
             let name = self.ident()?;
             self.eat(&Tok::RParen)?;
             self.eat(&Tok::LBrace)?;
+            let mark = self.scope.len();
+            let caught = if types.len() == 1 {
+                types[0].clone()
+            } else {
+                "Exception".to_string()
+            };
+            self.scope.push((name.clone(), caught));
             let arm_body = self.block()?;
+            self.scope.truncate(mark);
             catches.push(CatchArm {
                 types,
                 name,

@@ -15,6 +15,7 @@
 
 use crate::ast::*;
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
+use std::borrow::Cow;
 /// The tables in this file are keyed on identifiers out of the program being
 /// compiled — class names, method names, variable names — and on nothing an
 /// adversary chooses. So they are hashed with FNV-1a rather than with the
@@ -233,6 +234,10 @@ struct ClassInfo {
     /// field initializer or a bare `{ … }` block. Gates the call to its
     /// `<instinit>` subroutine when an instance is built.
     has_inst_init: bool,
+    /// The enclosing locals a local class captures, as `(name, type)`: the
+    /// trailing constructor arguments every construction of it passes
+    /// ([`Compiler::with_captures`]).
+    captures: Vec<(String, String)>,
 }
 
 /// One declared constructor's compile-time signature.
@@ -921,6 +926,11 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 methods,
                 ctors,
                 has_inst_init: !cl.inst_init.is_empty(),
+                captures: cl
+                    .captures
+                    .iter()
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect(),
             },
         );
     }
@@ -2331,15 +2341,38 @@ impl Compiler {
             self.emit_default_ctor(&sup, recv, line, depth + 1);
             return;
         }
-        if !info.ctors.iter().any(|c| c.param_tys.is_empty()) {
+        // A capturing local superclass takes its captures as the only
+        // arguments of its implicit `super()`; the subclass holds the same
+        // captures as constructor parameters of its own (`capture_locals`).
+        let captured: Vec<(String, String)> = info.captures.clone();
+        let tys: Vec<String> = captured.iter().map(|(_, t)| t.clone()).collect();
+        if !info.ctors.iter().any(|c| c.param_tys == tys) {
             return;
         }
         self.emit_recv(recv, line);
-        let mangled = mangle(&sup, "<init>", &[]);
+        for (name, _) in &captured {
+            self.emit_get(name, line);
+        }
+        let mangled = mangle(&sup, "<init>", &tys);
         let idx = self.b.add_name(&mangled);
-        self.b.emit(Op::Call(idx, 1), line);
+        self.b.emit(Op::Call(idx, 1 + captured.len() as u8), line);
         self.emit_exc_check(line);
         self.b.emit(Op::Pop, line);
+    }
+
+    /// A construction's arguments with `class`'s captured locals appended, read
+    /// by name where the construction is written: the enclosing local itself at
+    /// a `new` in the declaring method, the class's own field at a `new` inside
+    /// its body, and the constructor parameter in a `this(…)`/`super(…)`.
+    fn with_captures<'a>(&self, class: &str, args: &'a [Expr]) -> Cow<'a, [Expr]> {
+        match self.classes.get(class) {
+            Some(ci) if !ci.captures.is_empty() => {
+                let mut all = args.to_vec();
+                all.extend(ci.captures.iter().map(|(n, _)| Expr::Var(n.clone())));
+                Cow::Owned(all)
+            }
+            _ => Cow::Borrowed(args),
+        }
     }
 
     /// Emit the body of the default constructor javac synthesizes for a class
@@ -4054,6 +4087,17 @@ impl Compiler {
 
         for i in (0..=ctor.params.len()).rev() {
             self.b.emit(Op::SetSlot(i as u16), ctor.line);
+        }
+        // A local class stores its captured locals first, as javac does, so the
+        // superclass constructor and the instance initializers can read them.
+        for c in &cl.captures {
+            let store = StmtKind::FieldAssign {
+                recv: Expr::This,
+                name: c.name.clone(),
+                op: AssignOp::Assign,
+                value: Expr::Var(c.name.clone()),
+            };
+            self.stmt(&Stmt::new(ctor.line, store))?;
         }
         // JLS 8.8.7: a body that does not open with `this(…)`/`super(…)` runs an
         // implicit `super()` first. Without it a superclass constructor body
@@ -6743,6 +6787,8 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        let args = self.with_captures(ctor_class, args);
+        let args: &[Expr] = &args;
         // `new String(cs)` / `new String(s)` / `new String()` — javars models a
         // `String` as a primitive value rather than an instance, so constructing
         // one is exactly the conversion `String.valueOf` performs.
@@ -7259,6 +7305,8 @@ impl Compiler {
                     .get(&this_class)
                     .and_then(|ci| ci.superclass.clone())
                 {
+                    let args = self.with_captures(&sup, args);
+                    let args: &[Expr] = &args;
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
                     if let Some((param_tys, vararg_from)) = self.resolve_ctor(&sup, &arg_tys) {
@@ -7295,6 +7343,8 @@ impl Compiler {
         // `Compiler::chains_explicitly`).
         if name == "this" {
             if let Some(this_class) = self.this_class.clone() {
+                let args = self.with_captures(&this_class, args);
+                let args: &[Expr] = &args;
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
                 let (param_tys, vararg_from) =

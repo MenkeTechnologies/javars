@@ -5948,8 +5948,8 @@ public class T { public static void main(String[] a) {
 /// Local `record`, `enum`, `interface`, and `class` declarations in a method
 /// body. The type keeps `javac`'s binary name (`T$1P`), a local record can
 /// implement `Comparable` and sort, a local enum's constants can carry bodies,
-/// and a local class that reads an enclosing local is refused rather than
-/// run without its capture. Measured on `openjdk 27`.
+/// and a local class reads an enclosing local through its capture. Measured
+/// on `openjdk 27`.
 #[test]
 fn local_type_declarations() {
     let (out, ok) = run(r#"
@@ -5979,10 +5979,11 @@ public class T {
     ));
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
-    let (_, ok) = run(&wrap(
+    let (out, ok) = run(&wrap(
         "int base = 10; class A { int f() { return base + 1; } } System.out.println(new A().f());",
     ));
-    assert!(!ok);
+    assert!(ok, "{out}");
+    assert_eq!(out, "11\n");
 }
 
 /// `Collection`, `Queue`, `Deque`, and `ArrayDeque` declare no `remove(int)`,
@@ -6055,5 +6056,81 @@ public class T {
     assert_eq!(
         out,
         "[P[x=1], P[x=2]][P[x=2]]\nT$1P P\ntrue\nA 1 T$2P\nmember\n"
+    );
+}
+
+/// A local class captures the enclosing locals and parameters its body reads,
+/// javac-style: a field per capture plus a trailing constructor parameter, passed
+/// at every `new`, `this(…)`, and implicit `super()`. Covers explicit and
+/// delegating constructors, a field initializer reading a capture, a `new` of the
+/// class inside its own body, an instance method's `var` and array locals, a
+/// capturing local subclass of a capturing local class, a loop-body class, a class
+/// inside a lambda, and a local class nested in a local class's method. Measured
+/// on `openjdk 27`.
+#[test]
+fn local_class_captures_enclosing_locals() {
+    let (out, ok) = run(r#"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    interface Shape { double area(); }
+    static List<Shape> build(double scale, String label) {
+        List<Shape> out = new ArrayList<>();
+        class Sq implements Shape {
+            final double side;
+            final double twice = scale * 2;
+            Sq(double s) { side = s * scale; }
+            Sq() { this(1); }
+            public double area() { return side * side; }
+            Sq grow() { return new Sq(side); }
+            public String toString() { return label + ":" + side + "/" + twice; }
+        }
+        out.add(new Sq(2)); out.add(new Sq()); out.add(new Sq(3).grow());
+        for (Shape s : out) System.out.println(s + " " + s.area());
+        return out;
+    }
+    int k = 3;
+    int inst(int p) {
+        var v = 4;
+        int[] arr = {1, 2};
+        class C {
+            int f() { arr[0] += 10; return p + v + arr[0]; }
+        }
+        return new C().f() + new C().f();
+    }
+    public static void main(String[] args) {
+        build(1.5, "sq");
+        System.out.println(new T().inst(5));
+        int base = 100;
+        String tag = "x";
+        class A { int a() { return base; } }
+        class B extends A { String b() { return tag + a(); } }
+        System.out.println(new B().b());
+        for (int i = 0; i < 3; i++) {
+            final int j = i;
+            class L { Supplier<Integer> s() { return () -> j * base; } }
+            System.out.print(new L().s().get() + " ");
+        }
+        System.out.println();
+        Runnable r = () -> {
+            int q = 9;
+            class Q { int g() { return q + base; } }
+            System.out.println(new Q().g());
+        };
+        r.run();
+        class Outer1 {
+            int h() {
+                class Inner1 { int z() { return base * 2; } }
+                return new Inner1().z();
+            }
+        }
+        System.out.println(new Outer1().h());
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "sq:3.0/3.0 9.0\nsq:1.5/3.0 2.25\nsq:6.75/3.0 45.5625\n50\nx100\n0 100 200 \n109\n200\n"
     );
 }

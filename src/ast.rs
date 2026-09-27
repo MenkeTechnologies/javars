@@ -127,6 +127,11 @@ pub struct Class {
     pub ctors: Vec<Ctor>,
     /// Instance (non-static) methods.
     pub methods: Vec<Method>,
+    /// The enclosing locals a *local* class captures (JLS 8.1.3), in the
+    /// order they trail every constructor's parameter list. Each is also a
+    /// field of the class (unless a capturing local superclass already holds
+    /// it). Empty for every other type.
+    pub captures: Vec<Param>,
     /// 1-based source line the class starts on (diagnostics).
     pub line: u32,
 }
