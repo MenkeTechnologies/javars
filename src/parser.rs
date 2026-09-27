@@ -29,6 +29,8 @@ pub fn parse(src: &str) -> Result<Program, String> {
         scope: Vec::new(),
         local_captures: std::collections::HashMap::new(),
         inner_of: None,
+        enclosing_names: Vec::new(),
+        in_static: false,
     };
     p.program()
 }
@@ -105,6 +107,12 @@ struct Parser {
     /// The enclosing class's name, set just before an inner member class is
     /// parsed and taken by [`Parser::parse_class`].
     inner_of: Option<String>,
+    /// The simple names of the classes enclosing the cursor, innermost last
+    /// (the names [`Parser::enclosing`] holds the binary names of).
+    enclosing_names: Vec<String>,
+    /// True while the cursor is in a `static` method body (or `main`), where a
+    /// local class has no enclosing instance.
+    in_static: bool,
 }
 
 impl Parser {
@@ -227,6 +235,7 @@ impl Parser {
             (None, None) => name.clone(),
         };
         self.enclosing.push(binary.clone());
+        self.enclosing_names.push(name.clone());
         // Optional generic type-parameter declaration `<T>`, `<T extends X>`,
         // `<K, V>` — erased, but the names stay in scope for the body so a
         // parameter that shadows a class name is not read as that class.
@@ -360,6 +369,7 @@ impl Parser {
             }
         }
         self.enclosing.pop();
+        self.enclosing_names.pop();
         self.eat(&Tok::RBrace)?;
         if is_enum {
             enum_members(line, &name, &mut fields, &mut inst_methods);
@@ -571,7 +581,7 @@ fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
     for ctor in &mut cl.ctors {
         ctor.params.extend(captures.iter().cloned());
     }
-    cl.captures = captures;
+    cl.captures.extend(captures);
 }
 
 /// The index one past the last token of the block enclosing `from`: the
@@ -1245,6 +1255,11 @@ impl Parser {
         self.local_binary = Some(binary);
         let (mut entry, mut methods, mut classes) = (None, Vec::new(), Vec::new());
         let start = self.pos;
+        // A local class in an instance context is inner (JLS 8.1.3): it holds
+        // the instance of the class whose method declares it.
+        if !self.in_static && self.at_inner_class() {
+            self.inner_of = self.enclosing_names.last().cloned();
+        }
         self.parse_class(None, &mut entry, &mut methods, &mut classes)?;
         // `parse_class` pushes the declaration itself after any member types.
         if let Some(cl) = classes.last_mut() {
@@ -1284,19 +1299,25 @@ impl Parser {
                 }
             }
         }
+        // An inner local class already holds its enclosing instance.
+        let held = |caps: &[Param], name: &str| caps.iter().any(|c| c.name == name);
         let inherited: Vec<Param> = cl
             .superclass
             .as_ref()
             .and_then(|s| self.local_captures.get(s))
+            .into_iter()
+            .flatten()
+            .filter(|c| !held(&cl.captures, &c.name))
             .cloned()
-            .unwrap_or_default();
+            .collect();
         let mut captures = inherited.clone();
         for (i, (name, ty)) in self.scope.iter().enumerate() {
             let shadowed = self.scope[i + 1..].iter().any(|(n, _)| n == name);
             if shadowed
                 || !read.contains(name.as_str())
                 || cl.fields.iter().any(|f| f.name == *name)
-                || captures.iter().any(|c| c.name == *name)
+                || held(&captures, name)
+                || held(&cl.captures, name)
             {
                 continue;
             }
@@ -1306,12 +1327,13 @@ impl Parser {
                 varargs: false,
             });
         }
-        if captures.is_empty() {
-            return;
+        if !captures.is_empty() {
+            attach_captures(cl, captures, inherited.len());
         }
-        self.local_captures
-            .insert(cl.name.clone(), captures.clone());
-        attach_captures(cl, captures, inherited.len());
+        if !cl.captures.is_empty() {
+            self.local_captures
+                .insert(cl.name.clone(), cl.captures.clone());
+        }
     }
 
     /// True when the cursor is on a `record Name(` header. `record` is a
@@ -1372,7 +1394,7 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
-        let body = self.body_with_params(&params)?;
+        let body = self.body_with_params(&params, false)?;
         Ok(Some(Ctor { params, body, line }))
     }
 
@@ -1492,7 +1514,7 @@ impl Parser {
             (Vec::new(), true)
         } else {
             self.eat(&Tok::LBrace)?;
-            (self.body_with_params(&params)?, false)
+            (self.body_with_params(&params, saw_static)?, false)
         };
         self.undeclare_generics(method_generics);
         Ok(Some((
@@ -1679,7 +1701,7 @@ impl Parser {
         self.eat(&Tok::RParen)?;
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
-        let body = self.body_with_params(&params)?;
+        let body = self.body_with_params(&params, true)?;
         let param = params.into_iter().next().map(|p| p.name);
         Ok(Some(Entry {
             class_name: String::new(),
@@ -1735,12 +1757,14 @@ impl Parser {
 
     /// Parse a method or constructor body (the cursor just past its `{`) with
     /// the formal parameters in [`Parser::scope`] for its duration.
-    fn body_with_params(&mut self, params: &[Param]) -> Result<Vec<Stmt>, String> {
+    fn body_with_params(&mut self, params: &[Param], is_static: bool) -> Result<Vec<Stmt>, String> {
         let mark = self.scope.len();
+        let outer_static = std::mem::replace(&mut self.in_static, is_static);
         self.scope
             .extend(params.iter().map(|p| (p.name.clone(), p.ty.clone())));
         let body = self.block();
         self.scope.truncate(mark);
+        self.in_static = outer_static;
         body
     }
 

@@ -6374,3 +6374,32 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "19\n2 4 6 8 \n9,12,15,12,16,20,15,20,25,\n");
 }
+
+/// A local class declared in an instance method is inner: it reads and
+/// writes the declaring instance's fields and calls its methods, alongside the
+/// locals it captures, and so does a local subclass of it. One declared in a
+/// static method has no enclosing instance. Measured on `openjdk 27`.
+#[test]
+fn local_class_in_an_instance_method_is_inner() {
+    let (out, ok) = run(r#"
+public class T {
+    int total = 5;
+    String tag() { return "T" + total; }
+    void run(int k) {
+        class Acc { int get() { return total + k; } void add(int v) { total += v; } }
+        class Named extends Acc { String n() { return tag() + "/" + get(); } }
+        Acc a = new Acc();
+        System.out.println(a.get());
+        a.add(3);
+        System.out.println(total + " " + a.get() + " " + new Named().n());
+    }
+    static void st() {
+        class S { int v() { return 1; } }
+        System.out.println(new S().v());
+    }
+    public static void main(String[] args) { new T().run(100); st(); }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "105\n8 108 T8/108\n1\n");
+}
