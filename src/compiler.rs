@@ -4944,6 +4944,51 @@ impl Compiler {
     ///
     /// `continue` targets the increment, `break` the exit — the same contract
     /// the C-style loop uses, so labeled `break`/`continue` work unchanged.
+    /// The enhanced `for` over a user `Iterable`, desugared to the basic `for`
+    /// over its iterator (see [`Compiler::foreach_stmt`]). Unlike a collection,
+    /// which is snapshotted, this runs the class's own `hasNext`/`next`, so an
+    /// iterator that computes its elements, or never ends, behaves as in Java.
+    fn foreach_iterable(
+        &mut self,
+        ty: &str,
+        name: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: u32,
+    ) -> Result<(), String> {
+        let it = format!("#it{}", self.temp_counter);
+        self.temp_counter += 1;
+        let call = |recv: Expr, method: &str| Expr::MethodCall {
+            recv: Box::new(recv),
+            method: method.to_string(),
+            args: Vec::new(),
+            line,
+        };
+        let mut loop_body = vec![Stmt::new(
+            line,
+            StmtKind::Local {
+                ty: ty.to_string(),
+                name: name.to_string(),
+                init: Some(call(Expr::Var(it.clone()), "next")),
+            },
+        )];
+        loop_body.extend(body.iter().cloned());
+        let desugared = StmtKind::For {
+            init: vec![Stmt::new(
+                line,
+                StmtKind::Local {
+                    ty: "Iterator".to_string(),
+                    name: it.clone(),
+                    init: Some(call(iter.clone(), "iterator")),
+                },
+            )],
+            cond: Some(call(Expr::Var(it), "hasNext")),
+            update: Vec::new(),
+            body: loop_body,
+        };
+        self.stmt(&Stmt::new(line, desugared))
+    }
+
     fn foreach_stmt(
         &mut self,
         ty: &str,
@@ -4952,6 +4997,15 @@ impl Compiler {
         body: &[Stmt],
         line: u32,
     ) -> Result<(), String> {
+        // A user class that implements `Iterable` is iterated the way JLS
+        // 14.14.2 specifies, through its own `iterator()`:
+        // `for (I #it = e.iterator(); #it.hasNext(); ) { T x = #it.next(); … }`.
+        if let Some(class) = self.expr_java_type(iter) {
+            let class = class.split('<').next().unwrap_or_default();
+            if self.has_instance_method(class, "iterator", 0) {
+                return self.foreach_iterable(ty, name, iter, body, line);
+            }
+        }
         let label = self.pending_label.take();
         // `var` takes its type from the array's element type when that is
         // statically known (`String[]` → `String`), so the loop variable still

@@ -6324,3 +6324,53 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "java.lang.Integer\n4\n5\n12\n");
 }
+
+/// The enhanced `for` over a user class implementing `Iterable` runs its own
+/// `iterator()`/`hasNext()`/`next()`: labeled `break`/`continue`, a `var` loop
+/// variable, an endless iterator left by `break`, and nested loops over one
+/// iterable each getting a fresh iterator. Measured on `openjdk 27`.
+#[test]
+fn enhanced_for_over_a_user_iterable() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+    static class Range implements Iterable<Integer> {
+        final int lo, hi;
+        Range(int lo, int hi) { this.lo = lo; this.hi = hi; }
+        public Iterator<Integer> iterator() {
+            return new It();
+        }
+        class It implements Iterator<Integer> {
+            int cur = lo;
+            public boolean hasNext() { return cur < hi; }
+            public Integer next() { return cur++; }
+        }
+    }
+    static class Evens implements Iterable<Integer> {
+        public Iterator<Integer> iterator() { return new EvIt(); }
+    }
+    static class EvIt implements Iterator<Integer> {
+        int n = 0;
+        public boolean hasNext() { return true; }
+        public Integer next() { n += 2; return n; }
+    }
+    public static void main(String[] args) {
+        int sum = 0;
+        outer:
+        for (int x : new Range(0, 10)) {
+            if (x == 2) continue;
+            if (x == 7) break outer;
+            sum += x;
+        }
+        System.out.println(sum);
+        for (var e : new Evens()) { if (e > 8) break; System.out.print(e + " "); }
+        System.out.println();
+        Range r = new Range(3, 6);
+        for (Integer i : r) for (int j : r) System.out.print(i * j + ",");
+        System.out.println();
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "19\n2 4 6 8 \n9,12,15,12,16,20,15,20,25,\n");
+}
