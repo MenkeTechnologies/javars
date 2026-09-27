@@ -28,6 +28,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         local_classes: Vec::new(),
         scope: Vec::new(),
         local_captures: std::collections::HashMap::new(),
+        inner_of: None,
     };
     p.program()
 }
@@ -101,6 +102,9 @@ struct Parser {
     /// The captured locals of each local class parsed so far, by binary name,
     /// so a local class extending another captures what its superclass does.
     local_captures: std::collections::HashMap<String, Vec<Param>>,
+    /// The enclosing class's name, set just before an inner member class is
+    /// parsed and taken by [`Parser::parse_class`].
+    inner_of: Option<String>,
 }
 
 impl Parser {
@@ -191,6 +195,8 @@ impl Parser {
         methods: &mut Vec<Method>,
         classes: &mut Vec<Class>,
     ) -> Result<(), String> {
+        // Set by the enclosing class when this is an inner member class.
+        let inner_of = self.inner_of.take();
         // modifiers (`public`, `static`, and the ident-form ones — see
         // [`class_modifier_len`], which also spells `non-sealed`)
         loop {
@@ -318,6 +324,13 @@ impl Parser {
                     ..found
                 });
             } else if self.at_nested_class() {
+                // A member `class` without `static`, in a class, enum, or
+                // record body, is *inner*: it holds its enclosing instance.
+                // Interface members, and nested records, enums, and
+                // interfaces, are implicitly `static` (JLS 8.1.3, 9.5).
+                if !is_interface && self.at_inner_class() {
+                    self.inner_of = Some(name.clone());
+                }
                 self.parse_class(Some(&binary), entry, methods, classes)?;
             } else if let Some(c) = self.try_compact_ctor(&name, is_record, &components)? {
                 ctors.push(c);
@@ -380,6 +393,14 @@ impl Parser {
             captures: Vec::new(),
             line,
         });
+        if let (Some(outer), Some(cl)) = (inner_of, classes.last_mut()) {
+            let this0 = Param {
+                ty: outer,
+                name: OUTER_THIS.to_string(),
+                varargs: false,
+            };
+            attach_captures(cl, vec![this0], 0);
+        }
         Ok(())
     }
 
@@ -524,6 +545,35 @@ impl Parser {
 /// `sealed` and `non-sealed` are contextual keywords: a variable named `sealed`
 /// is still legal Java, so only the *declaration* position reads them as
 /// modifiers, which is exactly where this is asked.
+/// Give `cl` its captured values: a `final` field for each capture from
+/// `own_from` on (the earlier ones are fields of a capturing superclass
+/// already), and every capture as a trailing parameter of every constructor —
+/// synthesizing the no-argument one a class that declares none would have.
+/// A local class captures enclosing locals (`Parser::capture_locals`); an
+/// inner member class captures its enclosing instance as [`OUTER_THIS`].
+fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
+    for c in &captures[own_from..] {
+        cl.fields.push(FieldDecl {
+            ty: c.ty.clone(),
+            name: c.name.clone(),
+            is_final: true,
+            init: None,
+            line: cl.line,
+        });
+    }
+    if cl.ctors.is_empty() {
+        cl.ctors.push(Ctor {
+            params: Vec::new(),
+            body: Vec::new(),
+            line: cl.line,
+        });
+    }
+    for ctor in &mut cl.ctors {
+        ctor.params.extend(captures.iter().cloned());
+    }
+    cl.captures = captures;
+}
+
 /// The index one past the last token of the block enclosing `from`: the
 /// first `}` that closes a brace opened before `from`, or the end of input.
 fn block_end(toks: &[Token], from: usize) -> usize {
@@ -553,7 +603,10 @@ fn class_modifier_len(toks: &[Token], j: usize) -> usize {
     {
         return 3;
     }
-    usize::from(matches!(word, "final" | "abstract" | "sealed"))
+    usize::from(matches!(
+        word,
+        "final" | "abstract" | "sealed" | "private" | "protected" | "strictfp"
+    ))
 }
 
 fn record_at(toks: &[Token], j: usize) -> bool {
@@ -1139,6 +1192,23 @@ impl Parser {
             || record_at(&self.toks, j)
     }
 
+    /// True when the cursor is on a `class` declaration whose modifiers do not
+    /// include `static`.
+    fn at_inner_class(&self) -> bool {
+        let mut j = self.pos;
+        loop {
+            let n = class_modifier_len(&self.toks, j);
+            if n == 0 {
+                break;
+            }
+            if matches!(self.toks[j].kind, Tok::Static) {
+                return false;
+            }
+            j += n;
+        }
+        matches!(self.toks[j].kind, Tok::Class)
+    }
+
     /// Parse a local type declaration and hoist it (see `statement_kind`).
     fn local_type_decl(&mut self) -> Result<(), String> {
         let mut j = self.pos;
@@ -1239,28 +1309,9 @@ impl Parser {
         if captures.is_empty() {
             return;
         }
-        for c in &captures[inherited.len()..] {
-            cl.fields.push(FieldDecl {
-                ty: c.ty.clone(),
-                name: c.name.clone(),
-                is_final: true,
-                init: None,
-                line: cl.line,
-            });
-        }
-        if cl.ctors.is_empty() {
-            cl.ctors.push(Ctor {
-                params: Vec::new(),
-                body: Vec::new(),
-                line: cl.line,
-            });
-        }
-        for ctor in &mut cl.ctors {
-            ctor.params.extend(captures.iter().cloned());
-        }
         self.local_captures
             .insert(cl.name.clone(), captures.clone());
-        cl.captures = captures;
+        attach_captures(cl, captures, inherited.len());
     }
 
     /// True when the cursor is on a `record Name(` header. `record` is a
@@ -2149,6 +2200,7 @@ impl Parser {
                 args: vec![Expr::Str(
                     "Cannot enter synchronized block because the monitor is null".to_string(),
                 )],
+                outer: None,
                 line,
             }),
         );
@@ -3080,16 +3132,24 @@ impl Parser {
             if self.is(&Tok::Dot) {
                 let line = self.line();
                 self.advance();
-                // `outer.new Inner(…)` — a *qualified* class instance creation.
-                // javars flattens nested types into one namespace, so `Inner`
-                // names the same class a bare `new Inner(…)` does and the
-                // qualifier is dropped. An inner class that reads the outer
-                // *instance*'s fields is unmodeled either way (see BUGS.md); the
-                // qualifier only ever said which instance, and there is none to
-                // say. A side-effecting qualifier is evaluated by Java and not
-                // here, which is the observable part of dropping it.
+                // `outer.new Inner(…)` — a *qualified* class instance creation:
+                // `outer` is the enclosing instance the inner class holds.
                 if self.is(&Tok::New) {
-                    e = self.new_expr()?;
+                    e = match self.new_expr()? {
+                        Expr::NewObject {
+                            class, args, line, ..
+                        } => Expr::NewObject {
+                            class,
+                            args,
+                            outer: Some(Box::new(e)),
+                            line,
+                        },
+                        _ => {
+                            return Err(format!(
+                                "javars: a qualified `new` of an array or an anonymous class is not modeled (line {line})"
+                            ))
+                        }
+                    };
                     continue;
                 }
                 // An *explicit* generic method type argument
@@ -3425,6 +3485,7 @@ impl Parser {
         Ok(Expr::NewObject {
             class: ty,
             args,
+            outer: None,
             line,
         })
     }

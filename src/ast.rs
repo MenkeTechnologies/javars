@@ -67,6 +67,11 @@ pub fn static_global(class: &str, field: &str) -> String {
     format!("#static#{class}#{field}")
 }
 
+/// The field and trailing constructor parameter through which an inner
+/// (non-`static`) member class holds its enclosing instance — javac's own
+/// synthetic name for it.
+pub const OUTER_THIS: &str = "this$0";
+
 /// A user-defined class: its instance fields, constructors, and instance
 /// methods. `static` methods are hoisted into [`Program::methods`]; only the
 /// non-static members live here. Modeled as heap objects ([`crate::host`]
@@ -575,6 +580,10 @@ pub enum Expr {
     NewObject {
         class: String,
         args: Vec<Expr>,
+        /// The explicit enclosing instance of `outer.new Inner(…)`; `None` for
+        /// a bare `new`, whose enclosing instance (for an inner class) is the
+        /// innermost `this` of the right type.
+        outer: Option<Box<Expr>>,
         line: u32,
     },
     /// `this` — the receiver of the enclosing instance method or constructor

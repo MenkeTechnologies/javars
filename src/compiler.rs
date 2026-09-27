@@ -1008,7 +1008,7 @@ impl Compiler {
                 // subclass, but it is the *enum's* constructor that runs — Java
                 // gives an anonymous enum subclass no constructor of its own.
                 let runtime_class = constant.body_class.as_deref().unwrap_or(&cl.name);
-                self.new_object_as(runtime_class, &cl.name, &constant.args, line)?;
+                self.new_object_as(runtime_class, &cl.name, &constant.args, None, line)?;
                 let obj = self.temp();
                 self.emit_set(&obj, line);
                 // … then the identity every enum constant carries.
@@ -1540,7 +1540,12 @@ impl Compiler {
             }
         }
         // An unqualified `static` field of the enclosing class.
-        self.static_field_owner(name).map(|(_, ty)| ty)
+        if let Some((_, ty)) = self.static_field_owner(name) {
+            return Some(ty);
+        }
+        // A field of an enclosing instance, from an inner class.
+        let (_, owner) = self.outer_field_recv(name)?;
+        self.classes.get(&owner)?.field_types.get(name).cloned()
     }
 
     /// The static Java type-name of an expression (`int`, `double`, `boolean`,
@@ -1647,6 +1652,9 @@ impl Compiler {
                 Some(rank_name(tr.max(er)).to_string())
             }
             Expr::Field { recv, name } => {
+                if let Some(class) = self.qualified_this(e) {
+                    return Some(class.to_string());
+                }
                 if name == "length" {
                     return Some("int".to_string());
                 }
@@ -2360,19 +2368,137 @@ impl Compiler {
         self.b.emit(Op::Pop, line);
     }
 
-    /// A construction's arguments with `class`'s captured locals appended, read
-    /// by name where the construction is written: the enclosing local itself at
-    /// a `new` in the declaring method, the class's own field at a `new` inside
-    /// its body, and the constructor parameter in a `this(…)`/`super(…)`.
-    fn with_captures<'a>(&self, class: &str, args: &'a [Expr]) -> Cow<'a, [Expr]> {
-        match self.classes.get(class) {
-            Some(ci) if !ci.captures.is_empty() => {
-                let mut all = args.to_vec();
-                all.extend(ci.captures.iter().map(|(n, _)| Expr::Var(n.clone())));
-                Cow::Owned(all)
-            }
-            _ => Cow::Borrowed(args),
+    /// A construction's arguments with `class`'s captured values appended.
+    ///
+    /// A captured local is read by name where the construction is written:
+    /// the enclosing local itself at a `new` in the declaring method, the
+    /// class's own field at a `new` inside its body, and the constructor
+    /// parameter in a `this(…)`/`super(…)`. The enclosing instance of an inner
+    /// class ([`OUTER_THIS`]) is `outer` when the construction names one
+    /// (`o.new Inner()`, or the constructor parameter a `this(…)`/`super(…)`
+    /// forwards), else the innermost `this` of the enclosing type
+    /// ([`Compiler::enclosing_instance`]).
+    fn with_captures<'a>(
+        &self,
+        class: &str,
+        args: &'a [Expr],
+        outer: Option<&Expr>,
+    ) -> Cow<'a, [Expr]> {
+        let Some(ci) = self.classes.get(class).filter(|ci| !ci.captures.is_empty()) else {
+            return Cow::Borrowed(args);
+        };
+        let mut all = args.to_vec();
+        for (name, ty) in &ci.captures {
+            all.push(if name == OUTER_THIS {
+                match outer {
+                    Some(o) => o.clone(),
+                    None => self.enclosing_instance(ty),
+                }
+            } else {
+                Expr::Var(name.clone())
+            });
         }
+        Cow::Owned(all)
+    }
+
+    /// The class `e` names when it is a qualified `this` (`Outer.this`).
+    fn qualified_this<'e>(&self, e: &'e Expr) -> Option<&'e str> {
+        match e {
+            Expr::Field { recv, name } if name == "this" => match recv.as_ref() {
+                Expr::Var(class) if self.classes.contains_key(class) => Some(class),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The enclosing class an inner member class holds an instance of.
+    fn outer_class(&self, class: &str) -> Option<&str> {
+        self.classes
+            .get(class)?
+            .captures
+            .iter()
+            .find(|(n, _)| n == OUTER_THIS)
+            .map(|(_, ty)| ty.as_str())
+    }
+
+    /// The innermost `this` whose class is `outer` or a subclass of it: `this`
+    /// itself, else `this.this$0`, `this.this$0.this$0`, … up the chain of
+    /// enclosing instances — JLS 15.9.2's "immediately enclosing instance" and
+    /// what `Outer.this` denotes. In a static context there is none; javac
+    /// rejects a bare `new Inner()` there, and javars passes `null`, which
+    /// only an inner class that actually reads its enclosing instance can
+    /// observe.
+    fn enclosing_instance(&self, outer: &str) -> Expr {
+        let null = Expr::Var(NULL_LITERAL.to_string());
+        let Some(mut cur) = self.this_class.as_deref() else {
+            return null;
+        };
+        let mut recv = Expr::This;
+        for _ in 0..64 {
+            if self.is_subclass(cur, outer) {
+                return recv;
+            }
+            let Some(next) = self.outer_class(cur) else {
+                break;
+            };
+            recv = Expr::Field {
+                recv: Box::new(recv),
+                name: OUTER_THIS.to_string(),
+            };
+            cur = next;
+        }
+        null
+    }
+
+    /// The receiver an unqualified name that is none of `this`'s own fields
+    /// reads when an enclosing instance declares it (JLS 6.5.6.1): the
+    /// `this.this$0…` chain up to the first enclosing class with a field
+    /// `name`, and that class.
+    fn outer_field_recv(&self, name: &str) -> Option<(Expr, String)> {
+        if self.is_local(name) {
+            return None;
+        }
+        let mut cur = self.this_class.as_deref()?;
+        let mut recv = Expr::This;
+        for _ in 0..64 {
+            let next = self.outer_class(cur)?;
+            recv = Expr::Field {
+                recv: Box::new(recv),
+                name: OUTER_THIS.to_string(),
+            };
+            if self.classes.get(next)?.field_types.contains_key(name) {
+                return Some((recv, next.to_string()));
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// The receiver an unqualified call to a method `this`'s class does not
+    /// have reaches when an enclosing instance's class does, as
+    /// [`Compiler::outer_field_recv`] does for a field.
+    fn outer_method_recv(&self, name: &str) -> Option<Expr> {
+        let mut cur = self.this_class.as_deref()?;
+        let mut recv = Expr::This;
+        for _ in 0..64 {
+            let next = self.outer_class(cur)?;
+            recv = Expr::Field {
+                recv: Box::new(recv),
+                name: OUTER_THIS.to_string(),
+            };
+            if self
+                .classes
+                .get(next)?
+                .methods
+                .iter()
+                .any(|m| m.name == name)
+            {
+                return Some(recv);
+            }
+            cur = next;
+        }
+        None
     }
 
     /// Emit the body of the default constructor javac synthesizes for a class
@@ -3816,7 +3942,8 @@ impl Compiler {
             if method == "new" {
                 let arity = match ci.ctors.len() {
                     0 => 0,
-                    1 => ci.ctors[0].param_tys.len(),
+                    // Captured values are appended at the `new` itself.
+                    1 => ci.ctors[0].param_tys.len() - ci.captures.len(),
                     _ => {
                         return Err(format!(
                             "javars: `{name}::new` is ambiguous — {} constructors (line {line})",
@@ -3830,6 +3957,7 @@ impl Compiler {
                     Expr::NewObject {
                         class: name.to_string(),
                         args: vars(&ps),
+                        outer: None,
                         line,
                     },
                 )));
@@ -3883,6 +4011,7 @@ impl Compiler {
                 Expr::NewObject {
                     class: name.to_string(),
                     args: Vec::new(),
+                    outer: None,
                     line,
                 },
             )));
@@ -4190,6 +4319,10 @@ impl Compiler {
                 // writes that class's shared cell.
                 if let Some((class, ty)) = self.static_field_owner(name) {
                     return self.static_assign(&class, &ty, name, *op, value, line);
+                }
+                // A field of an enclosing instance, from an inner class.
+                if let Some((recv, _)) = self.outer_field_recv(name) {
+                    return self.field_assign(&recv, name, *op, value, line);
                 }
                 let l = self.lookup_type(name);
                 // A compound assignment back into an `int` variable wraps.
@@ -5356,8 +5489,23 @@ impl Compiler {
             self.emit_field_get(name, 0);
         } else if let Some((class, _)) = self.static_field_owner(name) {
             self.emit_global_get(&static_global(&class, name), 0);
+        } else if let Some((recv, _)) = self.outer_field_recv(name) {
+            self.emit_this_chain(&recv);
+            self.emit_field_get(name, 0);
         } else {
             self.emit_get(name, 0);
+        }
+    }
+
+    /// Emit `this`, or the `this.this$0…` chain [`Compiler::outer_field_recv`]
+    /// and [`Compiler::enclosing_instance`] build.
+    fn emit_this_chain(&mut self, recv: &Expr) {
+        match recv {
+            Expr::Field { recv, name } => {
+                self.emit_this_chain(recv);
+                self.emit_field_get(name, 0);
+            }
+            _ => self.emit_this(0),
         }
     }
 
@@ -5471,6 +5619,9 @@ impl Compiler {
         }
         if let Some((class, ty)) = self.static_field_owner(name) {
             return self.static_assign(&class, &ty, name, op, &Expr::Int(1), 0);
+        }
+        if let Some((recv, _)) = self.outer_field_recv(name) {
+            return self.field_assign(&recv, name, op, &Expr::Int(1), 0);
         }
         let decl = self.var_decl_type(name).map(str::to_string);
         let wrap = decl.as_deref() == Some("int");
@@ -5758,6 +5909,9 @@ impl Compiler {
                     self.emit_field_get(name, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
                     self.emit_global_get(&static_global(&class, name), 0);
+                } else if let Some((recv, _)) = self.outer_field_recv(name) {
+                    self.emit_this_chain(&recv);
+                    self.emit_field_get(name, 0);
                 } else if !self.is_declared_var(name) && name != NULL_LITERAL {
                     // Nothing declares this name. Java's answer is "cannot find
                     // symbol"; javars read the unset cell instead and got
@@ -5819,10 +5973,21 @@ impl Compiler {
                 self.emit_raising_builtin(crate::host::JARRAY_GET, 2, 0);
             }
             Expr::Field { recv, name } => {
+                // `Outer.this` — the enclosing instance of that class.
+                if let Some(class) = self.qualified_this(e) {
+                    match self.enclosing_instance(class) {
+                        Expr::Var(_) => {
+                            return Err(format!(
+                                "javars: `{class}.this` names no enclosing instance here"
+                            ))
+                        }
+                        inst => self.emit_this_chain(&inst),
+                    }
+                }
                 // `Integer.MAX_VALUE` / `Math.PI` / … — a `static final` of a
                 // `java.lang` type javars does not model as a class, folded to
                 // its literal value.
-                if let Some((v, _)) = self.wrapper_constant_ref(e) {
+                else if let Some((v, _)) = self.wrapper_constant_ref(e) {
                     let c = self.b.add_constant(v);
                     self.b.emit(Op::LoadConst(c), 0);
                 }
@@ -5839,7 +6004,12 @@ impl Compiler {
                     self.emit_field_get(name, 0);
                 }
             }
-            Expr::NewObject { class, args, line } => self.new_object(class, args, *line)?,
+            Expr::NewObject {
+                class,
+                args,
+                outer,
+                line,
+            } => self.new_object(class, args, outer.as_deref(), *line)?,
             Expr::InstanceOf {
                 expr,
                 class,
@@ -6770,8 +6940,14 @@ impl Compiler {
     /// Lower `new ClassName(args...)`: allocate the instance, seed its fields
     /// (defaults then declared initializers, ancestors first), run the matching
     /// constructor, and leave the instance handle on the stack.
-    fn new_object(&mut self, class: &str, args: &[Expr], line: u32) -> Result<(), String> {
-        self.new_object_as(class, class, args, line)
+    fn new_object(
+        &mut self,
+        class: &str,
+        args: &[Expr],
+        outer: Option<&Expr>,
+        line: u32,
+    ) -> Result<(), String> {
+        self.new_object_as(class, class, args, outer, line)
     }
 
     /// Lower a construction whose *runtime class* and *constructor* differ.
@@ -6785,9 +6961,15 @@ impl Compiler {
         class: &str,
         ctor_class: &str,
         args: &[Expr],
+        outer: Option<&Expr>,
         line: u32,
     ) -> Result<(), String> {
-        let args = self.with_captures(ctor_class, args);
+        if outer.is_some() && self.outer_class(ctor_class).is_none() {
+            return Err(format!(
+                "javars: `{ctor_class}` is not an inner class, so a qualified `new` names no enclosing instance for it (line {line})"
+            ));
+        }
+        let args = self.with_captures(ctor_class, args, outer);
         let args: &[Expr] = &args;
         // `new String(cs)` / `new String(s)` / `new String()` — javars models a
         // `String` as a primitive value rather than an instance, so constructing
@@ -7305,7 +7487,8 @@ impl Compiler {
                     .get(&this_class)
                     .and_then(|ci| ci.superclass.clone())
                 {
-                    let args = self.with_captures(&sup, args);
+                    let this0 = Expr::Var(OUTER_THIS.to_string());
+                    let args = self.with_captures(&sup, args, Some(&this0));
                     let args: &[Expr] = &args;
                     let arg_tys: Vec<Option<String>> =
                         args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -7343,7 +7526,8 @@ impl Compiler {
         // `Compiler::chains_explicitly`).
         if name == "this" {
             if let Some(this_class) = self.this_class.clone() {
-                let args = self.with_captures(&this_class, args);
+                let this0 = Expr::Var(OUTER_THIS.to_string());
+                let args = self.with_captures(&this_class, args, Some(&this0));
                 let args: &[Expr] = &args;
                 let arg_tys: Vec<Option<String>> =
                     args.iter().map(|a| self.expr_java_type(a)).collect();
@@ -7409,6 +7593,15 @@ impl Compiler {
             ) {
                 return self.expr(&Expr::MethodCall {
                     recv: Box::new(Expr::This),
+                    method: name.to_string(),
+                    args: args.to_vec(),
+                    line,
+                });
+            }
+            // An inner class calling a method of an enclosing instance.
+            if let Some(recv) = self.outer_method_recv(name) {
+                return self.expr(&Expr::MethodCall {
+                    recv: Box::new(recv),
                     method: name.to_string(),
                     args: args.to_vec(),
                     line,

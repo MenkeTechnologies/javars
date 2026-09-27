@@ -6172,3 +6172,107 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "5 Sq(9.0) 0 3\n");
 }
+
+/// Inner (non-`static`) member classes hold their enclosing instance, javac's
+/// `this$0`: an unqualified outer field or method resolves through it (also
+/// across two levels), `Outer.this` names it, `o.new Inner()` supplies it, a
+/// bare `new Inner()` in an instance context passes `this`, an inner subclass
+/// forwards it to its inner superclass, and a `private` inner iterator reads
+/// its generic outer's array. Measured on `openjdk 27`.
+#[test]
+fn inner_classes_hold_the_enclosing_instance() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+    static class Bag<E> implements Iterable<E> {
+        private Object[] items = new Object[4];
+        private int n = 0;
+        void add(E e) { items[n++] = e; }
+        public Iterator<E> iterator() { return new It(); }
+        private class It implements Iterator<E> {
+            int i = 0;
+            public boolean hasNext() { return i < n; }
+            public E next() { return (E) items[i++]; }
+        }
+    }
+    int x = 1;
+    class A {
+        int x = 2;
+        class B {
+            int x = 3;
+            String show() { return x + " " + this.x + " " + A.this.x + " " + T.this.x + " " + y(); }
+        }
+        int y() { return x * 10 + T.this.x; }
+    }
+    class Base { String who() { return "base" + x; } }
+    class Derived extends Base { String who() { return "derived/" + super.who(); } }
+    String name() { return "T" + x; }
+    class Namer { String n() { return name() + "!" + T.this.name(); } }
+    public static void main(String[] args) {
+        Bag<String> b = new Bag<>();
+        b.add("p"); b.add("q"); b.add("r");
+        for (Iterator<String> it = b.iterator(); it.hasNext();) System.out.print(it.next());
+        System.out.println();
+        T t = new T();
+        T.A a = t.new A();
+        T.A.B bb = a.new B();
+        System.out.println(bb.show());
+        t.x = 5;
+        System.out.println(bb.show());
+        Base d = t.new Derived();
+        System.out.println(d.who());
+        System.out.println(t.new Namer().n());
+        List<Base> l = new ArrayList<>();
+        l.add(t.new Base()); l.add(t.new Derived());
+        for (Base z : l) System.out.println(z.who() + " " + z.getClass().getName());
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "pqr\n3 3 2 1 21\n3 3 2 5 25\nderived/base5\nT5!T5\nbase5 T$Base\nderived/base5 T$Derived\n"
+    );
+}
+
+/// An inner class's compound assignment to an outer field writes the outer
+/// instance, and `new Node(v)` inside an outer instance method builds a linked
+/// list the outer owns. Measured on `openjdk 27`.
+#[test]
+fn inner_class_writes_outer_fields() {
+    let (out, ok) = run(r#"
+import java.util.*;
+public class T {
+    private int count = 0;
+    private String name;
+    T(String n) { name = n; }
+    class Counter {
+        int step;
+        Counter(int s) { step = s; }
+        void tick() { count += step; }
+        String show() { return name + "=" + count + " " + T.this.name; }
+    }
+    class Node {
+        int v; Node next;
+        Node(int v) { this.v = v; }
+    }
+    Node head;
+    void push(int v) { Node n = new Node(v); n.next = head; head = n; }
+    int bump() { return ++count; }
+    class Caller { int call() { return bump() * 10; } }
+    public static void main(String[] args) {
+        T t = new T("t");
+        T.Counter c = t.new Counter(2);
+        c.tick(); c.tick();
+        System.out.println(c.show());
+        t.push(1); t.push(2);
+        for (Node n = t.head; n != null; n = n.next) System.out.print(n.v + " ");
+        System.out.println();
+        System.out.println(t.new Caller().call());
+        System.out.println(c.getClass().getName());
+    }
+}
+"#);
+    assert!(ok, "{out}");
+    assert_eq!(out, "t=4 t\n2 1 \n50\nT$Counter\n");
+}
