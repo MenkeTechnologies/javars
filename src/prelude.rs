@@ -397,6 +397,15 @@ fn prelude_source(declared: &[String]) -> String {
             // `getLocalizedMessage()` is `Throwable`'s own one-liner
             // (`return getMessage();`), overridable but never overridden here.
             src.push_str("  String getLocalizedMessage() { return getMessage(); }\n");
+            // `printStackTrace()` writes to standard error: the throwable's
+            // `toString()`, then a `Caused by: ` line for each cause. javars
+            // keeps no call-site table, so the `\tat …` frame lines between
+            // them are absent; standard output is untouched either way.
+            src.push_str(
+                "  void printStackTrace() { System.err.println(this); Throwable c = getCause(); \
+                 while (c != null && c != this) { System.err.println(\"Caused by: \" + c); \
+                 c = c.getCause(); } }\n",
+            );
             // The name comes from the *object*, not from the class this method
             // was resolved on — `getName()` already answers `java.lang.Foo` for
             // a modeled throwable (including the two that are not in

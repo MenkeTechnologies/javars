@@ -1262,9 +1262,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   stores and continues, where the JDK throws `ArrayStoreException:
   java.lang.Integer`. Measured on `openjdk 21.0.12`. The array's element type
   would have to be recorded on the host object and checked on every store.
-- **`Throwable.getSuppressed()`, `addSuppressed`, `printStackTrace()`, and
-  `getStackTrace()`.** javars keeps no call-site table (see the uncaught-report
-  entry above), so a stack trace has nothing to print; the suppressed list has
+- **`Throwable.getSuppressed()`, `addSuppressed`, and `getStackTrace()`, and
+  the frames of `printStackTrace()`.** javars keeps no call-site table (see the
+  uncaught-report entry above), so a stack trace has no frames to print:
+  `printStackTrace()` writes the throwable's `toString()` and a `Caused by: `
+  line per cause to standard error, without the `\tat …` lines between them; the suppressed list has
   no such obstacle and is simply not built, so try-with-resources suppression is
   not observable. Cause chaining *is* implemented: `getCause()`, `initCause`
   (with the JDK's `Can't overwrite cause with …` and `Self-causation not
@@ -1441,8 +1443,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   language (`(?m)$` matches before a `\n` where Java's matches before any of its
   five line terminators; `(?x)` ignores whitespace inside a character class in
   Java but not in the engine), and a named error beats a silently different
-  answer. `java.util.regex.Pattern`/`Matcher` themselves are also absent — the
-  four `String` methods are the whole surface.
+  answer. `java.util.regex.Pattern`/`Matcher` are implemented over the same
+  translation (see README); their `MULTILINE`, `COMMENTS`, `UNICODE_CASE`,
+  `UNIX_LINES`, `CANON_EQ` and `UNICODE_CHARACTER_CLASS` flags are refused by
+  name for the reason `(?m)`/`(?x)` are, and a `MatchResult` is a frozen
+  `Matcher`, so its `getClass()` names `java.util.regex.Matcher`.
 - ~~**`List.listIterator`**~~ — implemented, on `ArrayList.ListItr`'s cursor
   model: `previous`/`hasPrevious`, `nextIndex`/`previousIndex`, and `set`/`add`
   at the cursor, with `IllegalStateException` after an `add` and a

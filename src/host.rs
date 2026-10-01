@@ -457,6 +457,15 @@ enum HostObj {
     Random(crate::jrandom::Random),
     /// An `Int`/`Long`/`DoubleSummaryStatistics`.
     Stats(SummaryStats),
+    /// A `java.util.regex.Pattern`: the source as written, its flags, and the
+    /// source the engine compiles (see [`regex_source`]).
+    RegexPattern {
+        shown: String,
+        flags: i64,
+        source: String,
+    },
+    /// A `java.util.regex.Matcher`.
+    RegexMatcher(Box<RegexMatcher>),
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
     /// is erased at runtime — the compiler sets each slot's default on creation.
     Array(Vec<Value>),
@@ -5110,6 +5119,8 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
+                    HostObj::RegexPattern { .. } => "java.util.regex.Pattern".to_string(),
+                    HostObj::RegexMatcher(_) => "java.util.regex.Matcher".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
@@ -8354,6 +8365,18 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = pattern_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
+    if let Some(r) = matcher_method(vm, &recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = stats_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -9042,26 +9065,82 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // one line and `""` is none. All three of `\n`, `\r\n` and a lone `\r`
         // terminate — Rust's `str::lines` handles the first two and treats a
         // lone `\r` as ordinary text, which is why this scans by hand.
-        ("lines", 0) => {
-            let mut out = Vec::new();
-            let mut line = String::new();
-            let mut it = s.chars().peekable();
-            while let Some(c) = it.next() {
-                match c {
-                    '\n' => out.push(Value::str(std::mem::take(&mut line))),
-                    '\r' => {
-                        if it.peek() == Some(&'\n') {
-                            it.next();
-                        }
-                        out.push(Value::str(std::mem::take(&mut line)));
-                    }
-                    other => line.push(other),
+        // `regionMatches([ignoreCase,] toffset, other, ooffset, len)`: the
+        // UTF-16 windows compared unit by unit, `false` for a window that
+        // falls outside either string. The case-blind form is
+        // `String.regionMatchesCI`'s: equal, or equal upper-cased, or equal
+        // lower-cased after upper-casing.
+        ("regionMatches", 4 | 5) => {
+            let (ci, a) = if args.len() == 5 {
+                (java_bool(&args[0]), &args[1..])
+            } else {
+                (false, args)
+            };
+            let other = a[1].as_str_cow();
+            let (to, oo, len) = (a[0].jint(), a[2].jint(), a[3].jint());
+            let x: Vec<u16> = s.encode_utf16().collect();
+            let y: Vec<u16> = other.encode_utf16().collect();
+            if oo < 0 || to < 0 || to > x.len() as i64 - len || oo > y.len() as i64 - len {
+                return Ok(Value::bool(false));
+            }
+            let fold = |u: u16, upper: bool| -> u32 {
+                match char::from_u32(u32::from(u)) {
+                    Some(c) if upper => one_to_one_case(c, char::to_uppercase) as u32,
+                    Some(c) => one_to_one_case(c, char::to_lowercase) as u32,
+                    None => u32::from(u),
                 }
+            };
+            let same = (0..len.max(0) as usize).all(|i| {
+                let (c1, c2) = (x[to as usize + i], y[oo as usize + i]);
+                c1 == c2
+                    || (ci && {
+                        let (u1, u2) = (fold(c1, true), fold(c2, true));
+                        u1 == u2 || fold(u1 as u16, false) == fold(u2 as u16, false)
+                    })
+            });
+            Ok(Value::bool(same))
+        }
+        // `codePointCount(begin, end)` over UTF-16 indices: a surrogate pair
+        // inside the range is one code point, an unpaired surrogate one too.
+        ("codePointCount", 2) => {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            let (b, e) = (args[0].jint(), args[1].jint());
+            if b < 0 || e > units.len() as i64 || b > e {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Range [{b}, {e}) out of bounds for length {}", units.len()),
+                ));
             }
-            if !line.is_empty() {
-                out.push(Value::str(line));
+            let n = char::decode_utf16(units[b as usize..e as usize].iter().copied()).count();
+            Ok(Value::Int(n as i64))
+        }
+        ("lines", 0) => Ok(stream_of(
+            java_lines(s).into_iter().map(Value::str).collect(),
+            StreamKind::Ref,
+        )),
+        // `indent(n)`: `lines()`, each given `n` leading spaces or relieved of
+        // up to `-n` leading whitespace characters (all of them for
+        // `Integer.MIN_VALUE`), joined with `\n` and ended with one.
+        ("indent", 1) => {
+            if s.is_empty() {
+                return Ok(Value::str(String::new()));
             }
-            Ok(stream_of(out, StreamKind::Ref))
+            let n = args[0].jint();
+            let mut out = String::new();
+            for line in java_lines(s) {
+                if n > 0 {
+                    out.push_str(&" ".repeat(n as usize));
+                    out.push_str(&line);
+                } else if n == i64::from(i32::MIN) {
+                    out.push_str(line.trim_start_matches(java_is_whitespace));
+                } else {
+                    let ws = line.chars().take_while(|&c| java_is_whitespace(c)).count();
+                    let cut = ws.min(n.unsigned_abs() as usize);
+                    out.extend(line.chars().skip(cut));
+                }
+                out.push('\n');
+            }
+            Ok(Value::str(out))
         }
         _ => Err(Fault::internal(format!(
             "javars: unsupported String method `{method}` with {} argument(s)",
@@ -9113,6 +9192,12 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    if let Some(r) = regex_static(&class, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = system_static(vm, &class, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -10976,14 +11061,517 @@ fn char_last_index_of(hay: &str, needle: &str, from: i64) -> i64 {
         .unwrap_or(-1)
 }
 
-/// The literal text a `String` regex argument matches, for the pattern subset
-/// javars supports.
+// ── java.util.regex.Pattern / Matcher ───────────────────────────────────────
+
+/// `Pattern.CASE_INSENSITIVE`.
+const RE_CASE_INSENSITIVE: i64 = 0x02;
+/// `Pattern.LITERAL`.
+const RE_LITERAL: i64 = 0x10;
+/// `Pattern.DOTALL`.
+const RE_DOTALL: i64 = 0x20;
+
+/// A `java.util.regex.Matcher`: the JDK's `first`/`last`/`groups` state over
+/// one input, held as byte offsets and reported in UTF-16 indices.
+#[derive(Clone)]
+struct RegexMatcher {
+    /// The pattern as `Pattern.pattern()` answers it.
+    shown: String,
+    flags: i64,
+    /// The source handed to [`crate::regex`]: `shown` with the flags spelled
+    /// inline (`(?i)`, `(?s)`) and quoted under `LITERAL`.
+    source: String,
+    text: String,
+    /// The start of the current match; `None` when there is none, which is
+    /// the JDK's `first == -1`.
+    first: Option<usize>,
+    /// The end of the last match, where the next `find()` starts.
+    last: usize,
+    groups: crate::regex::Groups,
+    /// Which compilation the current match came from, so `appendReplacement`
+    /// expands it against the same one.
+    mode: MatchMode,
+    /// `lastAppendPosition`.
+    append_pos: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MatchMode {
+    Search,
+    Whole,
+    Prefix,
+}
+
+/// `Pattern.quote(s)`: `\Q…\E`, with every `\E` in `s` closed and re-opened.
+fn regex_quote(s: &str) -> String {
+    if !s.contains("\\E") {
+        return format!("\\Q{s}\\E");
+    }
+    let mut out = String::from("\\Q");
+    let mut rest = s;
+    while let Some(i) = rest.find("\\E") {
+        out.push_str(&rest[..i]);
+        out.push_str("\\E\\\\E\\Q");
+        rest = &rest[i + 2..];
+    }
+    out.push_str(rest);
+    out.push_str("\\E");
+    out
+}
+
+/// The source [`crate::regex`] compiles for `Pattern.compile(source, flags)`.
+/// `CASE_INSENSITIVE` and `DOTALL` are the inline `(?i)`/`(?s)` the translator
+/// already models and `LITERAL` is [`regex_quote`]; any other flag is refused
+/// by name rather than ignored.
+fn regex_source(shown: &str, flags: i64) -> Result<String, Fault> {
+    let other = flags & !(RE_CASE_INSENSITIVE | RE_LITERAL | RE_DOTALL);
+    if other != 0 {
+        return Err(Fault::internal(format!(
+            "javars: Pattern flag 0x{other:x} is not modeled"
+        )));
+    }
+    let mut src = String::new();
+    if flags & RE_CASE_INSENSITIVE != 0 {
+        src.push_str("(?i)");
+    }
+    if flags & RE_DOTALL != 0 {
+        src.push_str("(?s)");
+    }
+    if flags & RE_LITERAL != 0 {
+        src.push_str(&regex_quote(shown));
+    } else {
+        src.push_str(shown);
+    }
+    Ok(src)
+}
+
+/// The compiled form of `source` for one matching mode, or its
+/// `PatternSyntaxException`.
+fn regex_compiled(source: &str, mode: MatchMode) -> Result<crate::regex::Compiled, Fault> {
+    let c = match mode {
+        MatchMode::Search => crate::regex::compile(source),
+        MatchMode::Whole => crate::regex::compile_whole(source),
+        MatchMode::Prefix => crate::regex::compile_prefix(source),
+    };
+    if let Err(e) = c.as_ref() {
+        return Err(pattern_fault(e));
+    }
+    Ok(c)
+}
+
+/// The UTF-16 index of byte offset `b` — what every `Matcher` index reports.
+fn utf16_at(text: &str, b: usize) -> i64 {
+    text[..b].encode_utf16().count() as i64
+}
+
+/// The byte offset of UTF-16 index `i`; an index inside a surrogate pair
+/// resolves to the character's end.
+fn byte_at_utf16(text: &str, i: usize) -> usize {
+    let mut units = 0;
+    for (b, c) in text.char_indices() {
+        if units >= i {
+            return b;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
+}
+
+impl RegexMatcher {
+    fn new(shown: String, flags: i64, source: String, text: String) -> Self {
+        RegexMatcher {
+            shown,
+            flags,
+            source,
+            text,
+            first: None,
+            last: 0,
+            groups: Vec::new(),
+            mode: MatchMode::Search,
+            append_pos: 0,
+        }
+    }
+
+    /// `reset()`.
+    fn reset(&mut self) {
+        self.first = None;
+        self.last = 0;
+        self.groups.clear();
+        self.append_pos = 0;
+    }
+
+    /// `search(from)` / `match(from, anchor)`: try one match starting at byte
+    /// `from`, recording it or clearing `first`.
+    fn attempt(&mut self, from: usize, mode: MatchMode) -> Result<bool, Fault> {
+        let c = regex_compiled(&self.source, mode)?;
+        let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
+        self.groups.clear();
+        match pat.captures_at(&self.text, from).map_err(engine_fault)? {
+            Some(g) => {
+                let (s, e) = g[0].expect("group 0 always participates");
+                self.first = Some(s);
+                self.last = e;
+                self.groups = g;
+                self.mode = mode;
+                Ok(true)
+            }
+            None => {
+                self.first = None;
+                Ok(false)
+            }
+        }
+    }
+
+    /// `find()`: from the end of the last match, one character further when
+    /// that match was empty.
+    fn find(&mut self) -> Result<bool, Fault> {
+        let mut next = self.last;
+        if Some(next) == self.first {
+            next = match self.text[next..].chars().next() {
+                Some(c) => next + c.len_utf8(),
+                None => self.text.len() + 1,
+            };
+        }
+        if next > self.text.len() {
+            self.groups.clear();
+            return Ok(false);
+        }
+        self.attempt(next, MatchMode::Search)
+    }
+
+    /// The current match, or the JDK's `IllegalStateException`.
+    fn check_match(&self) -> Result<(), Fault> {
+        match self.first {
+            Some(_) => Ok(()),
+            None => Err(Fault::java("IllegalStateException", "No match found")),
+        }
+    }
+
+    /// The span of group `g`, after the JDK's two checks.
+    fn group_span(&self, g: i64) -> Result<Option<(usize, usize)>, Fault> {
+        self.check_match()?;
+        let count = self.group_count()?;
+        if g < 0 || g as usize > count {
+            return Err(Fault::java(
+                "IndexOutOfBoundsException",
+                format!("No group {g}"),
+            ));
+        }
+        Ok(self.groups.get(g as usize).copied().flatten())
+    }
+
+    fn group_count(&self) -> Result<usize, Fault> {
+        let c = regex_compiled(&self.source, MatchMode::Search)?;
+        Ok(c.as_ref().as_ref().map_or(0, |p| p.group_count()))
+    }
+
+    /// The number a `(?<name>…)` group has, or the JDK's refusal.
+    fn named(&self, name: &str) -> Result<i64, Fault> {
+        self.check_match()?;
+        let c = regex_compiled(&self.source, MatchMode::Search)?;
+        c.as_ref()
+            .as_ref()
+            .ok()
+            .and_then(|p| p.group_index(name))
+            .map(|i| i as i64)
+            .ok_or_else(|| {
+                Fault::java(
+                    "IllegalArgumentException",
+                    format!("No group with name <{name}>"),
+                )
+            })
+    }
+
+    /// The replacement text for the current match.
+    fn expanded(&self, replacement: &str) -> Result<String, Fault> {
+        let first = self.first.expect("checked by the caller");
+        let c = regex_compiled(&self.source, self.mode)?;
+        let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
+        // An anchored compilation can only find its match from the start.
+        let from = match self.mode {
+            MatchMode::Search => first,
+            _ => 0,
+        };
+        pat.expand_groups(&self.text, from, replacement)
+            .map_err(replacement_fault)
+    }
+}
+
+/// A `java.util.regex` static: `Pattern.compile`, `Pattern.matches`,
+/// `Pattern.quote` and `Matcher.quoteReplacement`.
+fn regex_static(class: &str, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let npe = || Err(Fault::java("NullPointerException", String::new()));
+    Some(match (class, method, args) {
+        ("Pattern", "compile", [s, rest @ ..]) if rest.len() <= 1 => {
+            if matches!(s, Value::Undef) {
+                return Some(npe());
+            }
+            let shown = s.as_str_cow().into_owned();
+            let flags = rest.first().map_or(0, JavaNumeric::jint);
+            regex_source(&shown, flags).and_then(|src| {
+                regex_compiled(&src, MatchMode::Search)?;
+                Ok(Value::Obj(heap_alloc(HostObj::RegexPattern {
+                    shown,
+                    flags,
+                    source: src,
+                })))
+            })
+        }
+        ("Pattern", "matches", [re, input]) => {
+            let c = crate::regex::compile_whole(&re.as_str_cow());
+            match c.as_ref() {
+                Ok(p) => p
+                    .matches_whole(&input.as_str_cow())
+                    .map(Value::bool)
+                    .map_err(engine_fault),
+                Err(e) => Err(pattern_fault(e)),
+            }
+        }
+        ("Pattern", "quote", [s]) => Ok(Value::str(regex_quote(&s.as_str_cow()))),
+        // `Matcher.quoteReplacement`: a `\` before every `\` and `$`.
+        ("Matcher", "quoteReplacement", [s]) => {
+            let s = s.as_str_cow();
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if c == '\\' || c == '$' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            Ok(Value::str(out))
+        }
+        _ => return None,
+    })
+}
+
+/// A method call on a `Pattern` receiver; `None` for any other.
+fn pattern_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let (shown, flags, source) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::RegexPattern {
+            shown,
+            flags,
+            source,
+        }) => Some((shown.clone(), *flags, source.clone())),
+        _ => None,
+    })?;
+    Some(match (method, args) {
+        ("matcher", [t]) => {
+            if matches!(t, Value::Undef) {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::RegexMatcher(Box::new(
+                RegexMatcher::new(shown, flags, source, t.as_str_cow().into_owned()),
+            )))))
+        }
+        ("pattern" | "toString", []) => Ok(Value::str(shown)),
+        // `splitAsStream(input)`: `split(input)`'s fields as a stream.
+        ("splitAsStream", [t]) => regex_compiled(&source, MatchMode::Search).and_then(|c| {
+            let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
+            let parts = pat.split(&t.as_str_cow(), 0).map_err(engine_fault)?;
+            Ok(stream_of(
+                parts.into_iter().map(Value::str).collect(),
+                StreamKind::Ref,
+            ))
+        }),
+        ("flags", []) => Ok(Value::Int(flags)),
+        ("split", [t, rest @ ..]) if rest.len() <= 1 => regex_compiled(&source, MatchMode::Search)
+            .and_then(|c| {
+                let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
+                let limit = rest.first().map_or(0, JavaNumeric::jint);
+                let parts = pat.split(&t.as_str_cow(), limit).map_err(engine_fault)?;
+                Ok(Value::Obj(heap_alloc(HostObj::Array(
+                    parts.into_iter().map(Value::str).collect(),
+                ))))
+            }),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Pattern method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
+}
+
+/// Run `f` on the `Matcher` a handle names; `None` for any other value.
+fn with_matcher<R>(v: &Value, f: impl FnOnce(&mut RegexMatcher) -> R) -> Option<R> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::RegexMatcher(m)) => Some(f(m)),
+        _ => None,
+    })
+}
+
+/// A method call on a `Matcher` receiver; `None` for any other.
 ///
-/// javars links no regex engine, so `split`/`replaceAll`/`replaceFirst`/
-/// `matches` accept only patterns with no metacharacter — which is what the
-/// overwhelmingly common single-separator call is, and which the JDK itself
-/// fast-paths. A pattern that would need real matching is reported rather than
-/// silently treated as a literal and answered wrong.
+/// `appendReplacement`/`appendTail` write into a `StringBuilder`, which runs
+/// through [`builder_method`] once the matcher's borrow is released.
+fn matcher_method(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    // The text an `append*` call adds to its builder, worked out under the
+    // matcher's borrow and appended after it.
+    let appended = match (method, args) {
+        ("appendReplacement", [_, r]) => Some(with_matcher(recv, |m| {
+            m.check_match()?;
+            let first = m.first.expect("checked");
+            let piece = format!(
+                "{}{}",
+                &m.text[m.append_pos..first],
+                m.expanded(&r.as_str_cow())?
+            );
+            m.append_pos = m.last;
+            Ok(piece)
+        })?),
+        ("appendTail", [_]) => Some(with_matcher(recv, |m| {
+            Ok(m.text[m.append_pos..].to_string())
+        })?),
+        _ => None,
+    };
+    // `toMatchResult()` and `results()` hand out snapshots of the match
+    // state — a frozen matcher answers `group`/`start`/`end` exactly as the
+    // JDK's `MatchResult` does. `results()` does not reset: it runs `find()`
+    // from wherever the matcher stands, one snapshot per match.
+    if (method, args.len()) == ("toMatchResult", 0) {
+        let snap = with_matcher(recv, |m| m.clone())?;
+        return Some(Ok(Value::Obj(heap_alloc(HostObj::RegexMatcher(Box::new(
+            snap,
+        ))))));
+    }
+    if (method, args.len()) == ("results", 0) {
+        let mut snaps = Vec::new();
+        loop {
+            match with_matcher(recv, |m| m.find().map(|hit| hit.then(|| m.clone())))? {
+                Ok(Some(s)) => snaps.push(s),
+                Ok(None) => break,
+                Err(f) => return Some(Err(f)),
+            }
+        }
+        let items = snaps
+            .into_iter()
+            .map(|s| Value::Obj(heap_alloc(HostObj::RegexMatcher(Box::new(s)))))
+            .collect();
+        return Some(Ok(stream_of(items, StreamKind::Ref)));
+    }
+    // `pattern()` allocates a `Pattern`, which cannot happen under the
+    // matcher's borrow.
+    if (method, args.len()) == ("pattern", 0) {
+        let (shown, flags, source) =
+            with_matcher(recv, |m| (m.shown.clone(), m.flags, m.source.clone()))?;
+        return Some(Ok(Value::Obj(heap_alloc(HostObj::RegexPattern {
+            shown,
+            flags,
+            source,
+        }))));
+    }
+    if let Some(piece) = appended {
+        let sb = &args[0];
+        return Some(piece.and_then(|piece| {
+            let Some(id) = is_builder(sb) else {
+                return Err(Fault::java("NullPointerException", String::new()));
+            };
+            match builder_method(vm, id, "append", &[Value::str(piece)]) {
+                Some(Err(f)) => Err(f),
+                _ => Ok(if method == "appendTail" {
+                    sb.clone()
+                } else {
+                    recv.clone()
+                }),
+            }
+        }));
+    }
+    with_matcher(recv, |m| {
+        let at = |m: &RegexMatcher, b: usize| Value::Int(utf16_at(&m.text, b));
+        match (method, args) {
+            ("find", []) => m.find().map(Value::bool),
+            ("find", [s]) => {
+                let limit = m.text.encode_utf16().count() as i64;
+                let s = s.jint();
+                if s < 0 || s > limit {
+                    return Err(Fault::java(
+                        "IndexOutOfBoundsException",
+                        "Illegal start index",
+                    ));
+                }
+                m.reset();
+                let from = byte_at_utf16(&m.text, s as usize);
+                m.attempt(from, MatchMode::Search).map(Value::bool)
+            }
+            ("matches", []) => m.attempt(0, MatchMode::Whole).map(Value::bool),
+            ("lookingAt", []) => m.attempt(0, MatchMode::Prefix).map(Value::bool),
+            ("hasMatch", []) => Ok(Value::bool(m.first.is_some())),
+            ("group", []) => m.group_span(0).map(|s| match s {
+                Some((a, b)) => Value::str(m.text[a..b].to_string()),
+                None => Value::Undef,
+            }),
+            ("group", [n]) if matches!(n, Value::Str(_)) => {
+                let g = m.named(&n.as_str_cow())?;
+                m.group_span(g).map(|s| match s {
+                    Some((a, b)) => Value::str(m.text[a..b].to_string()),
+                    None => Value::Undef,
+                })
+            }
+            ("group", [g]) => m.group_span(g.jint()).map(|s| match s {
+                Some((a, b)) => Value::str(m.text[a..b].to_string()),
+                None => Value::Undef,
+            }),
+            ("start" | "end", []) => {
+                m.check_match()?;
+                let (s, e) = m.groups[0].expect("group 0 always participates");
+                Ok(at(m, if method == "start" { s } else { e }))
+            }
+            ("start" | "end", [g]) => {
+                let g = match g {
+                    Value::Str(_) => m.named(&g.as_str_cow())?,
+                    other => other.jint(),
+                };
+                m.group_span(g).map(|s| match s {
+                    Some((a, b)) => at(m, if method == "start" { a } else { b }),
+                    None => Value::Int(-1),
+                })
+            }
+            ("groupCount", []) => m.group_count().map(|n| Value::Int(n as i64)),
+            ("reset", []) => {
+                m.reset();
+                Ok(recv.clone())
+            }
+            ("reset", [t]) => {
+                m.text = t.as_str_cow().into_owned();
+                m.reset();
+                Ok(recv.clone())
+            }
+            ("replaceAll" | "replaceFirst", [r]) => {
+                m.reset();
+                let c = regex_compiled(&m.source, MatchMode::Search)?;
+                let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
+                let out = pat
+                    .replace(&m.text, &r.as_str_cow(), method == "replaceFirst")
+                    .map_err(replacement_fault)?;
+                // The JDK's loop ends on a failed `find()`, and `replaceFirst`
+                // leaves the one match it made current.
+                if method == "replaceFirst" {
+                    m.find()?;
+                } else {
+                    m.first = None;
+                }
+                Ok(Value::str(out))
+            }
+            ("regionStart", []) => Ok(Value::Int(0)),
+            ("regionEnd", []) => Ok(Value::Int(m.text.encode_utf16().count() as i64)),
+            _ => Err(Fault::internal(format!(
+                "javars: unsupported Matcher method `{method}` with {} argument(s)",
+                args.len()
+            ))),
+        }
+    })
+}
+
+/// The `PatternSyntaxException` a pattern the translator or the engine
+/// refused raises, carrying its message.
 fn pattern_fault(msg: &str) -> Fault {
     Fault::java("PatternSyntaxException", msg)
 }
@@ -11972,6 +12560,32 @@ fn java_digit(c: u32, radix: i64) -> i64 {
 
 /// Java's `Character.isWhitespace(int)`.
 ///
+/// `String.lines()`'s lines: `\n`, `\r\n` and a lone `\r` each end one, and the
+/// text after the last terminator is a line only when it is not empty, so
+/// `"a\n"` is one line and `""` none. Rust's `str::lines` treats a lone `\r`
+/// as ordinary text, which is why this scans by hand.
+fn java_lines(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\n' => out.push(std::mem::take(&mut line)),
+            '\r' => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                out.push(std::mem::take(&mut line));
+            }
+            other => line.push(other),
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
 /// Rust's `char::is_whitespace` is the Unicode `White_Space` property, and the
 /// two sets are different in *both* directions — which is why neither
 /// `String.strip` nor `String.isBlank` can be spelled with it. Java's
@@ -13871,6 +14485,17 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
+            // `Pattern.toString()` is its source; `Matcher.toString()` names the
+            // pattern, the region and the last match.
+            Some(HostObj::RegexPattern { shown, .. }) => shown.clone(),
+            Some(HostObj::RegexMatcher(m)) => format!(
+                "java.util.regex.Matcher[pattern={} region=0,{} lastmatch={}]",
+                m.shown,
+                m.text.encode_utf16().count(),
+                m.first
+                    .and_then(|_| m.groups.first().copied().flatten())
+                    .map_or("", |(a, b)| &m.text[a..b])
+            ),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
             Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),

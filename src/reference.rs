@@ -1009,6 +1009,20 @@ pub const REFERENCE: &[Entry] = &[
     ),
     // ── Static Library: the `(class, method, arity)` arms of `static_method` ──
     (
+        "Pattern",
+        "Static Library",
+        "Pattern.compile(String regex [, int flags])   |   Pattern.matches(regex, input)   |   Pattern.quote(s)",
+        "A compiled `java.util.regex` pattern on the same translation `String.matches` uses. `matcher(input)` starts a `Matcher`; `pattern()`/`toString()` answer the source, `flags()` the flags, `split`/`splitAsStream` split as `String.split` does. `CASE_INSENSITIVE`, `DOTALL` and `LITERAL` are modeled; the other flags are refused by name. A malformed pattern raises `PatternSyntaxException` at `compile`.",
+        "Pattern p = Pattern.compile(\"(\\\\w+)@(\\\\w+)\");",
+    ),
+    (
+        "Matcher",
+        "Static Library",
+        "boolean find()   |   find(int)   |   matches()   |   lookingAt()   |   String group([int | String])   |   int start([g])   |   int end([g])",
+        "The JDK's matcher state over one input: `find` resumes after the last match (one character on after an empty one), `matches`/`lookingAt` anchor at the whole input or its start, `group` answers `null` for a group that did not take part, and indices are UTF-16. `groupCount`, `reset([input])`, `replaceAll`/`replaceFirst`, `appendReplacement`/`appendTail`, `results()` and `toMatchResult()` are supported; with no current match the accessors throw `IllegalStateException: No match found`.",
+        "Matcher m = p.matcher(\"bob@site\");\nwhile (m.find()) System.out.println(m.group(2));",
+    ),
+    (
         "Math.tan",
         "Static Library",
         "double Math.tan(double a)",

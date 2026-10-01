@@ -345,6 +345,13 @@ Implemented and checked against the reference `java`:
   final one. A construct with no faithful translation (a possessive quantifier,
   an atomic group, a Unicode block) raises `PatternSyntaxException` naming it
   rather than compiling into a different language.
+  `Pattern.compile` (with `CASE_INSENSITIVE`, `DOTALL` and `LITERAL`) and
+  `Matcher` run on the same engine: `find`/`find(int)`/`matches`/`lookingAt`,
+  `group` by number or name, `start`/`end` in UTF-16 indices, `groupCount`,
+  `reset`, `replaceAll`/`replaceFirst`, `appendReplacement`/`appendTail`,
+  `results()`/`toMatchResult()`, plus `Pattern.matches`/`quote`/`split`/
+  `splitAsStream` and `Matcher.quoteReplacement`, with the JDK's
+  empty-match stepping and its `No match found` / `No group N` exceptions.
 - **Lambdas and functional interfaces** — `() -> e`, `x -> e`,
   `(a, b) -> { … }`, and the explicitly-typed `(int a, String b) -> …`. A lambda
   compiles to a heap closure carrying a by-value snapshot of the enclosing

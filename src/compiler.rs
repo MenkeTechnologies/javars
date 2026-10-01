@@ -4070,6 +4070,22 @@ impl Compiler {
         // method, the accumulator and combiner of the three-argument
         // `collect(StringBuilder::new, StringBuilder::append,
         // StringBuilder::append)`.
+        // `MatchResult::group`, `Matcher::start` — the mappers a `results()`
+        // pipeline is written with.
+        let regex_ref = matches!(name, "MatchResult" | "Matcher")
+            && matches!(method, "group" | "start" | "end" | "groupCount");
+        if regex_ref && !self.classes.contains_key(name) {
+            let ps = mk(1);
+            return Ok(Some(lambda(
+                ps.clone(),
+                Expr::MethodCall {
+                    recv: Box::new(Expr::Var(ps[0].clone())),
+                    method: method.to_string(),
+                    args: Vec::new(),
+                    line,
+                },
+            )));
+        }
         if matches!(name, "StringBuilder" | "StringBuffer") && !self.classes.contains_key(name) {
             if let Some(arity) = builder_instance_ref_arity(method) {
                 let ps = mk(arity + 1);
@@ -8438,6 +8454,8 @@ fn is_static_class(name: &str) -> bool {
             | "IntSummaryStatistics"
             | "LongSummaryStatistics"
             | "DoubleSummaryStatistics"
+            | "Pattern"
+            | "Matcher"
     )
 }
 
@@ -8563,6 +8581,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("StringReader", "#new") => "StringReader",
         ("StringTokenizer", "#new") => "StringTokenizer",
         ("Random", "#new") => "Random",
+        ("Pattern", "compile") => "Pattern",
+        ("Pattern", "matches") => "boolean",
+        ("Pattern", "quote") | ("Matcher", "quoteReplacement") => "String",
         ("IntSummaryStatistics", "#new") => "IntSummaryStatistics",
         ("LongSummaryStatistics", "#new") => "LongSummaryStatistics",
         ("DoubleSummaryStatistics", "#new") => "DoubleSummaryStatistics",
@@ -9144,6 +9165,16 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Double", "POSITIVE_INFINITY") => (Value::float(f64::INFINITY), "double"),
         ("Double", "NEGATIVE_INFINITY") => (Value::float(f64::NEG_INFINITY), "double"),
         ("Double", "NaN") => (Value::float(f64::NAN), "double"),
+        // The `java.util.regex.Pattern` flag bits.
+        ("Pattern", "UNIX_LINES") => (Value::Int(0x01), "int"),
+        ("Pattern", "CASE_INSENSITIVE") => (Value::Int(0x02), "int"),
+        ("Pattern", "COMMENTS") => (Value::Int(0x04), "int"),
+        ("Pattern", "MULTILINE") => (Value::Int(0x08), "int"),
+        ("Pattern", "LITERAL") => (Value::Int(0x10), "int"),
+        ("Pattern", "DOTALL") => (Value::Int(0x20), "int"),
+        ("Pattern", "UNICODE_CASE") => (Value::Int(0x40), "int"),
+        ("Pattern", "CANON_EQ") => (Value::Int(0x80), "int"),
+        ("Pattern", "UNICODE_CHARACTER_CLASS") => (Value::Int(0x100), "int"),
         ("Math", "PI") => (Value::float(std::f64::consts::PI), "double"),
         ("Math", "E") => (Value::float(std::f64::consts::E), "double"),
         _ => return None,
@@ -9390,6 +9421,16 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "nextToken") => "String",
         ("StringTokenizer", "hasMoreTokens" | "hasMoreElements") => "boolean",
         ("StringTokenizer", "countTokens") => "int",
+        ("Pattern", "matcher") => "Matcher",
+        ("Pattern", "pattern" | "toString") => "String",
+        ("Pattern", "split") => "String[]",
+        ("Pattern", "flags") => "int",
+        ("Matcher", "find" | "matches" | "lookingAt" | "hasMatch") => "boolean",
+        ("Matcher" | "MatchResult", "group") => "String",
+        ("Matcher", "replaceAll" | "replaceFirst") => "String",
+        ("Matcher" | "MatchResult", "start" | "end" | "groupCount") => "int",
+        ("Matcher", "regionStart" | "regionEnd") => "int",
+        ("Matcher", "pattern") => "Pattern",
         ("Random", "nextInt") => "int",
         ("Random", "nextLong") => "long",
         ("Random", "nextDouble" | "nextGaussian") => "double",

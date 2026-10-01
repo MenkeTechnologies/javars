@@ -41,12 +41,12 @@ pub struct Pattern {
 }
 
 thread_local! {
-    /// Compiled patterns, keyed by `(source, anchored)`. `String.split` and
+    /// Compiled patterns, keyed by `(source, anchoring)`. `String.split` and
     /// friends take the pattern *source* on every call, so a loop over a million
     /// lines would otherwise pay the compile each time; Java's own
     /// `String.matches` has the same shape and the same problem, and real
     /// programs write it in loops anyway.
-    static CACHE: RefCell<HashMap<(String, bool), Compiled>> =
+    static CACHE: RefCell<HashMap<(String, Anchor), Compiled>> =
         RefCell::new(HashMap::new());
 }
 
@@ -56,7 +56,7 @@ thread_local! {
 /// translation refusing a construct it cannot reproduce, or the engine refusing
 /// a malformed one.
 pub fn compile(source: &str) -> Compiled {
-    cached(source, false)
+    cached(source, Anchor::None)
 }
 
 /// Compile a pattern anchored to the **whole** input, which is what
@@ -66,10 +66,27 @@ pub fn compile(source: &str) -> Compiled {
 /// *before* a final line terminator, so `"a\n".matches("a")` would come out true
 /// where Java says false.
 pub fn compile_whole(source: &str) -> Compiled {
-    cached(source, true)
+    cached(source, Anchor::Whole)
 }
 
-fn cached(source: &str, anchored: bool) -> Compiled {
+/// Compile a pattern anchored at the **start** of the input only, which is what
+/// `Matcher.lookingAt` matches against.
+pub fn compile_prefix(source: &str) -> Compiled {
+    cached(source, Anchor::Start)
+}
+
+/// Where a compiled pattern is pinned to its input.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Anchor {
+    /// A search: the pattern may match anywhere.
+    None,
+    /// `\A(?:…)\z` — the whole input (`matches`).
+    Whole,
+    /// `\A(?:…)` — a prefix of the input (`lookingAt`).
+    Start,
+}
+
+fn cached(source: &str, anchored: Anchor) -> Compiled {
     let key = (source.to_string(), anchored);
     CACHE.with(|c| {
         if let Some(hit) = c.borrow().get(&key) {
@@ -81,12 +98,12 @@ fn cached(source: &str, anchored: bool) -> Compiled {
     })
 }
 
-fn build(source: &str, anchored: bool) -> Result<Pattern, String> {
+fn build(source: &str, anchored: Anchor) -> Result<Pattern, String> {
     let translated = translate(source)?;
-    let final_src = if anchored {
-        format!(r"\A(?:{translated})\z")
-    } else {
-        translated
+    let final_src = match anchored {
+        Anchor::Whole => format!(r"\A(?:{translated})\z"),
+        Anchor::Start => format!(r"\A(?:{translated})"),
+        Anchor::None => translated,
     };
     match Regex::new(&final_src) {
         Ok(re) => Ok(Pattern { re }),
@@ -94,7 +111,53 @@ fn build(source: &str, anchored: bool) -> Result<Pattern, String> {
     }
 }
 
+/// One match's groups as byte ranges into the input, group 0 first; `None` for
+/// a group that did not participate.
+pub type Groups = Vec<Option<(usize, usize)>>;
+
 impl Pattern {
+    /// The first match starting the search at byte `pos`, as [`Groups`], or
+    /// `None` when there is none. The text before `pos` stays visible to
+    /// lookbehind, as it does to `Matcher.find`.
+    pub fn captures_at(&self, text: &str, pos: usize) -> Result<Option<Groups>, String> {
+        let caps = self
+            .re
+            .captures_from_pos(text, pos)
+            .map_err(|e| e.to_string())?;
+        Ok(caps.map(|c| {
+            (0..c.len())
+                .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                .collect()
+        }))
+    }
+
+    /// `Matcher.groupCount()`: the capturing groups, group 0 not counted.
+    pub fn group_count(&self) -> usize {
+        self.re.captures_len().saturating_sub(1)
+    }
+
+    /// The number of the group a `(?<name>…)` declares.
+    pub fn group_index(&self, name: &str) -> Option<usize> {
+        self.re.capture_names().position(|n| n == Some(name))
+    }
+
+    /// Expand Java's replacement grammar against one match's [`Groups`] — the
+    /// `$n`/`${name}`/`\` grammar `replaceAll` uses, for
+    /// `Matcher.appendReplacement`.
+    pub fn expand_groups(
+        &self,
+        text: &str,
+        start: usize,
+        replacement: &str,
+    ) -> Result<String, String> {
+        let caps = self
+            .re
+            .captures_from_pos(text, start)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No match available".to_string())?;
+        expand(replacement, &caps)
+    }
+
     /// `String.matches(regex)` — true when the whole-input pattern from
     /// [`compile_whole`] matches.
     pub fn matches_whole(&self, text: &str) -> Result<bool, String> {
