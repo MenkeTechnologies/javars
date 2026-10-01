@@ -1386,27 +1386,24 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   when it is reached, and any other field is refused at parse time. A `Scanner` reads in the root locale only, as every
   other javars formatter does, and takes no custom delimiter
   (`useDelimiter`), radix, `findInLine`, or pattern argument.
-- **`Math`'s transcendentals** (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`,
-  `atan2`, `exp`, `log`, `log10`, `cbrt`, `hypot`, `sinh`/`cosh`/`tanh`). The JDK
-  answers these from its own fdlibm-derived implementation and permits a 1-ulp
-  error; Rust's libm does not reproduce it bit-for-bit. A 180-value differential
-  sweep against OpenJDK 26 diverged in the last digit for every one of them
-  (`sin` 14/180, `cbrt` 25/180, `tan` 5/10), so they are left out: an
-  unregistered static is a clear error, a silently different last digit is not.
+- **`Math.sin` and `Math.cos`.** Every other transcendental — `tan`, `asin`,
+  `acos`, `atan`, `atan2`, `exp`, `log`, `log10`, `log1p`, `expm1`, `cbrt`,
+  `hypot`, `sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `IEEEremainder`,
+  `pow`, and `scalb` — is answered by `src/fdlibm.rs`, a line-for-line port of
+  the JDK's own `java.lang.FdLibm` (openjdk 27) with every constant written as
+  its exact bit pattern, and is bit-identical to `StrictMath`: a 30,000-argument
+  sweep through huge `tan` reductions, `pow` over negative bases and subnormal
+  results, and `IEEEremainder`/`hypot`/`atan2` over the whole exponent range
+  hashes identically to openjdk 27. `Math` reaches `StrictMath` for these
+  either by delegation or, where HotSpot has an intrinsic, through an intrinsic
+  that agrees with it on aarch64 (200,000 random arguments each, measured on
+  openjdk 27; an x86_64 JVM's Intel-derived intrinsics may round the last place
+  differently). `sin` and `cos` are the two where it does not: their aarch64
+  intrinsic disagrees with fdlibm on 7,725 and 6,507 of 200,000 arguments, so a
+  port would print a different last digit than the program's own JVM. They stay
+  unregistered — a clear error rather than a silently different digit.
   `sqrt`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
-  `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported.
-  `pow` is supported but sits with the transcendentals rather than with them: the
-  JDK reaches it through the same fdlibm log/exp core and Rust's `powf` does not
-  reproduce it bit-for-bit. A 90-point sweep against openjdk 21.0.12.1 diverges
-  in the last place twice — `Math.pow(2.0, -0.5)` is `0.7071067811865475` there
-  and `…76` here, and `Math.pow(1e-300, 1.0/3)` ends `…127E-100` there and
-  `…128E-100` here. fdlibm's exponent short-circuits are taken, so an exponent of
-  exactly -1 is the reciprocal rather than the core's answer (which is what makes
-  `Math.pow(0.49999999999999994, -1)` the reference's `2.0000000000000004` and
-  not `2.0`); closing the last two needs the core itself ported. `pow` is kept
-  rather than withdrawn because the whole `Exact`/rounding family that reaches
-  for it is exact, and because a program that writes `Math.pow(2, 10)` — the
-  overwhelmingly common shape — gets the exact answer,
+  `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
   as are the `Math.PI`/`Math.E` constants — and so are `rint`, `copySign`,
   `ulp`, `nextUp`/`nextDown`/`nextAfter` and `fma`, which sit on the exact side
   of the same line: each is an IEEE operation or a walk over the bit pattern, so
@@ -1948,7 +1945,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   form and answers `NumberFormatException` for the hex one. Correctly-rounded
   hex-float parsing is real work and Rust's `str::parse` does not do it either,
   so the form is refused outright rather than approximated — the same choice the
-  transcendentals entry makes. No frozen record exercises it.
+  `Math.sin`/`Math.cos` entry makes. No frozen record exercises it.
 - **The identity hash is javars's heap handle, not the JVM's.** It shows in
   `Object.hashCode()` and in the `@<hash>` half of the default `toString()`.
   Java's number is not reproducible either — it differs between runs of the same

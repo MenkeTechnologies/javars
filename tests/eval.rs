@@ -504,12 +504,13 @@ fn system_err_writes_to_stderr_not_stdout() {
 
 #[test]
 fn unknown_static_method_is_an_error() {
-    // `Math.tan` is deliberately unregistered (its last digit does not match
-    // StrictMath), so the diagnostic must name it — a rejection that merely
-    // failed to parse the call would pass a bare status check.
+    // `Math.sin` is deliberately unregistered (the JVM answers it from an
+    // intrinsic whose last digit differs from fdlibm), so the diagnostic must
+    // name it — a rejection that merely failed to parse the call would pass a
+    // bare status check.
     rejected(
-        &wrap("System.out.println(Math.tan(1.0));"),
-        "javars: unsupported static method `Math.tan` with 1 argument(s)",
+        &wrap("System.out.println(Math.sin(1.0));"),
+        "javars: unsupported static method `Math.sin` with 1 argument(s)",
     );
 }
 

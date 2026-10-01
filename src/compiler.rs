@@ -8550,21 +8550,26 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // must NOT be treated as `int` — that is exactly the case where the
         // wrap would be wrong.
         ("Long", "parseLong") | ("Math", "round") => "long",
-        // The `double`-returning `Math` statics. Every one of these is exactly
-        // specified — an IEEE operation or a bit-pattern walk — so Rust
-        // reproduces it digit for digit; the transcendentals, which the JDK
-        // answers to within 1 ulp from its own fdlibm port, stay out (see
+        // The `double`-returning `Math` statics: the exactly specified ones (an
+        // IEEE operation or a bit-pattern walk) and the transcendentals answered
+        // from the fdlibm port (`crate::fdlibm`); `sin`/`cos` stay out (see
         // `static_method`).
         (
             "Math",
             "pow" | "sqrt" | "floor" | "ceil" | "rint" | "copySign" | "ulp" | "nextUp" | "nextDown"
-            | "nextAfter" | "fma",
+            | "nextAfter" | "fma" | "scalb" | "tan" | "asin" | "acos" | "atan" | "atan2" | "exp"
+            | "log" | "log10" | "log1p" | "expm1" | "cbrt" | "hypot" | "sinh" | "cosh" | "tanh"
+            | "asinh" | "acosh" | "atanh" | "IEEEremainder",
         ) => "double",
         ("Float", "parseFloat") => "float",
         ("Float", "valueOf") => "Float",
         ("Float", "toString") => "String",
         ("Float", "compare") => "int",
         ("Float", "isNaN") | ("Float", "isInfinite") => "boolean",
+        ("Double", "doubleToLongBits" | "doubleToRawLongBits") => "long",
+        ("Double", "longBitsToDouble") => "double",
+        ("Float", "floatToIntBits" | "floatToRawIntBits") => "int",
+        ("Float", "intBitsToFloat") => "float",
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
         ("Boolean", "parseBoolean") => "boolean",
@@ -8941,10 +8946,15 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Long", "valueOf")
         | ("Double", "valueOf")
         | ("Double", "parseDouble")
-        // The `java.lang.Math` statics javars models at arity 1. The
-        // transcendentals are deliberately unmodelled (see the note in
-        // `host::static_method`), so naming one here would synthesize a lambda
-        // whose body cannot run.
+        // The `java.lang.Math` statics javars models at arity 1, the fdlibm
+        // transcendentals among them. `sin` and `cos` are unmodelled (see the
+        // note in `host::static_method`), so naming one here would synthesize a
+        // lambda whose body cannot run.
+        | (
+            "Math",
+            "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "log1p" | "expm1"
+            | "cbrt" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh",
+        )
         | ("Math", "abs")
         | ("Math", "signum")
         | ("Math", "toRadians")
@@ -8984,6 +8994,7 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         ("Integer" | "Long" | "Double" | "Boolean", "compare") => 2,
         ("Integer" | "Long", "rotateLeft") | ("Integer" | "Long", "rotateRight") => 2,
         ("Math", "floorDiv") | ("Math", "floorMod") | ("Math", "copySign") => 2,
+        ("Math", "atan2" | "hypot" | "IEEEremainder") => 2,
         ("Objects", "equals") | ("Objects", "requireNonNullElse") => 2,
         // The floating wrappers' operators, the `reduce` identities of a
         // `double` pipeline. Each is static-only, so no instance method makes
