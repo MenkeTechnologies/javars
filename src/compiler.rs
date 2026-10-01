@@ -2580,6 +2580,48 @@ impl Compiler {
         false
     }
 
+    /// True when `rc` is a user interface whose `method(argc)` comes from a JDK
+    /// interface it extends rather than from any user declaration —
+    /// `interface Stack<E> extends Iterable<E>` has `iterator()`, `interface
+    /// Shape extends Comparable<Shape>` has `compareTo`. `javac` has already
+    /// accepted the call, so the method exists; the implementing classes hold
+    /// the bodies, which is where [`Compiler::virtual_targets`] looks.
+    fn inherits_jdk_method(&self, rc: &str, method: &str, argc: usize) -> bool {
+        self.classes.get(rc).is_some_and(|ci| ci.is_interface)
+            && self
+                .implementors(rc)
+                .any(|k| self.has_instance_method(k, method, argc))
+    }
+
+    /// The concrete classes below `rc`, by name.
+    fn implementors<'a>(&'a self, rc: &'a str) -> impl Iterator<Item = &'a String> + 'a {
+        let mut names: Vec<&String> = self
+            .classes
+            .iter()
+            .filter(|(_, ci)| !ci.is_interface)
+            .map(|(k, _)| k)
+            .filter(move |k| self.is_subclass(k, rc))
+            .collect();
+        names.sort();
+        names.into_iter()
+    }
+
+    /// [`Compiler::resolve_instance_call`] for a method `rc` inherits from a JDK
+    /// interface (see [`Compiler::inherits_jdk_method`]): the overload is the
+    /// one the first implementing class (by name) resolves.
+    fn resolve_on_implementor(
+        &self,
+        rc: &str,
+        method: &str,
+        arg_tys: &[Option<String>],
+    ) -> Option<InstanceResolved> {
+        if !self.inherits_jdk_method(rc, method, arg_tys.len()) {
+            return None;
+        }
+        self.implementors(rc)
+            .find_map(|k| self.resolve_instance_call(k, method, arg_tys))
+    }
+
     /// The virtual-dispatch targets for `method(argc)` on a static receiver class
     /// `rc`: for every class in `rc`'s subtree, its resolved `(class, mangled)`.
     /// `None` when `rc` does not resolve the method at all. Sorted by class name
@@ -2593,7 +2635,9 @@ impl Compiler {
         // The method must exist on the static type (else it is a type error).
         // An abstract-only method on an interface still gates dispatch — the
         // concrete implementors below supply the bodies.
-        if !self.has_instance_method(rc, method, param_tys.len()) {
+        if !self.has_instance_method(rc, method, param_tys.len())
+            && !self.inherits_jdk_method(rc, method, param_tys.len())
+        {
             return None;
         }
         let mut v: Vec<(String, String)> = self
@@ -2631,6 +2675,7 @@ impl Compiler {
         let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
         let resolved = self
             .resolve_instance_call(rc, method, &arg_tys)
+            .or_else(|| self.resolve_on_implementor(rc, method, &arg_tys))
             .ok_or_else(|| {
                 format!(
                 "javars: class `{rc}` has no method `{method}` taking {} argument(s) (line {line})",
@@ -5068,7 +5113,12 @@ impl Compiler {
         // `for (I #it = e.iterator(); #it.hasNext(); ) { T x = #it.next(); … }`.
         if let Some(class) = self.expr_java_type(iter) {
             let class = class.split('<').next().unwrap_or_default();
-            if self.has_instance_method(class, "iterator", 0) {
+            // An interface that extends `Iterable` declares no `iterator()` of
+            // its own, but its static type is just as much an `Iterable`: the
+            // call dispatches to the runtime class's method.
+            let user_iterable =
+                self.classes.contains_key(class) && self.is_subclass(class, "Iterable");
+            if self.has_instance_method(class, "iterator", 0) || user_iterable {
                 return self.foreach_iterable(ty, name, iter, body, line);
             }
         }
