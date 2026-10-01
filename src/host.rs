@@ -455,6 +455,8 @@ enum HostObj {
     Tokenizer(crate::jio::Tokenizer),
     /// A `java.util.Random` (see [`crate::jrandom`]).
     Random(crate::jrandom::Random),
+    /// An `Int`/`Long`/`DoubleSummaryStatistics`.
+    Stats(SummaryStats),
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
     /// is erased at runtime — the compiler sets each slot's default on creation.
     Array(Vec<Value>),
@@ -835,6 +837,219 @@ impl StreamKind {
             StreamKind::Double => "OptionalDouble",
         }
     }
+}
+
+/// An `IntSummaryStatistics`, `LongSummaryStatistics` or
+/// `DoubleSummaryStatistics`: the JDK's own fields, accumulated by its own
+/// `accept` and `combine` (`java.util.*SummaryStatistics`, openjdk 27).
+#[derive(Clone)]
+struct SummaryStats {
+    /// `Int`, `Long` or `Double` — which of the three classes this is.
+    kind: StreamKind,
+    count: i64,
+    /// The integral classes' `long` sum and extremes. An `int` one starts its
+    /// extremes at `Integer.MAX_VALUE`/`MIN_VALUE`, a `long` one at `Long`'s.
+    sum: i64,
+    min: i64,
+    max: i64,
+    /// The `double` class's Kahan pair, its naive sum (which answers an
+    /// infinite total the compensation turned into NaN), and its extremes,
+    /// which start at the two infinities.
+    dsum: f64,
+    comp: f64,
+    simple: f64,
+    dmin: f64,
+    dmax: f64,
+}
+
+impl SummaryStats {
+    fn new(kind: StreamKind) -> Self {
+        let (min, max) = match kind {
+            StreamKind::Int => (i64::from(i32::MAX), i64::from(i32::MIN)),
+            _ => (i64::MAX, i64::MIN),
+        };
+        SummaryStats {
+            kind,
+            count: 0,
+            sum: 0,
+            min,
+            max,
+            dsum: 0.0,
+            comp: 0.0,
+            simple: 0.0,
+            dmin: f64::INFINITY,
+            dmax: f64::NEG_INFINITY,
+        }
+    }
+
+    /// `sumWithCompensation`.
+    fn add_compensated(&mut self, value: f64) {
+        let tmp = value - self.comp;
+        let velvel = self.dsum + tmp;
+        self.comp = (velvel - self.dsum) - tmp;
+        self.dsum = velvel;
+    }
+
+    /// `accept(value)`.
+    fn accept(&mut self, v: &Value) {
+        self.count += 1;
+        if self.kind == StreamKind::Double {
+            let d = deboxed(v).jfloat();
+            self.simple += d;
+            self.add_compensated(d);
+            self.dmin = min_double(self.dmin, d);
+            self.dmax = max_double(self.dmax, d);
+        } else {
+            let n = deboxed(v).jint();
+            self.sum = self.sum.wrapping_add(n);
+            self.min = self.min.min(n);
+            self.max = self.max.max(n);
+        }
+    }
+
+    /// `combine(other)`.
+    fn combine(&mut self, o: &SummaryStats) {
+        self.count += o.count;
+        if self.kind == StreamKind::Double {
+            self.simple += o.simple;
+            self.add_compensated(o.dsum);
+            self.add_compensated(-o.comp);
+            self.dmin = min_double(self.dmin, o.dmin);
+            self.dmax = max_double(self.dmax, o.dmax);
+        } else {
+            self.sum = self.sum.wrapping_add(o.sum);
+            self.min = self.min.min(o.min);
+            self.max = self.max.max(o.max);
+        }
+    }
+
+    /// `getSum()`: the compensated total for `double`, unless that is a NaN
+    /// the naive sum shows to be an infinity.
+    fn double_sum(&self) -> f64 {
+        let tmp = self.dsum - self.comp;
+        if tmp.is_nan() && self.simple.is_infinite() {
+            self.simple
+        } else {
+            tmp
+        }
+    }
+
+    fn get_sum(&self) -> Value {
+        match self.kind {
+            StreamKind::Double => Value::float(self.double_sum()),
+            _ => Value::Int(self.sum),
+        }
+    }
+
+    fn get_min(&self) -> Value {
+        match self.kind {
+            StreamKind::Double => Value::float(self.dmin),
+            _ => Value::Int(self.min),
+        }
+    }
+
+    fn get_max(&self) -> Value {
+        match self.kind {
+            StreamKind::Double => Value::float(self.dmax),
+            _ => Value::Int(self.max),
+        }
+    }
+
+    /// `getAverage()`: `0.0` for no values.
+    fn average(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else if self.kind == StreamKind::Double {
+            self.double_sum() / self.count as f64
+        } else {
+            self.sum as f64 / self.count as f64
+        }
+    }
+
+    fn class_name(&self) -> &'static str {
+        match self.kind {
+            StreamKind::Double => "DoubleSummaryStatistics",
+            StreamKind::Long => "LongSummaryStatistics",
+            _ => "IntSummaryStatistics",
+        }
+    }
+
+    /// `toString()`, through the same `String.format` the JDK's calls.
+    fn render(&self) -> String {
+        let fmt = if self.kind == StreamKind::Double {
+            "%s{count=%d, sum=%f, min=%f, average=%f, max=%f}"
+        } else {
+            "%s{count=%d, sum=%d, min=%d, average=%f, max=%d}"
+        };
+        let args = [
+            Value::str(self.class_name().to_string()),
+            Value::Int(self.count),
+            self.get_sum(),
+            self.get_min(),
+            Value::float(self.average()),
+            self.get_max(),
+        ];
+        match java_format(fmt, &args, &[], None) {
+            Ok(v) => v.as_str_cow().into_owned(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// The statistics of `items`, accepted in order.
+    fn of(kind: StreamKind, items: &[Value]) -> Self {
+        let mut s = SummaryStats::new(kind);
+        for v in items {
+            s.accept(v);
+        }
+        s
+    }
+}
+
+/// Run `f` on the summary statistics a handle names; `None` for any other
+/// value.
+fn with_stats<R>(v: &Value, f: impl FnOnce(&mut SummaryStats) -> R) -> Option<R> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Stats(s)) => Some(f(s)),
+        _ => None,
+    })
+}
+
+/// A method call on an `Int`/`Long`/`DoubleSummaryStatistics`; `None` for any
+/// other receiver.
+fn stats_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    // `combine` reads another statistics object, so it is copied out before
+    // the receiver is borrowed.
+    let other = match (method, args) {
+        ("combine", [o]) => Some(with_stats(o, |s| s.clone())),
+        _ => None,
+    };
+    with_stats(recv, |s| match (method, args) {
+        ("getCount", []) => Ok(Value::Int(s.count)),
+        ("getSum", []) => Ok(s.get_sum()),
+        ("getMin", []) => Ok(s.get_min()),
+        ("getMax", []) => Ok(s.get_max()),
+        ("getAverage", []) => Ok(Value::float(s.average())),
+        ("toString", []) => Ok(Value::str(s.render())),
+        ("accept", [v]) => {
+            s.accept(v);
+            Ok(Value::Undef)
+        }
+        ("combine", [_]) => match other.flatten() {
+            Some(o) => {
+                s.combine(&o);
+                Ok(Value::Undef)
+            }
+            None => Err(Fault::java("NullPointerException", String::new())),
+        },
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported {} method `{method}` with {} argument(s)",
+            s.class_name(),
+            args.len()
+        ))),
+    })
 }
 
 /// The eight wrapper classes, indexed by the code the compiler passes [`JBOX`].
@@ -4894,6 +5109,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Reader(r) => r.kind.class_name().to_string(),
                     HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
                     HostObj::Random(_) => "java.util.Random".to_string(),
+                    HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
                     HostObj::Instance { class, .. } => class.clone(),
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
@@ -6665,6 +6881,13 @@ fn stream_method(
                 _ => Value::Int(wrapping_sum(&items)),
             })
         }
+        // `summaryStatistics()` of a primitive stream: one `accept` per element.
+        ("summaryStatistics", 0) if kind != StreamKind::Ref => {
+            let items = all(vm);
+            Ok(Value::Obj(heap_alloc(HostObj::Stats(SummaryStats::of(
+                kind, &items,
+            )))))
+        }
         // `average` answers an `OptionalDouble` whatever the stream's width,
         // and an empty one for an empty stream rather than a NaN.
         ("average", 0) => {
@@ -6829,6 +7052,9 @@ fn static_kind(method: &str) -> &'static str {
         "averagingInt",
         "averagingLong",
         "averagingDouble",
+        "summarizingInt",
+        "summarizingLong",
+        "summarizingDouble",
         "minBy",
         "maxBy",
         "toCollection",
@@ -7064,6 +7290,23 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
                 "averagingDouble" => Value::float(stream_average(&mapped, StreamKind::Double)),
                 _ => Value::float(stream_average(&mapped, StreamKind::Long)),
             }
+        }
+        // `summarizingInt`/`Long`/`Double(mapper)`: the mapped values, accepted
+        // in encounter order into one statistics object.
+        "summarizingInt" | "summarizingLong" | "summarizingDouble" => {
+            let mut stats = SummaryStats::new(match kind {
+                "summarizingInt" => StreamKind::Int,
+                "summarizingLong" => StreamKind::Long,
+                _ => StreamKind::Double,
+            });
+            for v in items {
+                let m = invoke_closure(vm, &cargs[0], &[v]);
+                if pending() {
+                    return Ok(Value::Undef);
+                }
+                stats.accept(&m);
+            }
+            Value::Obj(heap_alloc(HostObj::Stats(stats)))
         }
         // `minBy`/`maxBy` fold `BinaryOperator.minBy`/`maxBy` left to right, and
         // both keep the earlier element on a tie (`cmp(a, b) <= 0 ? a : b` and
@@ -8111,6 +8354,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = stats_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = random_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -9006,6 +9255,15 @@ fn system_static(
         ("Random", "#new", [seed]) => Ok(Value::Obj(heap_alloc(HostObj::Random(
             crate::jrandom::Random::new(seed.jint()),
         )))),
+        ("IntSummaryStatistics", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Stats(
+            SummaryStats::new(StreamKind::Int),
+        )))),
+        ("LongSummaryStatistics", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Stats(
+            SummaryStats::new(StreamKind::Long),
+        )))),
+        ("DoubleSummaryStatistics", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Stats(
+            SummaryStats::new(StreamKind::Double),
+        )))),
         // `Math.random()` is `nextDouble()` of one generator the JDK creates on
         // first use, unseeded.
         ("Math", "random", []) => Ok(Value::float(MATH_RANDOM.with(|m| {
@@ -9536,7 +9794,8 @@ fn collection_static(
         (
             "Collectors",
             "summingInt" | "summingLong" | "summingDouble" | "averagingInt" | "averagingLong"
-            | "averagingDouble" | "minBy" | "maxBy" | "toCollection",
+            | "averagingDouble" | "summarizingInt" | "summarizingLong" | "summarizingDouble"
+            | "minBy" | "maxBy" | "toCollection",
         ) if args.len() == 1 => Ok(collector(static_kind(method), args.to_vec())),
         // `java.util.Optional`'s factories. `of` rejects `null` — that is the
         // whole distinction from `ofNullable`, and accepting it would make an
@@ -12650,6 +12909,26 @@ fn format_conversion(
         numeric: true,
     };
     match conv {
+        // A non-finite floating argument never reaches the digit formatter
+        // (`Formatter.print(double)`): NaN is `NaN` with no sign at all, an
+        // infinity is the sign the flags ask for — `(` and `)` around a
+        // negative one under `(` — then `Infinity`, and neither takes zero
+        // padding or grouping, so both are justified with spaces as text.
+        'f' | 'e' | 'E' | 'g' | 'G' if !arg.jfloat().is_finite() => {
+            let x = arg.jfloat();
+            let upper = conv.is_ascii_uppercase();
+            if x.is_nan() {
+                return Ok(Rendered::text(
+                    if upper { "NAN" } else { "NaN" }.to_string(),
+                ));
+            }
+            let word = if upper { "INFINITY" } else { "Infinity" };
+            Ok(Rendered::text(match (x < 0.0, flags.parens) {
+                (true, true) => format!("({word})"),
+                (true, false) => format!("-{word}"),
+                (false, _) => format!("{}{word}", pos_sign()),
+            }))
+        }
         'd' => {
             let n = arg.jint();
             Ok(num(
@@ -13591,6 +13870,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Reader(r)) => format!("{}@{id:x}", r.kind.class_name()),
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
+            Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
             Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),

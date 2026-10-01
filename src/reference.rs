@@ -3017,6 +3017,13 @@ System.out.println(big.test(2000000000L));   // true",
         "System.out.println(Stream.of(1, 2, 5, 1).takeWhile(x -> x < 3).toList());   // [1, 2]",
     ),
     (
+        "summaryStatistics",
+        "Streams",
+        "IntSummaryStatistics summaryStatistics()   |   Collectors.summarizingInt/Long/Double(mapper)   |   new IntSummaryStatistics()",
+        "Count, sum, min, max and average in one pass, as the JDK's `Int`/`Long`/`DoubleSummaryStatistics`: `getCount`, `getSum`, `getMin`, `getMax`, `getAverage`, `accept`, `combine`, and the JDK's `toString` (`IntSummaryStatistics{count=…, sum=…, min=…, average=…, max=…}`). An empty one's extremes are the type's `MAX_VALUE`/`MIN_VALUE` (the infinities for `double`); the `double` sum is the compensated one.",
+        "System.out.println(IntStream.of(3, 1, 2).summaryStatistics().getMax());   // 3",
+    ),
+    (
         "Collectors.toMap",
         "Streams",
         "toMap(key, value)   |   toMap(key, value, merge)   |   toMap(key, value, merge, mapFactory)",

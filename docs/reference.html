@@ -2739,19 +2739,25 @@ xs.forEach(show);</code></pre>
           <pre><code class="lang-java">System.out.println(Stream.of(1, 2, 5, 1).takeWhile(x -&gt; x &lt; 3).toList());   // [1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-streams-5">
-          <h3><a class="doc-anchor" href="#doc-streams-5">#</a> <code>Collectors.toMap</code></h3>
+          <h3><a class="doc-anchor" href="#doc-streams-5">#</a> <code>summaryStatistics</code></h3>
+          <pre><code class="lang-java">IntSummaryStatistics summaryStatistics()   |   Collectors.summarizingInt/Long/Double(mapper)   |   new IntSummaryStatistics()</code></pre>
+          <p>Count, sum, min, max and average in one pass, as the JDK's <code>Int</code>/<code>Long</code>/<code>DoubleSummaryStatistics</code>: <code>getCount</code>, <code>getSum</code>, <code>getMin</code>, <code>getMax</code>, <code>getAverage</code>, <code>accept</code>, <code>combine</code>, and the JDK's <code>toString</code> (<code>IntSummaryStatistics{count=…, sum=…, min=…, average=…, max=…}</code>). An empty one's extremes are the type's <code>MAX_VALUE</code>/<code>MIN_VALUE</code> (the infinities for <code>double</code>); the <code>double</code> sum is the compensated one.</p>
+          <pre><code class="lang-java">System.out.println(IntStream.of(3, 1, 2).summaryStatistics().getMax());   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-streams-6">
+          <h3><a class="doc-anchor" href="#doc-streams-6">#</a> <code>Collectors.toMap</code></h3>
           <pre><code class="lang-java">toMap(key, value)   |   toMap(key, value, merge)   |   toMap(key, value, merge, mapFactory)</code></pre>
           <p>A map from each element's key to its value. Without a merge function a repeated key is <code>IllegalStateException: Duplicate key k (attempted merging values a and b)</code>; with one, the values are folded by <code>Map.merge</code>. The fourth argument supplies the map, so <code>TreeMap::new</code> sorts it.</p>
           <pre><code class="lang-java">System.out.println(Stream.of("a", "bb", "cc").collect(Collectors.toMap(String::length, s -&gt; s, (x, y) -&gt; x + y)));   // {1=a, 2=bbcc}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-streams-6">
-          <h3><a class="doc-anchor" href="#doc-streams-6">#</a> <code>Collectors.groupingBy</code></h3>
+        <article class="doc-entry" id="doc-streams-7">
+          <h3><a class="doc-anchor" href="#doc-streams-7">#</a> <code>Collectors.groupingBy</code></h3>
           <pre><code class="lang-java">groupingBy(key)   |   groupingBy(key, downstream)   |   groupingBy(key, mapFactory, downstream)</code></pre>
           <p>Groups in encounter order, each reduced by the downstream collector (<code>toList</code> when none is named). The downstream may be any collector: <code>counting</code>, <code>mapping</code>, <code>summingInt</code>, <code>averagingDouble</code>, <code>minBy</code>/<code>maxBy</code>, <code>reducing</code>, <code>toCollection</code>, <code>collectingAndThen</code>, <code>teeing</code>, or another <code>groupingBy</code>.</p>
           <pre><code class="lang-java">System.out.println(Stream.of("x", "yy", "zz").collect(Collectors.groupingBy(String::length, Collectors.counting())));   // {1=1, 2=2}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-streams-7">
-          <h3><a class="doc-anchor" href="#doc-streams-7">#</a> <code>Collectors.partitioningBy</code></h3>
+        <article class="doc-entry" id="doc-streams-8">
+          <h3><a class="doc-anchor" href="#doc-streams-8">#</a> <code>Collectors.partitioningBy</code></h3>
           <pre><code class="lang-java">partitioningBy(predicate)   |   partitioningBy(predicate, downstream)</code></pre>
           <p>Always both keys, <code>false</code> first, each reduced by the downstream collector.</p>
           <pre><code class="lang-java">System.out.println(Stream.of(1, 2, 3, 4).collect(Collectors.partitioningBy(x -&gt; x &gt; 2)));   // {false=[1, 2], true=[3, 4]}</code></pre>

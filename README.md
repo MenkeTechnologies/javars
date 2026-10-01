@@ -448,7 +448,8 @@ Implemented and checked against the reference `java`:
   laziness (an unbounded `iterate`/`generate` is pulled only as far as a
   `limit` or short-circuiting terminal wants), the terminals, and the
   `Collectors` factories (`toMap`, `groupingBy`, `partitioningBy`, `mapping`,
-  `teeing`, …); a `double` stream sums with the JDK's compensated summation.
+  `teeing`, `summarizingInt`/`Long`/`Double`, …), `summaryStatistics()`; a
+  `double` stream sums with the JDK's compensated summation.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
 - **Input** — `new Scanner(System.in)` (`nextInt`/`nextLong`/`nextDouble`/

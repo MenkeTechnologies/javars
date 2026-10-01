@@ -7211,7 +7211,9 @@ impl Compiler {
         // InputStreamReader(System.in))`, `new StringTokenizer(line)` — the
         // input classes are host shapes (see `crate::jio`), built by the
         // `#new` static their class answers to.
-        if !self.classes.contains_key(class) && (is_input_class(class) || class == "Random") {
+        if !self.classes.contains_key(class)
+            && (is_input_class(class) || is_host_value_class(class))
+        {
             let new_call = Expr::MethodCall {
                 recv: Box::new(Expr::Var(class.to_string())),
                 method: "#new".to_string(),
@@ -8433,6 +8435,9 @@ fn is_static_class(name: &str) -> bool {
             | "StringReader"
             | "StringTokenizer"
             | "Random"
+            | "IntSummaryStatistics"
+            | "LongSummaryStatistics"
+            | "DoubleSummaryStatistics"
     )
 }
 
@@ -8558,6 +8563,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("StringReader", "#new") => "StringReader",
         ("StringTokenizer", "#new") => "StringTokenizer",
         ("Random", "#new") => "Random",
+        ("IntSummaryStatistics", "#new") => "IntSummaryStatistics",
+        ("LongSummaryStatistics", "#new") => "LongSummaryStatistics",
+        ("DoubleSummaryStatistics", "#new") => "DoubleSummaryStatistics",
         ("Math", "random") => "double",
         ("Integer", "parseInt") => "int",
         // The wrapper `valueOf`s answer a *reference*, and saying so is what
@@ -9344,6 +9352,16 @@ fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
     })
 }
 
+/// The non-input classes the host models as shapes of its own, built by the
+/// `#new` static their class answers to: `java.util.Random` and the three
+/// summary-statistics classes.
+fn is_host_value_class(name: &str) -> bool {
+    matches!(
+        name,
+        "Random" | "IntSummaryStatistics" | "LongSummaryStatistics" | "DoubleSummaryStatistics"
+    )
+}
+
 /// The input classes `crate::jio` models as host shapes.
 fn is_input_class(name: &str) -> bool {
     matches!(
@@ -9377,6 +9395,12 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("Random", "nextDouble" | "nextGaussian") => "double",
         ("Random", "nextFloat") => "float",
         ("Random", "nextBoolean") => "boolean",
+        ("IntSummaryStatistics", "getMin" | "getMax") => "int",
+        ("IntSummaryStatistics" | "LongSummaryStatistics", "getSum" | "getCount") => "long",
+        ("LongSummaryStatistics", "getMin" | "getMax") => "long",
+        ("DoubleSummaryStatistics", "getCount") => "long",
+        ("DoubleSummaryStatistics", "getSum" | "getMin" | "getMax") => "double",
+        (_, "getAverage") if recv_ty.ends_with("SummaryStatistics") => "double",
         _ => return None,
     })
 }
