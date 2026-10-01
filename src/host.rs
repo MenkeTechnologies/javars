@@ -453,6 +453,8 @@ enum HostObj {
     Reader(crate::jio::Reader),
     /// A `java.util.StringTokenizer`.
     Tokenizer(crate::jio::Tokenizer),
+    /// A `java.util.Random` (see [`crate::jrandom`]).
+    Random(crate::jrandom::Random),
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
     /// is erased at runtime — the compiler sets each slot's default on creation.
     Array(Vec<Value>),
@@ -4891,6 +4893,7 @@ fn value_class(v: &Value) -> Option<String> {
                     // through: none of these is a name a program declares.
                     HostObj::Reader(r) => r.kind.class_name().to_string(),
                     HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
+                    HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
@@ -8092,6 +8095,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = random_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     // A `Stream` receiver. Every stage and every terminal runs user closures, so
     // it takes the VM and sits with the other handle shapes.
     if let Some(r) = stream_method(vm, &recv, &method, &args) {
@@ -8876,6 +8885,10 @@ thread_local! {
     /// The heap handle of `System.in`, so the stream is one object however
     /// often it is named (`System.in == System.in`). Cleared with the heap.
     static STDIN_HANDLE: Cell<Option<u32>> = const { Cell::new(None) };
+    /// The generator behind `Math.random()`, created on first use.
+    static MATH_RANDOM: RefCell<Option<crate::jrandom::Random>> = const { RefCell::new(None) };
+    /// The generator behind the one-argument `Collections.shuffle`.
+    static SHUFFLE_RANDOM: RefCell<Option<crate::jrandom::Random>> = const { RefCell::new(None) };
 }
 
 /// The status a `System.exit` call asked for, if the program made one.
@@ -8971,6 +8984,19 @@ fn system_static(
         ("InputStreamReader" | "BufferedReader", "#new", [a, ..]) if null(a) => npe(),
         ("InputStreamReader", "#new", [a, ..]) => Ok(wrap(Kind::InputStreamReader, reader_of(a)?)),
         ("BufferedReader", "#new", [a, ..]) => Ok(wrap(Kind::BufferedReader, reader_of(a)?)),
+        ("Random", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Random(
+            crate::jrandom::Random::unseeded(),
+        )))),
+        ("Random", "#new", [seed]) => Ok(Value::Obj(heap_alloc(HostObj::Random(
+            crate::jrandom::Random::new(seed.jint()),
+        )))),
+        // `Math.random()` is `nextDouble()` of one generator the JDK creates on
+        // first use, unseeded.
+        ("Math", "random", []) => Ok(Value::float(MATH_RANDOM.with(|m| {
+            m.borrow_mut()
+                .get_or_insert_with(crate::jrandom::Random::unseeded)
+                .next_double()
+        }))),
         ("StringTokenizer", "#new", [s, rest @ ..]) if rest.len() <= 2 => {
             if null(s) || rest.first().is_some_and(null) {
                 return Some(npe());
@@ -9105,6 +9131,64 @@ fn array_copy(
 
 /// A method call on a `System.in`/`Scanner`/reader/`StringTokenizer`
 /// receiver, or `None` when the receiver is none of those.
+/// Run `f` on the `java.util.Random` a handle names; `None` for any other
+/// value, `null` included.
+fn with_random<R>(v: &Value, f: impl FnOnce(&mut crate::jrandom::Random) -> R) -> Option<R> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Random(r)) => Some(f(r)),
+        _ => None,
+    })
+}
+
+/// A method call on a `java.util.Random` receiver; `None` for any other.
+///
+/// The overloads are told apart by arity and, for the bounded draws, by the
+/// argument the compiler passed: `nextInt(int)`, `nextLong(long)` and
+/// `nextDouble(double)` each have their own bound check and message
+/// (`bound must be positive`, `bound must be finite and positive`).
+fn random_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let iae = |m: &str| Fault::java("IllegalArgumentException", m.to_string());
+    let int = |r: Result<i32, &str>| r.map(|n| Value::Int(i64::from(n))).map_err(iae);
+    let long = |r: Result<i64, &str>| r.map(Value::Int).map_err(iae);
+    let double = |r: Result<f64, &str>| r.map(Value::float).map_err(iae);
+    // `nextBytes` writes into an array the generator does not own, so the
+    // bytes are drawn first and stored once the receiver's borrow is released.
+    if (method, args.len()) == ("nextBytes", 1) {
+        let len = array_items(&args[0])?.len();
+        let bytes = with_random(recv, |r| r.next_bytes(len))?;
+        let filled: Vec<Value> = bytes
+            .into_iter()
+            .map(|b| Value::Int(i64::from(b)))
+            .collect();
+        return Some(array_mutate(&args[0], |a| *a = filled).map(|()| Value::Undef));
+    }
+    with_random(recv, |r| match (method, args) {
+        ("nextInt", []) => Ok(Value::Int(i64::from(r.next_int()))),
+        ("nextInt", [b]) => int(r.next_int_bounded(b.jint() as i32)),
+        ("nextInt", [o, b]) => int(r.next_int_range(o.jint() as i32, b.jint() as i32)),
+        ("nextLong", []) => Ok(Value::Int(r.next_long())),
+        ("nextLong", [b]) => long(r.next_long_bounded(b.jint())),
+        ("nextLong", [o, b]) => long(r.next_long_range(o.jint(), b.jint())),
+        ("nextDouble", []) => Ok(Value::float(r.next_double())),
+        ("nextDouble", [b]) => double(r.next_double_bounded(b.jfloat())),
+        ("nextDouble", [o, b]) => double(r.next_double_range(o.jfloat(), b.jfloat())),
+        ("nextFloat", []) => Ok(Value::float(f64::from(r.next_float()))),
+        ("nextBoolean", []) => Ok(Value::bool(r.next_boolean())),
+        ("nextGaussian", []) => Ok(Value::float(r.next_gaussian())),
+        ("setSeed", [s]) => {
+            r.set_seed(s.jint());
+            Ok(Value::Undef)
+        }
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported Random method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
+}
+
 fn io_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
     use crate::jio::{ArgVal, Out};
     let Value::Obj(id) = recv else {
@@ -9641,6 +9725,44 @@ fn collection_static(
             } else {
                 sorted.first().cloned().unwrap_or(Value::Undef)
             })
+        }
+        // `shuffle(l [, rnd])`: the JDK's Fisher–Yates walk from the top,
+        // `swap(l, i - 1, rnd.nextInt(i))` for `i` from the size down to 2, so
+        // a seeded `Random` shuffles exactly as it does there. The one-argument
+        // form draws from a generator of its own, as `Collections.r` is.
+        ("Collections", "shuffle") if matches!(args.len(), 1 | 2) => {
+            let Some(mut items) = sequence_items(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            if items.len() < 2 {
+                return Some(Ok(Value::Undef));
+            }
+            if collection_fixity(&args[0]) == Some(Fixity::Immutable) {
+                return Some(Err(Fault::java(
+                    "UnsupportedOperationException",
+                    String::new(),
+                )));
+            }
+            let mut draw = |rnd: &mut crate::jrandom::Random| {
+                for i in (2..=items.len()).rev() {
+                    let j = rnd.next_int_bounded(i as i32).unwrap_or(0) as usize;
+                    items.swap(i - 1, j);
+                }
+            };
+            match args.get(1) {
+                Some(r) => {
+                    if with_random(r, draw).is_none() {
+                        return Some(Err(Fault::java("NullPointerException", String::new())));
+                    }
+                }
+                None => SHUFFLE_RANDOM.with(|s| {
+                    draw(
+                        s.borrow_mut()
+                            .get_or_insert_with(crate::jrandom::Random::unseeded),
+                    )
+                }),
+            }
+            write_list(&args[0], items).map(|()| Value::Undef)
         }
         _ => return None,
     })
@@ -13792,6 +13914,7 @@ fn obj_default_str(id: u32) -> String {
             // A reader renders as `Object.toString()` does: class, `@`, hash.
             Some(HostObj::Reader(r)) => format!("{}@{id:x}", r.kind.class_name()),
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
+            Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
             Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),

@@ -452,6 +452,12 @@ Implemented and checked against the reference `java`:
 - **`System`** — `exit(n)` (no `finally` runs; the process reports `n`),
   `arraycopy` with the JDK's checks and messages, `currentTimeMillis`,
   `nanoTime`, `lineSeparator`, and `System.out.flush()`.
+- **`java.util.Random`** — the JDK's 48-bit LCG ported from `Random.java` and
+  `RandomSupport`, so a seeded generator draws the JDK's exact sequence
+  (`nextInt`/`nextLong`/`nextDouble` and their bounded forms, `nextFloat`,
+  `nextBoolean`, `nextGaussian` through a port of fdlibm's `log`, `nextBytes`,
+  `setSeed`); `Collections.shuffle(list, rnd)` permutes in the JDK's order, and
+  `Math.random()` draws from an unseeded one.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
   compiles to a cached cdylib whose exported functions are callable by name
   (via `fusevm::ffi`); see [`examples/Ffi.java`](examples/Ffi.java).

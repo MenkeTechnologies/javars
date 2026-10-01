@@ -1009,6 +1009,20 @@ pub const REFERENCE: &[Entry] = &[
     ),
     // ── Static Library: the `(class, method, arity)` arms of `static_method` ──
     (
+        "Random",
+        "Static Library",
+        "new Random()   |   new Random(long seed)",
+        "`java.util.Random`, the JDK's 48-bit linear congruential generator, so a seeded generator draws exactly the JDK's sequence: `nextInt()`, `nextInt(bound)`, `nextInt(origin, bound)`, `nextLong()` and its bounded forms, `nextDouble()` and its bounded forms, `nextFloat`, `nextBoolean`, `nextGaussian` (fdlibm's `log`, as `StrictMath` computes it), `nextBytes` and `setSeed`. A bad bound is the JDK's `IllegalArgumentException` (`bound must be positive`, `bound must be greater than origin`). An unseeded generator is seeded from the clock, as the JDK's is.",
+        "Random r = new Random(42);\\nSystem.out.println(r.nextInt(100));   // 30",
+    ),
+    (
+        "Math.random",
+        "Static Library",
+        "double Math.random()",
+        "A uniform `double` in `[0, 1)`, from one unseeded `Random` created on first use.",
+        "double d = Math.random();",
+    ),
+    (
         "Math.abs",
         "Static Library",
         "int Math.abs(int a)   |   double Math.abs(double a)",
@@ -1494,6 +1508,13 @@ pub const REFERENCE: &[Entry] = &[
         "Collections.reverse(xs);",
     ),
     (
+        "Collections.shuffle",
+        "Collection Statics",
+        "void Collections.shuffle(List<?> list [, Random rnd])",
+        "Permutes the list in place by the JDK's walk — `swap(list, i - 1, rnd.nextInt(i))` from the size down to 2 — so a seeded `Random` gives the JDK's order. Without one, an unseeded generator of its own is used.",
+        "Collections.shuffle(xs, new Random(7));",
+    ),
+    (
         "Collections.reverseOrder",
         "Collection Statics",
         "Comparator<T> Collections.reverseOrder()   |   Collections.reverseOrder(Comparator<T> cmp)",
@@ -1641,6 +1662,27 @@ pub const REFERENCE: &[Entry] = &[
         "boolean removeIf(Predicate<? super T> filter)",
         "Removes every element the predicate accepts and answers whether any went. The receiver's shape decides the refusal: an immutable `List.of`/`Set.of` throws `UnsupportedOperationException` before it looks at the argument, while a fixed-size `Arrays.asList` runs the predicate and throws — with the message `remove` its iterator names — only when something must actually go. Through a `subList` the removal reaches the backing list and leaves the view usable.",
         "List<Integer> xs = new ArrayList<>(List.of(1, 2, 3, 4));\\nxs.removeIf(x -> x % 2 == 0);\\nSystem.out.println(xs);   // [1, 3]",
+    ),
+    (
+        "removeAll",
+        "List Methods",
+        "boolean removeAll(Collection<?> c)",
+        "Removes every element that `c` contains — `e.equals(x)` for some `x` of `c` — and answers whether any went. Lists and sets alike; the refusals are `removeIf`'s, and a `null` argument is a `NullPointerException`.",
+        "List<Integer> xs = new ArrayList<>(List.of(1, 2, 3, 2));\\nxs.removeAll(List.of(2));\\nSystem.out.println(xs);   // [1, 3]",
+    ),
+    (
+        "retainAll",
+        "List Methods",
+        "boolean retainAll(Collection<?> c)",
+        "Keeps only the elements `c` contains and answers whether any went, with `removeAll`'s refusals.",
+        "List<Integer> xs = new ArrayList<>(List.of(1, 2, 3));\\nxs.retainAll(Set.of(1, 3));\\nSystem.out.println(xs);   // [1, 3]",
+    ),
+    (
+        "containsAll",
+        "List Methods",
+        "boolean containsAll(Collection<?> c)",
+        "True when every element of `c` equals some element of the receiver; an empty `c` is contained in anything.",
+        "System.out.println(List.of(1, 2, 3).containsAll(List.of(3, 1)));   // true",
     ),
     (
         "replaceAll",

@@ -7142,7 +7142,7 @@ impl Compiler {
         // InputStreamReader(System.in))`, `new StringTokenizer(line)` — the
         // input classes are host shapes (see `crate::jio`), built by the
         // `#new` static their class answers to.
-        if !self.classes.contains_key(class) && is_input_class(class) {
+        if !self.classes.contains_key(class) && (is_input_class(class) || class == "Random") {
             let new_call = Expr::MethodCall {
                 recv: Box::new(Expr::Var(class.to_string())),
                 method: "#new".to_string(),
@@ -8363,6 +8363,7 @@ fn is_static_class(name: &str) -> bool {
             | "InputStreamReader"
             | "StringReader"
             | "StringTokenizer"
+            | "Random"
     )
 }
 
@@ -8487,6 +8488,8 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("InputStreamReader", "#new") => "InputStreamReader",
         ("StringReader", "#new") => "StringReader",
         ("StringTokenizer", "#new") => "StringTokenizer",
+        ("Random", "#new") => "Random",
+        ("Math", "random") => "double",
         ("Integer", "parseInt") => "int",
         // The wrapper `valueOf`s answer a *reference*, and saying so is what
         // makes `Integer.valueOf(128) == Integer.valueOf(128)` compare handles
@@ -9234,6 +9237,11 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "nextToken") => "String",
         ("StringTokenizer", "hasMoreTokens" | "hasMoreElements") => "boolean",
         ("StringTokenizer", "countTokens") => "int",
+        ("Random", "nextInt") => "int",
+        ("Random", "nextLong") => "long",
+        ("Random", "nextDouble" | "nextGaussian") => "double",
+        ("Random", "nextFloat") => "float",
+        ("Random", "nextBoolean") => "boolean",
         _ => return None,
     })
 }
