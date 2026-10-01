@@ -2226,7 +2226,7 @@ System.out.println(a.length);   // 3</code></pre>
         <article class="doc-entry" id="doc-method-references-1">
           <h3><a class="doc-anchor" href="#doc-method-references-1">#</a> <code>Type::new</code></h3>
           <pre><code class="lang-java">Supplier s = ClassName::new;</code></pre>
-          <p>A constructor reference. The arity comes from the class's single declared constructor (or zero when it declares none); a class with two or more constructors is rejected as ambiguous, because javars does not target-type a reference to pick an arity.</p>
+          <p>A constructor reference. For a user class the arity comes from its single declared constructor (or zero when it declares none); a class with two or more constructors is rejected as ambiguous, because javars does not target-type a reference to pick an arity. A modeled stdlib type (<code>ArrayList</code>, <code>HashMap</code>, <code>StringBuilder</code>, <code>String</code>, …) takes one parameter: a <code>Supplier</code> call leaves it <code>null</code> and gets the no-argument constructor, a <code>Function</code> call passes its argument to the one-argument constructor.</p>
           <pre><code class="lang-java">Supplier make = Box::new;
 System.out.println(make.get());</code></pre>
         </article>
@@ -2247,7 +2247,7 @@ Function t = Helper::twice;</code></pre>
         <article class="doc-entry" id="doc-method-references-4">
           <h3><a class="doc-anchor" href="#doc-method-references-4">#</a> <code>Class::stdlibStatic</code></h3>
           <pre><code class="lang-java">Function f = Integer::parseInt;</code></pre>
-          <p>A reference to a modeled stdlib static. Only the single-arity entries are nameable — <code>Integer.parseInt</code>, <code>Long.parseLong</code>, <code>Boolean.parseBoolean</code>, <code>Math.sqrt</code>/<code>floor</code>/<code>ceil</code>/<code>round</code>, <code>Arrays.toString</code>, and the two-argument <code>Math.max</code>/<code>min</code>/<code>pow</code>. Names Java overloads on arity (<code>Integer::toString</code>, <code>String::valueOf</code>) are refused, because a reference has no arity until it is target-typed.</p>
+          <p>A reference to a modeled stdlib static. Only the single-arity entries are nameable — among them <code>Integer.parseInt</code>, <code>Long.parseLong</code>, <code>Boolean.parseBoolean</code>, <code>String.valueOf</code>, the box <code>valueOf</code>s, <code>Math.sqrt</code>/<code>floor</code>/<code>ceil</code>/<code>round</code>/<code>abs</code>, <code>Arrays.toString</code>, <code>Integer.toBinaryString</code>/<code>toHexString</code>/<code>toOctalString</code>, and the two-argument <code>Math.max</code>/<code>min</code>/<code>pow</code>, <code>Integer::sum</code>/<code>max</code>/<code>min</code> and <code>Double::sum</code>/<code>max</code>/<code>min</code>. Names Java overloads on arity (<code>Integer::toString</code>) are refused, because a reference has no arity until it is target-typed.</p>
           <pre><code class="lang-java">Function pi = Integer::parseInt;
 System.out.println(pi.apply("21"));   // 21</code></pre>
         </article>

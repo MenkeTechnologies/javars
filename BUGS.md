@@ -901,8 +901,13 @@ at the bottom, and are summarized in the section right after this one.
 - **Method references.** `String::length` and `Integer::parseInt` (unbound
   receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
   `this::method` (bound — the receiver is captured), `Point::new`,
-  `ArrayList::new`/`HashMap::new`/`StringBuilder::new`/`String::new`/
-  `Object::new` (the no-argument constructor of a modeled stdlib type),
+  `ArrayList::new`/`HashMap::new`/`StringBuilder::new`/`String::new` (a
+  modeled stdlib type's constructor: the synthesized lambda takes one
+  parameter and calls the no-argument constructor when it reads `null`, which
+  is what a `Supplier` call leaves it, and the one-argument constructor
+  otherwise — so a `Function` handed an actual `null` gets an empty object
+  where Java's constructor would throw), `Object::new` (a `Supplier` only),
+  `StringBuilder::append`/`reverse` (an unbound builder method),
   `String[]::new`/`int[][]::new` (an array constructor, the generator
   `toArray` takes), `List::stream`/`Set::size`/`Map.Entry::getKey` (an
   unbound collection method), and `System.out::println`. Java infers the reference's arity from its *target*

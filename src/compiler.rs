@@ -4013,13 +4013,38 @@ impl Compiler {
         // every `Supplier`-shaped use means; the capacity-taking overload is
         // only reachable through a functional type javars would have to infer.
         if method == "new" && has_no_arg_constructor(name) {
+            let fresh = |args: Vec<Expr>| Expr::NewObject {
+                class: name.to_string(),
+                args,
+                outer: None,
+                line,
+            };
+            // `Object` has no one-argument constructor, so its reference is
+            // only ever a `Supplier`.
+            if name == "Object" {
+                return Ok(Some(lambda(Vec::new(), fresh(Vec::new()))));
+            }
+            // Every other type here also has a one-argument constructor, and
+            // a `Function`-shaped use means it: `map(String::new)` copies each
+            // string (or builds one from a `char[]`), `map(StringBuilder::new)`
+            // starts a builder from each, `collectingAndThen(toList(),
+            // ArrayList::new)` copies. A `Supplier` call passes no argument and
+            // the synthesized parameter reads `null`, which picks the
+            // no-argument constructor. The one call the two readings confuse
+            // is a `Function` handed an actual `null`, where Java's
+            // constructor would throw.
+            let ps = mk(1);
+            let p = Expr::Var(ps[0].clone());
             return Ok(Some(lambda(
-                Vec::new(),
-                Expr::NewObject {
-                    class: name.to_string(),
-                    args: Vec::new(),
-                    outer: None,
-                    line,
+                ps,
+                Expr::Ternary {
+                    cond: Box::new(Expr::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(p.clone()),
+                        rhs: Box::new(Expr::Var("null".to_string())),
+                    }),
+                    then: Box::new(fresh(Vec::new())),
+                    els: Box::new(fresh(vec![p])),
                 },
             )));
         }
@@ -4029,6 +4054,24 @@ impl Compiler {
         // with.
         if !self.classes.contains_key(name) && collection_kind(name).is_some() {
             if let Some(arity) = collection_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
+        // `StringBuilder::append`, `StringBuilder::reverse` — an unbound builder
+        // method, the accumulator and combiner of the three-argument
+        // `collect(StringBuilder::new, StringBuilder::append,
+        // StringBuilder::append)`.
+        if matches!(name, "StringBuilder" | "StringBuffer") && !self.classes.contains_key(name) {
+            if let Some(arity) = builder_instance_ref_arity(method) {
                 let ps = mk(arity + 1);
                 return Ok(Some(lambda(
                     ps.clone(),
@@ -8857,13 +8900,19 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
 /// does not do — so naming one is an error rather than a guess.
 /// The argument count (receiver excluded) of a collection instance method an
 /// unbound reference can name. Only names with one arity across `List`, `Set`,
-/// `Map`, and `Map.Entry` are listed: `remove` and `add` are overloaded on
-/// arity in `List`, so `javac` would need the target type to choose.
+/// `Map`, and `Map.Entry` are listed: `remove` is overloaded in `List` on the
+/// argument's type (`remove(int)` and `remove(Object)`), so `javac` would need
+/// the target type to choose. `add` is listed at its one-argument reading: the
+/// other, `add(int, E)`, needs a three-parameter target that no
+/// `java.util.function` interface declares, so a reference to it with any JDK
+/// functional type is `add(E)` — the accumulator of `collect(ArrayList::new,
+/// ArrayList::add, ArrayList::addAll)`.
 fn collection_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
         "stream" | "size" | "isEmpty" | "iterator" | "keySet" | "values" | "entrySet"
         | "getKey" | "getValue" | "clear" | "toString" | "hashCode" => 0,
-        "contains" | "containsKey" | "containsValue" | "get" | "addAll" | "equals" => 1,
+        "contains" | "containsKey" | "containsValue" | "get" | "add" | "addAll" | "putAll"
+        | "equals" => 1,
         "put" => 2,
         _ => return None,
     })
@@ -8936,6 +8985,12 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         ("Integer" | "Long", "rotateLeft") | ("Integer" | "Long", "rotateRight") => 2,
         ("Math", "floorDiv") | ("Math", "floorMod") | ("Math", "copySign") => 2,
         ("Objects", "equals") | ("Objects", "requireNonNullElse") => 2,
+        // The floating wrappers' operators, the `reduce` identities of a
+        // `double` pipeline. Each is static-only, so no instance method makes
+        // the reference ambiguous.
+        ("Double" | "Float", "sum" | "max" | "min") => 2,
+        // The radix renderings, static-only on both widths.
+        ("Integer" | "Long", "toBinaryString" | "toHexString" | "toOctalString") => 1,
         _ => return None,
     })
 }
@@ -8957,6 +9012,18 @@ fn boxed_instance_ref_arity(method: &str) -> Option<usize> {
         "intValue" | "longValue" | "shortValue" | "byteValue" | "doubleValue" | "floatValue"
         | "booleanValue" | "charValue" | "hashCode" | "toString" => 0,
         "equals" | "compareTo" => 1,
+        _ => return None,
+    })
+}
+
+/// The parameter count of a `StringBuilder` instance method an unbound
+/// reference can name, receiver excluded. `append` is overloaded on its
+/// argument's type but has one single-argument reading per type, which is all
+/// a dynamically typed call needs.
+fn builder_instance_ref_arity(method: &str) -> Option<usize> {
+    Some(match method {
+        "reverse" | "toString" | "length" => 0,
+        "append" | "charAt" => 1,
         _ => return None,
     })
 }

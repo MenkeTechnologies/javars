@@ -6738,6 +6738,22 @@ fn stream_method(
             let items = all(vm);
             collect_with(vm, items, &args[0])
         }
+        // `collect(supplier, accumulator, combiner)` — the mutable reduction
+        // `StringBuilder::new, StringBuilder::append, StringBuilder::append`
+        // spells. A sequential stream has one container and never combines:
+        // `ReduceOps.makeRef` runs the supplier once and the accumulator per
+        // element, in encounter order.
+        ("collect", 3) => {
+            let items = all(vm);
+            let container = invoke_closure(vm, &args[0], &[]);
+            for v in items {
+                if pending() {
+                    break;
+                }
+                invoke_closure(vm, &args[1], &[container.clone(), v]);
+            }
+            Ok(container)
+        }
         _ => Err(Fault::internal(format!(
             "javars: unsupported Stream method `{method}` with {} argument(s)",
             args.len()

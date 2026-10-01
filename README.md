@@ -363,9 +363,14 @@ Implemented and checked against the reference `java`:
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
   `Point::area`, `obj::method`, `this::method`, `Point::new`,
   `System.out::println`. A constructor reference also names a modeled stdlib
-  type's no-argument constructor — `ArrayList::new`, `HashMap::new`,
-  `StringBuilder::new`, `String::new`, `Object::new` — which is the form a
-  `Supplier`-shaped use takes.
+  type's constructor — `ArrayList::new`, `HashMap::new`, `StringBuilder::new`,
+  `String::new` — the no-argument one for a `Supplier`-shaped use and the
+  one-argument one for a `Function`-shaped one (`map(String::new)` copies,
+  `map(StringBuilder::new)` starts a builder from each element); `Object::new`
+  is a `Supplier` only. `StringBuilder::append`, `ArrayList::add` and
+  `Map::putAll` serve the three-argument `collect(supplier, accumulator,
+  combiner)`, and `Double::sum`/`max`/`min` and `Integer::toBinaryString`
+  and its radix siblings are nameable statics.
 - **`java.util` collections** — `List`/`ArrayList`/`LinkedList`,
   `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
