@@ -1190,6 +1190,9 @@ thread_local! {
     /// skip the entry bookkeeping on the collection path with one `Cell` read
     /// rather than a hash lookup per collection call.
     static ENTRIES_LIVE: Cell<bool> = const { Cell::new(false) };
+    /// A `keySet()`/`entrySet()`/`values()` result, by heap handle, to the map
+    /// it was taken from. See [`write_through`].
+    static MAP_VIEWS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
 }
 
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
@@ -1409,6 +1412,7 @@ pub fn heap_reset() {
     // entry belonging to this one's.
     ENTRY_INDEX.with(|x| x.borrow_mut().clear());
     ENTRIES_LIVE.with(|e| e.set(false));
+    MAP_VIEWS.with(|m| m.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     SORT_CMP.with(|s| s.borrow_mut().clear());
@@ -5207,9 +5211,178 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
     })
 }
 
+/// Evaluate `recv.method(args)` on a collection. A removal through a map's
+/// `keySet()`/`entrySet()`/`values()` is carried back to the map — see
+/// [`write_through`].
+fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    let through = matches!(
+        method,
+        "remove" | "removeObject" | "removeIf" | "removeAll" | "retainAll" | "clear"
+    )
+    .then(|| map_view_snapshot(recv))
+    .flatten();
+    let out = coll_method_ranked(vm, recv, method, args);
+    if let Some((map, before)) = through {
+        write_through(vm, map, recv, before);
+    }
+    out
+}
+
+/// The map a `keySet()`/`entrySet()`/`values()` result was taken from, and the
+/// elements the view holds right now — `None` for any other receiver.
+fn map_view_snapshot(recv: &Value) -> Option<(u32, Vec<Value>)> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let map = MAP_VIEWS.with(|m| {
+        let m = m.borrow();
+        if m.is_empty() {
+            None
+        } else {
+            m.get(id).copied()
+        }
+    })?;
+    Some((map, sequence_items(recv)?))
+}
+
+/// Remember that `view` (a fresh `keySet()`/`entrySet()`/`values()` result)
+/// was taken from `map`, so a removal through it reaches the map.
+fn register_map_view(view: &Value, map: u32) {
+    if let Value::Obj(v) = view {
+        MAP_VIEWS.with(|m| m.borrow_mut().insert(*v, map));
+    }
+}
+
+/// Carry a removal through a map view back to the map.
+///
+/// javars models the three views as copies (BUGS.md), so a held view still
+/// does not see later changes to the map. What it does now do is what makes
+/// the views worth calling for their own sake: `m.keySet().removeIf(…)`,
+/// `m.entrySet().removeIf(e -> …)`, `m.values().remove(v)`,
+/// `m.keySet().retainAll(c)`, and `it.remove()` on a view's iterator all
+/// remove the entries from the map, where they used to leave it untouched.
+///
+/// Every one of those calls only *deletes* view elements, so what is left is a
+/// subsequence of `before`. Matching it from the end recovers which elements
+/// went — from the end, so that of two equal values the *first* is the one
+/// `values().remove(v)` took, as `AbstractCollection.remove` takes the first
+/// its iterator meets. A key set or entry set names its keys directly; a
+/// removed value names the first entry, in the map's own order, that holds it.
+fn write_through(vm: &mut VM, map: u32, view: &Value, before: Vec<Value>) {
+    if pending() {
+        return;
+    }
+    let Some(now) = sequence_items(view) else {
+        return;
+    };
+    if now.len() >= before.len() {
+        return;
+    }
+    let mut left = now.len();
+    let mut gone = Vec::with_capacity(before.len() - now.len());
+    for v in before.iter().rev() {
+        if left > 0 && value_eq(v, &now[left - 1]) {
+            left -= 1;
+        } else {
+            gone.push(v.clone());
+        }
+    }
+    if left != 0 {
+        return;
+    }
+    gone.reverse();
+    let keyed = HEAP.with(|h| match h.borrow().get(view_handle(view)) {
+        Some(HostObj::Set {
+            view: SetView::Keys(_),
+            ..
+        }) => Some(false),
+        Some(HostObj::Set {
+            view: SetView::Entries(_),
+            ..
+        }) => Some(true),
+        _ => None,
+    });
+    let keys: Vec<Value> = match keyed {
+        Some(false) => gone,
+        Some(true) => gone
+            .iter()
+            .filter_map(|e| entry_pair(e).map(|p| p.key))
+            .collect(),
+        None => {
+            // `values()`: each removed value takes the first entry still
+            // holding it, in the order the map iterates in.
+            let Some(entries) = map_entries(&Value::Obj(map)) else {
+                return;
+            };
+            let order = HEAP.with(|h| match h.borrow().get(map as usize) {
+                Some(HostObj::Map { order, .. }) => Some(*order),
+                _ => None,
+            });
+            let Some(order) = order else {
+                return;
+            };
+            let ks: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            let mut taken = vec![false; entries.len()];
+            let mut keys = Vec::with_capacity(gone.len());
+            let walk = present_order(&ks, order);
+            for v in &gone {
+                if let Some(&i) = walk
+                    .iter()
+                    .find(|&&i| !taken[i] && value_eq(&entries[i].1, v))
+                {
+                    taken[i] = true;
+                    keys.push(entries[i].0.clone());
+                }
+            }
+            keys
+        }
+    };
+    let map = Value::Obj(map);
+    for k in keys {
+        coll_method_ranked(vm, &map, "remove", std::slice::from_ref(&k));
+        if pending() {
+            return;
+        }
+    }
+}
+
+/// The collection an [`HostObj::Iterator`] walks.
+fn iterator_source(v: &Value) -> Option<Value> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Iterator { source, .. }) => Some(Value::Obj(*source)),
+        _ => None,
+    })
+}
+
+/// Whether heap slot `id` holds a map's `values()` view.
+fn is_values_view(id: u32) -> bool {
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(id as usize),
+            Some(HostObj::List { view: Some(_), .. })
+        )
+    })
+}
+
+/// Whether heap slot `id` holds a `Map`.
+fn is_map_handle(id: usize) -> bool {
+    HEAP.with(|h| matches!(h.borrow().get(id), Some(HostObj::Map { .. })))
+}
+
+/// The heap slot a handle names, or one past any real slot for a non-handle.
+fn view_handle(v: &Value) -> usize {
+    match v {
+        Value::Obj(id) => *id as usize,
+        _ => usize::MAX,
+    }
+}
+
 /// Evaluate `recv.method(args)` on a collection, then restore a
 /// comparator-ordered `TreeMap`/`TreeSet` to its comparator's order.
-fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+fn coll_method_ranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
     if let (Value::Obj(id), Some(first)) = (recv, args.first()) {
         rank_by_compareto(vm, *id, first);
     }
@@ -5412,6 +5585,15 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
     if let Some(v) = pq_method(vm, *id, method, args) {
         return v;
     }
+    // A `values()` view is a `Collection`, not a `List`: its one `remove` is
+    // `remove(Object)`, so `m.values().remove(1)` removes the value 1 rather
+    // than the element at index 1 — the reading the compiler picks for a
+    // receiver it can only type as a list.
+    let method = if method == "remove" && args.len() == 1 && is_values_view(*id) {
+        "removeObject"
+    } else {
+        method
+    };
     if method == "toArray" && args.len() <= 1 {
         if let Some(items) = sequence_items(recv) {
             return match collection_to_array(vm, items, args.first()) {
@@ -5484,7 +5666,15 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
         // `ImmutableCollections` overrides both to throw before it looks at the
         // argument, so `List.of(1,2).removeIf(null)` is the UOE and not the NPE
         // that `Arrays.asList(1,2).removeIf(null)` gives.
-        ("removeIf", 1) | ("replaceAll", 1) if map_entries(recv).is_none() => {
+        // `removeAll(c)` and `retainAll(c)` are `removeIf` with the predicate
+        // `c.contains(e)` (or its negation) — `ArrayList.batchRemove` and the
+        // `AbstractCollection` default both ask `c` about each element in turn,
+        // which is `e.equals(x)` for the `x` in `c`. They share its fixity rules:
+        // `List.of(…).removeAll(c)` is the UOE outright, an `Arrays.asList`
+        // view only once an element would actually go.
+        ("removeIf" | "replaceAll" | "removeAll" | "retainAll", 1)
+            if map_entries(recv).is_none() =>
+        {
             let fixed = collection_fixity(recv).unwrap_or(Fixity::Mutable);
             if fixed == Fixity::Immutable {
                 return raise(
@@ -5519,13 +5709,36 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 }
                 return Value::Undef;
             }
+            let other = match method {
+                "removeAll" | "retainAll" => match sequence_items(&args[0]) {
+                    Some(o) => Some(o),
+                    None => {
+                        return raise(
+                            vm,
+                            Fault::internal(format!(
+                                "javars: `{method}` needs a collection argument"
+                            )),
+                        )
+                    }
+                },
+                _ => None,
+            };
             let mut kept = Vec::with_capacity(items.len());
             for it in items.iter() {
-                let verdict = invoke_closure(vm, &args[0], std::slice::from_ref(it));
+                let drop = match &other {
+                    Some(c) => {
+                        let found = c.iter().any(|x| eq_call(vm, it, x));
+                        found == (method == "removeAll")
+                    }
+                    None => matches!(
+                        invoke_closure(vm, &args[0], std::slice::from_ref(it)),
+                        Value::Bool(true)
+                    ),
+                };
                 if PENDING.with(|p| p.borrow().is_some()) {
                     return Value::Undef;
                 }
-                if !matches!(verdict, Value::Bool(true)) {
+                if !drop {
                     kept.push(it.clone());
                 }
             }
@@ -5553,6 +5766,30 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 }
             }
             return Value::bool(removed);
+        }
+        // `AbstractCollection.containsAll`: `contains(x)` for each `x` of the
+        // argument, which asks `x.equals(e)` of the receiver's elements.
+        ("containsAll", 1) if map_entries(recv).is_none() => {
+            if matches!(args[0], Value::Undef) {
+                return raise(vm, Fault::java("NullPointerException", String::new()));
+            }
+            let (Some(items), Some(other)) = (sequence_items(recv), sequence_items(&args[0]))
+            else {
+                return raise(
+                    vm,
+                    Fault::internal("javars: `containsAll` needs two collections"),
+                );
+            };
+            for x in &other {
+                let found = items.iter().any(|e| eq_call(vm, x, e));
+                if pending() {
+                    return Value::Undef;
+                }
+                if !found {
+                    return Value::bool(false);
+                }
+            }
+            return Value::bool(true);
         }
         // The six `Map` methods that are *compound*: each is defined in the JDK
         // as a short sequence of `get`/`put`/`remove`/`containsKey`, and four of
@@ -5923,13 +6160,19 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
         Ok(NewColl::Value(v)) => v,
         // A derived view (`keySet`, `values`) is allocated after the borrow is
         // released, because allocating touches the same slab.
-        Ok(NewColl::Alloc(obj)) => Value::Obj(heap_alloc(obj)),
+        Ok(NewColl::Alloc(obj)) => {
+            let view = Value::Obj(heap_alloc(obj));
+            if matches!(method, "keySet" | "values") && args.is_empty() && is_map_handle(id) {
+                register_map_view(&view, id as u32);
+            }
+            view
+        }
         Ok(NewColl::Entries { pairs, fixed, of }) => {
             let items: Vec<Value> = pairs
                 .into_iter()
                 .map(|(key, value)| entry_for(id as u32, key, value))
                 .collect();
-            Value::Obj(heap_alloc(HostObj::Set {
+            let view = Value::Obj(heap_alloc(HostObj::Set {
                 items,
                 // The pairs arrive already in the map's presentation order, so
                 // the view walks them as they lie.
@@ -5937,7 +6180,9 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 fixed,
                 view: SetView::Entries(of),
                 index: KeyIndex::default(),
-            }))
+            }));
+            register_map_view(&view, id as u32);
+            view
         }
         Err(f) => raise(vm, f),
     }
@@ -7586,8 +7831,9 @@ fn map_method(
                 items: ordered,
                 order: Order::Insertion,
                 // A `keySet` view is removable-through in Java when the map is;
-                // javars models it as a copy, so a removal is at least accepted
-                // where Java accepts it and refused where Java refuses it.
+                // javars models it as a copy whose removals `write_through`
+                // carries back, accepted where Java accepts them and refused
+                // where Java refuses them.
                 fixed,
                 view: SetView::Keys(ViewOf::of(order, fixed)),
                 index: KeyIndex::default(),
@@ -7619,8 +7865,8 @@ fn map_method(
                 mods: 0,
                 items: ordered,
                 // The view follows the map: a removal through the values of a
-                // `new HashMap<>()` is accepted (and, as a copy, lost — see
-                // BUGS.md) where a removal through a `Map.of`'s is refused. The
+                // `new HashMap<>()` is accepted (and carried back to the map by
+                // `write_through`) where a removal through a `Map.of`'s is refused. The
                 // marker is what refuses `add`, which Java refuses whatever the
                 // map, since a bare value has no key to be filed under.
                 fixed,
@@ -7866,7 +8112,15 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // An `Iterator` receiver. It is not a collection, so without this it fell
     // through to the `String` table and `it.hasNext()` was
     // ``unsupported String method `hasNext` ``.
+    // `it.remove()` over a map view removes the entry from the map as well.
+    let through = (method == "remove" && args.is_empty())
+        .then(|| iterator_source(&recv))
+        .flatten()
+        .and_then(|src| Some((map_view_snapshot(&src)?, src)));
     if let Some(r) = iterator_method(&recv, &method, &args) {
+        if let (Ok(_), Some(((map, before), src))) = (&r, through) {
+            write_through(vm, map, &src, before);
+        }
         return match r {
             Ok(v) => v,
             Err(f) => raise(vm, f),
@@ -7921,6 +8175,14 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
     if let Some(v) = object_method(&recv, &method, &args) {
         return v;
+    }
+    // `T[].clone()`, the one member an array declares beyond `Object`'s (JLS
+    // 10.7): a new array of the same length holding the same elements — a
+    // shallow copy, so the rows of a cloned `int[][]` are shared.
+    if method == "clone" && args.is_empty() {
+        if let Some(items) = array_items(&recv) {
+            return Value::Obj(heap_alloc(HostObj::Array(items)));
+        }
     }
     // A method call on a `null` reference is Java's NPE, not an empty string.
     if matches!(recv, Value::Undef) {

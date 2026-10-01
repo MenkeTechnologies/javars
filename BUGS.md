@@ -1094,15 +1094,12 @@ storage-model differences:
   read the subclass's value. See "Field *hiding* collapses to one cell" below
   for the reproducer and the exact divergence.
 - **`keySet()`/`values()`/`entrySet()` are copies, not views.** Java's are backed
-  by the map, so `m.keySet().remove(k)` removes the entry; javars builds a fresh
-  set or list in the map's order, so the removal is lost:
-
-  ```java
-  Map<String, String> m = new HashMap<>();
-  m.put("k", "v"); m.put("j", "w");
-  m.keySet().remove("k");
-  System.out.println(m.size());   // Java: 1     javars: 2
-  ```
+  by the map; javars builds a fresh set or list in the map's order. A *removal*
+  through one is carried back to the map — `remove`, `removeIf`, `removeAll`,
+  `retainAll` and `clear` on the view, and `remove()` on its iterator — so
+  `m.keySet().remove(k)`, `m.entrySet().removeIf(e -> …)` and
+  `m.values().remove(v)` (the first entry holding `v`, in iteration order) all
+  shrink the map as in Java. What the copy still cannot do is follow the map.
 
   `List.subList` *is* a real aliasing view (above); these three are not. Two
   consequences, both measured on `openjdk 21.0.12.1`:
