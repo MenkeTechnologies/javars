@@ -3264,6 +3264,23 @@ impl Parser {
                 let member = self.ident()?;
                 if self.is(&Tok::LParen) {
                     let args = self.call_args()?;
+                    // `Map.Entry.comparingByKey()` / `comparingByValue()`, and
+                    // the one-comparator forms: `Map.Entry`'s statics are
+                    // comparators, declared with `Comparator`'s in the prelude,
+                    // so the receiver becomes `Comparator`.
+                    let entry_owner = match &e {
+                        Expr::Field { recv, name } => {
+                            name == "Entry" && matches!(&**recv, Expr::Var(m) if m == "Map")
+                        }
+                        Expr::Var(v) => v == "Entry",
+                        _ => false,
+                    };
+                    if entry_owner
+                        && matches!(member.as_str(), "comparingByKey" | "comparingByValue")
+                    {
+                        self.uses_functional = true;
+                        e = Expr::Var("Comparator".to_string());
+                    }
                     e = Expr::MethodCall {
                         recv: Box::new(e),
                         method: member,

@@ -1648,6 +1648,27 @@ pub const REFERENCE: &[Entry] = &[
         "Collections.reverse(xs);",
     ),
     (
+        "EnumSet",
+        "Collection Statics",
+        "EnumSet.of(E e, E... rest)   |   EnumSet.noneOf(Class<E>)   |   EnumSet.allOf(Class<E>)   |   EnumSet.copyOf(Collection<E>)",
+        "An enum set, iterating in ordinal order. javars models it as the `TreeSet` it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; `getClass()` names `java.util.TreeSet`. `range` and `complementOf` are not modeled.",
+        "System.out.println(EnumSet.of(Day.SUN, Day.MON));   // [MON, SUN]",
+    ),
+    (
+        "EnumMap",
+        "Collection Statics",
+        "new EnumMap<>(Class<K> keyType)   |   new EnumMap<>(Map<K, V> m)",
+        "A map keyed by an enum, iterating in ordinal order — modeled as the `TreeMap` it behaves as.",
+        "Map<Day, Integer> h = new EnumMap<>(Day.class);",
+    ),
+    (
+        "Map.Entry.comparingByKey",
+        "Collection Statics",
+        "Comparator Map.Entry.comparingByKey([Comparator cmp])   |   Map.Entry.comparingByValue([Comparator cmp])",
+        "The comparators that order map entries by key or by value — natural order, or `cmp` applied to the key or value.",
+        "entries.sort(Map.Entry.comparingByValue());",
+    ),
+    (
         "Collections.shuffle",
         "Collection Statics",
         "void Collections.shuffle(List<?> list [, Random rnd])",

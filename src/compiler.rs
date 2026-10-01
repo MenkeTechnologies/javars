@@ -6413,6 +6413,20 @@ impl Compiler {
             // static only the host can answer: `Comparator.isKeyExtractor`
             // reads a lambda's parameter count, which no Java body can.
         }
+        // `EnumSet`'s factories. An `EnumSet` iterates in ordinal order, which
+        // is an enum's natural order, so javars models one as the `TreeSet` it
+        // behaves as and each factory as the matching `TreeSet` construction.
+        if let Expr::Var(c) = recv {
+            if c == "EnumSet" && !self.classes.contains_key(c) && !self.is_declared_var(c) {
+                let made = enum_set_factory(method, args, line).ok_or_else(|| {
+                    format!(
+                        "javars: `EnumSet.{method}` with {} argument(s) is not modeled (line {line})",
+                        args.len()
+                    )
+                })?;
+                return self.expr(&made);
+            }
+        }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
                 // A static whose parameter renders the value as text takes the
@@ -7098,6 +7112,18 @@ impl Compiler {
         }
         let args = self.with_captures(ctor_class, args, outer);
         let args: &[Expr] = &args;
+        // `new EnumMap<>(K.class)` / `new EnumMap<>(otherMap)`. An `EnumMap`
+        // iterates its keys in ordinal order, an enum's natural order, so
+        // javars models it as the `TreeMap` it behaves as; the class literal
+        // only names the key type, which the erased map does not need.
+        if !self.classes.contains_key(class) && class == "EnumMap" {
+            let rest: Vec<Expr> = args
+                .iter()
+                .filter(|a| !matches!(a, Expr::ClassLit(_)))
+                .cloned()
+                .collect();
+            return self.new_object_as("TreeMap", "TreeMap", &rest, None, line);
+        }
         // `new String(cs)` / `new String(s)` / `new String()` — javars models a
         // `String` as a primitive value rather than an instance, so constructing
         // one is exactly the conversion `String.valueOf` performs.
@@ -8828,8 +8854,8 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "ArrayList" | "LinkedList" | "ArrayDeque" => "list",
         "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
-        "HashMap" | "LinkedHashMap" | "TreeMap" | "Map" => "map",
-        "HashSet" | "LinkedHashSet" | "TreeSet" | "Set" => "set",
+        "HashMap" | "LinkedHashMap" | "TreeMap" | "EnumMap" | "Map" => "map",
+        "HashSet" | "LinkedHashSet" | "TreeSet" | "EnumSet" | "Set" => "set",
         // Not a `List`: it has no `remove(int)`, so an integral argument is an
         // element there, never an index.
         "PriorityQueue" => "pq",
@@ -9285,6 +9311,37 @@ fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<()
         }
     }
     Ok(())
+}
+
+/// The `TreeSet` construction an `EnumSet` factory call stands for, or `None`
+/// for a factory javars does not model (`range` and `complementOf` need the
+/// element type, which an erased receiver does not carry).
+fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
+    let tree_set = |args: Vec<Expr>| Expr::NewObject {
+        class: "TreeSet".to_string(),
+        args,
+        outer: None,
+        line,
+    };
+    let call = |class: &str, method: &str, args: Vec<Expr>| Expr::MethodCall {
+        recv: Box::new(Expr::Var(class.to_string())),
+        method: method.to_string(),
+        args,
+        line,
+    };
+    Some(match (method, args) {
+        // `EnumSet.of(e1, …)` — `List.of` refuses a `null` element as
+        // `EnumSet.of` does.
+        ("of", [_, ..]) => tree_set(vec![call("List", "of", args.to_vec())]),
+        ("noneOf", [_]) => tree_set(Vec::new()),
+        ("allOf", [Expr::ClassLit(e)]) => tree_set(vec![call(
+            "Arrays",
+            "asList",
+            vec![call(e, "values", Vec::new())],
+        )]),
+        ("copyOf", [c]) => tree_set(vec![c.clone()]),
+        _ => return None,
+    })
 }
 
 /// The input classes `crate::jio` models as host shapes.

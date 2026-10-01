@@ -374,8 +374,12 @@ Implemented and checked against the reference `java`:
 - **`java.util` collections** — `List`/`ArrayList`/`LinkedList`,
   `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
-  constructors, `Arrays.asList`, `List.of`/`Set.of`, and
-  `Collections.sort`/`reverse`/`max`/`min`. A `TreeMap` navigates by key
+  constructors, `Arrays.asList`, `List.of`/`Set.of`, `EnumMap` and
+  `EnumSet.of`/`noneOf`/`allOf`/`copyOf` (ordinal order, as the `TreeMap`/
+  `TreeSet` they behave as), `Map.Entry.comparingByKey`/`comparingByValue`,
+  `removeAll`/`retainAll`/`containsAll`, and
+  `Collections.sort`/`reverse`/`max`/`min`. A removal through a map's
+  `keySet()`/`values()`/`entrySet()` reaches the map. A `TreeMap` navigates by key
   (`firstKey`, `floorKey`, `ceilingEntry`, `pollFirstEntry`, …) and a `TreeSet`
   by element (`first`, `floor`, `higher`, `pollLast`, …), ordered by the
   `Comparator` it was constructed with (`String.CASE_INSENSITIVE_ORDER`, a

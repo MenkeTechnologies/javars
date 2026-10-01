@@ -1465,10 +1465,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
   `when` clauses). The arrow form itself is implemented (above); it is pattern
   labels that are not.
-- **`EnumSet`, `EnumMap`.** `Enum.compareTo` *is* supplied — it is `final` in
-  Java and is the ordinal difference, so it is synthesized onto every enum
-  alongside `name`/`ordinal`/`toString`/`equals`, which is also what makes
-  `Collections.sort` of an enum list work.
+- **`EnumSet.range` and `EnumSet.complementOf`.** `new EnumMap<>(K.class)`
+  (and the copy constructor), `EnumSet.of`/`noneOf`/`allOf`/`copyOf` run: an
+  `EnumMap` or `EnumSet` iterates in ordinal order, which is an enum's natural
+  order — `Enum.compareTo` is supplied, the ordinal difference — so each is
+  modeled as the `TreeMap`/`TreeSet` it behaves as, and prints, orders, and
+  answers every query the same. Two things show the model: `getClass()` names
+  `java.util.TreeMap`/`TreeSet`, and `range`/`complementOf` are refused,
+  because they need the element type, which an erased receiver does not carry.
 - **Sealed types.**
 - **A type *parameter* that shadows a class name.** `class Box<T>` inside a
   program that also declares a class `T` reads the declared return type `T` as

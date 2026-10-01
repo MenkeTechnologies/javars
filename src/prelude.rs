@@ -247,7 +247,11 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
          static Comparator comparing(Function key) { return (a, b) -> key.apply(a).compareTo(key.apply(b)); } \
          static Comparator comparingInt(Function key) { return Comparator.comparing(key); } \
          static Comparator comparingLong(Function key) { return Comparator.comparing(key); } \
-         static Comparator comparingDouble(Function key) { return Comparator.comparing(key); }",
+         static Comparator comparingDouble(Function key) { return Comparator.comparing(key); } \
+         static Comparator comparingByKey() { return (a, b) -> a.getKey().compareTo(b.getKey()); } \
+         static Comparator comparingByKey(Comparator c) { return (a, b) -> c.compare(a.getKey(), b.getKey()); } \
+         static Comparator comparingByValue() { return (a, b) -> a.getValue().compareTo(b.getValue()); } \
+         static Comparator comparingByValue(Comparator c) { return (a, b) -> c.compare(a.getValue(), b.getValue()); }",
     ),
     ("IntSupplier", "int getAsInt()", ""),
     (
