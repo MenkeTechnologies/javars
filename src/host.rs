@@ -1011,8 +1011,12 @@ enum Order {
     Hash,
     /// `LinkedHashMap`/`LinkedHashSet` — insertion order.
     Insertion,
-    /// `TreeMap`/`TreeSet` — ascending natural order of the keys/elements.
-    Sorted,
+    /// `TreeMap`/`TreeSet`. Ordered by the keys' natural order, or — when
+    /// `by_cmp` — by the `Comparator` the collection was constructed with
+    /// ([`SORT_CMP`]). A comparator-ordered collection is *stored* in that
+    /// order, kept so by [`rerank`] after every call that can add, because
+    /// only a VM re-entry can run the comparator and presentation has no VM.
+    Sorted { by_cmp: bool },
 }
 
 /// Whether a `Set` on the heap is one of its own or a view a `Map` handed out.
@@ -1059,7 +1063,7 @@ impl ViewOf {
             (Fixity::Immutable, _) => ViewOf::Immutable,
             (_, Order::Hash) => ViewOf::Hash,
             (_, Order::Insertion) => ViewOf::Linked,
-            (_, Order::Sorted) => ViewOf::Tree,
+            (_, Order::Sorted { .. }) => ViewOf::Tree,
         }
     }
 
@@ -1122,6 +1126,14 @@ thread_local! {
     /// [`set_binary_names`] before a run. Only nested types have an entry that
     /// differs from the key.
     static BINARY: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Functional interface → the name of its single abstract method, populated
+    /// by [`set_functional_sams`] before a run. It is what lets an *object* of a
+    /// class that implements one (`class Rev implements Comparator<String>`) go
+    /// wherever a lambda goes: the host calls the method the interface names.
+    static SAMS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// The `Comparator` of each comparator-ordered `TreeMap`/`TreeSet`, by heap
+    /// handle (see [`Order::Sorted`]). Cleared with the heap.
+    static SORT_CMP: RefCell<HashMap<u32, Value>> = RefCell::new(HashMap::new());
     /// The exception in flight, if any. Set by [`JTHROW`], cleared by
     /// [`JEXC_TAKE`] when a handler claims it. Lives here rather than on the
     /// value stack because it has to survive the `Op::ReturnValue` that unwinds
@@ -1395,6 +1407,7 @@ pub fn heap_reset() {
     ENTRIES_LIVE.with(|e| e.set(false));
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
+    SORT_CMP.with(|s| s.borrow_mut().clear());
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
@@ -1510,6 +1523,12 @@ pub fn set_supertypes(map: HashMap<String, Vec<String>>) {
 /// running the chunk; read by `qualified_or_binary`.
 pub fn set_binary_names(map: HashMap<String, String>) {
     BINARY.with(|b| *b.borrow_mut() = map);
+}
+
+/// Record each functional interface's single abstract method name. Call before
+/// running the chunk; read by [`instance_sam`].
+pub fn set_functional_sams(map: HashMap<String, String>) {
+    SAMS.with(|s| *s.borrow_mut() = map);
 }
 
 /// The name `getClass().getName()` reports for `class`: the qualified form for a
@@ -2110,6 +2129,100 @@ fn closure_meta(v: &Value) -> Option<(u16, u8, Vec<Value>)> {
     })
 }
 
+/// The single abstract method a user object supplies as a functional value: the
+/// entry ip of its body and its parameter count, or `None` when `v` is not an
+/// instance of a class that implements a functional interface.
+///
+/// `new Rev()` where `class Rev implements Comparator<String>` is as much a
+/// comparator as `(a, b) -> …` is, and `list.sort(new Rev())` must call its
+/// `compare`. The interface is found by walking the class's supertypes; the
+/// body by walking them again for the first class declaring that method — the
+/// rule virtual dispatch follows — so an inherited implementation is found too.
+fn instance_sam(vm: &VM, v: &Value) -> Option<(usize, usize)> {
+    let class = instance_class(v)?;
+    let mut sam = None;
+    walk_supertypes(&class, &mut |cur| {
+        sam = SAMS.with(|s| s.borrow().get(cur).cloned());
+        sam.is_some()
+    });
+    method_entry(vm, &class, &sam?)
+}
+
+/// Visit `class` and its supertypes breadth-first — nearest first, the order
+/// a declaration is inherited in — until `found` answers `true`.
+fn walk_supertypes(class: &str, found: &mut dyn FnMut(&str) -> bool) {
+    let mut queue = std::collections::VecDeque::from([class.to_string()]);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cur) = queue.pop_front() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        if found(&cur) {
+            return;
+        }
+        SUPERS.with(|s| queue.extend(s.borrow().get(&cur).cloned().unwrap_or_default()));
+    }
+}
+
+/// The entry ip and parameter count of the instance method `name` that
+/// `class` resolves — its own declaration, else the nearest inherited one.
+fn method_entry(vm: &VM, class: &str, name: &str) -> Option<(usize, usize)> {
+    let tail = format!("#{name}#");
+    let mut hit = None;
+    walk_supertypes(class, &mut |cur| {
+        let prefix = format!("{cur}{tail}");
+        hit = vm.chunk.names.iter().enumerate().find_map(|(i, n)| {
+            let tys = n.strip_prefix(&prefix)?;
+            let entry = vm.chunk.find_sub(i as u16)?;
+            Some((entry, if tys.is_empty() { 0 } else { tys.split(',').count() }))
+        });
+        hit.is_some()
+    });
+    hit
+}
+
+/// One comparison of a sorted collection's order: `compare(a, b)` through its
+/// comparator, or — when `cmp` is `null`, a natural-order collection of user
+/// objects — `a.compareTo(b)`, falling back to [`natural_cmp`] for the values
+/// javars orders itself. `None` when the call raised.
+fn rank_compare(vm: &mut VM, cmp: &Value, a: &Value, b: &Value) -> Option<i64> {
+    let n = if matches!(cmp, Value::Undef) {
+        match instance_class(a).and_then(|c| method_entry(vm, &c, "compareTo")) {
+            Some((entry, 1)) => {
+                let stack_base = vm.stack.len();
+                vm.stack.push(a.clone());
+                vm.stack.push(b.clone());
+                run_sub(vm, entry, stack_base).jint()
+            }
+            _ => natural_cmp(a, b) as i64,
+        }
+    } else {
+        invoke_closure(vm, cmp, &[a.clone(), b.clone()]).jint()
+    };
+    (!pending()).then_some(n)
+}
+
+/// Whether `v` is a user object that orders itself — its class declares (or
+/// inherits) a one-argument `compareTo`.
+fn self_ordering(vm: &VM, v: &Value) -> bool {
+    instance_class(v)
+        .and_then(|c| method_entry(vm, &c, "compareTo"))
+        .is_some_and(|(_, arity)| arity == 1)
+}
+
+/// A value that can be called as a functional interface: a lambda, or an
+/// object whose class implements one.
+fn is_callable(vm: &VM, v: &Value) -> bool {
+    closure_meta(v).is_some() || instance_sam(vm, v).is_some()
+}
+
+/// The parameter count of a callable value's single abstract method.
+fn callable_arity(vm: &VM, v: &Value) -> Option<usize> {
+    closure_meta(v)
+        .map(|(_, params, _)| params as usize)
+        .or_else(|| instance_sam(vm, v).map(|(_, arity)| arity))
+}
+
 /// [`JCLOSURE_CALL`] — invoke a closure with the arguments already on the stack.
 ///
 /// The body is an ordinary javars subroutine, so it runs in a real fusevm call
@@ -2131,6 +2244,16 @@ fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
         return Value::Undef;
     }
     let Some((name_idx, params, captures)) = closure_meta(&clo) else {
+        // An object of a class implementing the functional interface: the call
+        // is that interface's abstract method on the object, receiver first.
+        if let Some((entry, arity)) = instance_sam(vm, &clo) {
+            let stack_base = vm.stack.len();
+            vm.stack.push(clo);
+            for i in 0..arity {
+                vm.stack.push(args.get(i).cloned().unwrap_or(Value::Undef));
+            }
+            return run_sub(vm, entry, stack_base);
+        }
         return raise(
             vm,
             Fault::java(
@@ -2905,10 +3028,10 @@ fn new_priority_queue(
 ) -> Result<Value, Fault> {
     let explicit = [a1, a0]
         .into_iter()
-        .find(|v| closure_meta(v).is_some())
+        .find(|v| is_callable(vm, v))
         .cloned();
     let seed = match a0 {
-        Value::Obj(sid) if closure_meta(a0).is_none() => Some(*sid),
+        Value::Obj(sid) if !is_callable(vm, a0) => Some(*sid),
         _ => None,
     };
     let (mut cmp, mut natural) = match explicit {
@@ -2926,7 +3049,7 @@ fn new_priority_queue(
                 matches!(
                     h.borrow().get(sid as usize),
                     Some(HostObj::Set {
-                        order: Order::Sorted,
+                        order: Order::Sorted { .. },
                         ..
                     })
                 )
@@ -3296,7 +3419,8 @@ fn present_order(items: &[Value], order: Order) -> Vec<usize> {
     match order {
         Order::Insertion => (0..items.len()).collect(),
         Order::Hash => hash_order(items),
-        Order::Sorted => {
+        Order::Sorted { by_cmp: true } => (0..items.len()).collect(),
+        Order::Sorted { by_cmp: false } => {
             let mut idx: Vec<usize> = (0..items.len()).collect();
             idx.sort_by(|&a, &b| natural_cmp(&items[a], &items[b]));
             idx
@@ -3748,6 +3872,30 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// Allocate the collection `kind` names, seeded from `seed` when a copy
 /// constructor supplied one.
 fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault> {
+    // `new TreeMap<>(comparator)` / `new TreeSet<>(comparator)`: empty, and
+    // ordered by the comparator from the first insertion on.
+    if matches!(kind, "TreeMap" | "TreeSet") && is_callable(vm, seed) {
+        let order = Order::Sorted { by_cmp: true };
+        let obj = if kind == "TreeMap" {
+            HostObj::Map {
+                fixed: Fixity::Mutable,
+                entries: Vec::new(),
+                order,
+                index: KeyIndex::default(),
+            }
+        } else {
+            HostObj::Set {
+                items: Vec::new(),
+                order,
+                fixed: Fixity::Mutable,
+                view: SetView::Own,
+                index: KeyIndex::default(),
+            }
+        };
+        let id = heap_alloc(obj);
+        SORT_CMP.with(|s| s.borrow_mut().insert(id, seed.clone()));
+        return Ok(Value::Obj(id));
+    }
     let obj = match kind {
         // `ArrayDeque`/`Deque`/`Queue` join `LinkedList` on the mutable-list
         // shape. The `Deque` methods work on the same `Vec` (head at index 0),
@@ -3777,7 +3925,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         "TreeMap" => HostObj::Map {
             fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
-            order: Order::Sorted,
+            order: Order::Sorted { by_cmp: false },
             index: KeyIndex::default(),
         },
         "HashSet" | "Set" => HostObj::Set {
@@ -3796,7 +3944,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         },
         "TreeSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
-            order: Order::Sorted,
+            order: Order::Sorted { by_cmp: false },
             fixed: Fixity::Mutable,
             view: SetView::Own,
             index: KeyIndex::default(),
@@ -3807,7 +3955,13 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             )))
         }
     };
-    Ok(Value::Obj(heap_alloc(obj)))
+    let id = heap_alloc(obj);
+    // A copy of user objects that order themselves is ranked by their
+    // `compareTo` from the start.
+    if matches!(kind, "TreeMap" | "TreeSet") {
+        rank_by_compareto(vm, id, seed);
+    }
+    Ok(Value::Obj(id))
 }
 
 /// The distinct values of `vals`, keeping the first of each repeat — what
@@ -4750,7 +4904,7 @@ fn value_class(v: &Value) -> Option<String> {
                         (Fixity::Immutable, _) => "Map$immutable".to_string(),
                         (_, Order::Hash) => "HashMap".to_string(),
                         (_, Order::Insertion) => "LinkedHashMap".to_string(),
-                        (_, Order::Sorted) => "TreeMap".to_string(),
+                        (_, Order::Sorted { .. }) => "TreeMap".to_string(),
                     },
                     // `Set.of` is not a `HashSet`, exactly as `List.of` is not
                     // an `ArrayList`; without the fixity it answered to both.
@@ -4773,7 +4927,7 @@ fn value_class(v: &Value) -> Option<String> {
                         (Fixity::Mutable | Fixity::FixedSize, Order::Insertion) => {
                             "LinkedHashSet".to_string()
                         }
-                        (Fixity::Mutable | Fixity::FixedSize, Order::Sorted) => {
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Sorted { .. }) => {
                             "TreeSet".to_string()
                         }
                         (Fixity::Immutable, _) => "Set$immutable".to_string(),
@@ -4951,20 +5105,27 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
     let pairs: Vec<(Value, Value)> = HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::Map {
             entries,
-            order: Order::Sorted,
+            order: Order::Sorted { .. },
             ..
         }) if map_form => Some(entries.clone()),
         Some(HostObj::Set {
             items,
-            order: Order::Sorted,
+            order: Order::Sorted { .. },
             view: SetView::Own,
             ..
         }) if !map_form => Some(items.iter().map(|k| (k.clone(), Value::Undef)).collect()),
         _ => None,
     })?;
     use std::cmp::Ordering::{Greater, Less};
-    let cmp_probe = |k: &Value| natural_cmp(k, &args[0]);
-    if !args.is_empty() && matches!(deboxed(&args[0]), Value::Undef) && !pairs.is_empty() {
+    // A comparator-ordered collection is stored in its comparator's order, so
+    // a position *is* its rank there, and the probe is compared by calling the
+    // comparator — `compare(probe, key)`, the operand order `TreeMap` uses.
+    let ranked = SORT_CMP.with(|s| s.borrow().get(id).cloned());
+    if ranked.is_none()
+        && !args.is_empty()
+        && matches!(deboxed(&args[0]), Value::Undef)
+        && !pairs.is_empty()
+    {
         return Some(raise(
             vm,
             Fault::java(
@@ -4974,29 +5135,45 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
             ),
         ));
     }
-    let better = |cand: &(Value, Value), best: &(Value, Value), want_max: bool| {
-        let o = natural_cmp(&cand.0, &best.0);
+    // Each key's order against the probe (`key` vs `probe`).
+    let mut vs_probe = Vec::with_capacity(pairs.len());
+    if !args.is_empty() {
+        for p in &pairs {
+            vs_probe.push(match &ranked {
+                Some(cmp) => match rank_compare(vm, cmp, &args[0], &p.0) {
+                    Some(c) => 0.cmp(&c),
+                    None => return Some(Value::Undef),
+                },
+                None => natural_cmp(&p.0, &args[0]),
+            });
+        }
+    }
+    let better = |cand: usize, best: usize, want_max: bool| {
+        let o = match ranked {
+            Some(_) => cand.cmp(&best),
+            None => natural_cmp(&pairs[cand].0, &pairs[best].0),
+        };
         if want_max {
             o == Greater
         } else {
             o == Less
         }
     };
-    let mut found: Option<&(Value, Value)> = None;
-    for p in &pairs {
+    let mut found: Option<usize> = None;
+    for i in 0..pairs.len() {
         let (fits, want_max) = match nav {
             Nav::First => (true, false),
             Nav::Last => (true, true),
-            Nav::Floor => (cmp_probe(&p.0) != Greater, true),
-            Nav::Ceiling => (cmp_probe(&p.0) != Less, false),
-            Nav::Lower => (cmp_probe(&p.0) == Less, true),
-            Nav::Higher => (cmp_probe(&p.0) == Greater, false),
+            Nav::Floor => (vs_probe[i] != Greater, true),
+            Nav::Ceiling => (vs_probe[i] != Less, false),
+            Nav::Lower => (vs_probe[i] == Less, true),
+            Nav::Higher => (vs_probe[i] == Greater, false),
         };
-        if fits && found.is_none_or(|b| better(p, b, want_max)) {
-            found = Some(p);
+        if fits && found.is_none_or(|b| better(i, b, want_max)) {
+            found = Some(i);
         }
     }
-    let Some((key, value)) = found.cloned() else {
+    let Some((key, value)) = found.map(|i| pairs[i].clone()) else {
         let throws = !entry && !poll && matches!(nav, Nav::First | Nav::Last);
         return Some(if throws {
             raise(vm, Fault::java("NoSuchElementException", String::new()))
@@ -5014,13 +5191,198 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
     })
 }
 
+/// Evaluate `recv.method(args)` on a collection, then restore a
+/// comparator-ordered `TreeMap`/`TreeSet` to its comparator's order.
+fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    if let (Value::Obj(id), Some(first)) = (recv, args.first()) {
+        rank_by_compareto(vm, *id, first);
+    }
+    let ranked = match recv {
+        Value::Obj(id) => SORT_CMP.with(|s| s.borrow().get(id).cloned()).map(|c| (*id, c)),
+        _ => None,
+    };
+    let Some((id, cmp)) = ranked else {
+        return coll_method_unranked(vm, recv, method, args);
+    };
+    let keys = stored_keys(id);
+    let before = keys.len();
+    // A sorted collection locates a key by its order, not by `equals`: the key
+    // the comparator calls equal to the argument *is* the argument's key. So
+    // that key stands in for the argument, and the lookup below — which
+    // compares by value — finds exactly the entry `TreeMap.getEntry` would.
+    let keyed = matches!(
+        method,
+        "contains"
+            | "containsKey"
+            | "get"
+            | "getOrDefault"
+            | "remove"
+            | "add"
+            | "put"
+            | "putIfAbsent"
+            | "merge"
+            | "compute"
+            | "computeIfAbsent"
+            | "computeIfPresent"
+            | "replace"
+    );
+    let mut args = args.to_vec();
+    if keyed && !args.is_empty() && !keys.is_empty() {
+        let (mut lo, mut hi) = (0, keys.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let Some(c) = rank_compare(vm, &cmp, &args[0], &keys[mid]) else {
+                return Value::Undef;
+            };
+            match c {
+                0 => {
+                    args[0] = keys[mid].clone();
+                    break;
+                }
+                n if n < 0 => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+    }
+    let out = coll_method_unranked(vm, recv, method, &args);
+    if !pending() {
+        rerank(vm, id, &cmp, before);
+    }
+    out
+}
+
+/// Turn a natural-order `TreeMap`/`TreeSet` into one ranked by its keys' own
+/// `compareTo` the first time a call hands it a user object that declares one
+/// (`arg` itself, or an element of a collection `arg` — `addAll`, `putAll`).
+///
+/// [`natural_cmp`] orders the values javars models and calls every pair of
+/// user objects equal, so a `TreeSet` of a `Comparable` record kept insertion
+/// order. Only a VM re-entry can run `compareTo`, which is what the
+/// comparator-ordered representation already does; `null` in [`SORT_CMP`]
+/// stands for "the keys' own `compareTo`".
+fn rank_by_compareto(vm: &mut VM, id: u32, arg: &Value) {
+    if SORT_CMP.with(|s| s.borrow().contains_key(&id)) {
+        return;
+    }
+    let natural_tree = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(id as usize),
+            Some(HostObj::Map {
+                order: Order::Sorted { by_cmp: false },
+                ..
+            }) | Some(HostObj::Set {
+                order: Order::Sorted { by_cmp: false },
+                view: SetView::Own,
+                ..
+            })
+        )
+    });
+    if !natural_tree {
+        return;
+    }
+    let incoming = sequence_items(arg)
+        .or_else(|| map_entries(arg).map(|es| es.into_iter().map(|(k, _)| k).collect()))
+        .unwrap_or_else(|| vec![arg.clone()]);
+    if !incoming.iter().any(|v| self_ordering(vm, v)) {
+        return;
+    }
+    HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
+        Some(HostObj::Map { order, .. }) | Some(HostObj::Set { order, .. }) => {
+            *order = Order::Sorted { by_cmp: true }
+        }
+        _ => {}
+    });
+    SORT_CMP.with(|s| s.borrow_mut().insert(id, Value::Undef));
+    rerank(vm, id, &Value::Undef, 0);
+}
+
+/// The keys of a map, or the elements of a set, in stored order.
+fn stored_keys(id: u32) -> Vec<Value> {
+    HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map { entries, .. }) => entries.iter().map(|(k, _)| k.clone()).collect(),
+        Some(HostObj::Set { items, .. }) => items.clone(),
+        _ => Vec::new(),
+    })
+}
+
+/// Place the keys a call appended to a comparator-ordered collection.
+///
+/// Storage is insertion order with every new key appended, so after a call the
+/// first `before` keys are still in comparator order and only the tail is new.
+/// Each new key is located by binary search against the comparator, called as
+/// `compare(newKey, existingKey)` the way `TreeMap.put` calls it. A key the
+/// comparator calls equal to one already present is *not* a new key in Java:
+/// the set keeps the original element, and the map keeps the original key and
+/// takes the new value — which the append left on the duplicate.
+fn rerank(vm: &mut VM, id: u32, cmp: &Value, before: usize) {
+    let (keys, values): (Vec<Value>, Option<Vec<Value>>) =
+        HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Map { entries, .. }) => (
+                entries.iter().map(|(k, _)| k.clone()).collect(),
+                Some(entries.iter().map(|(_, v)| v.clone()).collect()),
+            ),
+            Some(HostObj::Set { items, .. }) => (items.clone(), None),
+            _ => (Vec::new(), None),
+        });
+    if keys.len() <= before {
+        return;
+    }
+    // Positions into `keys`, kept in comparator order.
+    let mut ranked: Vec<usize> = (0..before).collect();
+    // Where a duplicate's value goes: (surviving position, new value).
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for new in before..keys.len() {
+        let (mut lo, mut hi) = (0, ranked.len());
+        let mut equal = None;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let Some(c) = rank_compare(vm, cmp, &keys[new], &keys[ranked[mid]]) else {
+                return;
+            };
+            match c {
+                0 => {
+                    equal = Some(ranked[mid]);
+                    break;
+                }
+                n if n < 0 => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+        match equal {
+            Some(at) => merged.push((at, new)),
+            None => ranked.insert(lo, new),
+        }
+    }
+    let new_keys: Vec<Value> = ranked.iter().map(|&i| keys[i].clone()).collect();
+    HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
+        Some(HostObj::Map { entries, index, .. }) => {
+            let mut vals = values.unwrap_or_default();
+            for (at, new) in merged {
+                vals[at] = vals[new].clone();
+            }
+            *entries = ranked
+                .iter()
+                .zip(new_keys)
+                .map(|(&i, k)| (k, vals[i].clone()))
+                .collect();
+            index.invalidate();
+        }
+        Some(HostObj::Set { items, index, .. }) => {
+            *items = new_keys;
+            index.invalidate();
+        }
+        _ => {}
+    });
+}
+
 /// Evaluate `recv.method(args)` on a collection.
+
 ///
 /// Every method that mutates takes the heap borrow, edits, and drops it before
 /// returning; the two that run user code (`sort` with a comparator, `forEach`)
 /// snapshot first and re-enter the VM with no borrow held, because a lambda body
 /// can allocate.
-fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
     let Value::Obj(id) = recv else {
         return raise(
             vm,
@@ -6778,7 +7140,7 @@ fn sort_with(vm: &mut VM, mut items: Vec<Value>, cmp: &Value) -> Result<Vec<Valu
         items.sort_by(natural_cmp);
         return Ok(items);
     }
-    if closure_meta(cmp).is_none() {
+    if !is_callable(vm, cmp) {
         return Err(Fault::internal("javars: `sort` needs a Comparator lambda"));
     }
     // `sort_by` needs a total order it can trust; a user comparator may not give
@@ -7974,7 +8336,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             }
         }
         ("substring", 1) => substring(s, args[0].jint(), char_len()),
-        ("substring", 2) => substring(s, args[0].jint(), args[1].jint()),
+        ("substring", 2) | ("subSequence", 2) => substring(s, args[0].jint(), args[1].jint()),
         ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &args[0].as_str_cow()))),
         // `indexOf(t, from)` starts the search at `from`; the result is still an
         // index into the whole string.
@@ -8360,7 +8722,7 @@ fn collection_static(
         // which javars has no pass for; the arity is exact and is what the
         // prelude's `asComparator` branches on.
         ("Comparator", "isKeyExtractor") if args.len() == 1 => Ok(Value::bool(
-            closure_meta(&args[0]).is_some_and(|(_, params, _)| params == 1),
+            callable_arity(vm, &args[0]) == Some(1),
         )),
         // ── java.util.stream sources ──
         ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
@@ -8869,6 +9231,14 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             // `Long.MIN_VALUE` and -1 the quotient is `Long.MIN_VALUE` and
             // `q * b` overflows, which panicked and aborted. Java answers 0.
             floor_div(a, b).map(|q| Value::Int(a.wrapping_sub(q.wrapping_mul(b))))
+        }
+        // `Math.ceilDiv`/`ceilMod` (Java 18), the ceiling counterparts: the
+        // remainder takes the sign opposite the divisor, so `ceilMod(7, 2)` is
+        // -1.
+        ("Math", "ceilDiv", 2) => ceil_div(args[0].jint(), args[1].jint()).map(Value::Int),
+        ("Math", "ceilMod", 2) => {
+            let (a, b) = (args[0].jint(), args[1].jint());
+            ceil_div(a, b).map(|q| Value::Int(a.wrapping_sub(q.wrapping_mul(b))))
         }
         // ── The width-overloaded `Math` statics ──
         // Each carries one extra operand, the [`width`] code the compiler
@@ -9812,6 +10182,21 @@ fn floor_div(a: i64, b: i64) -> Result<i64, Fault> {
     // `Long.MIN_VALUE`: the remainder is 0, so no correction applies.
     Ok(if a.wrapping_rem(b) != 0 && (a ^ b) < 0 {
         q.wrapping_sub(1)
+    } else {
+        q
+    })
+}
+
+/// `Math.ceilDiv` (Java 18): the quotient rounded toward positive infinity —
+/// [`floor_div`]'s mirror, corrected upward when the signs *agree* and the
+/// division was inexact. `ceilDiv(7, 2)` is 4 and `ceilDiv(-7, 2)` is -3.
+fn ceil_div(a: i64, b: i64) -> Result<i64, Fault> {
+    if b == 0 {
+        return Err(Fault::java("ArithmeticException", "/ by zero"));
+    }
+    let q = a.wrapping_div(b);
+    Ok(if a.wrapping_rem(b) != 0 && (a ^ b) >= 0 {
+        q.wrapping_add(1)
     } else {
         q
     })

@@ -170,7 +170,7 @@ pub const REFERENCE: &[Entry] = &[
         "new",
         "Keywords",
         "new C(args)   |   new T[n]   |   new T[m][n]   |   new T[]{ … }   |   new ArrayList<>()",
-        "Allocation. A class instance goes through the `JNEW` builtin and then the field initializers and the selected constructor; an array through `JARRAY_NEW`/`JARRAY_NEW_MULTI`; a modeled `java.util` implementation through `JCOLL_NEW`. Every result is an opaque `Value::Obj` handle into the host heap, so assignment aliases by reference.",
+        "Allocation. A class instance goes through the `JNEW` builtin and then the field initializers and the selected constructor; an array through `JARRAY_NEW`/`JARRAY_NEW_MULTI`; a modeled `java.util` implementation through `JCOLL_NEW`. Every result is an opaque `Value::Obj` handle into the host heap, so assignment aliases by reference. `new I() { … }` / `new C(args) { … }` is an anonymous class: a body that is one method of an interface is the lambda it abbreviates, and any other body is lifted to the class `javac` emits (`Encloser$N`), which forwards `args` to `super(…)` and captures the enclosing locals it reads.",
         "Point p = new Point(1, 2);\nint[][] grid = new int[2][3];\nList<String> xs = new ArrayList<>();",
     ),
     // ── Contextual Keywords: words the lexer produces as `Tok::Ident` and the
@@ -194,7 +194,7 @@ pub const REFERENCE: &[Entry] = &[
         "interface",
         "Contextual Keywords",
         "interface Name [extends I, J] { abstract and default methods }",
-        "Declares an interface. Abstract methods, `default` bodies, multiple `implements`, and `interface extends` all work; an interface with exactly one abstract method is automatically a lambda target with no registration anywhere.",
+        "Declares an interface. Abstract methods, `default` bodies, multiple `implements`, and `interface extends` all work; a field is the implicit `public static final` constant JLS 9.3 makes it, read as `Name.FIELD` or bare inside the interface and its implementors; an interface with exactly one abstract method is automatically a lambda target with no registration anywhere.",
         "interface Shape { int area(); default String describe() { return \"area \" + area(); } }",
     ),
     (

@@ -170,7 +170,7 @@ interface Shape { int area(); default String describe() { return "area " + area(
         <article class="doc-entry" id="doc-keywords-18">
           <h3><a class="doc-anchor" href="#doc-keywords-18">#</a> <code>new</code></h3>
           <pre><code class="lang-java">new C(args)   |   new T[n]   |   new T[m][n]   |   new T[]{ … }   |   new ArrayList&lt;&gt;()</code></pre>
-          <p>Allocation. A class instance goes through the <code>JNEW</code> builtin and then the field initializers and the selected constructor; an array through <code>JARRAY_NEW</code>/<code>JARRAY_NEW_MULTI</code>; a modeled <code>java.util</code> implementation through <code>JCOLL_NEW</code>. Every result is an opaque <code>Value::Obj</code> handle into the host heap, so assignment aliases by reference.</p>
+          <p>Allocation. A class instance goes through the <code>JNEW</code> builtin and then the field initializers and the selected constructor; an array through <code>JARRAY_NEW</code>/<code>JARRAY_NEW_MULTI</code>; a modeled <code>java.util</code> implementation through <code>JCOLL_NEW</code>. Every result is an opaque <code>Value::Obj</code> handle into the host heap, so assignment aliases by reference. <code>new I() { … }</code> / <code>new C(args) { … }</code> is an anonymous class: a body that is one method of an interface is the lambda it abbreviates, and any other body is lifted to the class <code>javac</code> emits (<code>Encloser$N</code>), which forwards <code>args</code> to <code>super(…)</code> and captures the enclosing locals it reads.</p>
           <pre><code class="lang-java">Point p = new Point(1, 2);
 int[][] grid = new int[2][3];
 List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></pre>
@@ -194,7 +194,7 @@ List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></pre>
         <article class="doc-entry" id="doc-contextual-keywords-3">
           <h3><a class="doc-anchor" href="#doc-contextual-keywords-3">#</a> <code>interface</code></h3>
           <pre><code class="lang-java">interface Name [extends I, J] { abstract and default methods }</code></pre>
-          <p>Declares an interface. Abstract methods, <code>default</code> bodies, multiple <code>implements</code>, and <code>interface extends</code> all work; an interface with exactly one abstract method is automatically a lambda target with no registration anywhere.</p>
+          <p>Declares an interface. Abstract methods, <code>default</code> bodies, multiple <code>implements</code>, and <code>interface extends</code> all work; a field is the implicit <code>public static final</code> constant JLS 9.3 makes it, read as <code>Name.FIELD</code> or bare inside the interface and its implementors; an interface with exactly one abstract method is automatically a lambda target with no registration anywhere.</p>
           <pre><code class="lang-java">interface Shape { int area(); default String describe() { return "area " + area(); } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-contextual-keywords-4">

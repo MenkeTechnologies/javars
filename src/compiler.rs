@@ -6535,7 +6535,8 @@ impl Compiler {
                 // `int`-width, since the `long` overloads must keep 64 bits.
                 let int_overflowing = matches!(
                     (class.as_str(), method, args.len()),
-                    ("Math", "abs", 1) | ("Math", "floorDiv", 2) | ("Math", "floorMod", 2)
+                    ("Math", "abs", 1)
+                        | ("Math", "floorDiv" | "floorMod" | "ceilDiv" | "ceilMod", 2)
                 );
                 if int_overflowing
                     && args

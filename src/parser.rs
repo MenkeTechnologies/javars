@@ -32,7 +32,22 @@ pub fn parse(src: &str) -> Result<Program, String> {
         enclosing_names: Vec::new(),
         in_static: false,
         enclosing_enum: None,
+        anon_supers: Vec::new(),
+        class_names: std::collections::HashSet::new(),
     };
+    // The names declared as classes (not interfaces) anywhere in the unit, so
+    // an anonymous class can tell a superclass from an interface even when the
+    // type is declared after the `new` that names it.
+    for w in p.toks.windows(2) {
+        if let (Tok::Class, Tok::Ident(n)) = (&w[0].kind, &w[1].kind) {
+            p.class_names.insert(n.clone());
+        }
+        if let (Tok::Ident(kw), Tok::Ident(n)) = (&w[0].kind, &w[1].kind) {
+            if kw == "enum" || kw == "record" {
+                p.class_names.insert(n.clone());
+            }
+        }
+    }
     p.program()
 }
 
@@ -117,6 +132,14 @@ struct Parser {
     /// The innermost enum whose body (constant bodies included) the cursor
     /// is in.
     enclosing_enum: Option<String>,
+    /// The anonymous classes lifted to real classes, as `(binary name, the type
+    /// after `new`)`. Whether that type is a class to extend or an interface to
+    /// implement is only known once every declaration is parsed — a top-level
+    /// interface may be declared after the `main` that instantiates it — so
+    /// [`Parser::program`] settles it at the end.
+    anon_supers: Vec<(String, String)>,
+    /// Every type the unit declares as a `class`, `enum`, or `record`.
+    class_names: std::collections::HashSet<String>,
 }
 
 impl Parser {
@@ -179,6 +202,31 @@ impl Parser {
         }
         methods.append(&mut self.local_methods);
         classes.append(&mut self.local_classes);
+        // An anonymous class's synthesized constructor forwards its arguments
+        // to `super(…)`, and javac types its parameters as the superclass
+        // constructor it selected. With every class now parsed, the superclass
+        // constructor of the same arity supplies them; when there is none, or
+        // more than one, the erased `Object` stands.
+        for (anon, sup) in std::mem::take(&mut self.anon_supers) {
+            let Some(sup_cl) = classes.iter().find(|c| c.name == sup) else {
+                continue;
+            };
+            let own = sup_cl.captures.len();
+            let Some(anon_cl) = classes.iter().find(|c| c.name == anon) else {
+                continue;
+            };
+            let nargs = anon_cl.ctors[0].params.len() - anon_cl.captures.len();
+            let mut fits = sup_cl.ctors.iter().filter(|c| c.params.len() - own == nargs);
+            let (Some(fit), None) = (fits.next(), fits.next()) else {
+                continue;
+            };
+            let tys: Vec<String> = fit.params[..nargs].iter().map(|p| p.ty.clone()).collect();
+            if let Some(anon_cl) = classes.iter_mut().find(|c| c.name == anon) {
+                for (p, ty) in anon_cl.ctors[0].params.iter_mut().zip(tys) {
+                    p.ty = ty;
+                }
+            }
+        }
         match entry {
             Some(entry) => Ok(Program {
                 class_name: entry.class_name,
@@ -360,7 +408,11 @@ impl Parser {
                     inst_methods.push(m);
                 }
             } else if let Some((fs, is_static)) = self.try_fields()? {
-                if is_static {
+                // Every field of an interface is implicitly `public static
+                // final` (JLS 9.3): `interface G { String P = "x"; }` declares a
+                // constant, read as `G.P`, as a bare `P` in the interface's own
+                // methods, and as a bare `P` in every implementing class.
+                if is_static || is_interface {
                     static_declaration(line, fs, &mut static_fields, &mut static_init);
                 } else {
                     instance_declaration(line, fs, &mut fields, &mut inst_init);
@@ -3215,6 +3267,32 @@ impl Parser {
                         args,
                         line,
                     };
+                } else if member == "CASE_INSENSITIVE_ORDER" && matches!(&e, Expr::Var(c) if c == "String") {
+                    // `String.CASE_INSENSITIVE_ORDER` is the comparator whose
+                    // `compare` is `compareToIgnoreCase` — the JDK documents
+                    // the method as "the same as" this comparator — so it is
+                    // that lambda. `#` keeps the parameters out of the user's
+                    // namespace.
+                    self.uses_functional = true;
+                    let (a, b) = ("#ci0".to_string(), "#ci1".to_string());
+                    // Cast to its interface, so a member call straight on it
+                    // (`String.CASE_INSENSITIVE_ORDER.reversed()`) has the
+                    // static type a field read would.
+                    let lambda = Expr::Lambda {
+                        params: vec![a.clone(), b.clone()],
+                        body: LambdaBody::Expr(Box::new(Expr::MethodCall {
+                            recv: Box::new(Expr::Var(a)),
+                            method: "compareToIgnoreCase".to_string(),
+                            args: vec![Expr::Var(b)],
+                            line,
+                        })),
+                        line,
+                    };
+                    e = Expr::Cast {
+                        ty: "Comparator".to_string(),
+                        expr: Box::new(lambda),
+                        line,
+                    };
                 } else {
                     e = Expr::Field {
                         recv: Box::new(e),
@@ -3531,7 +3609,7 @@ impl Parser {
         // the same way. Desugaring to one reuses that whole path — including the
         // capture machinery, which is the part an anonymous class most needs.
         if self.is(&Tok::LBrace) {
-            return self.anonymous_class(&ty, line);
+            return self.anonymous_class(&ty, args, line);
         }
         Ok(Expr::NewObject {
             class: ty,
@@ -3541,52 +3619,215 @@ impl Parser {
         })
     }
 
-    /// Desugar an anonymous class body into the lambda it abbreviates.
+    /// Model an anonymous class body `new G(args) { … }`.
     ///
-    /// Only the single-method form is modeled, which is the form an anonymous
-    /// class is written in: the interface it implements has one abstract method
-    /// and the body supplies it. A body that declares a field, a constructor, or
-    /// a second method is a real class with state, and is refused by name rather
-    /// than silently losing the members javars would not carry.
-    fn anonymous_class(&mut self, ty: &str, line: u32) -> Result<Expr, String> {
+    /// The single-method form of an *interface* desugars to the lambda it
+    /// abbreviates: the interface has one abstract method, the body supplies it,
+    /// and the enclosing locals it reads are captured the same way. Keeping that
+    /// form a lambda is what lets an anonymous `Comparator` or `Runnable` go
+    /// everywhere a lambda already goes.
+    ///
+    /// Every other body is a real class with state — fields, an instance
+    /// initializer, two or more methods, an override of an inherited
+    /// `toString`/`equals`/`hashCode`, or a *class* supertype — and is lifted to
+    /// one by [`Parser::lift_anonymous_class`].
+    fn anonymous_class(&mut self, ty: &str, args: Vec<Expr>, line: u32) -> Result<Expr, String> {
+        let open = self.pos;
+        let class_super = ty == "Object" || !args.is_empty() || self.is_class_name(ty);
+        if !class_super {
+            // Try the lambda form, restoring every piece of parser state the
+            // attempt touched when the body turns out to be a class: a local type
+            // declared inside the body renames its tokens and hoists itself.
+            let toks = self.toks.clone();
+            let (n_classes, n_methods) = (self.local_classes.len(), self.local_methods.len());
+            let (counts, captures) = (self.local_counts.clone(), self.local_captures.clone());
+            if let Some(lambda) = self.anonymous_lambda(ty, line)? {
+                // javac still compiles it to a class, which takes the next
+                // `Encloser$N`; a lifted anonymous class after it is `$N+1`.
+                let outer = self.enclosing.last().cloned().unwrap_or_default();
+                *self.local_counts.entry((outer, String::new())).or_insert(0) += 1;
+                return Ok(lambda);
+            }
+            self.toks = toks;
+            self.local_classes.truncate(n_classes);
+            self.local_methods.truncate(n_methods);
+            self.local_counts = counts;
+            self.local_captures = captures;
+            self.pos = open;
+        }
+        self.lift_anonymous_class(ty, args, class_super, line)
+    }
+
+    /// The lambda an anonymous class body abbreviates, or `None` when the body
+    /// is not exactly one method supplying an abstract one.
+    fn anonymous_lambda(&mut self, ty: &str, line: u32) -> Result<Option<Expr>, String> {
         self.eat(&Tok::LBrace)?;
         let mut methods = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             match self.try_any_method(ty)? {
                 Some((m, _)) => methods.push(m),
-                None => {
-                    return Err(format!(
-                        "javars: an anonymous `{ty}` may declare only methods (line {line})"
-                    ))
-                }
+                None => return Ok(None),
             }
         }
         self.eat(&Tok::RBrace)?;
-        let [m] = <[Method; 1]>::try_from(methods).map_err(|ms| {
-            format!(
-                "javars: an anonymous `{ty}` is modeled only when its body declares exactly one                  method; this one declares {} (line {line})",
-                ms.len()
-            )
-        })?;
-        // One method is still not enough on its own. `new Object() { public
-        // String toString() { … } }` declares exactly one — and `Object` has no
-        // abstract method for it to supply, so what the body overrides is an
-        // *inherited* body, which is a real class and not a lambda. Desugaring
-        // it made `System.out.println(o)` print `<lambda>@e` where Java prints
-        // what the override returns: a silent wrong answer rather than a
-        // refusal, which is the one outcome this frontend does not ship. The
-        // same holds for `equals`/`hashCode`, and for those three names under
-        // any supertype.
-        if ty == "Object" || matches!(m.name.as_str(), "toString" | "equals" | "hashCode") {
-            return Err(format!(
-                "javars: an anonymous `{ty}` whose body overrides `{}` is a class with inherited state, not the single abstract method javars models an anonymous class by (line {line})",
-                m.name
-            ));
+        let Ok([m]) = <[Method; 1]>::try_from(methods) else {
+            return Ok(None);
+        };
+        // `toString`/`equals`/`hashCode` are never the abstract method: what
+        // such a body overrides is an *inherited* implementation, so the object
+        // is a class. Desugaring one to a lambda made `println(o)` print
+        // `<lambda>@e` where Java prints what the override returns.
+        if matches!(m.name.as_str(), "toString" | "equals" | "hashCode") {
+            return Ok(None);
         }
         self.uses_functional = true;
-        Ok(Expr::Lambda {
+        Ok(Some(Expr::Lambda {
             params: m.params.iter().map(|p| p.name.clone()).collect(),
             body: LambdaBody::Block(m.body),
+            line,
+        }))
+    }
+
+    /// True when `name` is a class (not an interface) this program can extend:
+    /// a declared `class`, `enum`, or `record`, a local class already parsed, or
+    /// a modeled throwable.
+    fn is_class_name(&self, name: &str) -> bool {
+        self.class_names.contains(name)
+            || self.local_classes.iter().any(|c| c.name == name && !c.is_interface)
+            || crate::prelude::is_throwable(name)
+    }
+
+    /// Lift an anonymous class body to the class javac compiles it to.
+    ///
+    /// javac's lowering, which javars follows: the class is named
+    /// `Encloser$N`, the smallest `N` not yet taken under that encloser
+    /// (`T$1`, `T$2`, `T$Inner$1`); it extends the named class or implements
+    /// the named interface; its constructor takes the arguments the `new`
+    /// supplied and passes them to `super(…)`; and, like a local class, it
+    /// captures the enclosing locals its body reads and — in an instance
+    /// context — the enclosing instance. The expression is then an ordinary
+    /// `new` of that class.
+    fn lift_anonymous_class(
+        &mut self,
+        ty: &str,
+        args: Vec<Expr>,
+        class_super: bool,
+        line: u32,
+    ) -> Result<Expr, String> {
+        let outer = self.enclosing.last().cloned().unwrap_or_default();
+        let n = self.local_counts.entry((outer.clone(), String::new())).or_insert(0);
+        *n += 1;
+        let binary = format!("{outer}${n}");
+        let start = self.pos;
+        self.eat(&Tok::LBrace)?;
+        self.enclosing.push(binary.clone());
+        self.enclosing_names.push(binary.clone());
+        let outer_static = std::mem::replace(&mut self.in_static, false);
+        let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut static_init = Vec::new();
+        let mut inst_init = Vec::new();
+        let mut methods = Vec::new();
+        let body = (|| {
+            while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
+                if let Some((m, is_static)) = self.try_any_method(&binary)? {
+                    if is_static {
+                        return Err(format!(
+                            "javars: a `static` method in an anonymous class is not modeled (line {})",
+                            m.line
+                        ));
+                    }
+                    methods.push(m);
+                } else if let Some((fs, is_static)) = self.try_fields()? {
+                    if is_static {
+                        static_declaration(line, fs, &mut static_fields, &mut static_init);
+                    } else {
+                        instance_declaration(line, fs, &mut fields, &mut inst_init);
+                    }
+                } else if self.is(&Tok::LBrace) {
+                    // An instance initializer: an anonymous class cannot declare
+                    // a constructor, so this is where its setup code goes.
+                    self.advance();
+                    inst_init.extend(self.block()?);
+                } else {
+                    return Err(format!(
+                        "javars: unsupported member in an anonymous `{ty}` (line {})",
+                        self.line()
+                    ));
+                }
+            }
+            self.eat(&Tok::RBrace)
+        })();
+        self.in_static = outer_static;
+        self.enclosing.pop();
+        self.enclosing_names.pop();
+        body?;
+        // The constructor javac synthesizes: one parameter per argument, passed
+        // straight to `super(…)`. Its parameter types are the superclass
+        // constructor's, which `program` copies in once every class is parsed.
+        let ctors = if args.is_empty() {
+            Vec::new()
+        } else {
+            let params: Vec<Param> = (0..args.len())
+                .map(|i| Param {
+                    ty: "Object".to_string(),
+                    name: format!("x{i}"),
+                    varargs: false,
+                })
+                .collect();
+            let call = Expr::Call {
+                name: "super".to_string(),
+                args: params.iter().map(|p| Expr::Var(p.name.clone())).collect(),
+                line,
+            };
+            vec![Ctor {
+                params,
+                body: vec![Stmt::new(line, StmtKind::Expr(call))],
+                line,
+            }]
+        };
+        let (superclass, interfaces) = match ty {
+            "Object" => (None, Vec::new()),
+            _ if class_super => (Some(ty.to_string()), Vec::new()),
+            _ => (None, vec![ty.to_string()]),
+        };
+        let mut cl = Class {
+            name: binary.clone(),
+            binary: binary.clone(),
+            superclass,
+            interfaces,
+            is_interface: false,
+            is_enum: false,
+            is_record: false,
+            enum_constants: Vec::new(),
+            fields,
+            static_fields,
+            static_init,
+            inst_init,
+            ctors,
+            methods,
+            captures: Vec::new(),
+            line,
+        };
+        if !self.in_static {
+            if let Some(outer) = self.enclosing_names.last().cloned() {
+                let this0 = Param {
+                    ty: outer,
+                    name: OUTER_THIS.to_string(),
+                    varargs: false,
+                };
+                attach_captures(&mut cl, vec![this0], 0);
+            }
+        }
+        self.capture_locals(&mut cl, start);
+        if !args.is_empty() {
+            self.anon_supers.push((binary.clone(), ty.to_string()));
+        }
+        self.local_classes.push(cl);
+        Ok(Expr::NewObject {
+            class: binary,
+            args,
+            outer: None,
             line,
         })
     }

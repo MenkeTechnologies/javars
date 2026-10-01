@@ -76,6 +76,29 @@ pub(crate) fn supertype_map(prog: &ast::Program) -> std::collections::HashMap<St
         .collect()
 }
 
+/// Every functional interface the program can name → the name of its single
+/// abstract method: each declared interface with exactly one abstract method
+/// (the prelude's, once injected, among them), plus every modeled
+/// `java.util.function` interface whether or not the prelude was injected —
+/// a class can `implements Comparator<T>` without the program writing a
+/// lambda. Read by the host to call an *object* where a lambda is expected.
+pub(crate) fn functional_sam_map(prog: &ast::Program) -> std::collections::HashMap<String, String> {
+    let mut map: std::collections::HashMap<String, String> = prelude::FUNCTIONAL
+        .iter()
+        .filter_map(|(name, sam, _)| {
+            let head = sam.split('(').next()?;
+            Some((name.to_string(), head.split_whitespace().last()?.to_string()))
+        })
+        .collect();
+    for c in prog.classes.iter().filter(|c| c.is_interface) {
+        let mut abstracts = c.methods.iter().filter(|m| m.is_abstract);
+        if let (Some(m), None) = (abstracts.next(), abstracts.next()) {
+            map.insert(c.name.clone(), m.name.clone());
+        }
+    }
+    map
+}
+
 /// Every user class's simple name → Java's binary name (`Outer$Nested`).
 pub(crate) fn binary_name_map(prog: &ast::Program) -> std::collections::HashMap<String, String> {
     prog.classes
@@ -149,6 +172,7 @@ pub fn run_str_args(src: &str, argv: &[String]) -> Result<Value, String> {
     let supers = supertype_map(&prog);
     let binaries = binary_name_map(&prog);
     let chunk = compiler::compile(&prog)?;
+    host::set_functional_sams(functional_sam_map(&prog));
     run_chunk(chunk, supers, binaries, prog.uses_exceptions, argv)
 }
 

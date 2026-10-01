@@ -356,7 +356,9 @@ Implemented and checked against the reference `java`:
   `Predicate`, `Comparator`, `UnaryOperator`/`BinaryOperator` and the `Int*`
   shapes are supplied as one-method interfaces in the prelude. A
   functional-interface variable may hold a lambda *or* a class instance; the
-  runtime-class dispatch chain routes each. `return`, `break`/`continue`,
+  runtime-class dispatch chain routes each, and a class instance goes wherever a
+  lambda goes — `list.sort(new ByLength())`, `new TreeMap<>(new Rev())`,
+  `new PriorityQueue<>(cmp)` call the method its functional interface names. `return`, `break`/`continue`,
   `try`/`finally` and `throw` all work inside a lambda body.
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
   `Point::area`, `obj::method`, `this::method`, `Point::new`,
@@ -370,7 +372,12 @@ Implemented and checked against the reference `java`:
   constructors, `Arrays.asList`, `List.of`/`Set.of`, and
   `Collections.sort`/`reverse`/`max`/`min`. A `TreeMap` navigates by key
   (`firstKey`, `floorKey`, `ceilingEntry`, `pollFirstEntry`, …) and a `TreeSet`
-  by element (`first`, `floor`, `higher`, `pollLast`, …). A deque reads and writes at both
+  by element (`first`, `floor`, `higher`, `pollLast`, …), ordered by the
+  `Comparator` it was constructed with (`String.CASE_INSENSITIVE_ORDER`, a
+  lambda, `Comparator.reverseOrder()`) or by its keys' own `compareTo` — and,
+  as in Java, a key the comparator calls equal to one present *is* that key, so
+  `add` answers `false`, `put` keeps the first key, and `get`/`contains` find
+  it. A deque reads and writes at both
   ends (`push`/`pop`/`peek`, `addFirst`/`addLast`, `offer*`, `poll*`,
   `get*`/`remove*`/`element`) and distinguishes the two empty-receiver
   families: the `get`/`remove`/`element`/`pop` spellings throw
@@ -419,6 +426,14 @@ Implemented and checked against the reference `java`:
   sorted), `List.listIterator` walks both ways and writes at its cursor, and a
   local `record`/`enum`/`interface`/`class` declared in a method body runs
   under `javac`'s binary name (`T$1Point`).
+- **Anonymous classes** — `new I() { … }` and `new Base(args) { … }` with
+  fields, instance initializers, several methods, and overrides of
+  `toString`/`equals`/`hashCode`, lowered as `javac` lowers them: a class named
+  `Encloser$N` that extends the class or implements the interface, forwards its
+  arguments to `super(…)`, and captures the enclosing locals it reads and, in an
+  instance context, the enclosing instance. A body that is one method of an
+  interface stays the lambda it abbreviates. Interface fields are the implicit
+  `static final` constants Java makes them.
 - **Streams** — `Collection.stream()`, `Stream.of`/`iterate`/`generate`/
   `concat`/`empty`, `IntStream.range`, the intermediate stages with Java's
   laziness (an unbounded `iterate`/`generate` is pulled only as far as a

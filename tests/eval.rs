@@ -5518,17 +5518,18 @@ fn pow_takes_fdlibms_reciprocal_shortcut_at_exponent_minus_one() {
 }
 
 #[test]
-fn an_anonymous_object_that_overrides_tostring_is_refused_not_desugared() {
-    // It declares exactly one method, so it took the lambda desugaring — and
-    // `Object` has no abstract method for the body to supply, so printing the
-    // value rendered `<lambda>@e` where Java prints what the override returns.
-    // A refusal is the correct answer for a shape javars does not model; a
-    // plausible-looking wrong one is not.
+fn an_anonymous_object_that_overrides_tostring_is_a_class_not_a_lambda() {
+    // It declares exactly one method, so it used to take the lambda desugaring
+    // — and `Object` has no abstract method for the body to supply, so printing
+    // the value rendered `<lambda>@e` where Java prints what the override
+    // returns. It is now lifted to the class javac compiles it to (`T$1`, as
+    // `openjdk 27` names it).
     let (out, ok) = run(&wrap(
         "Object o = new Object() { public String toString() { return \"anon\"; } };\
-         System.out.println(o);",
+         System.out.println(o + \" \" + o.getClass().getName());",
     ));
-    assert!(!ok, "{out}");
+    assert!(ok, "{out}");
+    assert_eq!(out, "anon T$1\n");
     let (out, ok) = run(&wrap(
         "Runnable r = new Runnable() { public void run() { System.out.println(\"ran\"); } };\
          r.run();",

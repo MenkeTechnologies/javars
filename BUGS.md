@@ -234,13 +234,21 @@ at the bottom, and are summarized in the section right after this one.
   declares its own `implements`/`extends` edge, so the list adds nothing the
   supertype graph does not already carry. Both remain contextual keywords, so a
   variable named `sealed` or `permits` still parses.
-- **Anonymous classes, in their single-method form.** `new Runnable() { public
-  void run() { … } }` desugars to the lambda it abbreviates — the interface has
-  one abstract method, the body supplies it, and the enclosing locals it reads
-  are captured the same way, which is the part an anonymous class most needs. A
-  body that declares a field, a constructor, or a *second* method is a real
-  class with state; it is refused by name rather than silently losing the
-  members javars would not carry.
+- **Anonymous classes.** A body that is exactly one method of an interface —
+  `new Runnable() { public void run() { … } }` — desugars to the lambda it
+  abbreviates, so it goes everywhere a lambda goes. Every other body is lifted
+  to the class `javac` compiles it to: fields, instance initializers (`{ … }`),
+  several methods, an override of `toString`/`equals`/`hashCode`, a
+  `new Object() { … }`, and a *class* supertype with constructor arguments
+  (`new Shape("sq") { double area() { … } }`, which forwards them to
+  `super(…)`). The class is named `Encloser$N` — the next free number under its
+  encloser, counting the lambda-shaped ones too, so `getClass().getName()`
+  agrees with `javac` — and like a local class it captures the enclosing locals
+  its body reads and, in an instance context, the enclosing instance. Fields
+  declared in an interface are the implicit `static final` constants JLS 9.3
+  makes them (`G.P`, a bare `P` in the interface and in every implementor).
+  An anonymous subclass of a JDK class javars does not model as a class
+  (`new HashMap<>() {{ put(…); }}`) is refused, as a named subclass of one is.
 - **Nested types named through their enclosers.** `new Outer.Nested()` and
   `Outer.Nested.aStatic()` parse. javars flattens nested types into one
   namespace keyed by the simple name, so a type qualifier names the same class
@@ -987,8 +995,19 @@ at the bottom, and are summarized in the section right after this one.
     `ArrayList` hashes nothing and so asks this of nobody. A class whose
     `hashCode` contradicts its `equals` is where the two models part, and that
     program has no defined answer in Java either.
-  * **`TreeSet`/`TreeMap` locate by `compareTo`, not `equals`.** Those keep the
-    value model; a user class in a sorted collection is a separate gap.
+  * **`TreeSet`/`TreeMap` locate by their order, not `equals`.** A sorted
+    collection constructed with a `Comparator` (a lambda, a `Comparator`
+    factory, `String.CASE_INSENSITIVE_ORDER`, or an object of a class
+    implementing `Comparator`) is stored in that comparator's order, and one
+    holding user objects that declare `compareTo` is stored in theirs. A key
+    the order calls equal to one already present *is* that key, as in Java:
+    `add` answers `false`, `put` keeps the first key and replaces its value,
+    and `get`/`contains`/`remove` find it. Two shapes still differ:
+    `new TreeSet<>(aSortedSet)` and `new TreeMap<>(aSortedMap)` start in
+    natural order rather than inheriting the source's comparator (Java picks
+    that overload by the argument's *static* type, which the host does not
+    see), and a `PriorityQueue` seeded from a comparator-ordered `TreeSet`
+    heapifies by natural order rather than by the set's comparator.
 
   One shape is a real divergence rather than a boundary: an `equals` that
   *structurally modifies the collection being searched*. javars resolves the
@@ -1446,29 +1465,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   alongside `name`/`ordinal`/`toString`/`equals`, which is also what makes
   `Collections.sort` of an enum list work.
 - **Sealed types.**
-- **An anonymous class past one method.** The single-method form of an
-  INTERFACE works — `new Greet() { public String name() { return "anon"; } }`
-  runs, and its inherited `default` methods dispatch to that override — which is
-  the shape a listener or a comparator is written in. Everything past it is
-  refused loudly, each with its own message:
-
-  | shape | javars |
-  | --- | --- |
-  | two or more methods | `an anonymous G is modeled only when its body declares exactly one` |
-  | any field beside the method | `an anonymous G may declare only methods` |
-  | extending an abstract CLASS | `no concrete implementation of a for A` |
-  | overriding `toString`/`equals`/`hashCode`, or any `new Object() { … }` | `whose body overrides ... is a class with inherited state` |
-
-  That last row is the one that used to be a *wrong answer* rather than a
-  refusal. `new Object() { public String toString() { return "x"; } }` declares
-  exactly one method, so it took the lambda desugaring — and `Object` has no
-  abstract method for the body to supply, so `System.out.println(o)` rendered
-  `<lambda>@e` where Java prints `x`. What such a body overrides is an inherited
-  implementation, which is a class with state and not a functional method.
-
-  This entry previously said anonymous classes were unimplemented outside the
-  enum-constant body form, which understated it: the one-method interface form
-  has been working and is now pinned in the frozen corpus.
 - **A type *parameter* that shadows a class name.** `class Box<T>` inside a
   program that also declares a class `T` reads the declared return type `T` as
   that class, so `box.get().length()` is rejected as ``class `T` has no method
