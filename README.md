@@ -442,6 +442,16 @@ Implemented and checked against the reference `java`:
   `teeing`, …); a `double` stream sums with the JDK's compensated summation.
 - **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
   formatting.
+- **Input** — `new Scanner(System.in)` (`nextInt`/`nextLong`/`nextDouble`/
+  `nextBoolean`/`next`/`nextLine` and their `hasNext*` tests, with Java's
+  `InputMismatchException`/`NoSuchElementException` behavior),
+  `new BufferedReader(new InputStreamReader(System.in))` (`readLine` to `null`,
+  `read`, `lines()`), the same two over a `String`/`StringReader`, and
+  `StringTokenizer`. Stdin is read a line at a time on demand, with stdout
+  flushed before a read blocks, so an interactive prompt shows first.
+- **`System`** — `exit(n)` (no `finally` runs; the process reports `n`),
+  `arraycopy` with the JDK's checks and messages, `currentTimeMillis`,
+  `nanoTime`, `lineSeparator`, and `System.out.flush()`.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
   compiles to a cached cdylib whose exported functions are callable by name
   (via `fusevm::ffi`); see [`examples/Ffi.java`](examples/Ffi.java).

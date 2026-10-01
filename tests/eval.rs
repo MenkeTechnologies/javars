@@ -6427,3 +6427,109 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "CLUBS HEARTS SPADES 3\n");
 }
+
+/// Run a Java source string with `input` on its stdin, returning (stdout, exit
+/// status) — the only way to observe `System.in` and `System.exit`.
+fn run_stdin(src: &str, input: &str) -> (String, Option<i32>) {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("javars_test_{}.java", fasthash(src)));
+    std::fs::write(&path, src).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn java");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait java");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// `Scanner(System.in)`: tokens cross line boundaries, `nextLine()` after a
+/// `nextLong()` answers the empty rest of that line, and `hasNext()` drains to
+/// the end. A prompt printed with `print` precedes the answer it asks for.
+/// Measured on openjdk 27.
+#[test]
+fn scanner_reads_tokens_and_lines_from_stdin() {
+    let (out, code) = run_stdin(
+        "import java.util.*;\
+         public class T { public static void main(String[] a) {\
+           Scanner sc = new Scanner(System.in);\
+           int n = sc.nextInt(); long sum = 0;\
+           for (int i = 0; i < n; i++) sum += sc.nextLong();\
+           sc.nextLine();\
+           String line = sc.nextLine();\
+           System.out.println(sum + \" [\" + line + \"]\");\
+           while (sc.hasNext()) System.out.print(sc.next().toUpperCase() + \",\");\
+           System.out.println();\
+         } }",
+        "3 10 20\n30\nhello there\nfoo bar\nbaz\n",
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "60 [hello there]\nFOO,BAR,BAZ,\n");
+    let (out, code) = run_stdin(
+        "import java.util.*;\
+         public class T { public static void main(String[] a) {\
+           Scanner in = new Scanner(System.in);\
+           System.out.print(\"Name? \"); String n = in.nextLine();\
+           System.out.print(\"Age? \"); int age = in.nextInt();\
+           System.out.println(\"Hello, \" + n + \" (\" + (age / 10) + \"0s)\");\
+           System.out.println(in.hasNext() + \" \" + in.hasNextLine());\
+           try { in.next(); } catch (NoSuchElementException e) { System.out.println(e); }\
+         } }",
+        "Bob Smith\n42\n",
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(
+        out,
+        "Name? Age? Hello, Bob Smith (40s)\nfalse true\njava.util.NoSuchElementException\n"
+    );
+}
+
+/// `BufferedReader(new InputStreamReader(System.in))` reads line by line to a
+/// `null` at the end of input, and `StringTokenizer` splits a line the way
+/// competitive-programming input is read. Measured on openjdk 27.
+#[test]
+fn buffered_reader_reads_stdin_lines_to_null() {
+    let (out, code) = run_stdin(
+        "import java.io.*; import java.util.*;\
+         public class T { public static void main(String[] args) throws IOException {\
+           BufferedReader br = new BufferedReader(new InputStreamReader(System.in));\
+           StringTokenizer st = new StringTokenizer(br.readLine());\
+           int a = Integer.parseInt(st.nextToken()), b = Integer.parseInt(st.nextToken());\
+           System.out.println(a + b);\
+           String l; int c = 0;\
+           while ((l = br.readLine()) != null) { c++; System.out.println(c + \": \" + l.trim()); }\
+         } }",
+        "4 5\n  x  \ny",
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "9\n1: x\n2: y\n");
+}
+
+/// `System.exit(n)` ends the program where it stands — the enclosing
+/// `finally` does not run — and the process reports `n`.
+#[test]
+fn system_exit_stops_without_finally_and_reports_its_status() {
+    let (out, code) = run_stdin(
+        "public class T {\
+           static int f(int n) { if (n == 3) { System.out.println(\"exiting\"); System.exit(n + 4); } return n; }\
+           public static void main(String[] a) {\
+             try { for (int i = 0; i < 10; i++) System.out.println(f(i)); }\
+             finally { System.out.println(\"finally must not run\"); }\
+           } }",
+        "",
+    );
+    assert_eq!(out, "0\n1\n2\nexiting\n");
+    assert_eq!(code, Some(7));
+}

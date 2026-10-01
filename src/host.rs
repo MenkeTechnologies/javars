@@ -449,6 +449,10 @@ type ArgEntries<'a> = &'a [Option<Vec<(Value, Value)>>];
 
 /// One object on the host-owned Java heap. `Value::Obj(id)` indexes [`HEAP`].
 enum HostObj {
+    /// `System.in`, a `Scanner`, or a `java.io` reader (see [`crate::jio`]).
+    Reader(crate::jio::Reader),
+    /// A `java.util.StringTokenizer`.
+    Tokenizer(crate::jio::Tokenizer),
     /// A Java reference array (`int[]`, `String[]`, `Point[]`, …). Element type
     /// is erased at runtime — the compiler sets each slot's default on creation.
     Array(Vec<Value>),
@@ -1408,6 +1412,8 @@ pub fn heap_reset() {
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     SORT_CMP.with(|s| s.borrow_mut().clear());
+    EXIT_CODE.with(|c| c.set(None));
+    STDIN_HANDLE.with(|s| s.set(None));
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
@@ -2174,7 +2180,14 @@ fn method_entry(vm: &VM, class: &str, name: &str) -> Option<(usize, usize)> {
         hit = vm.chunk.names.iter().enumerate().find_map(|(i, n)| {
             let tys = n.strip_prefix(&prefix)?;
             let entry = vm.chunk.find_sub(i as u16)?;
-            Some((entry, if tys.is_empty() { 0 } else { tys.split(',').count() }))
+            Some((
+                entry,
+                if tys.is_empty() {
+                    0
+                } else {
+                    tys.split(',').count()
+                },
+            ))
         });
         hit.is_some()
     });
@@ -3026,10 +3039,7 @@ fn new_priority_queue(
     a1: &Value,
     natural_cmp: &Value,
 ) -> Result<Value, Fault> {
-    let explicit = [a1, a0]
-        .into_iter()
-        .find(|v| is_callable(vm, v))
-        .cloned();
+    let explicit = [a1, a0].into_iter().find(|v| is_callable(vm, v)).cloned();
     let seed = match a0 {
         Value::Obj(sid) if !is_callable(vm, a0) => Some(*sid),
         _ => None,
@@ -4873,6 +4883,10 @@ fn value_class(v: &Value) -> Option<String> {
         Value::Obj(id) => {
             return HEAP.with(|h| {
                 Some(match h.borrow().get(*id as usize)? {
+                    // Named by its qualified class, which [`binary_name`] passes
+                    // through: none of these is a name a program declares.
+                    HostObj::Reader(r) => r.kind.class_name().to_string(),
+                    HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
@@ -5159,15 +5173,17 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
             o == Less
         }
     };
+    // `First`/`Last` take no probe and compare against none.
+    vs_probe.resize(pairs.len(), std::cmp::Ordering::Equal);
     let mut found: Option<usize> = None;
-    for i in 0..pairs.len() {
+    for (i, &ord) in vs_probe.iter().enumerate() {
         let (fits, want_max) = match nav {
             Nav::First => (true, false),
             Nav::Last => (true, true),
-            Nav::Floor => (vs_probe[i] != Greater, true),
-            Nav::Ceiling => (vs_probe[i] != Less, false),
-            Nav::Lower => (vs_probe[i] == Less, true),
-            Nav::Higher => (vs_probe[i] == Greater, false),
+            Nav::Floor => (ord != Greater, true),
+            Nav::Ceiling => (ord != Less, false),
+            Nav::Lower => (ord == Less, true),
+            Nav::Higher => (ord == Greater, false),
         };
         if fits && found.is_none_or(|b| better(i, b, want_max)) {
             found = Some(i);
@@ -5198,7 +5214,9 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         rank_by_compareto(vm, *id, first);
     }
     let ranked = match recv {
-        Value::Obj(id) => SORT_CMP.with(|s| s.borrow().get(id).cloned()).map(|c| (*id, c)),
+        Value::Obj(id) => SORT_CMP
+            .with(|s| s.borrow().get(id).cloned())
+            .map(|c| (*id, c)),
         _ => None,
     };
     let Some((id, cmp)) = ranked else {
@@ -5376,7 +5394,6 @@ fn rerank(vm: &mut VM, id: u32, cmp: &Value, before: usize) {
 }
 
 /// Evaluate `recv.method(args)` on a collection.
-
 ///
 /// Every method that mutates takes the heap borrow, edits, and drops it before
 /// returning; the two that run user code (`sort` with a comparator, `forEach`)
@@ -7823,6 +7840,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         }
         return b_closure_call(vm, n as u8 + 1);
     }
+    if let Some(r) = io_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     // A `Stream` receiver. Every stage and every terminal runs user closures, so
     // it takes the VM and sits with the other handle shapes.
     if let Some(r) = stream_method(vm, &recv, &method, &args) {
@@ -8554,6 +8577,12 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    if let Some(r) = system_static(vm, &class, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     // The collection statics come first: two of them (`Collections.sort` with a
     // comparator) run user code, which `static_method` — which has no VM — could
     // not do.
@@ -8574,6 +8603,282 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
+}
+
+// ── java.lang.System and console/text input ─────────────────────────────────
+
+thread_local! {
+    /// The status `System.exit` asked for, read by the `java` binary once the
+    /// VM has halted. Cleared with the heap.
+    static EXIT_CODE: Cell<Option<i32>> = const { Cell::new(None) };
+    /// The heap handle of `System.in`, so the stream is one object however
+    /// often it is named (`System.in == System.in`). Cleared with the heap.
+    static STDIN_HANDLE: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// The status a `System.exit` call asked for, if the program made one.
+pub fn exit_code() -> Option<i32> {
+    EXIT_CODE.with(Cell::get)
+}
+
+/// The `System` members beyond the two output streams, and the constructors of
+/// the input classes [`crate::jio`] models. `None` for every other static.
+fn system_static(
+    vm: &mut VM,
+    class: &str,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    let null = |v: &Value| matches!(v, Value::Undef);
+    let npe = || Err(Fault::java("NullPointerException", String::new()));
+    let reader_of = |v: &Value| -> Option<u32> {
+        match v {
+            Value::Obj(id) => HEAP.with(|h| {
+                matches!(h.borrow().get(*id as usize), Some(HostObj::Reader(_))).then_some(*id)
+            }),
+            _ => None,
+        }
+    };
+    // A reader that takes over another reader's characters.
+    let wrap = |kind: crate::jio::Kind, inner: u32| -> Value {
+        let r = HEAP.with(|h| match h.borrow_mut().get_mut(inner as usize) {
+            Some(HostObj::Reader(r)) => crate::jio::Reader::wrap(kind, r),
+            _ => crate::jio::Reader::stdin(kind),
+        });
+        Value::Obj(heap_alloc(HostObj::Reader(r)))
+    };
+    use crate::jio::{Kind, Reader};
+    Some(match (class, method, args) {
+        ("System", "#in", []) => Ok(Value::Obj(STDIN_HANDLE.with(|s| match s.get() {
+            Some(id) => id,
+            None => {
+                let id = heap_alloc(HostObj::Reader(Reader::stdin(Kind::InputStream)));
+                s.set(Some(id));
+                id
+            }
+        }))),
+        // `System.exit` ends the program where it stands: no `finally` runs
+        // and nothing after the call executes. The status is Java's `int`,
+        // which the process reports modulo 256.
+        ("System", "exit", [code]) => {
+            EXIT_CODE.with(|c| c.set(Some(code.jint() as i32)));
+            vm.request_halt();
+            Ok(Value::Undef)
+        }
+        ("System", "currentTimeMillis", []) => Ok(Value::Int(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64),
+        )),
+        // An arbitrary but fixed origin, as Java's is: only differences between
+        // two readings mean anything.
+        ("System", "nanoTime", []) => {
+            thread_local!(static ORIGIN: std::time::Instant = std::time::Instant::now());
+            Ok(Value::Int(ORIGIN.with(|o| o.elapsed().as_nanos() as i64)))
+        }
+        ("System", "lineSeparator", []) => Ok(Value::str("\n".to_string())),
+        ("System", "#flushOut", []) => {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            Ok(Value::Undef)
+        }
+        ("System", "#flushErr", []) => {
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            Ok(Value::Undef)
+        }
+        ("System", "arraycopy", [src, sp, dst, dp, len, sty, dty]) => array_copy(
+            src,
+            sp.jint(),
+            dst,
+            dp.jint(),
+            len.jint(),
+            &sty.as_str_cow(),
+            &dty.as_str_cow(),
+        ),
+        ("Scanner", "#new", [a]) if null(a) => npe(),
+        ("Scanner", "#new", [Value::Str(s)]) => Ok(Value::Obj(heap_alloc(HostObj::Reader(
+            Reader::text(Kind::Scanner, s),
+        )))),
+        ("Scanner", "#new", [a]) => Ok(wrap(Kind::Scanner, reader_of(a)?)),
+        ("StringReader", "#new", [a]) if null(a) => npe(),
+        ("StringReader", "#new", [a]) => Ok(Value::Obj(heap_alloc(HostObj::Reader(Reader::text(
+            Kind::StringReader,
+            &a.as_str_cow(),
+        ))))),
+        ("InputStreamReader" | "BufferedReader", "#new", [a, ..]) if null(a) => npe(),
+        ("InputStreamReader", "#new", [a, ..]) => Ok(wrap(Kind::InputStreamReader, reader_of(a)?)),
+        ("BufferedReader", "#new", [a, ..]) => Ok(wrap(Kind::BufferedReader, reader_of(a)?)),
+        ("StringTokenizer", "#new", [s, rest @ ..]) if rest.len() <= 2 => {
+            if null(s) || rest.first().is_some_and(null) {
+                return Some(npe());
+            }
+            let delims = rest.first().map(|d| d.as_str_cow().into_owned());
+            let ret = rest.get(1).is_some_and(|b| matches!(b, Value::Bool(true)));
+            Ok(Value::Obj(heap_alloc(HostObj::Tokenizer(
+                crate::jio::Tokenizer::new(&s.as_str_cow(), delims.as_deref(), ret),
+            ))))
+        }
+        _ => return None,
+    })
+}
+
+/// `System.arraycopy`, with the JDK's checks in the JDK's order: `null`, a
+/// non-array, an element-type mismatch, then the four index checks. The
+/// element types are erased at run time, so the compiler passes each array's
+/// static type (`int[]`, `String[]`, or empty when unknown), which is also what
+/// the messages name — a primitive array as `int[5]`, any reference array as
+/// `object array[5]`.
+fn array_copy(
+    src: &Value,
+    sp: i64,
+    dst: &Value,
+    dp: i64,
+    len: i64,
+    sty: &str,
+    dty: &str,
+) -> Result<Value, Fault> {
+    let (Value::Obj(sid), Value::Obj(did)) = (src, dst) else {
+        if matches!(src, Value::Undef) || matches!(dst, Value::Undef) {
+            return Err(Fault::java("NullPointerException", String::new()));
+        }
+        let (which, v) = if matches!(src, Value::Obj(_)) {
+            ("destination", dst)
+        } else {
+            ("source", src)
+        };
+        let class = value_class(v)
+            .map(|c| binary_name(&c, v).unwrap_or(c))
+            .unwrap_or_default();
+        return Err(Fault::java(
+            "ArrayStoreException",
+            format!("arraycopy: {which} type {class} is not an array"),
+        ));
+    };
+    let items = |id: u32| {
+        HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Array(a)) => Some(a.clone()),
+            _ => None,
+        })
+    };
+    for (which, v, id) in [("source", src, *sid), ("destination", dst, *did)] {
+        if items(id).is_none() {
+            let class = value_class(v)
+                .map(|c| binary_name(&c, v).unwrap_or(c))
+                .unwrap_or_default();
+            return Err(Fault::java(
+                "ArrayStoreException",
+                format!("arraycopy: {which} type {class} is not an array"),
+            ));
+        }
+    }
+    let from = items(*sid).unwrap_or_default();
+    let to_len = items(*did).map_or(0, |a| a.len());
+    // A primitive element type is named as itself; every reference array is
+    // an `object array`.
+    let elem = |ty: &str| -> &'static str {
+        match ty.strip_suffix("[]") {
+            Some("int") => "int",
+            Some("long") => "long",
+            Some("short") => "short",
+            Some("byte") => "byte",
+            Some("char") => "char",
+            Some("boolean") => "boolean",
+            Some("float") => "float",
+            Some("double") => "double",
+            _ => "object array",
+        }
+    };
+    let (se, de) = (elem(sty), elem(dty));
+    let known = !sty.is_empty() && !dty.is_empty();
+    if known && se != de && (se != "object array" || de != "object array") {
+        return Err(Fault::java(
+            "ArrayStoreException",
+            format!("arraycopy: type mismatch: can not copy {se}[] into {de}[]"),
+        ));
+    }
+    let oob = |msg: String| {
+        Err(Fault::java(
+            "ArrayIndexOutOfBoundsException",
+            format!("arraycopy: {msg}"),
+        ))
+    };
+    if sp < 0 {
+        return oob(format!(
+            "source index {sp} out of bounds for {se}[{}]",
+            from.len()
+        ));
+    }
+    if dp < 0 {
+        return oob(format!(
+            "destination index {dp} out of bounds for {de}[{to_len}]"
+        ));
+    }
+    if len < 0 {
+        return oob(format!("length {len} is negative"));
+    }
+    if sp + len > from.len() as i64 {
+        return oob(format!(
+            "last source index {} out of bounds for {se}[{}]",
+            sp + len,
+            from.len()
+        ));
+    }
+    if dp + len > to_len as i64 {
+        return oob(format!(
+            "last destination index {} out of bounds for {de}[{to_len}]",
+            dp + len
+        ));
+    }
+    // Copied through a snapshot of the source range, which is what makes an
+    // overlapping copy within one array behave "as if" through a temporary.
+    let chunk = from[sp as usize..(sp + len) as usize].to_vec();
+    HEAP.with(|h| {
+        if let Some(HostObj::Array(a)) = h.borrow_mut().get_mut(*did as usize) {
+            a[dp as usize..(dp + len) as usize].clone_from_slice(&chunk);
+        }
+    });
+    Ok(Value::Undef)
+}
+
+/// A method call on a `System.in`/`Scanner`/reader/`StringTokenizer`
+/// receiver, or `None` when the receiver is none of those.
+fn io_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jio::{ArgVal, Out};
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let jargs: Vec<ArgVal> = args
+        .iter()
+        .map(|a| match a {
+            Value::Int(n) => ArgVal::Int(*n),
+            other => ArgVal::Str(other.as_str_cow().into_owned()),
+        })
+        .collect();
+    let out = HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Reader(r)) => Some(r.call(method, &jargs)),
+        Some(HostObj::Tokenizer(t)) => Some(t.call(method, args.len())),
+        _ => None,
+    })?;
+    let Some(out) = out else {
+        return Some(Err(Fault::internal(format!(
+            "javars: unsupported method `{method}` with {} argument(s) on {}",
+            args.len(),
+            value_class(recv).unwrap_or_default()
+        ))));
+    };
+    Some(match out {
+        Ok(Out::Str(s)) => Ok(Value::str(s)),
+        Ok(Out::Int(n)) => Ok(Value::Int(n)),
+        Ok(Out::Float(f)) => Ok(Value::float(f)),
+        Ok(Out::Bool(b)) => Ok(Value::bool(b)),
+        Ok(Out::Null | Out::Unit) => Ok(Value::Undef),
+        Ok(Out::Lines(ls)) => Ok(stream_of(
+            ls.into_iter().map(Value::str).collect(),
+            StreamKind::Ref,
+        )),
+        Err((class, msg)) => Err(Fault::java(class, msg.unwrap_or_default())),
+    })
 }
 
 /// The stdlib statics whose whole job is to render an argument, re-implemented
@@ -8721,9 +9026,9 @@ fn collection_static(
         // overloaded on the two in Java and told apart by the target type,
         // which javars has no pass for; the arity is exact and is what the
         // prelude's `asComparator` branches on.
-        ("Comparator", "isKeyExtractor") if args.len() == 1 => Ok(Value::bool(
-            callable_arity(vm, &args[0]) == Some(1),
-        )),
+        ("Comparator", "isKeyExtractor") if args.len() == 1 => {
+            Ok(Value::bool(callable_arity(vm, &args[0]) == Some(1)))
+        }
         // ── java.util.stream sources ──
         ("Stream", "of") => Ok(stream_of(varargs_items(args), StreamKind::Ref)),
         // The three-argument `iterate(seed, hasNext, f)` bounds itself, so it is
@@ -13222,6 +13527,9 @@ fn obj_default_str(id: u32) -> String {
             // which is not reproducible (and not stable across JVM runs), so
             // javars prints a fixed marker instead. See `BUGS.md`.
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
+            // A reader renders as `Object.toString()` does: class, `@`, hash.
+            Some(HostObj::Reader(r)) => format!("{}@{id:x}", r.kind.class_name()),
+            Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Boxed) => unreachable!("a box is answered above"),
             Some(HostObj::Iterator { .. }) => format!("<iterator>@{id:x}"),
             Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),
@@ -14043,6 +14351,7 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
     let len = || sequence_len(v).unwrap_or(0);
     Some(match class {
         "[]" => return None,
+        qualified if qualified.starts_with("java.") => qualified.to_string(),
         "List$fixed" => "java.util.Arrays$ArrayList".to_string(),
         "List$immutable" => match len() {
             1 | 2 => "java.util.ImmutableCollections$List12".to_string(),

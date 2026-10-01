@@ -12,6 +12,7 @@ pub mod cli;
 pub mod compiler;
 pub mod dap;
 pub mod host;
+pub mod jio;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
@@ -87,7 +88,10 @@ pub(crate) fn functional_sam_map(prog: &ast::Program) -> std::collections::HashM
         .iter()
         .filter_map(|(name, sam, _)| {
             let head = sam.split('(').next()?;
-            Some((name.to_string(), head.split_whitespace().last()?.to_string()))
+            Some((
+                name.to_string(),
+                head.split_whitespace().last()?.to_string(),
+            ))
         })
         .collect();
     for c in prog.classes.iter().filter(|c| c.is_interface) {

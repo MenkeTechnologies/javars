@@ -63,7 +63,11 @@ fn main() -> ExitCode {
     }
 
     match javars::run_str_args(&src, &cli.argv) {
-        Ok(_) => ExitCode::SUCCESS,
+        // `System.exit(n)` reports `n` modulo 256, as a Unix process does.
+        Ok(_) => match javars::host::exit_code() {
+            Some(code) => ExitCode::from(code as u8),
+            None => ExitCode::SUCCESS,
+        },
         Err(e) => fail(&e),
     }
 }

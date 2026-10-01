@@ -551,9 +551,11 @@ fn strip_annotations(toks: Vec<Token>) -> Result<Vec<Token>, String> {
         }
         let line = toks[i].line;
         match toks.get(i + 1).map(|t| &t.kind) {
-            Some(Tok::Ident(w)) if w == "interface" => return Err(format!(
+            Some(Tok::Ident(w)) if w == "interface" => {
+                return Err(format!(
                 "javars: annotation type declarations (`@interface`) are not modeled (line {line})"
-            )),
+            ))
+            }
             Some(Tok::Ident(_)) => i += 2,
             _ => {
                 return Err(format!(

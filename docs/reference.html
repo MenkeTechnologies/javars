@@ -758,43 +758,67 @@ System.out.println(arr.length);</code></pre>
         <h2>Console IO</h2>
         <article class="doc-entry" id="doc-console-io-1">
           <h3><a class="doc-anchor" href="#doc-console-io-1">#</a> <code>System</code></h3>
-          <pre><code class="lang-java">System.out   |   System.err</code></pre>
-          <p>The <code>System</code> class. javars models exactly two of its members — the two console streams. <code>System.in</code> is rejected at parse time with a message naming it, so a program that reads stdin fails loudly rather than silently returning nothing.</p>
-          <pre><code class="lang-java">System.out.println(42);</code></pre>
+          <pre><code class="lang-java">System.out   |   System.err   |   System.in   |   System.exit(int)   |   System.arraycopy(src, sp, dst, dp, n)</code></pre>
+          <p>The <code>System</code> class: the two output streams, the input stream <code>System.in</code> that a <code>Scanner</code> or an <code>InputStreamReader</code> wraps, and the statics <code>exit</code>, <code>arraycopy</code>, <code>currentTimeMillis</code>, <code>nanoTime</code> and <code>lineSeparator</code>. <code>exit(n)</code> stops the program where it stands — no <code>finally</code> runs — and the process reports <code>n</code> modulo 256. <code>arraycopy</code> makes Java's checks in Java's order (null, non-array, element-type mismatch, then the index checks) with the JDK's messages, and copies an overlapping range of one array as if through a temporary.</p>
+          <pre><code class="lang-java">int[] a = {1, 2, 3}, b = new int[3];
+System.arraycopy(a, 0, b, 1, 2);   // b is [0, 1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-console-io-2">
-          <h3><a class="doc-anchor" href="#doc-console-io-2">#</a> <code>System.out</code></h3>
-          <pre><code class="lang-java">System.out</code></pre>
-          <p>The standard output stream. It is not an object javars can pass around: <code>System.out</code> is recognized only as the receiver of <code>print</code>/<code>println</code> or as the left side of a <code>System.out::println</code> method reference.</p>
-          <pre><code class="lang-java">System.out.print("x");</code></pre>
+          <h3><a class="doc-anchor" href="#doc-console-io-2">#</a> <code>Scanner</code></h3>
+          <pre><code class="lang-java">new Scanner(System.in)   |   new Scanner(String text)</code></pre>
+          <p><code>java.util.Scanner</code> over stdin or a string. Tokens are delimited by Java whitespace: <code>next</code>, <code>nextInt</code>/<code>nextLong</code>/<code>nextShort</code>/<code>nextByte</code>, <code>nextDouble</code>/<code>nextFloat</code>, <code>nextBoolean</code>, and the matching <code>hasNext*</code> skip delimiters and read one token; <code>nextLine</code>/<code>hasNextLine</code> answer the rest of the current line (empty right after a <code>nextInt</code>). A token that is not the requested type throws <code>InputMismatchException</code> and stays unread (an out-of-range integer's message is <code>For input string: "…"</code>); the root locale's grouping separator is accepted (<code>1,234</code>). Exhausted input is <code>NoSuchElementException</code> (<code>No line found</code> from <code>nextLine</code>), and a closed scanner answers <code>IllegalStateException: Scanner closed</code>. Every reader over <code>System.in</code> shares one stream, filled a line at a time, and stdout is flushed before a read blocks, so a prompt shows before its answer is typed.</p>
+          <pre><code class="lang-java">Scanner sc = new Scanner(System.in);
+int n = sc.nextInt();
+String rest = sc.nextLine();</code></pre>
         </article>
         <article class="doc-entry" id="doc-console-io-3">
-          <h3><a class="doc-anchor" href="#doc-console-io-3">#</a> <code>System.err</code></h3>
+          <h3><a class="doc-anchor" href="#doc-console-io-3">#</a> <code>BufferedReader</code></h3>
+          <pre><code class="lang-java">new BufferedReader(new InputStreamReader(System.in))   |   new BufferedReader(new StringReader(text))</code></pre>
+          <p><code>java.io.BufferedReader</code> over stdin or a <code>StringReader</code>. <code>readLine</code> answers each line without its terminator (<code>\n</code>, <code>\r\n</code>, or <code>\r</code>) and <code>null</code> at the end of input; <code>read</code> answers one character or -1; <code>lines()</code> is a stream of the remaining lines; <code>ready</code> and <code>skip</code> are supported. After <code>close</code> every read throws <code>IOException: Stream closed</code>.</p>
+          <pre><code class="lang-java">BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+String line;
+while ((line = br.readLine()) != null) System.out.println(line.trim());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-4">
+          <h3><a class="doc-anchor" href="#doc-console-io-4">#</a> <code>StringTokenizer</code></h3>
+          <pre><code class="lang-java">new StringTokenizer(String s [, String delims [, boolean returnDelims]])</code></pre>
+          <p><code>java.util.StringTokenizer</code>: the tokens of <code>s</code> split on any of the delimiter characters (default <code>" \t\n\r\f"</code>), with the delimiters themselves as tokens when <code>returnDelims</code> is true. <code>hasMoreTokens</code>/<code>hasMoreElements</code>, <code>nextToken</code>/<code>nextElement</code> (<code>NoSuchElementException</code> when none remain) and <code>countTokens</code> are supported.</p>
+          <pre><code class="lang-java">StringTokenizer st = new StringTokenizer("3 4");
+int a = Integer.parseInt(st.nextToken());</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-5">
+          <h3><a class="doc-anchor" href="#doc-console-io-5">#</a> <code>System.out</code></h3>
+          <pre><code class="lang-java">System.out</code></pre>
+          <p>The standard output stream. It is not an object javars can pass around: <code>System.out</code> is recognized only as the receiver of <code>print</code>/<code>println</code>/<code>printf</code>/<code>flush</code> or as the left side of a <code>System.out::println</code> method reference.</p>
+          <pre><code class="lang-java">System.out.print("x");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-6">
+          <h3><a class="doc-anchor" href="#doc-console-io-6">#</a> <code>System.err</code></h3>
           <pre><code class="lang-java">System.err</code></pre>
           <p>The standard error stream, recognized in exactly the same positions as <code>System.out</code> and lowered to the stderr pair of print builtins.</p>
           <pre><code class="lang-java">System.err.println("oops");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-4">
-          <h3><a class="doc-anchor" href="#doc-console-io-4">#</a> <code>System.out.println</code></h3>
+        <article class="doc-entry" id="doc-console-io-7">
+          <h3><a class="doc-anchor" href="#doc-console-io-7">#</a> <code>System.out.println</code></h3>
           <pre><code class="lang-java">void System.out.println([Object x])</code></pre>
           <p>Prints one argument in Java's <code>String.valueOf</code> form followed by a newline, then returns nothing. The Java formatting is the point of the builtin: <code>true</code> prints as <code>true</code> (not <code>1</code>), a whole double as <code>3.0</code> (not <code>3</code>), and a null reference as <code>null</code>. Called with no argument it prints just the newline.</p>
           <pre><code class="lang-java">System.out.println("hello");
 System.out.println();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-5">
-          <h3><a class="doc-anchor" href="#doc-console-io-5">#</a> <code>System.out.print</code></h3>
+        <article class="doc-entry" id="doc-console-io-8">
+          <h3><a class="doc-anchor" href="#doc-console-io-8">#</a> <code>System.out.print</code></h3>
           <pre><code class="lang-java">void System.out.print([Object x])</code></pre>
           <p>As <code>println</code>, but with no trailing newline.</p>
           <pre><code class="lang-java">System.out.print("no newline");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-6">
-          <h3><a class="doc-anchor" href="#doc-console-io-6">#</a> <code>System.err.println</code></h3>
+        <article class="doc-entry" id="doc-console-io-9">
+          <h3><a class="doc-anchor" href="#doc-console-io-9">#</a> <code>System.err.println</code></h3>
           <pre><code class="lang-java">void System.err.println([Object x])</code></pre>
           <p>As <code>System.out.println</code>, writing to stderr. stdout and stderr are locked and written independently, so redirecting one does not reorder the other.</p>
           <pre><code class="lang-java">System.err.println("to stderr");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-7">
-          <h3><a class="doc-anchor" href="#doc-console-io-7">#</a> <code>System.err.print</code></h3>
+        <article class="doc-entry" id="doc-console-io-10">
+          <h3><a class="doc-anchor" href="#doc-console-io-10">#</a> <code>System.err.print</code></h3>
           <pre><code class="lang-java">void System.err.print([Object x])</code></pre>
           <p>As <code>System.err.println</code>, with no trailing newline.</p>
           <pre><code class="lang-java">System.err.print("partial");</code></pre>
@@ -1845,13 +1869,31 @@ l.add(4);
           <pre><code class="lang-java">try { Collections.max(new ArrayList&lt;&gt;()); } catch (NoSuchElementException e) { System.out.println(e); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-throwables-18">
-          <h3><a class="doc-anchor" href="#doc-throwables-18">#</a> <code>IllegalFormatException</code></h3>
+          <h3><a class="doc-anchor" href="#doc-throwables-18">#</a> <code>InputMismatchException</code></h3>
+          <pre><code class="lang-java">class InputMismatchException extends NoSuchElementException</code></pre>
+          <p>Raised by a <code>Scanner</code> <code>nextInt</code>/<code>nextDouble</code>/… whose token is not of the requested type; the token stays unread. An integer token out of range carries <code>For input string: "…"</code>, any other none. Prints as <code>java.util.InputMismatchException</code>.</p>
+          <pre><code class="lang-java">try { new Scanner("x").nextInt(); } catch (InputMismatchException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-19">
+          <h3><a class="doc-anchor" href="#doc-throwables-19">#</a> <code>IOException</code></h3>
+          <pre><code class="lang-java">class IOException extends Exception</code></pre>
+          <p>The checked <code>java.io</code> exception. A closed <code>BufferedReader</code> raises it as <code>java.io.IOException: Stream closed</code>; a <code>throws IOException</code> clause on <code>main</code> is accepted as Java requires it.</p>
+          <pre><code class="lang-java">try { br.readLine(); } catch (IOException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-20">
+          <h3><a class="doc-anchor" href="#doc-throwables-20">#</a> <code>ArrayStoreException</code></h3>
+          <pre><code class="lang-java">class ArrayStoreException extends RuntimeException</code></pre>
+          <p>Raised by <code>System.arraycopy</code> when an argument is not an array or the two element types cannot be copied between, with the JDK's message (<code>arraycopy: type mismatch: can not copy int[] into long[]</code>).</p>
+          <pre><code class="lang-java">try { System.arraycopy(new int[1], 0, new long[1], 0, 1); } catch (ArrayStoreException e) { System.out.println(e); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-21">
+          <h3><a class="doc-anchor" href="#doc-throwables-21">#</a> <code>IllegalFormatException</code></h3>
           <pre><code class="lang-java">class IllegalFormatException extends IllegalArgumentException</code></pre>
           <p>The base of the <code>java.util.Formatter</code> failures. It is not thrown directly; catching it catches the conversion mismatch below.</p>
           <pre><code class="lang-java">try { String.format("%d", 1.5); } catch (IllegalFormatException e) { System.out.println("bad format"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-throwables-19">
-          <h3><a class="doc-anchor" href="#doc-throwables-19">#</a> <code>IllegalFormatConversionException</code></h3>
+        <article class="doc-entry" id="doc-throwables-22">
+          <h3><a class="doc-anchor" href="#doc-throwables-22">#</a> <code>IllegalFormatConversionException</code></h3>
           <pre><code class="lang-java">class IllegalFormatConversionException extends IllegalFormatException</code></pre>
           <p>Raised when a <code>String.format</code>/<code>printf</code> conversion does not accept its argument's boxed type — <code>%d</code> of a <code>Double</code>, <code>%f</code> of an <code>Integer</code>, <code>%c</code> of a <code>String</code>. The detail message is Java's <code>&lt;conversion&gt; != &lt;class&gt;</code>.</p>
           <pre><code class="lang-java">try { System.out.println(String.format("%.2f", 3)); } catch (IllegalFormatConversionException e) { System.out.println(e.getMessage()); }   // f != java.lang.Integer</code></pre>

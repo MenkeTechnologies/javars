@@ -216,7 +216,10 @@ impl Parser {
                 continue;
             };
             let nargs = anon_cl.ctors[0].params.len() - anon_cl.captures.len();
-            let mut fits = sup_cl.ctors.iter().filter(|c| c.params.len() - own == nargs);
+            let mut fits = sup_cl
+                .ctors
+                .iter()
+                .filter(|c| c.params.len() - own == nargs);
             let (Some(fit), None) = (fits.next(), fits.next()) else {
                 continue;
             };
@@ -3267,7 +3270,9 @@ impl Parser {
                         args,
                         line,
                     };
-                } else if member == "CASE_INSENSITIVE_ORDER" && matches!(&e, Expr::Var(c) if c == "String") {
+                } else if member == "CASE_INSENSITIVE_ORDER"
+                    && matches!(&e, Expr::Var(c) if c == "String")
+                {
                     // `String.CASE_INSENSITIVE_ORDER` is the comparator whose
                     // `compare` is `compareToIgnoreCase` — the JDK documents
                     // the method as "the same as" this comparator — so it is
@@ -3693,7 +3698,10 @@ impl Parser {
     /// a modeled throwable.
     fn is_class_name(&self, name: &str) -> bool {
         self.class_names.contains(name)
-            || self.local_classes.iter().any(|c| c.name == name && !c.is_interface)
+            || self
+                .local_classes
+                .iter()
+                .any(|c| c.name == name && !c.is_interface)
             || crate::prelude::is_throwable(name)
     }
 
@@ -3715,7 +3723,10 @@ impl Parser {
         line: u32,
     ) -> Result<Expr, String> {
         let outer = self.enclosing.last().cloned().unwrap_or_default();
-        let n = self.local_counts.entry((outer.clone(), String::new())).or_insert(0);
+        let n = self
+            .local_counts
+            .entry((outer.clone(), String::new()))
+            .or_insert(0);
         *n += 1;
         let binary = format!("{outer}${n}");
         let start = self.pos;
@@ -3882,13 +3893,30 @@ impl Parser {
     fn system_out(&mut self) -> Result<Expr, String> {
         self.ident()?; // System
         self.eat(&Tok::Dot)?;
+        let line = self.line();
         let stream = self.ident()?;
+        let system_call = |method: &str, args: Vec<Expr>| Expr::MethodCall {
+            recv: Box::new(Expr::Var("System".to_string())),
+            method: method.to_string(),
+            args,
+            line,
+        };
         let err = match stream.as_str() {
             "out" => false,
             "err" => true,
+            // `System.in` is the console input stream a `Scanner` or an
+            // `InputStreamReader` wraps. `#` keeps the host's name for it out
+            // of the user's namespace.
+            "in" => return Ok(system_call("#in", Vec::new())),
+            // The other `System` members javars models — `exit`, `arraycopy`,
+            // `currentTimeMillis`, `nanoTime`, `lineSeparator` — are statics.
+            _ if self.is(&Tok::LParen) => {
+                let args = self.call_args()?;
+                return Ok(system_call(&stream, args));
+            }
             _ => {
                 return Err(format!(
-                    "javars: only `System.out`/`System.err` are supported, not `System.{stream}` (line {})",
+                    "javars: `System.{stream}` is not a member javars models (line {})",
                     self.line()
                 ))
             }
@@ -3896,6 +3924,17 @@ impl Parser {
         self.eat(&Tok::Dot)?;
         let line = self.line();
         let method = self.ident()?;
+        // `flush()` writes out whatever the stream holds; the host's streams
+        // hold nothing a later write would not also flush, but a prompt read
+        // back by another process must not wait for the program to end.
+        if method == "flush" {
+            self.eat(&Tok::LParen)?;
+            self.eat(&Tok::RParen)?;
+            return Ok(system_call(
+                if err { "#flushErr" } else { "#flushOut" },
+                Vec::new(),
+            ));
+        }
         // `printf(fmt, args…)` is `print(String.format(fmt, args…))` — the same
         // formatter, no trailing newline. Desugaring here keeps one formatting
         // implementation instead of two.

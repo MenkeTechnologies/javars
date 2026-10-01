@@ -57,6 +57,9 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("PatternSyntaxException", "IllegalArgumentException"),
     ("ConcurrentModificationException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
+    ("InputMismatchException", "NoSuchElementException"),
+    ("IOException", "Exception"),
+    ("ArrayStoreException", "RuntimeException"),
     ("IllegalFormatException", "IllegalArgumentException"),
     ("IllegalFormatConversionException", "IllegalFormatException"),
     // The rest of `java.util`'s format family. Each is a *catchable*
@@ -97,6 +100,7 @@ const CAUSE_CTORS: &[&str] = &[
     "UnsupportedOperationException",
     "ConcurrentModificationException",
     "NoSuchElementException",
+    "IOException",
 ];
 
 /// True when `name` is one of the modeled JDK throwables.
@@ -116,8 +120,10 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
     }
     Some(match name {
         "PatternSyntaxException" => format!("java.util.regex.{name}"),
+        "IOException" => format!("java.io.{name}"),
         "ConcurrentModificationException"
         | "NoSuchElementException"
+        | "InputMismatchException"
         | "IllegalFormatException"
         | "IllegalFormatConversionException"
         | "IllegalFormatWidthException"

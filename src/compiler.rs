@@ -1787,6 +1787,13 @@ impl Compiler {
                 {
                     return Some(t.to_string());
                 }
+                if let Some(t) = self
+                    .expr_java_type(recv)
+                    .as_deref()
+                    .and_then(|t| input_call_java_type(t, method))
+                {
+                    return Some(t.to_string());
+                }
                 // A collection receiver's known return types.
                 if let Some(kind) = self
                     .expr_java_type(recv)
@@ -6513,6 +6520,18 @@ impl Compiler {
                     let c = self.b.add_constant(v);
                     self.b.emit(Op::LoadConst(c), line);
                 }
+                // `System.arraycopy` checks the two arrays' element types
+                // against each other and names them in its messages
+                // (`int[5]`, `object array[2]`); only the static types carry
+                // them, so both ride along as two more operands.
+                let array_tags = class == "System" && method == "arraycopy" && args.len() == 5;
+                if array_tags {
+                    for a in [&args[0], &args[2]] {
+                        let ty = self.expr_java_type(a).unwrap_or_default();
+                        let c = self.b.add_constant(Value::str(ty));
+                        self.b.emit(Op::LoadConst(c), line);
+                    }
+                }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
                 let method_c = self.b.add_constant(Value::str(method.to_string()));
@@ -6522,7 +6541,11 @@ impl Compiler {
                 // is one of each.
                 self.emit_raising_builtin(
                     crate::host::JSTATIC_DISPATCH,
-                    args.len() as u8 + 2 + u8::from(widened.is_some()) + u8::from(pad.is_some()),
+                    args.len() as u8
+                        + 2
+                        + u8::from(widened.is_some())
+                        + u8::from(pad.is_some())
+                        + 2 * u8::from(array_tags),
                     line,
                 );
                 // The `Math` overloads that overflow at `int` width:
@@ -7114,6 +7137,19 @@ impl Compiler {
             }
             self.emit_raising_builtin(crate::host::JSB_NEW, 2, line);
             return Ok(());
+        }
+        // `new Scanner(System.in)`, `new BufferedReader(new
+        // InputStreamReader(System.in))`, `new StringTokenizer(line)` — the
+        // input classes are host shapes (see `crate::jio`), built by the
+        // `#new` static their class answers to.
+        if !self.classes.contains_key(class) && is_input_class(class) {
+            let new_call = Expr::MethodCall {
+                recv: Box::new(Expr::Var(class.to_string())),
+                method: "#new".to_string(),
+                args: args.to_vec(),
+                line,
+            };
+            return self.expr(&new_call);
         }
         // `new PriorityQueue<>(…)` — every JDK overload but the `SortedSet` one:
         // `()`, `(int)`, `(Comparator)`, `(int, Comparator)`, `(Collection)`.
@@ -8319,6 +8355,14 @@ fn is_static_class(name: &str) -> bool {
             | "Collectors"
             | "Comparator"
             | "Objects"
+            // `System`'s statics beyond its two streams, and the input
+            // classes, whose constructors `new` lowers to the `#new` static.
+            | "System"
+            | "Scanner"
+            | "BufferedReader"
+            | "InputStreamReader"
+            | "StringReader"
+            | "StringTokenizer"
     )
 }
 
@@ -8435,6 +8479,14 @@ fn boxed_call_java_type(method: &str, argc: usize) -> Option<&'static str> {
 /// 32-bit `int` wrap decision.
 fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
     Some(match (class, method) {
+        ("System", "currentTimeMillis" | "nanoTime") => "long",
+        ("System", "lineSeparator") => "String",
+        ("System", "#in") => "InputStream",
+        ("Scanner", "#new") => "Scanner",
+        ("BufferedReader", "#new") => "BufferedReader",
+        ("InputStreamReader", "#new") => "InputStreamReader",
+        ("StringReader", "#new") => "StringReader",
+        ("StringTokenizer", "#new") => "StringTokenizer",
         ("Integer", "parseInt") => "int",
         // The wrapper `valueOf`s answer a *reference*, and saying so is what
         // makes `Integer.valueOf(128) == Integer.valueOf(128)` compare handles
@@ -9152,4 +9204,36 @@ fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<()
         }
     }
     Ok(())
+}
+
+/// The input classes `crate::jio` models as host shapes.
+fn is_input_class(name: &str) -> bool {
+    matches!(
+        name,
+        "Scanner" | "BufferedReader" | "InputStreamReader" | "StringReader" | "StringTokenizer"
+    )
+}
+
+/// The declared Java return type of a method of one of the input classes, so
+/// `sc.nextInt() / 2` truncates and `(char) br.read()` is a character.
+fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
+    Some(match (recv_ty, method) {
+        ("Scanner", "nextInt") => "int",
+        ("Scanner", "nextLong") => "long",
+        ("Scanner", "nextShort") => "short",
+        ("Scanner", "nextByte") => "byte",
+        ("Scanner", "nextDouble") => "double",
+        ("Scanner", "nextFloat") => "float",
+        ("Scanner", "nextBoolean") => "boolean",
+        ("Scanner", "next" | "nextLine") => "String",
+        ("Scanner", m) if m.starts_with("hasNext") => "boolean",
+        ("BufferedReader" | "InputStreamReader" | "StringReader" | "InputStream", "read") => "int",
+        ("BufferedReader" | "InputStreamReader" | "StringReader", "ready") => "boolean",
+        ("BufferedReader", "readLine") => "String",
+        ("BufferedReader" | "InputStreamReader" | "StringReader", "skip") => "long",
+        ("StringTokenizer", "nextToken") => "String",
+        ("StringTokenizer", "hasMoreTokens" | "hasMoreElements") => "boolean",
+        ("StringTokenizer", "countTokens") => "int",
+        _ => return None,
+    })
 }

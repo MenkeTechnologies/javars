@@ -1366,18 +1366,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
   the `Objects` members, the `String` instance methods, and the `java.util`
   collections are the whole
-  library surface — no I/O. A stream is evaluated
+  library surface, with console and text input (`Scanner`, `BufferedReader`
+  over `InputStreamReader`/`StringReader`, `StringTokenizer`) and no file,
+  network, or other I/O. A stream is evaluated
   in one thread whatever `parallel()` would ask for, which is observable only
   through a side-effecting pipeline's *ordering* — Java makes no ordering
   promise for one either. An iterator over a `Set` is not fail-fast, because a `Set` carries no
   modification counter for it to check; Java's raises
   `ConcurrentModificationException` there too. `Math.powExact` and the
   `unsignedMultiplyExact`/`unsignedPowExact` pair are on the same footing: a
-  call is a compile error naming the method. `System` carries
-  only its two streams: `System.exit(3)` is
-  ``javars: only `System.out`/`System.err` are supported, not `System.exit` ``,
-  which also means a program cannot choose its exit status — 0 for a clean run
-  and 1 for an uncaught throwable are the only two javars produces.
+  call is a compile error naming the method. `System` carries its three
+  streams and `exit`, `arraycopy`, `currentTimeMillis`, `nanoTime` and
+  `lineSeparator`; any other member call (`getProperty`, `getenv`,
+  `identityHashCode`, `setOut`) stops the program with
+  ``javars: unsupported static method `System.getProperty` with 1 argument(s)``
+  when it is reached, and any other field is refused at parse time. A `Scanner` reads in the root locale only, as every
+  other javars formatter does, and takes no custom delimiter
+  (`useDelimiter`), radix, `findInLine`, or pattern argument.
 - **`Math`'s transcendentals** (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`,
   `atan2`, `exp`, `log`, `log10`, `cbrt`, `hypot`, `sinh`/`cosh`/`tanh`). The JDK
   answers these from its own fdlibm-derived implementation and permits a 1-ulp
@@ -1987,7 +1992,7 @@ The three are `tests/parity.rs` (replays the frozen corpus, no JDK needed),
 | all three | **`javac` diagnostics** | No harness compares a rejection *message*. The capture script drops a program `javac` refuses; the fuzzer counts it a skip; the corpus can only hold programs that ran. Every "javars: cannot find symbol" wording in this file was checked by hand. |
 | all three | **anything needing a JVM flag** | The launcher is invoked with the source file and (for the oracle) the locale pin. No `-ea`, no `-g`, no `-Xss`, no `--enable-preview`, no classpath beyond the working directory. |
 | all three | **more than one source file** | One `T.java` per run. Packages, imports of a second unit, and split compilation are unreachable by construction. |
-| all three | **stdin** | The fuzzer nulls it; the other two inherit a terminal. `Scanner`/`System.in` has no probe. |
+| all three | **stdin** | The fuzzer nulls it, and the capture script's `java` inherits the loop's stdin — which is the programs file itself — so a corpus record must not read `System.in`. Reading stdin is pinned by the `run_stdin` tests in `tests/eval.rs` instead, with expectations measured on openjdk 27. |
 | `parity.rs` + capture | **empty output** | A record is written only when stdout is non-empty, and the replay asserts a frozen string, so "prints nothing" cannot be frozen as the expected answer. |
 | `parity.rs` + capture | **a non-zero exit** | Rejected at capture time. An uncaught exception's exit status is therefore never frozen. |
 | `parity.rs` + capture | **trailing blank lines** | `$(...)` strips them and the script puts exactly one back, so the number of trailing newlines is pinned to 1 for every record. |
