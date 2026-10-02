@@ -5985,6 +5985,34 @@ fn iterator_source(v: &Value) -> Option<Value> {
     })
 }
 
+/// `Object.clone()` for a class instance: a shallow copy, or the JDK's
+/// `CloneNotSupportedException` (its message the class name) when no
+/// supertype is `Cloneable`. `None` for any other receiver.
+fn instance_clone(recv: &Value) -> Option<Result<Value, Fault>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let (class, fields) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Instance { class, fields }) => Some((class.clone(), fields.clone())),
+        _ => None,
+    })?;
+    let mut cloneable = false;
+    walk_supertypes(&class, &mut |c| {
+        cloneable = c == "Cloneable";
+        cloneable
+    });
+    if !cloneable {
+        return Some(Err(Fault::java(
+            "CloneNotSupportedException",
+            qualified_or_binary(&class),
+        )));
+    }
+    Some(Ok(Value::Obj(heap_alloc(HostObj::Instance {
+        class,
+        fields,
+    }))))
+}
+
 /// Whether heap slot `id` holds a map's `values()` view.
 fn is_values_view(id: u32) -> bool {
     HEAP.with(|h| {
@@ -8888,6 +8916,18 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     }
     if let Some(v) = object_method(&recv, &method, &args) {
         return v;
+    }
+    // `Object.clone()` on a class instance — reached through `super.clone()`
+    // in an override, which is the only way a program calls it: a field-by-
+    // field copy of the same runtime class, or `CloneNotSupportedException`
+    // naming the class when it is not `Cloneable`.
+    if method == "clone" && args.is_empty() {
+        if let Some(r) = instance_clone(&recv) {
+            return match r {
+                Ok(v) => v,
+                Err(f) => raise(vm, f),
+            };
+        }
     }
     // `T[].clone()`, the one member an array declares beyond `Object`'s (JLS
     // 10.7): a new array of the same length holding the same elements — a

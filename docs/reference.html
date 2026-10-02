@@ -2094,19 +2094,31 @@ l.add(4);
           <pre><code class="lang-java">try { br.readLine(); } catch (IOException e) { System.out.println(e); }</code></pre>
         </article>
         <article class="doc-entry" id="doc-throwables-20">
-          <h3><a class="doc-anchor" href="#doc-throwables-20">#</a> <code>ArrayStoreException</code></h3>
+          <h3><a class="doc-anchor" href="#doc-throwables-20">#</a> <code>AssertionError</code></h3>
+          <pre><code class="lang-java">class AssertionError extends Error</code></pre>
+          <p>The error a program throws by hand for a branch that cannot be reached, with an optional message.</p>
+          <pre><code class="lang-java">throw new AssertionError("unreachable");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-21">
+          <h3><a class="doc-anchor" href="#doc-throwables-21">#</a> <code>CloneNotSupportedException</code></h3>
+          <pre><code class="lang-java">class CloneNotSupportedException extends Exception</code></pre>
+          <p>What <code>super.clone()</code> throws for a class that does not implement <code>Cloneable</code>; its message is the class's binary name. On a <code>Cloneable</code> class <code>super.clone()</code> is a field-by-field copy of the same runtime class.</p>
+          <pre><code class="lang-java">try { return (Point) super.clone(); } catch (CloneNotSupportedException e) { throw new AssertionError(); }</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-throwables-22">
+          <h3><a class="doc-anchor" href="#doc-throwables-22">#</a> <code>ArrayStoreException</code></h3>
           <pre><code class="lang-java">class ArrayStoreException extends RuntimeException</code></pre>
           <p>Raised by <code>System.arraycopy</code> when an argument is not an array or the two element types cannot be copied between, with the JDK's message (<code>arraycopy: type mismatch: can not copy int[] into long[]</code>).</p>
           <pre><code class="lang-java">try { System.arraycopy(new int[1], 0, new long[1], 0, 1); } catch (ArrayStoreException e) { System.out.println(e); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-throwables-21">
-          <h3><a class="doc-anchor" href="#doc-throwables-21">#</a> <code>IllegalFormatException</code></h3>
+        <article class="doc-entry" id="doc-throwables-23">
+          <h3><a class="doc-anchor" href="#doc-throwables-23">#</a> <code>IllegalFormatException</code></h3>
           <pre><code class="lang-java">class IllegalFormatException extends IllegalArgumentException</code></pre>
           <p>The base of the <code>java.util.Formatter</code> failures. It is not thrown directly; catching it catches the conversion mismatch below.</p>
           <pre><code class="lang-java">try { String.format("%d", 1.5); } catch (IllegalFormatException e) { System.out.println("bad format"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-throwables-22">
-          <h3><a class="doc-anchor" href="#doc-throwables-22">#</a> <code>IllegalFormatConversionException</code></h3>
+        <article class="doc-entry" id="doc-throwables-24">
+          <h3><a class="doc-anchor" href="#doc-throwables-24">#</a> <code>IllegalFormatConversionException</code></h3>
           <pre><code class="lang-java">class IllegalFormatConversionException extends IllegalFormatException</code></pre>
           <p>Raised when a <code>String.format</code>/<code>printf</code> conversion does not accept its argument's boxed type — <code>%d</code> of a <code>Double</code>, <code>%f</code> of an <code>Integer</code>, <code>%c</code> of a <code>String</code>. The detail message is Java's <code>&lt;conversion&gt; != &lt;class&gt;</code>.</p>
           <pre><code class="lang-java">try { System.out.println(String.format("%.2f", 3)); } catch (IllegalFormatConversionException e) { System.out.println(e.getMessage()); }   // f != java.lang.Integer</code></pre>

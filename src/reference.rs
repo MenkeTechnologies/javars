@@ -2278,6 +2278,20 @@ pub const REFERENCE: &[Entry] = &[
         "try { br.readLine(); } catch (IOException e) { System.out.println(e); }",
     ),
     (
+        "AssertionError",
+        "Throwables",
+        "class AssertionError extends Error",
+        "The error a program throws by hand for a branch that cannot be reached, with an optional message.",
+        "throw new AssertionError(\"unreachable\");",
+    ),
+    (
+        "CloneNotSupportedException",
+        "Throwables",
+        "class CloneNotSupportedException extends Exception",
+        "What `super.clone()` throws for a class that does not implement `Cloneable`; its message is the class's binary name. On a `Cloneable` class `super.clone()` is a field-by-field copy of the same runtime class.",
+        "try { return (Point) super.clone(); } catch (CloneNotSupportedException e) { throw new AssertionError(); }",
+    ),
+    (
         "ArrayStoreException",
         "Throwables",
         "class ArrayStoreException extends RuntimeException",

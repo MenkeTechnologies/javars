@@ -60,6 +60,11 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("InputMismatchException", "NoSuchElementException"),
     ("IOException", "Exception"),
     ("ArrayStoreException", "RuntimeException"),
+    // The `assert`-style failure a program throws by hand
+    // (`throw new AssertionError()` in an unreachable branch).
+    ("AssertionError", "Error"),
+    // What `Object.clone()` throws for a class that is not `Cloneable`.
+    ("CloneNotSupportedException", "Exception"),
     ("IllegalFormatException", "IllegalArgumentException"),
     ("IllegalFormatConversionException", "IllegalFormatException"),
     // The rest of `java.util`'s format family. Each is a *catchable*

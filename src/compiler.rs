@@ -7168,7 +7168,7 @@ impl Compiler {
         // `toString`, and the identity `hashCode`.
         if matches!(
             (method, args.len()),
-            ("toString", 0) | ("hashCode", 0) | ("equals", 1)
+            ("toString", 0) | ("hashCode", 0) | ("equals", 1) | ("clone", 0)
         ) {
             self.emit_this(line);
             for a in args {

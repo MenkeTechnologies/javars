@@ -446,6 +446,9 @@ Implemented and checked against the reference `java`:
   sorted), `List.listIterator` walks both ways and writes at its cursor, and a
   local `record`/`enum`/`interface`/`class` declared in a method body runs
   under `javac`'s binary name (`T$1Point`).
+- **`Object.clone()`** — `super.clone()` in a `Cloneable` class is a field-by-field
+  copy of the same runtime class (arrays clone too); a class that is not
+  `Cloneable` gets `CloneNotSupportedException` naming it.
 - **Anonymous classes** — `new I() { … }` and `new Base(args) { … }` with
   fields, instance initializers, several methods, and overrides of
   `toString`/`equals`/`hashCode`, lowered as `javac` lowers them: a class named
