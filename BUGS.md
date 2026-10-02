@@ -1163,16 +1163,14 @@ storage-model differences:
   functional interface in the prelude and for the two stream stages whose
   result is a reference by signature — `mapToObj`, and `map` on a pipeline the
   compiler can read as a `Stream` (`"abc".chars().mapToObj(c -> (char) c)` is
-  `[a, b, c]`, and `IntStream.map` still widens the same body to `97`). The
-  other JDK methods that take an untargeted lambda do not convert yet, measured
-  on `openjdk 27`. The `Collectors` factories convert: every lambda one takes
-  answers a reference except its predicates, `ToXFunction`s, and comparators,
-  so `groupingBy(s -> s.charAt(0))` keys by `Character`.
-
-  ```java
-  System.out.println(Optional.of("q").map(s -> s.charAt(0)).get());
-  // Java: q         javars: 113
-  ```
+  `[a, b, c]`, and `IntStream.map` still widens the same body to `97`). So do
+  the `Collectors` factories (every lambda but their predicates, `ToXFunction`s
+  and comparators), `Optional`'s `map`/`flatMap`/`or`/`orElseGet` on a
+  receiver recognisably an `Optional`, `Map`'s `compute*`/`merge`/`replaceAll`,
+  `List.replaceAll`, a reference stream's `reduce`, and `Stream.iterate`/
+  `generate`. What remains is a lambda passed where the receiver's type is not
+  recognisable — an `Optional` held in a `var` initialized by an unmodeled call,
+  say — which keeps the code point.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are

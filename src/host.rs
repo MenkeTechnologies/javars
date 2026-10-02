@@ -7999,6 +7999,55 @@ fn optional_method(
             }
             None => optional(None),
         }),
+        // `flatMap(f)`: `f`'s own `Optional`, which must not be `null`.
+        ("flatMap", 1) => match inner {
+            Some(v) => {
+                let r = invoke_closure(vm, &args[0], &[v]);
+                if matches!(r, Value::Undef) && !pending() {
+                    Err(Fault::java("NullPointerException", String::new()))
+                } else {
+                    Ok(r)
+                }
+            }
+            None => Ok(optional(None)),
+        },
+        // `or(supplier)`: this `Optional` when present, else the supplier's.
+        ("or", 1) => match inner {
+            Some(_) => Ok(recv.clone()),
+            None => {
+                let r = invoke_closure(vm, &args[0], &[]);
+                if matches!(r, Value::Undef) && !pending() {
+                    Err(Fault::java("NullPointerException", String::new()))
+                } else {
+                    Ok(r)
+                }
+            }
+        },
+        // `orElseThrow(supplier)`: the value, or the supplier's throwable
+        // thrown as `throw` throws it.
+        ("orElseThrow", 1) => match inner {
+            Some(v) => Ok(v),
+            None => {
+                let exc = invoke_closure(vm, &args[0], &[]);
+                if !pending() {
+                    if matches!(exc, Value::Undef) {
+                        return Some(Err(Fault::java("NullPointerException", String::new())));
+                    }
+                    PENDING.with(|p| *p.borrow_mut() = Some(exc));
+                }
+                Ok(Value::Undef)
+            }
+        },
+        // `stream()`: zero or one element, of the `Optional`'s own width.
+        ("stream", 0) => Ok(stream_of(
+            inner.into_iter().collect(),
+            match class {
+                "OptionalInt" => StreamKind::Int,
+                "OptionalLong" => StreamKind::Long,
+                "OptionalDouble" => StreamKind::Double,
+                _ => StreamKind::Ref,
+            },
+        )),
         ("filter", 1) => Ok(match inner {
             Some(v) => {
                 let keep = matches!(

@@ -4121,7 +4121,12 @@ impl Compiler {
         // on any receiver, dispatched on its runtime class.
         let regex_ref = (matches!(name, "MatchResult" | "Matcher")
             && matches!(method, "group" | "start" | "end" | "groupCount"))
-            || (name == "Object" && matches!(method, "toString" | "hashCode"));
+            || (name == "Object" && matches!(method, "toString" | "hashCode"))
+            || (name == "Optional"
+                && matches!(
+                    method,
+                    "stream" | "isPresent" | "isEmpty" | "get" | "orElseThrow"
+                ));
         if regex_ref && !self.classes.contains_key(name) {
             let ps = mk(1);
             return Ok(Some(lambda(
@@ -6543,6 +6548,10 @@ impl Compiler {
                     || matches!(
                         (class.as_str(), method),
                         ("List", "of") | ("Set", "of") | ("Map", "of") | ("Arrays", "asList")
+                            | ("Stream", "of")
+                            | ("Stream", "iterate")
+                            | ("Optional", "of")
+                            | ("Optional", "ofNullable")
                     );
                 for (i, a) in args.iter().enumerate() {
                     let floats = match &text_slots {
@@ -6568,7 +6577,20 @@ impl Compiler {
                                 | "averagingDouble"
                                 | "minBy"
                                 | "maxBy"
+                                | "summarizingInt"
+                                | "summarizingLong"
+                                | "summarizingDouble"
                         )
+                    {
+                        self.lambda_ret_hint = Some("Object".to_string());
+                    }
+                    // `Stream.iterate`'s step (its last argument — the middle one of
+                    // three is a predicate) and `Stream.generate`'s supplier answer
+                    // the element type, a reference; `IntStream`'s take primitive
+                    // functions and are not named here.
+                    if class == "Stream"
+                        && matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. })
+                        && ((method == "iterate" && i + 1 == args.len()) || method == "generate")
                     {
                         self.lambda_ret_hint = Some("Object".to_string());
                     }
@@ -6796,7 +6818,18 @@ impl Compiler {
                     self.expr_unboxed(a)?;
                     continue;
                 }
-                self.emit_char_string(a)?;
+                // A function argument whose result is a reference by signature
+                // (`computeIfAbsent`, `merge`, `List.replaceAll`, …) boxes a
+                // `char` body to a `Character`, as `lambda_returns_reference`
+                // says for the erased calls.
+                let ref_result = matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. })
+                    && self.lambda_returns_reference(recv, method);
+                if ref_result {
+                    self.lambda_ret_hint = Some("Object".to_string());
+                }
+                let r = self.emit_char_string(a);
+                self.lambda_ret_hint = None;
+                r?;
                 if let Some(code) = self.autobox_code(a) {
                     self.b.emit(Op::LoadInt(code), line);
                     self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
@@ -7005,10 +7038,52 @@ impl Compiler {
     /// not on an `IntStream` (`IntUnaryOperator`), where the same `(char) c`
     /// body widens to the `int` 97 rather than boxing to `'a'` — so `map` is
     /// hinted only when the receiver is recognisably a `Stream`.
+    ///
+    /// The other JDK methods whose function parameter answers a reference by
+    /// signature box the same way: `Optional`'s `map`/`flatMap`/`or`/
+    /// `orElseGet`, `Map`'s `compute*`/`merge`/`replaceAll`, `List.replaceAll`
+    /// (a `UnaryOperator<E>`), a `Stream`'s `reduce`, and `Stream.iterate`/
+    /// `generate` named on `Stream` itself (`IntStream`'s take primitive
+    /// functions). Without it `Optional.of("q").map(s -> s.charAt(0))` held
+    /// the code point 113 where Java holds the `Character` `q`.
     fn lambda_returns_reference(&self, recv: &Expr, method: &str) -> bool {
         match method {
             "mapToObj" => true,
-            "map" => self.stream_is_ref(recv) == Some(true),
+            "map" | "flatMap" => self.stream_is_ref(recv) == Some(true) || self.is_optional(recv),
+            "or" | "orElseGet" => self.is_optional(recv),
+            "computeIfAbsent" | "computeIfPresent" | "compute" | "merge" | "replaceAll" => true,
+            "reduce" => self.stream_is_ref(recv) == Some(true),
+            "iterate" | "generate" => {
+                matches!(recv, Expr::Var(c) if c == "Stream" && !self.is_declared_var(c))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is recognisably a `java.util.Optional` (not one of the
+    /// primitive `OptionalInt` family): an `Optional`-typed name, an
+    /// `Optional.of`/`ofNullable`/`empty`, a reference stream's
+    /// `findFirst`/`findAny`/`max`/`min`/one-argument `reduce`, or an
+    /// `Optional`'s own `map`/`filter`/`flatMap`/`or`.
+    fn is_optional(&self, e: &Expr) -> bool {
+        if let Some(t) = self.expr_java_type(e) {
+            if t == "Optional" || t.starts_with("Optional<") {
+                return true;
+            }
+        }
+        let Expr::MethodCall {
+            recv, method, args, ..
+        } = e
+        else {
+            return false;
+        };
+        match (recv.as_ref(), method.as_str()) {
+            (Expr::Var(c), "of" | "ofNullable" | "empty") if c == "Optional" => {
+                !self.is_declared_var(c)
+            }
+            (_, "findFirst" | "findAny" | "max" | "min") => self.stream_is_ref(recv) == Some(true),
+            (_, "reduce") if args.len() == 1 => self.stream_is_ref(recv) == Some(true),
+            (_, "map" | "filter" | "flatMap" | "or") => self.is_optional(recv),
             _ => false,
         }
     }
