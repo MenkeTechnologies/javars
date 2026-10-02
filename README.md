@@ -384,6 +384,9 @@ Implemented and checked against the reference `java`:
   constructors, `Arrays.asList`, `List.of`/`Set.of`, `EnumMap` and
   `EnumSet.of`/`noneOf`/`allOf`/`copyOf` (ordinal order, as the `TreeMap`/
   `TreeSet` they behave as), `Map.Entry.comparingByKey`/`comparingByValue`,
+  `List.copyOf`/`Set.copyOf`/`Map.copyOf`, `Collections.emptySet`/`emptyMap`/
+  `singleton`/`singletonMap`, `AtomicInteger`/`AtomicLong`/`AtomicBoolean` (plain
+  read-modify-write, javars running one thread),
   `removeAll`/`retainAll`/`containsAll`, `Collections.addAll`, `java.util.BitSet`
   (a port of the JDK's word vector, its growth rule, `hashCode` and messages), and
   `Collections.sort`/`reverse`/`max`/`min`. A removal through a map's

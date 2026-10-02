@@ -964,434 +964,442 @@ System.out.println();</code></pre>
       <section class="tutorial-section" id="ch-static-library">
         <h2>Static Library</h2>
         <article class="doc-entry" id="doc-static-library-1">
-          <h3><a class="doc-anchor" href="#doc-static-library-1">#</a> <code>BitSet</code></h3>
+          <h3><a class="doc-anchor" href="#doc-static-library-1">#</a> <code>AtomicInteger</code></h3>
+          <pre><code class="lang-java">new AtomicInteger([int])   |   new AtomicLong([long])   |   new AtomicBoolean([boolean])</code></pre>
+          <p>The <code>java.util.concurrent.atomic</code> cells, the counters a lambda body can update. <code>get</code>/<code>set</code>, <code>incrementAndGet</code>/<code>getAndIncrement</code> and the decrements, <code>addAndGet</code>/<code>getAndAdd</code>, <code>getAndSet</code>, <code>compareAndSet</code>, <code>updateAndGet</code>/<code>getAndUpdate</code>, <code>accumulateAndGet</code>/<code>getAndAccumulate</code>; an <code>AtomicInteger</code> wraps at 32 bits. javars runs one thread, so each is the plain read-modify-write it names.</p>
+          <pre><code class="lang-java">AtomicInteger n = new AtomicInteger();
+List.of(1, 2).forEach(x -&gt; n.addAndGet(x));
+System.out.println(n);   // 3</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-2">
+          <h3><a class="doc-anchor" href="#doc-static-library-2">#</a> <code>BitSet</code></h3>
           <pre><code class="lang-java">new BitSet([int nbits])</code></pre>
           <p><code>java.util.BitSet</code>, ported from the JDK: <code>set</code>/<code>clear</code>/<code>flip</code>/<code>get</code> by index or <code>[from, to)</code> range, <code>cardinality</code>, <code>length</code>, <code>size</code> (the JDK's doubling capacity), <code>isEmpty</code>, <code>nextSetBit</code>/<code>nextClearBit</code>/<code>previousSetBit</code>/<code>previousClearBit</code>, <code>and</code>/<code>or</code>/<code>xor</code>/<code>andNot</code>/<code>intersects</code>, <code>stream()</code>, <code>clone</code>, <code>equals</code>/<code>hashCode</code>, and the <code>{1, 3, 5}</code> rendering, with the JDK's index messages (<code>bitIndex &lt; 0: -1</code>).</p>
           <pre><code class="lang-java">BitSet b = new BitSet();
 b.set(1, 4);
 System.out.println(b);   // {1, 2, 3}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-2">
-          <h3><a class="doc-anchor" href="#doc-static-library-2">#</a> <code>Pattern</code></h3>
+        <article class="doc-entry" id="doc-static-library-3">
+          <h3><a class="doc-anchor" href="#doc-static-library-3">#</a> <code>Pattern</code></h3>
           <pre><code class="lang-java">Pattern.compile(String regex [, int flags])   |   Pattern.matches(regex, input)   |   Pattern.quote(s)</code></pre>
           <p>A compiled <code>java.util.regex</code> pattern on the same translation <code>String.matches</code> uses. <code>matcher(input)</code> starts a <code>Matcher</code>; <code>pattern()</code>/<code>toString()</code> answer the source, <code>flags()</code> the flags, <code>split</code>/<code>splitAsStream</code> split as <code>String.split</code> does. <code>CASE_INSENSITIVE</code>, <code>DOTALL</code> and <code>LITERAL</code> are modeled; the other flags are refused by name. A malformed pattern raises <code>PatternSyntaxException</code> at <code>compile</code>.</p>
           <pre><code class="lang-java">Pattern p = Pattern.compile("(\\w+)@(\\w+)");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-3">
-          <h3><a class="doc-anchor" href="#doc-static-library-3">#</a> <code>Matcher</code></h3>
+        <article class="doc-entry" id="doc-static-library-4">
+          <h3><a class="doc-anchor" href="#doc-static-library-4">#</a> <code>Matcher</code></h3>
           <pre><code class="lang-java">boolean find()   |   find(int)   |   matches()   |   lookingAt()   |   String group([int | String])   |   int start([g])   |   int end([g])</code></pre>
           <p>The JDK's matcher state over one input: <code>find</code> resumes after the last match (one character on after an empty one), <code>matches</code>/<code>lookingAt</code> anchor at the whole input or its start, <code>group</code> answers <code>null</code> for a group that did not take part, and indices are UTF-16. <code>groupCount</code>, <code>reset([input])</code>, <code>replaceAll</code>/<code>replaceFirst</code>, <code>appendReplacement</code>/<code>appendTail</code>, <code>results()</code> and <code>toMatchResult()</code> are supported; with no current match the accessors throw <code>IllegalStateException: No match found</code>.</p>
           <pre><code class="lang-java">Matcher m = p.matcher("bob@site");
 while (m.find()) System.out.println(m.group(2));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-4">
-          <h3><a class="doc-anchor" href="#doc-static-library-4">#</a> <code>Math.tan</code></h3>
+        <article class="doc-entry" id="doc-static-library-5">
+          <h3><a class="doc-anchor" href="#doc-static-library-5">#</a> <code>Math.tan</code></h3>
           <pre><code class="lang-java">double Math.tan(double a)</code></pre>
           <p>The tangent. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.tan(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-5">
-          <h3><a class="doc-anchor" href="#doc-static-library-5">#</a> <code>Math.asin</code></h3>
+        <article class="doc-entry" id="doc-static-library-6">
+          <h3><a class="doc-anchor" href="#doc-static-library-6">#</a> <code>Math.asin</code></h3>
           <pre><code class="lang-java">double Math.asin(double a)</code></pre>
           <p>The arc sine, in [-pi/2, pi/2]; NaN outside [-1, 1]. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.asin(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-6">
-          <h3><a class="doc-anchor" href="#doc-static-library-6">#</a> <code>Math.acos</code></h3>
+        <article class="doc-entry" id="doc-static-library-7">
+          <h3><a class="doc-anchor" href="#doc-static-library-7">#</a> <code>Math.acos</code></h3>
           <pre><code class="lang-java">double Math.acos(double a)</code></pre>
           <p>The arc cosine, in [0, pi]; NaN outside [-1, 1]. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.acos(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-7">
-          <h3><a class="doc-anchor" href="#doc-static-library-7">#</a> <code>Math.atan</code></h3>
+        <article class="doc-entry" id="doc-static-library-8">
+          <h3><a class="doc-anchor" href="#doc-static-library-8">#</a> <code>Math.atan</code></h3>
           <pre><code class="lang-java">double Math.atan(double a)</code></pre>
           <p>The arc tangent, in [-pi/2, pi/2]. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.atan(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-8">
-          <h3><a class="doc-anchor" href="#doc-static-library-8">#</a> <code>Math.atan2</code></h3>
+        <article class="doc-entry" id="doc-static-library-9">
+          <h3><a class="doc-anchor" href="#doc-static-library-9">#</a> <code>Math.atan2</code></h3>
           <pre><code class="lang-java">double Math.atan2(double y, double x)</code></pre>
           <p>The angle of the point (x, y), in [-pi, pi], with the JDK's signed-zero and infinity cases. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.atan2(3.0, 4.0));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-9">
-          <h3><a class="doc-anchor" href="#doc-static-library-9">#</a> <code>Math.exp</code></h3>
+        <article class="doc-entry" id="doc-static-library-10">
+          <h3><a class="doc-anchor" href="#doc-static-library-10">#</a> <code>Math.exp</code></h3>
           <pre><code class="lang-java">double Math.exp(double a)</code></pre>
           <p>e raised to a. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.exp(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-10">
-          <h3><a class="doc-anchor" href="#doc-static-library-10">#</a> <code>Math.log</code></h3>
+        <article class="doc-entry" id="doc-static-library-11">
+          <h3><a class="doc-anchor" href="#doc-static-library-11">#</a> <code>Math.log</code></h3>
           <pre><code class="lang-java">double Math.log(double a)</code></pre>
           <p>The natural logarithm; -Infinity at zero, NaN below it. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.log(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-11">
-          <h3><a class="doc-anchor" href="#doc-static-library-11">#</a> <code>Math.log10</code></h3>
+        <article class="doc-entry" id="doc-static-library-12">
+          <h3><a class="doc-anchor" href="#doc-static-library-12">#</a> <code>Math.log10</code></h3>
           <pre><code class="lang-java">double Math.log10(double a)</code></pre>
           <p>The base-10 logarithm, exact at powers of ten. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.log10(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-12">
-          <h3><a class="doc-anchor" href="#doc-static-library-12">#</a> <code>Math.log1p</code></h3>
+        <article class="doc-entry" id="doc-static-library-13">
+          <h3><a class="doc-anchor" href="#doc-static-library-13">#</a> <code>Math.log1p</code></h3>
           <pre><code class="lang-java">double Math.log1p(double x)</code></pre>
           <p>ln(1 + x), accurate for x near zero. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.log1p(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-13">
-          <h3><a class="doc-anchor" href="#doc-static-library-13">#</a> <code>Math.expm1</code></h3>
+        <article class="doc-entry" id="doc-static-library-14">
+          <h3><a class="doc-anchor" href="#doc-static-library-14">#</a> <code>Math.expm1</code></h3>
           <pre><code class="lang-java">double Math.expm1(double x)</code></pre>
           <p>e^x - 1, accurate for x near zero. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.expm1(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-14">
-          <h3><a class="doc-anchor" href="#doc-static-library-14">#</a> <code>Math.cbrt</code></h3>
+        <article class="doc-entry" id="doc-static-library-15">
+          <h3><a class="doc-anchor" href="#doc-static-library-15">#</a> <code>Math.cbrt</code></h3>
           <pre><code class="lang-java">double Math.cbrt(double a)</code></pre>
           <p>The cube root, keeping the sign. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.cbrt(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-15">
-          <h3><a class="doc-anchor" href="#doc-static-library-15">#</a> <code>Math.hypot</code></h3>
+        <article class="doc-entry" id="doc-static-library-16">
+          <h3><a class="doc-anchor" href="#doc-static-library-16">#</a> <code>Math.hypot</code></h3>
           <pre><code class="lang-java">double Math.hypot(double x, double y)</code></pre>
           <p>sqrt(x^2 + y^2) without intermediate overflow or underflow. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.hypot(3.0, 4.0));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-16">
-          <h3><a class="doc-anchor" href="#doc-static-library-16">#</a> <code>Math.sinh</code></h3>
+        <article class="doc-entry" id="doc-static-library-17">
+          <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>Math.sinh</code></h3>
           <pre><code class="lang-java">double Math.sinh(double x)</code></pre>
           <p>The hyperbolic sine. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.sinh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-17">
-          <h3><a class="doc-anchor" href="#doc-static-library-17">#</a> <code>Math.cosh</code></h3>
+        <article class="doc-entry" id="doc-static-library-18">
+          <h3><a class="doc-anchor" href="#doc-static-library-18">#</a> <code>Math.cosh</code></h3>
           <pre><code class="lang-java">double Math.cosh(double x)</code></pre>
           <p>The hyperbolic cosine. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.cosh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-18">
-          <h3><a class="doc-anchor" href="#doc-static-library-18">#</a> <code>Math.tanh</code></h3>
+        <article class="doc-entry" id="doc-static-library-19">
+          <h3><a class="doc-anchor" href="#doc-static-library-19">#</a> <code>Math.tanh</code></h3>
           <pre><code class="lang-java">double Math.tanh(double x)</code></pre>
           <p>The hyperbolic tangent. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.tanh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-19">
-          <h3><a class="doc-anchor" href="#doc-static-library-19">#</a> <code>Math.asinh</code></h3>
+        <article class="doc-entry" id="doc-static-library-20">
+          <h3><a class="doc-anchor" href="#doc-static-library-20">#</a> <code>Math.asinh</code></h3>
           <pre><code class="lang-java">double Math.asinh(double x)</code></pre>
           <p>The inverse hyperbolic sine. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.asinh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-20">
-          <h3><a class="doc-anchor" href="#doc-static-library-20">#</a> <code>Math.acosh</code></h3>
+        <article class="doc-entry" id="doc-static-library-21">
+          <h3><a class="doc-anchor" href="#doc-static-library-21">#</a> <code>Math.acosh</code></h3>
           <pre><code class="lang-java">double Math.acosh(double x)</code></pre>
           <p>The inverse hyperbolic cosine; NaN below 1. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.acosh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-21">
-          <h3><a class="doc-anchor" href="#doc-static-library-21">#</a> <code>Math.atanh</code></h3>
+        <article class="doc-entry" id="doc-static-library-22">
+          <h3><a class="doc-anchor" href="#doc-static-library-22">#</a> <code>Math.atanh</code></h3>
           <pre><code class="lang-java">double Math.atanh(double x)</code></pre>
           <p>The inverse hyperbolic tangent; NaN outside [-1, 1]. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.atanh(0.5));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-22">
-          <h3><a class="doc-anchor" href="#doc-static-library-22">#</a> <code>Math.IEEEremainder</code></h3>
+        <article class="doc-entry" id="doc-static-library-23">
+          <h3><a class="doc-anchor" href="#doc-static-library-23">#</a> <code>Math.IEEEremainder</code></h3>
           <pre><code class="lang-java">double Math.IEEEremainder(double f1, double f2)</code></pre>
           <p>f1 - f2 * n with n the integer nearest f1 / f2 (ties to even). Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.IEEEremainder(3.0, 4.0));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-23">
-          <h3><a class="doc-anchor" href="#doc-static-library-23">#</a> <code>Math.scalb</code></h3>
+        <article class="doc-entry" id="doc-static-library-24">
+          <h3><a class="doc-anchor" href="#doc-static-library-24">#</a> <code>Math.scalb</code></h3>
           <pre><code class="lang-java">double Math.scalb(double d, int scaleFactor)</code></pre>
           <p>d * 2^scaleFactor, rounded once. Ported from the JDK's fdlibm (<code>java.lang.FdLibm</code>), so the result is <code>StrictMath</code>'s to the last bit.</p>
           <pre><code class="lang-java">System.out.println(Math.scalb(1.5, 3));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-24">
-          <h3><a class="doc-anchor" href="#doc-static-library-24">#</a> <code>Random</code></h3>
+        <article class="doc-entry" id="doc-static-library-25">
+          <h3><a class="doc-anchor" href="#doc-static-library-25">#</a> <code>Random</code></h3>
           <pre><code class="lang-java">new Random()   |   new Random(long seed)</code></pre>
           <p><code>java.util.Random</code>, the JDK's 48-bit linear congruential generator, so a seeded generator draws exactly the JDK's sequence: <code>nextInt()</code>, <code>nextInt(bound)</code>, <code>nextInt(origin, bound)</code>, <code>nextLong()</code> and its bounded forms, <code>nextDouble()</code> and its bounded forms, <code>nextFloat</code>, <code>nextBoolean</code>, <code>nextGaussian</code> (fdlibm's <code>log</code>, as <code>StrictMath</code> computes it), <code>nextBytes</code> and <code>setSeed</code>. A bad bound is the JDK's <code>IllegalArgumentException</code> (<code>bound must be positive</code>, <code>bound must be greater than origin</code>). An unseeded generator is seeded from the clock, as the JDK's is.</p>
           <pre><code class="lang-java">Random r = new Random(42);\nSystem.out.println(r.nextInt(100));   // 30</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-25">
-          <h3><a class="doc-anchor" href="#doc-static-library-25">#</a> <code>Math.random</code></h3>
+        <article class="doc-entry" id="doc-static-library-26">
+          <h3><a class="doc-anchor" href="#doc-static-library-26">#</a> <code>Math.random</code></h3>
           <pre><code class="lang-java">double Math.random()</code></pre>
           <p>A uniform <code>double</code> in <code>[0, 1)</code>, from one unseeded <code>Random</code> created on first use.</p>
           <pre><code class="lang-java">double d = Math.random();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-26">
-          <h3><a class="doc-anchor" href="#doc-static-library-26">#</a> <code>Math.abs</code></h3>
+        <article class="doc-entry" id="doc-static-library-27">
+          <h3><a class="doc-anchor" href="#doc-static-library-27">#</a> <code>Math.abs</code></h3>
           <pre><code class="lang-java">int Math.abs(int a)   |   double Math.abs(double a)</code></pre>
           <p>Absolute value, keeping the operand's kind: an integral argument returns an integer, anything else returns a double. The result type is deliberately not modeled statically, because claiming either would mis-type the other overload.</p>
           <pre><code class="lang-java">System.out.println(Math.abs(-3) + " " + Math.abs(-3.5));   // 3 3.5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-27">
-          <h3><a class="doc-anchor" href="#doc-static-library-27">#</a> <code>Math.max</code></h3>
+        <article class="doc-entry" id="doc-static-library-28">
+          <h3><a class="doc-anchor" href="#doc-static-library-28">#</a> <code>Math.max</code></h3>
           <pre><code class="lang-java">int Math.max(int a, int b)   |   double Math.max(double a, double b)</code></pre>
           <p>The larger of two values; integral when both operands are integral, double otherwise. A <code>NaN</code> operand propagates (unlike C's <code>fmax</code> and Rust's <code>f64::max</code>, which return the other operand), and <code>max(-0.0, 0.0)</code> is <code>0.0</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.max(1, 2));   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-28">
-          <h3><a class="doc-anchor" href="#doc-static-library-28">#</a> <code>Math.min</code></h3>
+        <article class="doc-entry" id="doc-static-library-29">
+          <h3><a class="doc-anchor" href="#doc-static-library-29">#</a> <code>Math.min</code></h3>
           <pre><code class="lang-java">int Math.min(int a, int b)   |   double Math.min(double a, double b)</code></pre>
           <p>The smaller of two values, with the same integral-versus-double rule as <code>max</code> — and the same <code>NaN</code> propagation, which <code>f64::min</code> does not do.</p>
           <pre><code class="lang-java">System.out.println(Math.min(1.5, 2));   // 1.5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-29">
-          <h3><a class="doc-anchor" href="#doc-static-library-29">#</a> <code>Math.pow</code></h3>
+        <article class="doc-entry" id="doc-static-library-30">
+          <h3><a class="doc-anchor" href="#doc-static-library-30">#</a> <code>Math.pow</code></h3>
           <pre><code class="lang-java">double Math.pow(double a, double b)</code></pre>
           <p><code>a</code> raised to the power <code>b</code>, always as a double. Java departs from IEEE <code>pow</code> twice: a <code>NaN</code> exponent gives <code>NaN</code> even for a base of 1, and <code>|a| == 1</code> with an infinite exponent gives <code>NaN</code>. A zero exponent still gives <code>1.0</code> for every base.</p>
           <pre><code class="lang-java">System.out.println(Math.pow(2, 10));   // 1024.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-30">
-          <h3><a class="doc-anchor" href="#doc-static-library-30">#</a> <code>Math.sqrt</code></h3>
+        <article class="doc-entry" id="doc-static-library-31">
+          <h3><a class="doc-anchor" href="#doc-static-library-31">#</a> <code>Math.sqrt</code></h3>
           <pre><code class="lang-java">double Math.sqrt(double a)</code></pre>
           <p>Square root, always as a double. A negative argument gives NaN rather than faulting, as in Java.</p>
           <pre><code class="lang-java">System.out.println(Math.sqrt(9));   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-31">
-          <h3><a class="doc-anchor" href="#doc-static-library-31">#</a> <code>Math.floor</code></h3>
+        <article class="doc-entry" id="doc-static-library-32">
+          <h3><a class="doc-anchor" href="#doc-static-library-32">#</a> <code>Math.floor</code></h3>
           <pre><code class="lang-java">double Math.floor(double a)</code></pre>
           <p>The largest double less than or equal to <code>a</code> that is a mathematical integer.</p>
           <pre><code class="lang-java">System.out.println(Math.floor(1.7));   // 1.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-32">
-          <h3><a class="doc-anchor" href="#doc-static-library-32">#</a> <code>Math.ceil</code></h3>
+        <article class="doc-entry" id="doc-static-library-33">
+          <h3><a class="doc-anchor" href="#doc-static-library-33">#</a> <code>Math.ceil</code></h3>
           <pre><code class="lang-java">double Math.ceil(double a)</code></pre>
           <p>The smallest double greater than or equal to <code>a</code> that is a mathematical integer.</p>
           <pre><code class="lang-java">System.out.println(Math.ceil(1.2));   // 2.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-33">
-          <h3><a class="doc-anchor" href="#doc-static-library-33">#</a> <code>Math.round</code></h3>
+        <article class="doc-entry" id="doc-static-library-34">
+          <h3><a class="doc-anchor" href="#doc-static-library-34">#</a> <code>Math.round</code></h3>
           <pre><code class="lang-java">long Math.round(double a)   |   int Math.round(float a)</code></pre>
           <p>Java's rounding: ties go toward positive infinity, so <code>round(-2.5)</code> is <code>-2</code> where Rust's half-away-from-zero <code>round</code> gives <code>-3</code>. It is *not* <code>floor(a + 0.5)</code> either — that was the pre-Java-7 implementation and it answers 1 for <code>0.49999999999999994</code>, where Java answers 0. A <code>float</code> argument selects the overload returning <code>int</code>, which saturates at <code>Integer.MAX_VALUE</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.round(-2.5));   // -2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-34">
-          <h3><a class="doc-anchor" href="#doc-static-library-34">#</a> <code>Math.rint</code></h3>
+        <article class="doc-entry" id="doc-static-library-35">
+          <h3><a class="doc-anchor" href="#doc-static-library-35">#</a> <code>Math.rint</code></h3>
           <pre><code class="lang-java">double Math.rint(double a)</code></pre>
           <p>Rounds to the nearest integral <code>double</code>, ties going to the **even** neighbour — the IEEE <code>roundToIntegralTiesToEven</code> operation, and therefore not <code>Math.round</code>'s ties-toward-positive-infinity: <code>rint(2.5)</code> is <code>2.0</code> while <code>round(2.5)</code> is <code>3</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.rint(2.5) + " " + Math.rint(3.5));   // 2.0 4.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-35">
-          <h3><a class="doc-anchor" href="#doc-static-library-35">#</a> <code>Math.copySign</code></h3>
+        <article class="doc-entry" id="doc-static-library-36">
+          <h3><a class="doc-anchor" href="#doc-static-library-36">#</a> <code>Math.copySign</code></h3>
           <pre><code class="lang-java">double Math.copySign(double magnitude, double sign)</code></pre>
           <p>The magnitude of the first argument with the sign of the second. The sign of a zero counts, so <code>copySign(3.0, -0.0)</code> is <code>-3.0</code>.</p>
           <pre><code class="lang-java">System.out.println(Math.copySign(3.0, -0.0));   // -3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-36">
-          <h3><a class="doc-anchor" href="#doc-static-library-36">#</a> <code>Math.ulp</code></h3>
+        <article class="doc-entry" id="doc-static-library-37">
+          <h3><a class="doc-anchor" href="#doc-static-library-37">#</a> <code>Math.ulp</code></h3>
           <pre><code class="lang-java">double Math.ulp(double d)</code></pre>
           <p>The distance from <code>d</code> to the next representable <code>double</code> away from zero — the size of one unit in the last place. <code>ulp(Double.MAX_VALUE)</code> is measured downward, because one step further would be infinity.</p>
           <pre><code class="lang-java">System.out.println(Math.ulp(1.0));   // 2.220446049250313E-16</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-37">
-          <h3><a class="doc-anchor" href="#doc-static-library-37">#</a> <code>Math.nextUp</code></h3>
+        <article class="doc-entry" id="doc-static-library-38">
+          <h3><a class="doc-anchor" href="#doc-static-library-38">#</a> <code>Math.nextUp</code></h3>
           <pre><code class="lang-java">double Math.nextUp(double d)   |   double Math.nextDown(double d)</code></pre>
           <p>The representable <code>double</code> adjacent to <code>d</code> toward positive (<code>nextUp</code>) or negative (<code>nextDown</code>) infinity. Both zeros step to the smallest subnormal of the target's sign.</p>
           <pre><code class="lang-java">System.out.println(Math.nextUp(1.0));   // 1.0000000000000002</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-38">
-          <h3><a class="doc-anchor" href="#doc-static-library-38">#</a> <code>Math.nextAfter</code></h3>
+        <article class="doc-entry" id="doc-static-library-39">
+          <h3><a class="doc-anchor" href="#doc-static-library-39">#</a> <code>Math.nextAfter</code></h3>
           <pre><code class="lang-java">double Math.nextAfter(double start, double direction)</code></pre>
           <p>The representable <code>double</code> adjacent to <code>start</code> in the direction of <code>direction</code>, or <code>direction</code> itself when the two are equal.</p>
           <pre><code class="lang-java">System.out.println(Math.nextAfter(1.0, 0.0));   // 0.9999999999999999</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-39">
-          <h3><a class="doc-anchor" href="#doc-static-library-39">#</a> <code>Math.fma</code></h3>
+        <article class="doc-entry" id="doc-static-library-40">
+          <h3><a class="doc-anchor" href="#doc-static-library-40">#</a> <code>Math.fma</code></h3>
           <pre><code class="lang-java">double Math.fma(double a, double b, double c)</code></pre>
           <p><code>a * b + c</code> computed as one fused operation, rounded **once** — so it is not the same number as writing the two operations separately when the exact product needs more than 53 bits.</p>
           <pre><code class="lang-java">System.out.println(Math.fma(2.0, 3.0, 4.0));   // 10.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-40">
-          <h3><a class="doc-anchor" href="#doc-static-library-40">#</a> <code>Math.addExact</code></h3>
+        <article class="doc-entry" id="doc-static-library-41">
+          <h3><a class="doc-anchor" href="#doc-static-library-41">#</a> <code>Math.addExact</code></h3>
           <pre><code class="lang-java">int Math.addExact(int a, int b)   |   long Math.addExact(long a, long b)   |   subtractExact   |   multiplyExact</code></pre>
           <p>The arithmetic that raises <code>ArithmeticException</code> instead of wrapping. The overload is chosen from the arguments' **static** types and the two disagree exactly where the method is interesting: the <code>int</code> one overflows at 2^31 with <code>integer overflow</code>, the <code>long</code> one at 2^63 with <code>long overflow</code>. A call whose argument types javars cannot infer is refused, naming the method.</p>
           <pre><code class="lang-java">System.out.println(Math.addExact(2000000000L, 2000000000L));   // 4000000000</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-41">
-          <h3><a class="doc-anchor" href="#doc-static-library-41">#</a> <code>Math.toIntExact</code></h3>
+        <article class="doc-entry" id="doc-static-library-42">
+          <h3><a class="doc-anchor" href="#doc-static-library-42">#</a> <code>Math.toIntExact</code></h3>
           <pre><code class="lang-java">int Math.toIntExact(long value)</code></pre>
           <p><code>value</code> narrowed to an <code>int</code>, or <code>ArithmeticException: integer overflow</code> when it does not fit — the checked counterpart of the <code>(int)</code> cast, which wraps silently.</p>
           <pre><code class="lang-java">System.out.println(Math.toIntExact(5L));   // 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-42">
-          <h3><a class="doc-anchor" href="#doc-static-library-42">#</a> <code>Math.clamp</code></h3>
+        <article class="doc-entry" id="doc-static-library-43">
+          <h3><a class="doc-anchor" href="#doc-static-library-43">#</a> <code>Math.clamp</code></h3>
           <pre><code class="lang-java">int Math.clamp(long v, int min, int max)   |   long   |   double   |   float</code></pre>
           <p><code>v</code> confined to <code>[min, max]</code>. The **bounds** pick the overload, so <code>clamp(aLong, 1, 10)</code> answers an <code>int</code> and <code>clamp(aLong, 1L, 10L)</code> a <code>long</code>. <code>min &gt; max</code> is <code>IllegalArgumentException: "&lt;min&gt; &gt; &lt;max&gt;"</code>, a NaN bound is <code>min is NaN</code> / <code>max is NaN</code>, and a NaN value passes through.</p>
           <pre><code class="lang-java">System.out.println(Math.clamp(15, 1, 10));   // 10</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-43">
-          <h3><a class="doc-anchor" href="#doc-static-library-43">#</a> <code>Integer.parseInt</code></h3>
+        <article class="doc-entry" id="doc-static-library-44">
+          <h3><a class="doc-anchor" href="#doc-static-library-44">#</a> <code>Integer.parseInt</code></h3>
           <pre><code class="lang-java">int Integer.parseInt(String s)</code></pre>
           <p>Parses a signed decimal integer with <code>java.lang.Integer</code>'s exact rules: no surrounding whitespace is tolerated and the value must fit 32 bits. Every failure raises <code>NumberFormatException</code> carrying Java's own <code>For input string: "…"</code> message.</p>
           <pre><code class="lang-java">System.out.println(Integer.parseInt("42"));   // 42</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-44">
-          <h3><a class="doc-anchor" href="#doc-static-library-44">#</a> <code>Integer.parseInt</code></h3>
+        <article class="doc-entry" id="doc-static-library-45">
+          <h3><a class="doc-anchor" href="#doc-static-library-45">#</a> <code>Integer.parseInt</code></h3>
           <pre><code class="lang-java">int Integer.parseInt(String s, int radix)</code></pre>
           <p>As above in the given radix, which must lie between <code>Character.MIN_RADIX</code> and <code>Character.MAX_RADIX</code>. A bad radix and a bad digit string produce Java's two distinct <code>NumberFormatException</code> messages.</p>
           <pre><code class="lang-java">System.out.println(Integer.parseInt("ff", 16));   // 255</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-45">
-          <h3><a class="doc-anchor" href="#doc-static-library-45">#</a> <code>Integer.valueOf</code></h3>
+        <article class="doc-entry" id="doc-static-library-46">
+          <h3><a class="doc-anchor" href="#doc-static-library-46">#</a> <code>Integer.valueOf</code></h3>
           <pre><code class="lang-java">int Integer.valueOf(String s)   |   int Integer.valueOf(int i)</code></pre>
           <p>Parses a decimal string with <code>parseInt</code>'s rules, or boxes an integral argument. The box has Java's identity: <code>Integer.valueOf(1000) == Integer.valueOf(1000)</code> is <code>false</code>, as it is outside the JDK's small-value cache. <code>valueOf(String s, int radix)</code> parses in the given radix.</p>
           <pre><code class="lang-java">System.out.println(Integer.valueOf("7"));   // 7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-46">
-          <h3><a class="doc-anchor" href="#doc-static-library-46">#</a> <code>Integer.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-47">
+          <h3><a class="doc-anchor" href="#doc-static-library-47">#</a> <code>Integer.toString</code></h3>
           <pre><code class="lang-java">String Integer.toString(int i)</code></pre>
           <p>The decimal rendering of an integer.</p>
           <pre><code class="lang-java">System.out.println(Integer.toString(255));   // 255</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-47">
-          <h3><a class="doc-anchor" href="#doc-static-library-47">#</a> <code>Integer.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-48">
+          <h3><a class="doc-anchor" href="#doc-static-library-48">#</a> <code>Integer.toString</code></h3>
           <pre><code class="lang-java">String Integer.toString(int i, int radix)</code></pre>
           <p>The rendering in radix 2 through 36, sign-prefixed for negatives. An out-of-range radix falls back to 10, exactly as Java specifies.</p>
           <pre><code class="lang-java">System.out.println(Integer.toString(255, 16));   // ff</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-48">
-          <h3><a class="doc-anchor" href="#doc-static-library-48">#</a> <code>Long.parseLong</code></h3>
+        <article class="doc-entry" id="doc-static-library-49">
+          <h3><a class="doc-anchor" href="#doc-static-library-49">#</a> <code>Long.parseLong</code></h3>
           <pre><code class="lang-java">long Long.parseLong(String s)</code></pre>
           <p>Parses a signed decimal <code>long</code>, using the same rules and the same <code>NumberFormatException</code> messages as <code>parseInt</code> but with the 64-bit width check.</p>
           <pre><code class="lang-java">System.out.println(Long.parseLong("9000000000"));   // 9000000000</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-49">
-          <h3><a class="doc-anchor" href="#doc-static-library-49">#</a> <code>Boolean.parseBoolean</code></h3>
+        <article class="doc-entry" id="doc-static-library-50">
+          <h3><a class="doc-anchor" href="#doc-static-library-50">#</a> <code>Boolean.parseBoolean</code></h3>
           <pre><code class="lang-java">boolean Boolean.parseBoolean(String s)</code></pre>
           <p>True when the string equals <code>"true"</code> ignoring ASCII case, false for everything else — including <code>null</code> and malformed input, which Java also never rejects here.</p>
           <pre><code class="lang-java">System.out.println(Boolean.parseBoolean("TRUE"));   // true</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-50">
-          <h3><a class="doc-anchor" href="#doc-static-library-50">#</a> <code>String.valueOf</code></h3>
+        <article class="doc-entry" id="doc-static-library-51">
+          <h3><a class="doc-anchor" href="#doc-static-library-51">#</a> <code>String.valueOf</code></h3>
           <pre><code class="lang-java">String String.valueOf(Object x)</code></pre>
           <p>Renders any value with Java's <code>println</code> rules: <code>true</code>/<code>false</code>, a whole double with its trailing <code>.0</code>, <code>null</code> for a null reference, and <code>ClassName@hash</code> for an instance whose class declares no <code>toString()</code>.</p>
           <pre><code class="lang-java">System.out.println(String.valueOf(3.0));   // 3.0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-51">
-          <h3><a class="doc-anchor" href="#doc-static-library-51">#</a> <code>String.copyValueOf</code></h3>
+        <article class="doc-entry" id="doc-static-library-52">
+          <h3><a class="doc-anchor" href="#doc-static-library-52">#</a> <code>String.copyValueOf</code></h3>
           <pre><code class="lang-java">String String.copyValueOf(char[] data)</code></pre>
           <p>The characters of <code>data</code> as a <code>String</code>. The JDK implements it as one call to <code>String.valueOf(char[])</code>, and so does javars.</p>
           <pre><code class="lang-java">System.out.println(String.copyValueOf(new char[]{'a', 'b'}));   // ab</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-52">
-          <h3><a class="doc-anchor" href="#doc-static-library-52">#</a> <code>StringBuilder</code></h3>
+        <article class="doc-entry" id="doc-static-library-53">
+          <h3><a class="doc-anchor" href="#doc-static-library-53">#</a> <code>StringBuilder</code></h3>
           <pre><code class="lang-java">new StringBuilder()   |   new StringBuilder(int capacity)   |   new StringBuilder(String s)</code></pre>
           <p>The mutable character sequence, and <code>StringBuffer</code> alongside it (javars runs one thread, so the two differ only in their class name). <code>append</code>/<code>insert</code>/<code>delete</code>/<code>deleteCharAt</code>/<code>replace</code>/<code>reverse</code>/<code>setCharAt</code>/<code>setLength</code>/<code>charAt</code>/<code>substring</code>/<code>indexOf</code>/<code>lastIndexOf</code>/<code>length</code>/<code>isEmpty</code>/<code>capacity</code>/<code>compareTo</code>/<code>toString</code> are implemented, the mutators answering the receiver so a chain keeps building. A builder is a reference: passing one to a method or storing it in a collection denotes the one object, <code>equals</code> stays <code>Object</code>'s identity comparison, and <code>toString</code> — and therefore <code>println(sb)</code>, <code>"" + sb</code> and <code>%s</code> — is the contents. <code>capacity()</code> reproduces the JDK's growth curve (16 to start, then <code>2 * old + 2</code>), because it is observable.</p>
           <pre><code class="lang-java">StringBuilder b = new StringBuilder();
 for (int i = 0; i &lt; 3; i++) { b.append(i).append(','); }
 System.out.println(b);   // 0,1,2,</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-53">
-          <h3><a class="doc-anchor" href="#doc-static-library-53">#</a> <code>String.format</code></h3>
+        <article class="doc-entry" id="doc-static-library-54">
+          <h3><a class="doc-anchor" href="#doc-static-library-54">#</a> <code>String.format</code></h3>
           <pre><code class="lang-java">String String.format(String fmt, Object... args)</code></pre>
           <p>printf-style formatting — a faithful subset of <code>java.util.Formatter</code> covering the conversions <code>d s S f e E g G b B h H x X o c %</code> and <code>%n</code>, all seven flags <code>-</code> <code>#</code> <code>+</code> <code> </code> <code>0</code> <code>,</code> <code>(</code>, an optional width, an optional <code>.precision</code>, and explicit argument indexes (<code>%2$s</code>). <code>%f</code> rounds HALF_UP on the double's exact value, as Java does. <code>System.out.printf</code> is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.</p>
           <pre><code class="lang-java">System.out.println(String.format("%05.2f|%-6s|%+d", 3.14159, "ab", 7));   // 03.14|ab    |+7</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-54">
-          <h3><a class="doc-anchor" href="#doc-static-library-54">#</a> <code>Arrays.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-55">
+          <h3><a class="doc-anchor" href="#doc-static-library-55">#</a> <code>Arrays.toString</code></h3>
           <pre><code class="lang-java">String Arrays.toString(Object[] a)</code></pre>
           <p>The shallow <code>[e0, e1, …]</code> rendering of an array, each element through the same Java value-to-string rules. A null reference renders as <code>null</code>; a nested array renders as its handle, since the rendering is shallow.</p>
           <pre><code class="lang-java">System.out.println(Arrays.toString(new int[]{1, 2, 3}));   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-55">
-          <h3><a class="doc-anchor" href="#doc-static-library-55">#</a> <code>Arrays.sort</code></h3>
+        <article class="doc-entry" id="doc-static-library-56">
+          <h3><a class="doc-anchor" href="#doc-static-library-56">#</a> <code>Arrays.sort</code></h3>
           <pre><code class="lang-java">void Arrays.sort(T[] a)   |   (T[] a, Comparator&lt;T&gt; c)   |   (T[] a, int from, int to)   |   (T[] a, int from, int to, Comparator&lt;T&gt; c)</code></pre>
           <p>Sorts the array, or its <code>[from, to)</code> range, in place. A primitive array sorts numerically (<code>-0.0</code> before <code>0.0</code>, NaN last); a reference array with no comparator, or a <code>null</code> one, orders by the elements' own <code>compareTo</code>; a comparator sorts through the same stable merge sort as <code>List.sort</code>. The range is checked as <code>Arrays.rangeCheck</code> does: <code>from &gt; to</code> is <code>IllegalArgumentException: fromIndex(3) &gt; toIndex(1)</code> and an index outside the array is <code>ArrayIndexOutOfBoundsException: Array index out of range: 9</code>.</p>
           <pre><code class="lang-java">int[][] g = {{3, 1}, {2, 2}};
 Arrays.sort(g, (x, y) -&gt; x[0] - y[0]);
 System.out.println(Arrays.deepToString(g));   // [[2, 2], [3, 1]]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-56">
-          <h3><a class="doc-anchor" href="#doc-static-library-56">#</a> <code>Integer.decode</code></h3>
+        <article class="doc-entry" id="doc-static-library-57">
+          <h3><a class="doc-anchor" href="#doc-static-library-57">#</a> <code>Integer.decode</code></h3>
           <pre><code class="lang-java">int Integer.decode(String s)</code></pre>
           <p>An optional sign, then a <code>0x</code>/<code>0X</code>/<code>#</code> hexadecimal, a leading-<code>0</code> octal, or a decimal literal. The sign is read before the radix prefix, so <code>-0x80000000</code> is <code>Integer.MIN_VALUE</code> and <code>0x-1</code> is <code>NumberFormatException: Sign character in wrong position</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.decode("0x1F") + " " + Integer.decode("010"));   // 31 8</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-57">
-          <h3><a class="doc-anchor" href="#doc-static-library-57">#</a> <code>Integer.parseUnsignedInt</code></h3>
+        <article class="doc-entry" id="doc-static-library-58">
+          <h3><a class="doc-anchor" href="#doc-static-library-58">#</a> <code>Integer.parseUnsignedInt</code></h3>
           <pre><code class="lang-java">int Integer.parseUnsignedInt(String s)   |   (String s, int radix)</code></pre>
           <p>A non-negative number up to 2^32 - 1, answered as the <code>int</code> with that bit pattern. A leading <code>-</code> and a value past the range each raise <code>NumberFormatException</code> with the JDK's own message.</p>
           <pre><code class="lang-java">System.out.println(Integer.parseUnsignedInt("4294967295"));   // -1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-58">
-          <h3><a class="doc-anchor" href="#doc-static-library-58">#</a> <code>Integer.divideUnsigned</code></h3>
+        <article class="doc-entry" id="doc-static-library-59">
+          <h3><a class="doc-anchor" href="#doc-static-library-59">#</a> <code>Integer.divideUnsigned</code></h3>
           <pre><code class="lang-java">int Integer.divideUnsigned(int a, int b)   |   remainderUnsigned   |   compareUnsigned   |   toUnsignedLong   |   toUnsignedString</code></pre>
           <p>The operands read as unsigned 32-bit values. The <code>Long</code> overloads read 64 bits. A zero divisor is <code>ArithmeticException: / by zero</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.divideUnsigned(-1, 2) + " " + Integer.toUnsignedString(-1));   // 2147483647 4294967295</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-59">
-          <h3><a class="doc-anchor" href="#doc-static-library-59">#</a> <code>Short.parseShort</code></h3>
+        <article class="doc-entry" id="doc-static-library-60">
+          <h3><a class="doc-anchor" href="#doc-static-library-60">#</a> <code>Short.parseShort</code></h3>
           <pre><code class="lang-java">short Short.parseShort(String s[, int radix])   |   byte Byte.parseByte(String s[, int radix])</code></pre>
           <p><code>Integer.parseInt</code> at the given radix, then a range check whose failure is <code>NumberFormatException: Value out of range. Value:"200" Radix:10</code>. <code>Short</code>/<code>Byte</code> also carry <code>valueOf</code>, <code>compare</code> (the difference, not a sign), <code>toUnsignedInt</code>, <code>toString</code> and <code>hashCode</code>.</p>
           <pre><code class="lang-java">System.out.println(Byte.parseByte("-12") + " " + Short.parseShort("7f", 16));   // -12 127</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-60">
-          <h3><a class="doc-anchor" href="#doc-static-library-60">#</a> <code>Character.isDigit</code></h3>
+        <article class="doc-entry" id="doc-static-library-61">
+          <h3><a class="doc-anchor" href="#doc-static-library-61">#</a> <code>Character.isDigit</code></h3>
           <pre><code class="lang-java">boolean Character.isDigit(char c)   |   isLetter   |   isLetterOrDigit   |   isAlphabetic   |   isSpaceChar   |   isISOControl   |   isWhitespace   |   isUpperCase   |   isLowerCase</code></pre>
           <p>Unicode general-category predicates, as Java defines them: <code>isDigit</code> is DECIMAL_DIGIT_NUMBER in every script (<code>'٣'</code> is a digit), <code>isLetter</code> excludes the <code>Other_Alphabetic</code> marks and letter numbers that <code>isAlphabetic</code> includes, <code>isSpaceChar</code> counts the no-break spaces that <code>isWhitespace</code> does not. A sweep of all 65,536 <code>char</code> values is byte-identical to openjdk 27.</p>
           <pre><code class="lang-java">System.out.println(Character.isDigit('\u0663') + " " + Character.isLetter('\u0345'));   // true false</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-61">
-          <h3><a class="doc-anchor" href="#doc-static-library-61">#</a> <code>Character.digit</code></h3>
+        <article class="doc-entry" id="doc-static-library-62">
+          <h3><a class="doc-anchor" href="#doc-static-library-62">#</a> <code>Character.digit</code></h3>
           <pre><code class="lang-java">int Character.digit(char c, int radix)   |   char Character.forDigit(int digit, int radix)</code></pre>
           <p><code>digit</code> is the value of a decimal digit of any script, or of an ASCII or fullwidth Latin letter as 10..35, when that value is below <code>radix</code>; -1 otherwise and for a radix outside 2..36. <code>forDigit</code> is its inverse over lowercase ASCII, and the NUL <code>char</code> when the digit or radix is out of range.</p>
           <pre><code class="lang-java">System.out.println(Character.digit('f', 16) + " " + Character.forDigit(11, 16));   // 15 b</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-62">
-          <h3><a class="doc-anchor" href="#doc-static-library-62">#</a> <code>Integer.bitCount</code></h3>
+        <article class="doc-entry" id="doc-static-library-63">
+          <h3><a class="doc-anchor" href="#doc-static-library-63">#</a> <code>Integer.bitCount</code></h3>
           <pre><code class="lang-java">int Integer.bitCount(int i)   |   int Long.bitCount(long i)</code></pre>
           <p>The number of one-bits in the two's complement representation, read at the declared width — so <code>Integer.bitCount(-1)</code> is 32 and <code>Long.bitCount(-1L)</code> is 64.</p>
           <pre><code class="lang-java">System.out.println(Integer.bitCount(255) + " " + Long.bitCount(-1L));   // 8 64</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-63">
-          <h3><a class="doc-anchor" href="#doc-static-library-63">#</a> <code>Integer.reverse</code></h3>
+        <article class="doc-entry" id="doc-static-library-64">
+          <h3><a class="doc-anchor" href="#doc-static-library-64">#</a> <code>Integer.reverse</code></h3>
           <pre><code class="lang-java">int Integer.reverse(int i)   |   int Integer.reverseBytes(int i)</code></pre>
           <p><code>reverse</code> reverses the bit order, <code>reverseBytes</code> the byte order, each at the declared width. <code>Integer.reverse(1)</code> is <code>Integer.MIN_VALUE</code>; the <code>Long</code> overloads answer at 64 bits.</p>
           <pre><code class="lang-java">System.out.println(Integer.reverse(1));   // -2147483648</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-64">
-          <h3><a class="doc-anchor" href="#doc-static-library-64">#</a> <code>Integer.highestOneBit</code></h3>
+        <article class="doc-entry" id="doc-static-library-65">
+          <h3><a class="doc-anchor" href="#doc-static-library-65">#</a> <code>Integer.highestOneBit</code></h3>
           <pre><code class="lang-java">int Integer.highestOneBit(int i)   |   int Integer.lowestOneBit(int i)</code></pre>
           <p>The isolated highest or lowest set bit — a value with at most one bit set, not its index. Zero has no set bit, so both answer 0 for it. <code>Long</code> overloads answer at 64 bits.</p>
           <pre><code class="lang-java">System.out.println(Integer.highestOneBit(100) + " " + Integer.lowestOneBit(12));   // 64 4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-65">
-          <h3><a class="doc-anchor" href="#doc-static-library-65">#</a> <code>Integer.numberOfLeadingZeros</code></h3>
+        <article class="doc-entry" id="doc-static-library-66">
+          <h3><a class="doc-anchor" href="#doc-static-library-66">#</a> <code>Integer.numberOfLeadingZeros</code></h3>
           <pre><code class="lang-java">int Integer.numberOfLeadingZeros(int i)   |   int Integer.numberOfTrailingZeros(int i)</code></pre>
           <p>The count of zero bits above the highest, or below the lowest, set bit. A zero argument answers the full width — 32 for <code>Integer</code>, 64 for <code>Long</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.numberOfTrailingZeros(8));   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-66">
-          <h3><a class="doc-anchor" href="#doc-static-library-66">#</a> <code>Integer.rotateLeft</code></h3>
+        <article class="doc-entry" id="doc-static-library-67">
+          <h3><a class="doc-anchor" href="#doc-static-library-67">#</a> <code>Integer.rotateLeft</code></h3>
           <pre><code class="lang-java">int Integer.rotateLeft(int i, int distance)   |   int Integer.rotateRight(int i, int distance)</code></pre>
           <p>A circular shift: bits leaving one end re-enter at the other. The distance is taken modulo the width and a negative distance rotates the other way, so <code>Integer.rotateLeft(1, 33)</code> is 2 and <code>Integer.rotateLeft(1, -1)</code> is <code>Integer.MIN_VALUE</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.rotateLeft(1, 33));   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-67">
-          <h3><a class="doc-anchor" href="#doc-static-library-67">#</a> <code>Integer.sum</code></h3>
+        <article class="doc-entry" id="doc-static-library-68">
+          <h3><a class="doc-anchor" href="#doc-static-library-68">#</a> <code>Integer.sum</code></h3>
           <pre><code class="lang-java">int Integer.sum(int a, int b)   |   long Long.sum(long a, long b)</code></pre>
           <p>Addition at the declared width, which is the whole reason the two exist separately: <code>Integer.sum(Integer.MAX_VALUE, 1)</code> wraps to <code>Integer.MIN_VALUE</code> where <code>Long.sum</code> of the same operands is 2147483648. <code>max</code>/<code>min</code>/<code>signum</code>/<code>compare</code> are the same shape.</p>
           <pre><code class="lang-java">System.out.println(Integer.sum(Integer.MAX_VALUE, 1));   // -2147483648</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-68">
-          <h3><a class="doc-anchor" href="#doc-static-library-68">#</a> <code>Objects.hashCode</code></h3>
+        <article class="doc-entry" id="doc-static-library-69">
+          <h3><a class="doc-anchor" href="#doc-static-library-69">#</a> <code>Objects.hashCode</code></h3>
           <pre><code class="lang-java">int Objects.hashCode(Object o)   |   int Objects.hash(Object... values)</code></pre>
           <p><code>hashCode</code> is the argument's own hash, or 0 for a null — a collection hashes by its contents, and a user class through its own <code>hashCode()</code>. <code>hash</code> folds a varargs array the way <code>Arrays.hashCode</code> does, seeded at 1, so <code>Objects.hash()</code> is 1 and <code>Objects.hash((Object) null)</code> is 31.</p>
           <pre><code class="lang-java">System.out.println(Objects.hashCode(null) + " " + Objects.hash("a", "b"));   // 0 4066</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-69">
-          <h3><a class="doc-anchor" href="#doc-static-library-69">#</a> <code>Objects.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-70">
+          <h3><a class="doc-anchor" href="#doc-static-library-70">#</a> <code>Objects.toString</code></h3>
           <pre><code class="lang-java">String Objects.toString(Object o)   |   String Objects.toString(Object o, String nullDefault)</code></pre>
           <p>The argument rendered as <code>println</code> would render it, reaching a user <code>toString()</code>. A null renders as the four-character string <code>null</code>, or as <code>nullDefault</code> when the two-argument form supplies one.</p>
           <pre><code class="lang-java">System.out.println(Objects.toString(null, "none"));   // none</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-70">
-          <h3><a class="doc-anchor" href="#doc-static-library-70">#</a> <code>Objects.requireNonNull</code></h3>
+        <article class="doc-entry" id="doc-static-library-71">
+          <h3><a class="doc-anchor" href="#doc-static-library-71">#</a> <code>Objects.requireNonNull</code></h3>
           <pre><code class="lang-java">T Objects.requireNonNull(T o)   |   T Objects.requireNonNull(T o, String message)   |   T Objects.requireNonNullElse(T o, T other)</code></pre>
           <p><code>requireNonNull</code> returns its argument or throws <code>NullPointerException</code> — with no detail message, or with the caller's text. <code>requireNonNullElse</code> returns the first non-null of the two and throws naming <code>defaultObj</code> when both are null.</p>
           <pre><code class="lang-java">System.out.println(Objects.requireNonNullElse(null, "fallback"));   // fallback</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-71">
-          <h3><a class="doc-anchor" href="#doc-static-library-71">#</a> <code>Objects.isNull</code></h3>
+        <article class="doc-entry" id="doc-static-library-72">
+          <h3><a class="doc-anchor" href="#doc-static-library-72">#</a> <code>Objects.isNull</code></h3>
           <pre><code class="lang-java">boolean Objects.isNull(Object o)   |   boolean Objects.nonNull(Object o)</code></pre>
           <p>The null test as a value, for use as a predicate. <code>Objects.equals(a, b)</code> is the matching equality test: <code>a == b || (a != null &amp;&amp; a.equals(b))</code>, so it reaches a user <code>equals</code> and answers for a null receiver.</p>
           <pre><code class="lang-java">System.out.println(Objects.isNull(null) + " " + Objects.nonNull(null));   // true false</code></pre>
@@ -1401,87 +1409,99 @@ System.out.println(Arrays.deepToString(g));   // [[2, 2], [3, 1]]</code></pre>
       <section class="tutorial-section" id="ch-collection-statics">
         <h2>Collection Statics</h2>
         <article class="doc-entry" id="doc-collection-statics-1">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-1">#</a> <code>Collections.addAll</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-statics-1">#</a> <code>List.copyOf</code></h3>
+          <pre><code class="lang-java">List.copyOf(c)   |   Set.copyOf(c)   |   Map.copyOf(m)</code></pre>
+          <p>Immutable copies that refuse a <code>null</code> element, key or value; <code>Set.copyOf</code> drops repeats where <code>Set.of</code> refuses them.</p>
+          <pre><code class="lang-java">System.out.println(List.copyOf(new ArrayList&lt;&gt;(List.of(1, 2))));   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-2">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-2">#</a> <code>Collections.singleton</code></h3>
+          <pre><code class="lang-java">Collections.singleton(o)   |   singletonMap(k, v)   |   emptySet()   |   emptyMap()</code></pre>
+          <p>The immutable one- and zero-element sets and maps; unlike <code>Set.of</code>/<code>Map.of</code> they accept <code>null</code>.</p>
+          <pre><code class="lang-java">System.out.println(Collections.singletonMap("k", 1));   // {k=1}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-3">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-3">#</a> <code>Collections.addAll</code></h3>
           <pre><code class="lang-java">boolean Collections.addAll(Collection&lt;T&gt; c, T... elements)</code></pre>
           <p>Adds each element through the collection's own <code>add</code> and answers whether any call changed it.</p>
           <pre><code class="lang-java">Collections.addAll(xs, 1, 2, 3);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-2">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-2">#</a> <code>Arrays.asList</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-4">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-4">#</a> <code>Arrays.asList</code></h3>
           <pre><code class="lang-java">List&lt;T&gt; Arrays.asList(T... a)</code></pre>
           <p>A *fixed-size* list view: <code>set</code> replaces an element, but <code>add</code>, <code>remove</code>, and <code>clear</code> raise <code>UnsupportedOperationException</code> exactly as Java's does. A lone array argument spreads into its elements rather than becoming a one-element list, matching Java's varargs rule for reference arrays.</p>
           <pre><code class="lang-java">List&lt;Integer&gt; xs = Arrays.asList(1, 2, 3);
 xs.set(0, 9);   // fine
 // xs.add(4);   // UnsupportedOperationException</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-3">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-3">#</a> <code>List.of</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-5">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-5">#</a> <code>List.of</code></h3>
           <pre><code class="lang-java">List&lt;T&gt; List.of(T... elements)</code></pre>
           <p>A fully immutable list: every structural change *and* every element replacement raises <code>UnsupportedOperationException</code>.</p>
           <pre><code class="lang-java">System.out.println(List.of(1, 2, 3));   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-4">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-4">#</a> <code>Set.of</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-6">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-6">#</a> <code>Set.of</code></h3>
           <pre><code class="lang-java">Set&lt;T&gt; Set.of(T... elements)</code></pre>
           <p>An immutable set with <code>HashSet</code> iteration order, keeping the first of each repeated element.</p>
           <pre><code class="lang-java">System.out.println(Set.of("p"));   // [p]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-5">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-5">#</a> <code>Collections.sort</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-7">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-7">#</a> <code>Collections.sort</code></h3>
           <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list)</code></pre>
           <p>Sorts the list in place into ascending natural order — the elements' own <code>compareTo</code>, so a list of a user <code>Comparable</code> sorts by its method — and the change is visible through every reference to it.</p>
           <pre><code class="lang-java">Collections.sort(xs);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-6">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-6">#</a> <code>Collections.sort</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-8">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-8">#</a> <code>Collections.sort</code></h3>
           <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list, Comparator&lt;T&gt; cmp)</code></pre>
           <p>Sorts in place with a comparator lambda. The sort is a bottom-up merge sort that never panics on an inconsistent comparator and is stable, as Java guarantees for <code>List.sort</code>. A <code>null</code> comparator means natural order.</p>
           <pre><code class="lang-java">Collections.sort(xs, (a, b) -&gt; a.length() - b.length());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-7">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-7">#</a> <code>Collections.reverse</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-9">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-9">#</a> <code>Collections.reverse</code></h3>
           <pre><code class="lang-java">void Collections.reverse(List&lt;T&gt; list)</code></pre>
           <p>Reverses the list in place.</p>
           <pre><code class="lang-java">Collections.reverse(xs);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-8">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-8">#</a> <code>EnumSet</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-10">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-10">#</a> <code>EnumSet</code></h3>
           <pre><code class="lang-java">EnumSet.of(E e, E... rest)   |   EnumSet.noneOf(Class&lt;E&gt;)   |   EnumSet.allOf(Class&lt;E&gt;)   |   EnumSet.copyOf(Collection&lt;E&gt;)</code></pre>
           <p>An enum set, iterating in ordinal order. javars models it as the <code>TreeSet</code> it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; <code>getClass()</code> names <code>java.util.TreeSet</code>. <code>range</code> and <code>complementOf</code> are not modeled.</p>
           <pre><code class="lang-java">System.out.println(EnumSet.of(Day.SUN, Day.MON));   // [MON, SUN]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-9">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-9">#</a> <code>EnumMap</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-11">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-11">#</a> <code>EnumMap</code></h3>
           <pre><code class="lang-java">new EnumMap&lt;&gt;(Class&lt;K&gt; keyType)   |   new EnumMap&lt;&gt;(Map&lt;K, V&gt; m)</code></pre>
           <p>A map keyed by an enum, iterating in ordinal order — modeled as the <code>TreeMap</code> it behaves as.</p>
           <pre><code class="lang-java">Map&lt;Day, Integer&gt; h = new EnumMap&lt;&gt;(Day.class);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-10">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-10">#</a> <code>Map.Entry.comparingByKey</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-12">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-12">#</a> <code>Map.Entry.comparingByKey</code></h3>
           <pre><code class="lang-java">Comparator Map.Entry.comparingByKey([Comparator cmp])   |   Map.Entry.comparingByValue([Comparator cmp])</code></pre>
           <p>The comparators that order map entries by key or by value — natural order, or <code>cmp</code> applied to the key or value.</p>
           <pre><code class="lang-java">entries.sort(Map.Entry.comparingByValue());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-11">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-11">#</a> <code>Collections.shuffle</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-13">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-13">#</a> <code>Collections.shuffle</code></h3>
           <pre><code class="lang-java">void Collections.shuffle(List&lt;?&gt; list [, Random rnd])</code></pre>
           <p>Permutes the list in place by the JDK's walk — <code>swap(list, i - 1, rnd.nextInt(i))</code> from the size down to 2 — so a seeded <code>Random</code> gives the JDK's order. Without one, an unseeded generator of its own is used.</p>
           <pre><code class="lang-java">Collections.shuffle(xs, new Random(7));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-12">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-12">#</a> <code>Collections.reverseOrder</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-14">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-14">#</a> <code>Collections.reverseOrder</code></h3>
           <pre><code class="lang-java">Comparator&lt;T&gt; Collections.reverseOrder()   |   Collections.reverseOrder(Comparator&lt;T&gt; cmp)</code></pre>
           <p>The comparator that imposes the reverse of natural order — <code>Comparator.reverseOrder()</code> — or the reverse of <code>cmp</code> (<code>cmp.reversed()</code>). A <code>null</code> argument means natural order, as the JDK specifies.</p>
           <pre><code class="lang-java">xs.sort(Collections.reverseOrder());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-13">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-13">#</a> <code>Collections.max</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-15">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-15">#</a> <code>Collections.max</code></h3>
           <pre><code class="lang-java">T Collections.max(Collection&lt;T&gt; c)</code></pre>
           <p>The largest element in ascending natural order. An empty collection raises <code>java.util.NoSuchElementException</code>, catchable like any modeled throwable.</p>
           <pre><code class="lang-java">System.out.println(Collections.max(xs));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-14">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-14">#</a> <code>Collections.min</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-16">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-16">#</a> <code>Collections.min</code></h3>
           <pre><code class="lang-java">T Collections.min(Collection&lt;T&gt; c)</code></pre>
           <p>The smallest element in ascending natural order; empty raises the same <code>NoSuchElementException</code> as <code>Collections.max</code>.</p>
           <pre><code class="lang-java">System.out.println(Collections.min(xs));</code></pre>

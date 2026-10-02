@@ -459,6 +459,8 @@ enum HostObj {
     Stats(SummaryStats),
     /// A `java.util.BitSet` (see [`crate::jbitset`]).
     Bits(crate::jbitset::BitSet),
+    /// An `AtomicInteger`, `AtomicLong` or `AtomicBoolean`.
+    Atomic { kind: AtomicKind, value: Value },
     /// A `java.util.regex.Pattern`: the source as written, its flags, and the
     /// source the engine compiles (see [`regex_source`]).
     RegexPattern {
@@ -1014,6 +1016,132 @@ impl SummaryStats {
         }
         s
     }
+}
+
+/// Which `java.util.concurrent.atomic` class an [`HostObj::Atomic`] is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicKind {
+    Int,
+    Long,
+    Bool,
+}
+
+/// The value an atomic holds, normalized to its width: an `AtomicInteger`
+/// wraps at 32 bits as `int` arithmetic does.
+fn atomic_norm(kind: AtomicKind, v: &Value) -> Value {
+    match kind {
+        AtomicKind::Int => Value::Int(i64::from(v.jint() as i32)),
+        AtomicKind::Long => Value::Int(v.jint()),
+        AtomicKind::Bool => Value::bool(matches!(deboxed(v), Value::Bool(true))),
+    }
+}
+
+/// Read or replace an atomic's value; `None` for any other value.
+fn atomic_cell(v: &Value, put: Option<Value>) -> Option<(AtomicKind, Value)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Atomic { kind, value }) => {
+            let old = value.clone();
+            if let Some(new) = put {
+                *value = atomic_norm(*kind, &new);
+            }
+            Some((*kind, old))
+        }
+        _ => None,
+    })
+}
+
+/// A method call on an `AtomicInteger`/`AtomicLong`/`AtomicBoolean`; `None`
+/// for any other receiver. javars runs one thread, so every operation is the
+/// plain read-modify-write its name describes, with `int` wrap for an
+/// `AtomicInteger`; the update functions run on the VM.
+fn atomic_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let (kind, cur) = atomic_cell(recv, None)?;
+    let store = |v: Value| {
+        atomic_cell(recv, Some(v));
+    };
+    let norm = |v: Value| atomic_norm(kind, &v);
+    let add = |d: i64| norm(Value::Int(cur.jint().wrapping_add(d)));
+    Some(match (method, args) {
+        ("get" | "getPlain" | "getAcquire" | "getOpaque" | "intValue" | "longValue", []) => cur,
+        ("doubleValue", []) => Value::float(cur.jint() as f64),
+        ("set" | "lazySet" | "setPlain" | "setRelease" | "setOpaque", [v]) => {
+            store(v.clone());
+            Value::Undef
+        }
+        ("getAndSet", [v]) => {
+            store(v.clone());
+            cur
+        }
+        ("incrementAndGet", []) => {
+            let n = add(1);
+            store(n.clone());
+            n
+        }
+        ("decrementAndGet", []) => {
+            let n = add(-1);
+            store(n.clone());
+            n
+        }
+        ("getAndIncrement", []) => {
+            store(add(1));
+            cur
+        }
+        ("getAndDecrement", []) => {
+            store(add(-1));
+            cur
+        }
+        ("addAndGet", [d]) => {
+            let n = add(d.jint());
+            store(n.clone());
+            n
+        }
+        ("getAndAdd", [d]) => {
+            store(add(d.jint()));
+            cur
+        }
+        ("compareAndSet" | "weakCompareAndSet" | "weakCompareAndSetPlain", [e, n]) => {
+            let hit = value_eq(&cur, &norm(e.clone()));
+            if hit {
+                store(n.clone());
+            }
+            Value::bool(hit)
+        }
+        ("updateAndGet" | "getAndUpdate", [f]) => {
+            let n = norm(invoke_closure(vm, f, std::slice::from_ref(&cur)));
+            if pending() {
+                return Some(Value::Undef);
+            }
+            store(n.clone());
+            if method == "updateAndGet" {
+                n
+            } else {
+                cur
+            }
+        }
+        ("accumulateAndGet" | "getAndAccumulate", [x, f]) => {
+            let n = norm(invoke_closure(vm, f, &[cur.clone(), x.clone()]));
+            if pending() {
+                return Some(Value::Undef);
+            }
+            store(n.clone());
+            if method == "accumulateAndGet" {
+                n
+            } else {
+                cur
+            }
+        }
+        ("toString", []) => Value::str(java_str(&cur)),
+        _ => raise(
+            vm,
+            Fault::internal(format!(
+                "javars: unsupported atomic method `{method}` with {} argument(s)",
+                args.len()
+            )),
+        ),
+    })
 }
 
 /// Run `f` on the `BitSet` a handle names; `None` for any other value.
@@ -5246,6 +5374,12 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
                     HostObj::Bits(_) => "java.util.BitSet".to_string(),
+                    HostObj::Atomic { kind, .. } => match kind {
+                        AtomicKind::Int => "java.util.concurrent.atomic.AtomicInteger",
+                        AtomicKind::Long => "java.util.concurrent.atomic.AtomicLong",
+                        AtomicKind::Bool => "java.util.concurrent.atomic.AtomicBoolean",
+                    }
+                    .to_string(),
                     HostObj::RegexPattern { .. } => "java.util.regex.Pattern".to_string(),
                     HostObj::RegexMatcher(_) => "java.util.regex.Matcher".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
@@ -8815,6 +8949,9 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(v) = atomic_method(vm, &recv, &method, &args) {
+        return v;
+    }
     if let Some(r) = bitset_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -9796,6 +9933,21 @@ fn system_static(
         ("Random", "#new", [seed]) => Ok(Value::Obj(heap_alloc(HostObj::Random(
             crate::jrandom::Random::new(seed.jint()),
         )))),
+        ("AtomicInteger" | "AtomicLong" | "AtomicBoolean", "#new", rest) if rest.len() <= 1 => {
+            let kind = match class {
+                "AtomicInteger" => AtomicKind::Int,
+                "AtomicLong" => AtomicKind::Long,
+                _ => AtomicKind::Bool,
+            };
+            let init = rest.first().cloned().unwrap_or(match kind {
+                AtomicKind::Bool => Value::bool(false),
+                _ => Value::Int(0),
+            });
+            Ok(Value::Obj(heap_alloc(HostObj::Atomic {
+                kind,
+                value: atomic_norm(kind, &init),
+            })))
+        }
         ("BitSet", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Bits(
             crate::jbitset::BitSet::new(),
         )))),
@@ -10185,6 +10337,88 @@ fn collection_static(
                 order: Order::Hash,
                 fixed: Fixity::Immutable,
                 view: SetView::Own,
+                index: KeyIndex::default(),
+            })))
+        }
+        // `List.copyOf`/`Set.copyOf`/`Map.copyOf`: immutable copies that refuse
+        // a `null` element, key or value as the `of` factories do. `Set.copyOf`
+        // drops a repeat where `Set.of` refuses one — it is a copy of a
+        // collection that may legitimately hold equal elements.
+        ("List", "copyOf") if args.len() == 1 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            if let Err(f) = reject_null_element(&items) {
+                return Some(Err(f));
+            }
+            list(items, Fixity::Immutable)
+        }
+        ("Set", "copyOf") if args.len() == 1 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            if let Err(f) = reject_null_element(&items) {
+                return Some(Err(f));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Set {
+                items: distinct(vm, &items),
+                order: Order::Hash,
+                fixed: Fixity::Immutable,
+                view: SetView::Own,
+                index: KeyIndex::default(),
+            })))
+        }
+        ("Map", "copyOf") if args.len() == 1 => {
+            let Some(entries) = map_entries(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            if entries
+                .iter()
+                .any(|(k, v)| matches!(k, Value::Undef) || matches!(v, Value::Undef))
+            {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            Ok(Value::Obj(heap_alloc(HostObj::Map {
+                entries,
+                order: Order::Hash,
+                fixed: Fixity::Immutable,
+                index: KeyIndex::default(),
+            })))
+        }
+        // `Collections.emptySet`/`emptyMap`/`singleton`/`singletonMap`: the
+        // immutable one- and zero-element collections. Unlike `Set.of`/`Map.of`
+        // they accept a `null` element, key or value.
+        ("Collections", "emptySet") if args.is_empty() => {
+            Ok(Value::Obj(heap_alloc(HostObj::Set {
+                items: Vec::new(),
+                order: Order::Insertion,
+                fixed: Fixity::Immutable,
+                view: SetView::Own,
+                index: KeyIndex::default(),
+            })))
+        }
+        ("Collections", "singleton") if args.len() == 1 => {
+            Ok(Value::Obj(heap_alloc(HostObj::Set {
+                items: vec![args[0].clone()],
+                order: Order::Insertion,
+                fixed: Fixity::Immutable,
+                view: SetView::Own,
+                index: KeyIndex::default(),
+            })))
+        }
+        ("Collections", "emptyMap") if args.is_empty() => {
+            Ok(Value::Obj(heap_alloc(HostObj::Map {
+                entries: Vec::new(),
+                order: Order::Insertion,
+                fixed: Fixity::Immutable,
+                index: KeyIndex::default(),
+            })))
+        }
+        ("Collections", "singletonMap") if args.len() == 2 => {
+            Ok(Value::Obj(heap_alloc(HostObj::Map {
+                entries: vec![(args[0].clone(), args[1].clone())],
+                order: Order::Insertion,
+                fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             })))
         }
@@ -11331,9 +11565,12 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             char::to_lowercase,
         ))),
         ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
-        ("Character", "getNumericValue", 1) => Ok(Value::Int(
-            char_arg(&args[0]).to_digit(36).map_or(-1, i64::from),
-        )),
+        // `getNumericValue` is `digit(c, 36)` for every script's decimal digits
+        // and the Latin letters (fullwidth included); the characters whose
+        // numeric value is not a digit (Roman numerals, fractions) are -1 here.
+        ("Character", "getNumericValue", 1) => {
+            Ok(Value::Int(java_digit(char_arg(&args[0]) as u32, 36)))
+        }
 
         // ── java.lang.Boolean ──
         ("Boolean", "parseBoolean", 1) => Ok(Value::bool(
@@ -15006,6 +15243,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Bits(b)) => b.render(),
+            Some(HostObj::Atomic { value, .. }) => java_str(value),
             // `Pattern.toString()` is its source; `Matcher.toString()` names the
             // pattern, the region and the last match.
             Some(HostObj::RegexPattern { shown, .. }) => shown.clone(),

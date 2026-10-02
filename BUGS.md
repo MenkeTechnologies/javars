@@ -1381,9 +1381,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   library surface, with console and text input (`Scanner`, `BufferedReader`
   over `InputStreamReader`/`StringReader`, `StringTokenizer`), `java.util.Random`
   (a port of the JDK's generator, so a seeded sequence is the JDK's),
-  `java.util.BitSet`, `java.util.regex.Pattern`/`Matcher`, and the
-  `Int`/`Long`/`DoubleSummaryStatistics` classes, and no file, network, or other
-  I/O. A stream is evaluated
+  `java.util.BitSet`, `java.util.regex.Pattern`/`Matcher`, the
+  `Int`/`Long`/`DoubleSummaryStatistics` classes, and `AtomicInteger`/`AtomicLong`/
+  `AtomicBoolean` (whose operations, with one thread, are the plain
+  read-modify-writes they name), and no file, network, or other I/O. A stream is evaluated
   in one thread whatever `parallel()` would ask for, which is observable only
   through a side-effecting pipeline's *ordering* — Java makes no ordering
   promise for one either. An iterator over a `Set` is not fail-fast, because a `Set` carries no

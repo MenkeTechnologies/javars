@@ -1009,6 +1009,27 @@ pub const REFERENCE: &[Entry] = &[
     ),
     // ── Static Library: the `(class, method, arity)` arms of `static_method` ──
     (
+        "AtomicInteger",
+        "Static Library",
+        "new AtomicInteger([int])   |   new AtomicLong([long])   |   new AtomicBoolean([boolean])",
+        "The `java.util.concurrent.atomic` cells, the counters a lambda body can update. `get`/`set`, `incrementAndGet`/`getAndIncrement` and the decrements, `addAndGet`/`getAndAdd`, `getAndSet`, `compareAndSet`, `updateAndGet`/`getAndUpdate`, `accumulateAndGet`/`getAndAccumulate`; an `AtomicInteger` wraps at 32 bits. javars runs one thread, so each is the plain read-modify-write it names.",
+        "AtomicInteger n = new AtomicInteger();\nList.of(1, 2).forEach(x -> n.addAndGet(x));\nSystem.out.println(n);   // 3",
+    ),
+    (
+        "List.copyOf",
+        "Collection Statics",
+        "List.copyOf(c)   |   Set.copyOf(c)   |   Map.copyOf(m)",
+        "Immutable copies that refuse a `null` element, key or value; `Set.copyOf` drops repeats where `Set.of` refuses them.",
+        "System.out.println(List.copyOf(new ArrayList<>(List.of(1, 2))));   // [1, 2]",
+    ),
+    (
+        "Collections.singleton",
+        "Collection Statics",
+        "Collections.singleton(o)   |   singletonMap(k, v)   |   emptySet()   |   emptyMap()",
+        "The immutable one- and zero-element sets and maps; unlike `Set.of`/`Map.of` they accept `null`.",
+        "System.out.println(Collections.singletonMap(\"k\", 1));   // {k=1}",
+    ),
+    (
         "BitSet",
         "Static Library",
         "new BitSet([int nbits])",

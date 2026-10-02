@@ -4117,8 +4117,11 @@ impl Compiler {
         // StringBuilder::append)`.
         // `MatchResult::group`, `Matcher::start` — the mappers a `results()`
         // pipeline is written with.
-        let regex_ref = matches!(name, "MatchResult" | "Matcher")
-            && matches!(method, "group" | "start" | "end" | "groupCount");
+        // `Object::toString`, `Object::hashCode` — `java.lang.Object`'s methods
+        // on any receiver, dispatched on its runtime class.
+        let regex_ref = (matches!(name, "MatchResult" | "Matcher")
+            && matches!(method, "group" | "start" | "end" | "groupCount"))
+            || (name == "Object" && matches!(method, "toString" | "hashCode"));
         if regex_ref && !self.classes.contains_key(name) {
             let ps = mk(1);
             return Ok(Some(lambda(
@@ -8556,6 +8559,9 @@ fn is_static_class(name: &str) -> bool {
             | "Pattern"
             | "Matcher"
             | "BitSet"
+            | "AtomicInteger"
+            | "AtomicLong"
+            | "AtomicBoolean"
     )
 }
 
@@ -8682,6 +8688,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "#new") => "StringTokenizer",
         ("Random", "#new") => "Random",
         ("BitSet", "#new") => "BitSet",
+        ("AtomicInteger", "#new") => "AtomicInteger",
+        ("AtomicLong", "#new") => "AtomicLong",
+        ("AtomicBoolean", "#new") => "AtomicBoolean",
         ("Pattern", "compile") => "Pattern",
         ("Pattern", "matches") => "boolean",
         ("Pattern", "quote") | ("Matcher", "quoteReplacement") => "String",
@@ -9513,6 +9522,9 @@ fn is_host_value_class(name: &str) -> bool {
             | "LongSummaryStatistics"
             | "DoubleSummaryStatistics"
             | "BitSet"
+            | "AtomicInteger"
+            | "AtomicLong"
+            | "AtomicBoolean"
     )
 }
 
@@ -9547,6 +9559,20 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("BitSet", "cardinality" | "length" | "size" | "nextSetBit" | "nextClearBit") => "int",
         ("BitSet", "previousSetBit" | "previousClearBit" | "hashCode") => "int",
         ("BitSet", "isEmpty" | "intersects") => "boolean",
+        (
+            "AtomicInteger",
+            "get" | "intValue" | "incrementAndGet" | "decrementAndGet" | "getAndIncrement"
+            | "getAndDecrement" | "addAndGet" | "getAndAdd" | "getAndSet" | "updateAndGet"
+            | "getAndUpdate" | "accumulateAndGet" | "getAndAccumulate",
+        ) => "int",
+        (
+            "AtomicLong",
+            "get" | "longValue" | "incrementAndGet" | "decrementAndGet" | "getAndIncrement"
+            | "getAndDecrement" | "addAndGet" | "getAndAdd" | "getAndSet" | "updateAndGet"
+            | "getAndUpdate" | "accumulateAndGet" | "getAndAccumulate",
+        ) => "long",
+        ("AtomicInteger" | "AtomicLong" | "AtomicBoolean", "compareAndSet") => "boolean",
+        ("AtomicBoolean", "get" | "getAndSet") => "boolean",
         ("Pattern", "matcher") => "Matcher",
         ("Pattern", "pattern" | "toString") => "String",
         ("Pattern", "split") => "String[]",
