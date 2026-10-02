@@ -1106,6 +1106,14 @@ storage-model differences:
   `m.values().remove(v)` (the first entry holding `v`, in iteration order) all
   shrink the map as in Java. What the copy still cannot do is follow the map.
 
+  The navigable range and descending views — `headMap`/`tailMap`/`subMap`,
+  `headSet`/`tailSet`/`subSet`, `descendingMap`/`descendingSet`,
+  `navigableKeySet`/`descendingKeySet` — are copies on the same terms: in
+  range, sorted by the source's comparator (or presented and navigated in
+  reverse), with removals carried back to the source. An *insertion* through
+  one (`put`, `add`, `merge`, …) is refused with a javars error rather than
+  kept from the source, and a copy does not see a later change to the source.
+
   `List.subList` *is* a real aliasing view (above); these three are not. Two
   consequences, both measured on `openjdk 21.0.12.1`:
 

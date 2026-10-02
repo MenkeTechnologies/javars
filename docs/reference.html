@@ -1758,110 +1758,116 @@ System.out.println(l);   // [10, 99, 30, 40]</code></pre>
       <section class="tutorial-section" id="ch-map-methods">
         <h2>Map Methods</h2>
         <article class="doc-entry" id="doc-map-methods-1">
-          <h3><a class="doc-anchor" href="#doc-map-methods-1">#</a> <code>size</code></h3>
+          <h3><a class="doc-anchor" href="#doc-map-methods-1">#</a> <code>headMap</code></h3>
+          <pre><code class="lang-java">headMap(to [, incl])   |   tailMap(from [, incl])   |   subMap(from, to)   |   subMap(from, fi, to, ti)   |   descendingMap()   |   navigableKeySet()   |   descendingKeySet()</code></pre>
+          <p>A <code>TreeMap</code>'s range and descending views: <code>head</code> excludes its key unless <code>incl</code>, <code>tail</code> includes it, <code>sub</code> is <code>[from, to)</code>; a <code>null</code> bound is <code>NullPointerException</code> and <code>from &gt; to</code> <code>IllegalArgumentException: fromKey &gt; toKey</code>. A descending view iterates and navigates in reverse. javars returns a copy whose removals (<code>remove</code>, <code>clear</code>, <code>pollFirstEntry</code>, …) reach the source map; an insertion through one is refused.</p>
+          <pre><code class="lang-java">System.out.println(new TreeMap&lt;&gt;(Map.of(1, "a", 5, "e", 3, "c")).headMap(4));   // {1=a, 3=c}</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-map-methods-2">
+          <h3><a class="doc-anchor" href="#doc-map-methods-2">#</a> <code>size</code></h3>
           <pre><code class="lang-java">int size()</code></pre>
           <p>The number of entries.</p>
           <pre><code class="lang-java">System.out.println(m.size());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-2">
-          <h3><a class="doc-anchor" href="#doc-map-methods-2">#</a> <code>isEmpty</code></h3>
+        <article class="doc-entry" id="doc-map-methods-3">
+          <h3><a class="doc-anchor" href="#doc-map-methods-3">#</a> <code>isEmpty</code></h3>
           <pre><code class="lang-java">boolean isEmpty()</code></pre>
           <p>True when the map holds no entries.</p>
           <pre><code class="lang-java">if (m.isEmpty()) { System.out.println("empty"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-3">
-          <h3><a class="doc-anchor" href="#doc-map-methods-3">#</a> <code>put</code></h3>
+        <article class="doc-entry" id="doc-map-methods-4">
+          <h3><a class="doc-anchor" href="#doc-map-methods-4">#</a> <code>put</code></h3>
           <pre><code class="lang-java">V put(K key, V value)</code></pre>
           <p>Associates <code>key</code> with <code>value</code> and returns the previous value, or <code>null</code> when the key was absent. Re-putting an existing key keeps the entry's original insertion position, which is what Java's linked and bucket layouts both do.</p>
           <pre><code class="lang-java">m.put("one", 1);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-4">
-          <h3><a class="doc-anchor" href="#doc-map-methods-4">#</a> <code>putIfAbsent</code></h3>
+        <article class="doc-entry" id="doc-map-methods-5">
+          <h3><a class="doc-anchor" href="#doc-map-methods-5">#</a> <code>putIfAbsent</code></h3>
           <pre><code class="lang-java">V putIfAbsent(K key, V value)</code></pre>
           <p>Inserts only when the key is absent; returns the existing value when it was present, <code>null</code> otherwise.</p>
           <pre><code class="lang-java">m.putIfAbsent("one", 99);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-5">
-          <h3><a class="doc-anchor" href="#doc-map-methods-5">#</a> <code>get</code></h3>
+        <article class="doc-entry" id="doc-map-methods-6">
+          <h3><a class="doc-anchor" href="#doc-map-methods-6">#</a> <code>get</code></h3>
           <pre><code class="lang-java">V get(Object key)</code></pre>
           <p>The value for <code>key</code>, or <code>null</code> when absent. Keys are matched with the same value-or-identity equality the rest of the collections use.</p>
           <pre><code class="lang-java">System.out.println(m.get("one"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-6">
-          <h3><a class="doc-anchor" href="#doc-map-methods-6">#</a> <code>getOrDefault</code></h3>
+        <article class="doc-entry" id="doc-map-methods-7">
+          <h3><a class="doc-anchor" href="#doc-map-methods-7">#</a> <code>getOrDefault</code></h3>
           <pre><code class="lang-java">V getOrDefault(Object key, V fallback)</code></pre>
           <p>The value for <code>key</code>, or <code>fallback</code> when the key is absent.</p>
           <pre><code class="lang-java">System.out.println(m.getOrDefault("nope", 0));   // 0</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-7">
-          <h3><a class="doc-anchor" href="#doc-map-methods-7">#</a> <code>containsKey</code></h3>
+        <article class="doc-entry" id="doc-map-methods-8">
+          <h3><a class="doc-anchor" href="#doc-map-methods-8">#</a> <code>containsKey</code></h3>
           <pre><code class="lang-java">boolean containsKey(Object key)</code></pre>
           <p>True when the map holds an entry for <code>key</code>.</p>
           <pre><code class="lang-java">System.out.println(m.containsKey("one"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-8">
-          <h3><a class="doc-anchor" href="#doc-map-methods-8">#</a> <code>containsValue</code></h3>
+        <article class="doc-entry" id="doc-map-methods-9">
+          <h3><a class="doc-anchor" href="#doc-map-methods-9">#</a> <code>containsValue</code></h3>
           <pre><code class="lang-java">boolean containsValue(Object value)</code></pre>
           <p>True when some entry's value matches — a linear scan, as in Java.</p>
           <pre><code class="lang-java">System.out.println(m.containsValue(1));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-9">
-          <h3><a class="doc-anchor" href="#doc-map-methods-9">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-map-methods-10">
+          <h3><a class="doc-anchor" href="#doc-map-methods-10">#</a> <code>remove</code></h3>
           <pre><code class="lang-java">V remove(Object key)</code></pre>
           <p>Removes the entry and returns its value, or <code>null</code> when the key was absent.</p>
           <pre><code class="lang-java">m.remove("one");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-10">
-          <h3><a class="doc-anchor" href="#doc-map-methods-10">#</a> <code>clear</code></h3>
+        <article class="doc-entry" id="doc-map-methods-11">
+          <h3><a class="doc-anchor" href="#doc-map-methods-11">#</a> <code>clear</code></h3>
           <pre><code class="lang-java">void clear()</code></pre>
           <p>Removes every entry.</p>
           <pre><code class="lang-java">m.clear();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-11">
-          <h3><a class="doc-anchor" href="#doc-map-methods-11">#</a> <code>keySet</code></h3>
+        <article class="doc-entry" id="doc-map-methods-12">
+          <h3><a class="doc-anchor" href="#doc-map-methods-12">#</a> <code>keySet</code></h3>
           <pre><code class="lang-java">Set&lt;K&gt; keySet()</code></pre>
           <p>A <code>Set</code> of the keys, already materialized in the map's own presentation order — so it iterates and prints exactly as the map does. It is a snapshot, not a live view: removing from it does not change the map.</p>
           <pre><code class="lang-java">System.out.println(m.keySet());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-12">
-          <h3><a class="doc-anchor" href="#doc-map-methods-12">#</a> <code>values</code></h3>
+        <article class="doc-entry" id="doc-map-methods-13">
+          <h3><a class="doc-anchor" href="#doc-map-methods-13">#</a> <code>values</code></h3>
           <pre><code class="lang-java">Collection&lt;V&gt; values()</code></pre>
           <p>A fixed-size list of the values, in the map's presentation order and therefore aligned position-for-position with <code>keySet()</code>. Also a snapshot.</p>
           <pre><code class="lang-java">System.out.println(m.values());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-13">
-          <h3><a class="doc-anchor" href="#doc-map-methods-13">#</a> <code>forEach</code></h3>
+        <article class="doc-entry" id="doc-map-methods-14">
+          <h3><a class="doc-anchor" href="#doc-map-methods-14">#</a> <code>forEach</code></h3>
           <pre><code class="lang-java">void forEach(BiConsumer&lt;K,V&gt; action)</code></pre>
           <p>Invokes a two-argument action per entry, in presentation order. The map's <code>forEach</code> is distinguished from a list's by the receiver, so the same lambda arity rules as Java apply.</p>
           <pre><code class="lang-java">m.forEach((k, v) -&gt; System.out.println(k + "=" + v));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-14">
-          <h3><a class="doc-anchor" href="#doc-map-methods-14">#</a> <code>toString</code></h3>
+        <article class="doc-entry" id="doc-map-methods-15">
+          <h3><a class="doc-anchor" href="#doc-map-methods-15">#</a> <code>toString</code></h3>
           <pre><code class="lang-java">String toString()</code></pre>
           <p><code>AbstractMap.toString</code> — <code>{k=v, k=v}</code> in presentation order, which for a <code>HashMap</code> is Java's real bucket order.</p>
           <pre><code class="lang-java">System.out.println(m);   // {one=1, two=2, three=3}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-15">
-          <h3><a class="doc-anchor" href="#doc-map-methods-15">#</a> <code>firstKey</code></h3>
+        <article class="doc-entry" id="doc-map-methods-16">
+          <h3><a class="doc-anchor" href="#doc-map-methods-16">#</a> <code>firstKey</code></h3>
           <pre><code class="lang-java">K firstKey()   |   K lastKey()</code></pre>
           <p>A <code>TreeMap</code>'s lowest or highest key in its sorted order. An empty map raises <code>NoSuchElementException</code>.</p>
           <pre><code class="lang-java">TreeMap&lt;Integer,String&gt; t = new TreeMap&lt;&gt;(Map.of(1, "a", 5, "e"));
 System.out.println(t.firstKey() + " " + t.lastKey());   // 1 5</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-16">
-          <h3><a class="doc-anchor" href="#doc-map-methods-16">#</a> <code>floorKey</code></h3>
+        <article class="doc-entry" id="doc-map-methods-17">
+          <h3><a class="doc-anchor" href="#doc-map-methods-17">#</a> <code>floorKey</code></h3>
           <pre><code class="lang-java">K floorKey(K k)   |   ceilingKey   |   lowerKey   |   higherKey</code></pre>
           <p>A <code>TreeMap</code>'s greatest key <code>&lt;=</code> / least key <code>&gt;=</code> / greatest key <code>&lt;</code> / least key <code>&gt;</code> the probe, or <code>null</code> when there is none. A <code>null</code> probe is <code>NullPointerException</code> once the map has a key to compare it with.</p>
           <pre><code class="lang-java">System.out.println(t.floorKey(4) + " " + t.higherKey(5));   // 1 null</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-17">
-          <h3><a class="doc-anchor" href="#doc-map-methods-17">#</a> <code>firstEntry</code></h3>
+        <article class="doc-entry" id="doc-map-methods-18">
+          <h3><a class="doc-anchor" href="#doc-map-methods-18">#</a> <code>firstEntry</code></h3>
           <pre><code class="lang-java">Map.Entry&lt;K,V&gt; firstEntry()   |   lastEntry   |   floorEntry(K)   |   ceilingEntry(K)   |   lowerEntry(K)   |   higherEntry(K)</code></pre>
           <p>The key-navigation methods' pairs: an immutable snapshot whose <code>setValue</code> is <code>UnsupportedOperationException</code>, or <code>null</code> when there is no such key — an empty map included.</p>
           <pre><code class="lang-java">System.out.println(t.ceilingEntry(2));   // 5=e</code></pre>
         </article>
-        <article class="doc-entry" id="doc-map-methods-18">
-          <h3><a class="doc-anchor" href="#doc-map-methods-18">#</a> <code>pollFirstEntry</code></h3>
+        <article class="doc-entry" id="doc-map-methods-19">
+          <h3><a class="doc-anchor" href="#doc-map-methods-19">#</a> <code>pollFirstEntry</code></h3>
           <pre><code class="lang-java">Map.Entry&lt;K,V&gt; pollFirstEntry()   |   pollLastEntry()</code></pre>
           <p>Removes and answers the lowest or highest entry of a <code>TreeMap</code>, or <code>null</code> when it is empty.</p>
           <pre><code class="lang-java">while (!t.isEmpty()) System.out.println(t.pollFirstEntry());</code></pre>
@@ -1871,74 +1877,80 @@ System.out.println(t.firstKey() + " " + t.lastKey());   // 1 5</code></pre>
       <section class="tutorial-section" id="ch-set-methods">
         <h2>Set Methods</h2>
         <article class="doc-entry" id="doc-set-methods-1">
-          <h3><a class="doc-anchor" href="#doc-set-methods-1">#</a> <code>size</code></h3>
+          <h3><a class="doc-anchor" href="#doc-set-methods-1">#</a> <code>headSet</code></h3>
+          <pre><code class="lang-java">headSet(to [, incl])   |   tailSet(from [, incl])   |   subSet(from, to)   |   subSet(from, fi, to, ti)   |   descendingSet()</code></pre>
+          <p>A <code>TreeSet</code>'s range and descending views, on the same bound rules and copy terms as <code>TreeMap.headMap</code>.</p>
+          <pre><code class="lang-java">System.out.println(new TreeSet&lt;&gt;(List.of(5, 1, 3)).tailSet(3));   // [3, 5]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-set-methods-2">
+          <h3><a class="doc-anchor" href="#doc-set-methods-2">#</a> <code>size</code></h3>
           <pre><code class="lang-java">int size()</code></pre>
           <p>The number of distinct elements.</p>
           <pre><code class="lang-java">System.out.println(s.size());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-2">
-          <h3><a class="doc-anchor" href="#doc-set-methods-2">#</a> <code>isEmpty</code></h3>
+        <article class="doc-entry" id="doc-set-methods-3">
+          <h3><a class="doc-anchor" href="#doc-set-methods-3">#</a> <code>isEmpty</code></h3>
           <pre><code class="lang-java">boolean isEmpty()</code></pre>
           <p>True when the set holds no elements.</p>
           <pre><code class="lang-java">if (s.isEmpty()) { System.out.println("empty"); }</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-3">
-          <h3><a class="doc-anchor" href="#doc-set-methods-3">#</a> <code>add</code></h3>
+        <article class="doc-entry" id="doc-set-methods-4">
+          <h3><a class="doc-anchor" href="#doc-set-methods-4">#</a> <code>add</code></h3>
           <pre><code class="lang-java">boolean add(T e)</code></pre>
           <p>Adds the element if it is not already present, returning whether the set changed.</p>
           <pre><code class="lang-java">System.out.println(s.add("a"));   // true the first time</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-4">
-          <h3><a class="doc-anchor" href="#doc-set-methods-4">#</a> <code>contains</code></h3>
+        <article class="doc-entry" id="doc-set-methods-5">
+          <h3><a class="doc-anchor" href="#doc-set-methods-5">#</a> <code>contains</code></h3>
           <pre><code class="lang-java">boolean contains(Object o)</code></pre>
           <p>Membership test, by value for strings, numbers, and booleans and by handle identity for a heap object.</p>
           <pre><code class="lang-java">System.out.println(s.contains("a"));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-5">
-          <h3><a class="doc-anchor" href="#doc-set-methods-5">#</a> <code>remove</code></h3>
+        <article class="doc-entry" id="doc-set-methods-6">
+          <h3><a class="doc-anchor" href="#doc-set-methods-6">#</a> <code>remove</code></h3>
           <pre><code class="lang-java">boolean remove(Object o)</code></pre>
           <p>Removes the element if present, returning whether the set changed. Unlike <code>List.remove</code>, this overload is by value rather than by index.</p>
           <pre><code class="lang-java">s.remove("a");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-6">
-          <h3><a class="doc-anchor" href="#doc-set-methods-6">#</a> <code>clear</code></h3>
+        <article class="doc-entry" id="doc-set-methods-7">
+          <h3><a class="doc-anchor" href="#doc-set-methods-7">#</a> <code>clear</code></h3>
           <pre><code class="lang-java">void clear()</code></pre>
           <p>Removes every element.</p>
           <pre><code class="lang-java">s.clear();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-7">
-          <h3><a class="doc-anchor" href="#doc-set-methods-7">#</a> <code>addAll</code></h3>
+        <article class="doc-entry" id="doc-set-methods-8">
+          <h3><a class="doc-anchor" href="#doc-set-methods-8">#</a> <code>addAll</code></h3>
           <pre><code class="lang-java">boolean addAll(Collection&lt;T&gt; other)</code></pre>
           <p>Adds every element of <code>other</code> that is not already present, returning whether the set changed.</p>
           <pre><code class="lang-java">s.addAll(other);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-8">
-          <h3><a class="doc-anchor" href="#doc-set-methods-8">#</a> <code>forEach</code></h3>
+        <article class="doc-entry" id="doc-set-methods-9">
+          <h3><a class="doc-anchor" href="#doc-set-methods-9">#</a> <code>forEach</code></h3>
           <pre><code class="lang-java">void forEach(Consumer&lt;T&gt; action)</code></pre>
           <p>Invokes the action once per element, in the set's presentation order.</p>
           <pre><code class="lang-java">s.forEach(x -&gt; System.out.println(x));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-9">
-          <h3><a class="doc-anchor" href="#doc-set-methods-9">#</a> <code>toString</code></h3>
+        <article class="doc-entry" id="doc-set-methods-10">
+          <h3><a class="doc-anchor" href="#doc-set-methods-10">#</a> <code>toString</code></h3>
           <pre><code class="lang-java">String toString()</code></pre>
           <p><code>[a, b, c]</code> in presentation order — bucket order for a <code>HashSet</code>, insertion order for a <code>LinkedHashSet</code>, ascending for a <code>TreeSet</code>.</p>
           <pre><code class="lang-java">System.out.println(s);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-10">
-          <h3><a class="doc-anchor" href="#doc-set-methods-10">#</a> <code>first</code></h3>
+        <article class="doc-entry" id="doc-set-methods-11">
+          <h3><a class="doc-anchor" href="#doc-set-methods-11">#</a> <code>first</code></h3>
           <pre><code class="lang-java">E first()   |   E last()</code></pre>
           <p>A <code>TreeSet</code>'s lowest or highest element. An empty set raises <code>NoSuchElementException</code>.</p>
           <pre><code class="lang-java">TreeSet&lt;String&gt; s = new TreeSet&lt;&gt;(List.of("pear", "fig"));
 System.out.println(s.first());   // fig</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-11">
-          <h3><a class="doc-anchor" href="#doc-set-methods-11">#</a> <code>floor</code></h3>
+        <article class="doc-entry" id="doc-set-methods-12">
+          <h3><a class="doc-anchor" href="#doc-set-methods-12">#</a> <code>floor</code></h3>
           <pre><code class="lang-java">E floor(E e)   |   ceiling   |   lower   |   higher</code></pre>
           <p>A <code>TreeSet</code>'s greatest element <code>&lt;=</code> / least <code>&gt;=</code> / greatest <code>&lt;</code> / least <code>&gt;</code> the probe, or <code>null</code> when there is none.</p>
           <pre><code class="lang-java">System.out.println(s.ceiling("g"));   // pear</code></pre>
         </article>
-        <article class="doc-entry" id="doc-set-methods-12">
-          <h3><a class="doc-anchor" href="#doc-set-methods-12">#</a> <code>pollFirst</code></h3>
+        <article class="doc-entry" id="doc-set-methods-13">
+          <h3><a class="doc-anchor" href="#doc-set-methods-13">#</a> <code>pollFirst</code></h3>
           <pre><code class="lang-java">E pollFirst()   |   E pollLast()</code></pre>
           <p>Removes and answers a <code>TreeSet</code>'s lowest or highest element, or <code>null</code> when it is empty. On a <code>Deque</code> the same names are the deque's own methods.</p>
           <pre><code class="lang-java">System.out.println(s.pollLast());   // pear</code></pre>

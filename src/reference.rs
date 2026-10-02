@@ -1903,6 +1903,13 @@ pub const REFERENCE: &[Entry] = &[
     ),
     // ── Map Methods: `host.rs` `map_method`, plus `forEach`/`toString` ──
     (
+        "headMap",
+        "Map Methods",
+        "headMap(to [, incl])   |   tailMap(from [, incl])   |   subMap(from, to)   |   subMap(from, fi, to, ti)   |   descendingMap()   |   navigableKeySet()   |   descendingKeySet()",
+        "A `TreeMap`'s range and descending views: `head` excludes its key unless `incl`, `tail` includes it, `sub` is `[from, to)`; a `null` bound is `NullPointerException` and `from > to` `IllegalArgumentException: fromKey > toKey`. A descending view iterates and navigates in reverse. javars returns a copy whose removals (`remove`, `clear`, `pollFirstEntry`, …) reach the source map; an insertion through one is refused.",
+        "System.out.println(new TreeMap<>(Map.of(1, \"a\", 5, \"e\", 3, \"c\")).headMap(4));   // {1=a, 3=c}",
+    ),
+    (
         "size",
         "Map Methods",
         "int size()",
@@ -2028,6 +2035,13 @@ pub const REFERENCE: &[Entry] = &[
         "Map.Entry<K,V> pollFirstEntry()   |   pollLastEntry()",
         "Removes and answers the lowest or highest entry of a `TreeMap`, or `null` when it is empty.",
         "while (!t.isEmpty()) System.out.println(t.pollFirstEntry());",
+    ),
+    (
+        "headSet",
+        "Set Methods",
+        "headSet(to [, incl])   |   tailSet(from [, incl])   |   subSet(from, to)   |   subSet(from, fi, to, ti)   |   descendingSet()",
+        "A `TreeSet`'s range and descending views, on the same bound rules and copy terms as `TreeMap.headMap`.",
+        "System.out.println(new TreeSet<>(List.of(5, 1, 3)).tailSet(3));   // [3, 5]",
     ),
     (
         "size",

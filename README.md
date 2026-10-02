@@ -393,7 +393,10 @@ Implemented and checked against the reference `java`:
   lambda, `Comparator.reverseOrder()`) or by its keys' own `compareTo` — and,
   as in Java, a key the comparator calls equal to one present *is* that key, so
   `add` answers `false`, `put` keeps the first key, and `get`/`contains` find
-  it. A deque reads and writes at both
+  it. The range and descending views (`headMap`/`tailMap`/`subMap`,
+  `headSet`/`tailSet`/`subSet`, `descendingMap`/`descendingSet`,
+  `navigableKeySet`/`descendingKeySet`) answer with `TreeMap`'s bound rules and
+  navigate in their own direction. A deque reads and writes at both
   ends (`push`/`pop`/`peek`, `addFirst`/`addLast`, `offer*`, `poll*`,
   `get*`/`remove*`/`element`) and distinguishes the two empty-receiver
   families: the `get`/`remove`/`element`/`pop` spellings throw

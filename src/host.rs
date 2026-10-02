@@ -1246,7 +1246,11 @@ enum Order {
     /// ([`SORT_CMP`]). A comparator-ordered collection is *stored* in that
     /// order, kept so by [`rerank`] after every call that can add, because
     /// only a VM re-entry can run the comparator and presentation has no VM.
-    Sorted { by_cmp: bool },
+    ///
+    /// `desc` marks a `descendingMap()`/`descendingSet()` copy: stored and
+    /// located exactly as its ascending source is, presented in reverse, and
+    /// navigated with first/last, floor/ceiling and lower/higher swapped.
+    Sorted { by_cmp: bool, desc: bool },
 }
 
 /// Whether a `Set` on the heap is one of its own or a view a `Map` handed out.
@@ -1416,9 +1420,11 @@ thread_local! {
     /// skip the entry bookkeeping on the collection path with one `Cell` read
     /// rather than a hash lookup per collection call.
     static ENTRIES_LIVE: Cell<bool> = const { Cell::new(false) };
-    /// A `keySet()`/`entrySet()`/`values()` result, by heap handle, to the map
-    /// it was taken from. See [`write_through`].
-    static MAP_VIEWS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// A `keySet()`/`entrySet()`/`values()` result, or a navigable range or
+    /// descending copy (`headMap`, `subSet`, `descendingMap`, …), by heap
+    /// handle, to the collection it was taken from and whether it is one of
+    /// the navigable kind. See [`write_through`] and [`navigable_view`].
+    static MAP_VIEWS: RefCell<HashMap<u32, (u32, bool)>> = RefCell::new(HashMap::new());
 }
 
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
@@ -3659,10 +3665,14 @@ fn present_order(items: &[Value], order: Order) -> Vec<usize> {
     match order {
         Order::Insertion => (0..items.len()).collect(),
         Order::Hash => hash_order(items),
-        Order::Sorted { by_cmp: true } => (0..items.len()).collect(),
-        Order::Sorted { by_cmp: false } => {
+        Order::Sorted { by_cmp, desc } => {
             let mut idx: Vec<usize> = (0..items.len()).collect();
-            idx.sort_by(|&a, &b| natural_cmp(&items[a], &items[b]));
+            if !by_cmp {
+                idx.sort_by(|&a, &b| natural_cmp(&items[a], &items[b]));
+            }
+            if desc {
+                idx.reverse();
+            }
             idx
         }
     }
@@ -4115,7 +4125,10 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
     // `new TreeMap<>(comparator)` / `new TreeSet<>(comparator)`: empty, and
     // ordered by the comparator from the first insertion on.
     if matches!(kind, "TreeMap" | "TreeSet") && is_callable(vm, seed) {
-        let order = Order::Sorted { by_cmp: true };
+        let order = Order::Sorted {
+            by_cmp: true,
+            desc: false,
+        };
         let obj = if kind == "TreeMap" {
             HostObj::Map {
                 fixed: Fixity::Mutable,
@@ -4165,7 +4178,10 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         "TreeMap" => HostObj::Map {
             fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
-            order: Order::Sorted { by_cmp: false },
+            order: Order::Sorted {
+                by_cmp: false,
+                desc: false,
+            },
             index: KeyIndex::default(),
         },
         "HashSet" | "Set" => HostObj::Set {
@@ -4184,7 +4200,10 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         },
         "TreeSet" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
-            order: Order::Sorted { by_cmp: false },
+            order: Order::Sorted {
+                by_cmp: false,
+                desc: false,
+            },
             fixed: Fixity::Mutable,
             view: SetView::Own,
             index: KeyIndex::default(),
@@ -5350,6 +5369,26 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
         ("pollLast", 0) => (Nav::Last, false, false, true),
         _ => return None,
     };
+    // A descending copy navigates its ascending storage the other way round:
+    // its first is the source's last, its floor the source's ceiling.
+    let desc = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { order, .. }) | Some(HostObj::Set { order, .. }) => {
+            matches!(order, Order::Sorted { desc: true, .. })
+        }
+        _ => false,
+    });
+    let nav = if desc {
+        match nav {
+            Nav::First => Nav::Last,
+            Nav::Last => Nav::First,
+            Nav::Floor => Nav::Ceiling,
+            Nav::Ceiling => Nav::Floor,
+            Nav::Lower => Nav::Higher,
+            Nav::Higher => Nav::Lower,
+        }
+    } else {
+        nav
+    };
     let pairs: Vec<(Value, Value)> = HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::Map {
             entries,
@@ -5445,6 +5484,9 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
 /// `keySet()`/`entrySet()`/`values()` is carried back to the map — see
 /// [`write_through`].
 fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    if let Some(f) = refused_view_write(recv, method) {
+        return raise(vm, f);
+    }
     let through = matches!(
         method,
         "remove" | "removeObject" | "removeIf" | "removeAll" | "retainAll" | "clear"
@@ -5464,7 +5506,7 @@ fn map_view_snapshot(recv: &Value) -> Option<(u32, Vec<Value>)> {
     let Value::Obj(id) = recv else {
         return None;
     };
-    let map = MAP_VIEWS.with(|m| {
+    let (map, _) = MAP_VIEWS.with(|m| {
         let m = m.borrow();
         if m.is_empty() {
             None
@@ -5472,15 +5514,69 @@ fn map_view_snapshot(recv: &Value) -> Option<(u32, Vec<Value>)> {
             m.get(id).copied()
         }
     })?;
-    Some((map, sequence_items(recv)?))
+    Some((map, view_items(recv)?))
 }
 
 /// Remember that `view` (a fresh `keySet()`/`entrySet()`/`values()` result)
 /// was taken from `map`, so a removal through it reaches the map.
 fn register_map_view(view: &Value, map: u32) {
     if let Value::Obj(v) = view {
-        MAP_VIEWS.with(|m| m.borrow_mut().insert(*v, map));
+        MAP_VIEWS.with(|m| m.borrow_mut().insert(*v, (map, false)));
     }
+}
+
+/// The elements a view holds, in the order it presents them: a map view's
+/// keys, any other view's elements.
+fn view_items(view: &Value) -> Option<Vec<Value>> {
+    if let Value::Obj(id) = view {
+        let keys = HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Map { entries, order, .. }) => {
+                let ks: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+                Some(
+                    present_order(&ks, *order)
+                        .into_iter()
+                        .map(|i| ks[i].clone())
+                        .collect(),
+                )
+            }
+            _ => None,
+        });
+        if keys.is_some() {
+            return keys;
+        }
+    }
+    sequence_items(view)
+}
+
+/// A write a navigable copy cannot carry back: javars models `headMap`,
+/// `subSet`, `descendingMap` and their kin as copies whose *removals* reach
+/// the source (see [`write_through`]) but whose insertions would not, so an
+/// insertion through one is refused rather than silently lost.
+fn refused_view_write(recv: &Value, method: &str) -> Option<Fault> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let navigable = MAP_VIEWS.with(|m| m.borrow().get(id).is_some_and(|(_, nav)| *nav));
+    (navigable
+        && matches!(
+            method,
+            "put"
+                | "putAll"
+                | "putIfAbsent"
+                | "merge"
+                | "compute"
+                | "computeIfAbsent"
+                | "computeIfPresent"
+                | "replace"
+                | "replaceAll"
+                | "add"
+                | "addAll"
+        ))
+    .then(|| {
+        Fault::internal(format!(
+            "javars: `{method}` through a navigable range or descending view is not modeled"
+        ))
+    })
 }
 
 /// Carry a removal through a map view back to the map.
@@ -5502,7 +5598,7 @@ fn write_through(vm: &mut VM, map: u32, view: &Value, before: Vec<Value>) {
     if pending() {
         return;
     }
-    let Some(now) = sequence_items(view) else {
+    let Some(now) = view_items(view) else {
         return;
     };
     if now.len() >= before.len() {
@@ -5530,6 +5626,11 @@ fn write_through(vm: &mut VM, map: u32, view: &Value, before: Vec<Value>) {
             view: SetView::Entries(_),
             ..
         }) => Some(true),
+        // A navigable copy holds its source's own keys or elements.
+        Some(HostObj::Map { .. })
+        | Some(HostObj::Set {
+            view: SetView::Own, ..
+        }) => Some(false),
         _ => None,
     });
     let keys: Vec<Value> = match keyed {
@@ -5567,13 +5668,202 @@ fn write_through(vm: &mut VM, map: u32, view: &Value, before: Vec<Value>) {
             keys
         }
     };
+    // Through the wrapper, so a removal through a view of a view (a
+    // `headMap(k).keySet()`) carries on to the collection under both.
     let map = Value::Obj(map);
     for k in keys {
-        coll_method_ranked(vm, &map, "remove", std::slice::from_ref(&k));
+        coll_method(vm, &map, "remove", std::slice::from_ref(&k));
         if pending() {
             return;
         }
     }
+}
+
+/// `NavigableMap`/`NavigableSet`'s range and descending views on a `TreeMap`
+/// or `TreeSet`: `headMap`/`tailMap`/`subMap` (both arities), `headSet`/
+/// `tailSet`/`subSet`, `descendingMap`/`descendingSet`, and
+/// `navigableKeySet`/`descendingKeySet`. `None` for any other method or
+/// receiver.
+///
+/// Java's are live views; javars builds a copy of the entries in range, in the
+/// source's order (reversed for the descending ones), registered with the
+/// source so that a *removal* through it — `remove`, `clear`, `pollFirst…`,
+/// `removeIf`, an iterator's `remove` — reaches the source as it does in Java.
+/// An insertion through one is refused by [`refused_view_write`] rather than
+/// silently kept from the source, and a copy does not see a later change to
+/// the source. A range copy stays sorted by the source's comparator; a
+/// descending copy keeps its reversed order as an insertion-ordered
+/// collection, so it iterates, prints and queries as Java's does.
+///
+/// The bounds follow `TreeMap`'s rules: `head` excludes its key unless told
+/// otherwise, `tail` includes it, `sub` is `[from, to)`; a `null` bound is a
+/// `NullPointerException` and `from > to` an `IllegalArgumentException`
+/// (`fromKey > toKey`).
+fn navigable_view(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let id = *id;
+    let is_map = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map {
+            order: Order::Sorted { .. },
+            ..
+        }) => Some(true),
+        Some(HostObj::Set {
+            order: Order::Sorted { .. },
+            view: SetView::Own,
+            ..
+        }) => Some(false),
+        _ => None,
+    })?;
+    let flag = |v: &Value| matches!(v, Value::Bool(true));
+    type Bound = Option<(Value, bool)>;
+    // (low bound, high bound, descending, keys only)
+    let (lo, hi, descending, keys_only): (Bound, Bound, bool, bool) = match (is_map, method, args) {
+        (true, "headMap", [k]) | (false, "headSet", [k]) => {
+            (None, Some((k.clone(), false)), false, false)
+        }
+        (true, "headMap", [k, i]) | (false, "headSet", [k, i]) => {
+            (None, Some((k.clone(), flag(i))), false, false)
+        }
+        (true, "tailMap", [k]) | (false, "tailSet", [k]) => {
+            (Some((k.clone(), true)), None, false, false)
+        }
+        (true, "tailMap", [k, i]) | (false, "tailSet", [k, i]) => {
+            (Some((k.clone(), flag(i))), None, false, false)
+        }
+        (true, "subMap", [a, b]) | (false, "subSet", [a, b]) => (
+            Some((a.clone(), true)),
+            Some((b.clone(), false)),
+            false,
+            false,
+        ),
+        (true, "subMap", [a, ai, b, bi]) | (false, "subSet", [a, ai, b, bi]) => (
+            Some((a.clone(), flag(ai))),
+            Some((b.clone(), flag(bi))),
+            false,
+            false,
+        ),
+        (true, "descendingMap", []) | (false, "descendingSet", []) => (None, None, true, false),
+        (true, "navigableKeySet", []) => (None, None, false, true),
+        (true, "descendingKeySet", []) => (None, None, true, true),
+        _ => return None,
+    };
+    for (b, _) in lo.iter().chain(hi.iter()) {
+        if matches!(deboxed(b), Value::Undef) {
+            return Some(raise(
+                vm,
+                Fault::java("NullPointerException", String::new()),
+            ));
+        }
+    }
+    let ranked = SORT_CMP.with(|s| s.borrow().get(&id).cloned());
+    // A view of a descending copy compares the way the copy presents: a
+    // `descendingMap().headMap(k)` is the keys *above* `k`.
+    let (by_cmp, src_desc) = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map {
+            order: Order::Sorted { by_cmp, desc },
+            ..
+        })
+        | Some(HostObj::Set {
+            order: Order::Sorted { by_cmp, desc },
+            ..
+        }) => (*by_cmp, *desc),
+        _ => (false, false),
+    });
+    let sign = if src_desc { -1 } else { 1 };
+    let compare = |vm: &mut VM, a: &Value, b: &Value| -> Option<i64> {
+        let c = match &ranked {
+            Some(c) => rank_compare(vm, c, a, b)?,
+            None => natural_cmp(a, b) as i64,
+        };
+        Some(c.signum() * sign)
+    };
+    if let (Some((a, _)), Some((b, _))) = (&lo, &hi) {
+        if compare(vm, a, b)? > 0 {
+            return Some(raise(
+                vm,
+                Fault::java("IllegalArgumentException", "fromKey > toKey".to_string()),
+            ));
+        }
+    }
+    // The source's pairs in its presentation order (a set's values are unit).
+    let (pairs, _, fixed) = HEAP.with(|h| match h.borrow().get(id as usize) {
+        Some(HostObj::Map {
+            entries,
+            order,
+            fixed,
+            ..
+        }) => {
+            let ks: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
+            let pairs = present_order(&ks, *order)
+                .into_iter()
+                .map(|i| entries[i].clone())
+                .collect::<Vec<_>>();
+            (pairs, *order, *fixed)
+        }
+        Some(HostObj::Set {
+            items,
+            order,
+            fixed,
+            ..
+        }) => {
+            let pairs = present_order(items, *order)
+                .into_iter()
+                .map(|i| (items[i].clone(), Value::Undef))
+                .collect::<Vec<_>>();
+            (pairs, *order, *fixed)
+        }
+        _ => (Vec::new(), Order::Insertion, Fixity::Mutable),
+    });
+    let mut kept = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if let Some((b, incl)) = &lo {
+            let c = compare(vm, &k, b)?;
+            if c < 0 || (c == 0 && !incl) {
+                continue;
+            }
+        }
+        if let Some((b, incl)) = &hi {
+            let c = compare(vm, &k, b)?;
+            if c > 0 || (c == 0 && !incl) {
+                continue;
+            }
+        }
+        kept.push((k, v));
+    }
+    // `kept` is in the order the view presents only when the view and its
+    // source face the same way; storage is always ascending, with the
+    // direction carried by the order's `desc` flag.
+    if src_desc {
+        kept.reverse();
+    }
+    let order = Order::Sorted {
+        by_cmp,
+        desc: src_desc != descending,
+    };
+    let obj = if is_map && !keys_only {
+        HostObj::Map {
+            entries: kept,
+            order,
+            fixed,
+            index: KeyIndex::default(),
+        }
+    } else {
+        HostObj::Set {
+            items: kept.into_iter().map(|(k, _)| k).collect(),
+            order,
+            fixed,
+            view: SetView::Own,
+            index: KeyIndex::default(),
+        }
+    };
+    let view = heap_alloc(obj);
+    if let Some(c) = ranked {
+        SORT_CMP.with(|s| s.borrow_mut().insert(view, c));
+    }
+    MAP_VIEWS.with(|m| m.borrow_mut().insert(view, (id, true)));
+    Some(Value::Obj(view))
 }
 
 /// The collection an [`HostObj::Iterator`] walks.
@@ -5689,10 +5979,16 @@ fn rank_by_compareto(vm: &mut VM, id: u32, arg: &Value) {
         matches!(
             h.borrow().get(id as usize),
             Some(HostObj::Map {
-                order: Order::Sorted { by_cmp: false },
+                order: Order::Sorted {
+                    by_cmp: false,
+                    desc: false,
+                },
                 ..
             }) | Some(HostObj::Set {
-                order: Order::Sorted { by_cmp: false },
+                order: Order::Sorted {
+                    by_cmp: false,
+                    desc: false,
+                },
                 view: SetView::Own,
                 ..
             })
@@ -5709,7 +6005,10 @@ fn rank_by_compareto(vm: &mut VM, id: u32, arg: &Value) {
     }
     HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
         Some(HostObj::Map { order, .. }) | Some(HostObj::Set { order, .. }) => {
-            *order = Order::Sorted { by_cmp: true }
+            *order = Order::Sorted {
+                by_cmp: true,
+                desc: false,
+            }
         }
         _ => {}
     });
@@ -5856,6 +6155,9 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
             Ok(v) => v,
             Err(f) => raise(vm, f),
         };
+    }
+    if let Some(v) = navigable_view(vm, recv, method, args) {
+        return v;
     }
     if let Some(v) = navigate(vm, recv, method, args) {
         return v;

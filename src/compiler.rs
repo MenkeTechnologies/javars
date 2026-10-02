@@ -6414,6 +6414,17 @@ impl Compiler {
         if matches!(recv, Expr::Var(n) if n == SUPER) {
             return self.super_call(method, args, line);
         }
+        // `I.super.m(args)` — the default method of a direct superinterface
+        // `I`, called on `this` without virtual dispatch (JLS 15.12.1), which is
+        // how an implementation reaches the default it overrides.
+        if let Expr::Field { recv: owner, name } = recv {
+            if let (Expr::Var(iface), true) = (&**owner, name == SUPER) {
+                if self.classes.get(iface).is_some_and(|ci| ci.is_interface) {
+                    let iface = iface.clone();
+                    return self.interface_super_call(&iface, method, args, line);
+                }
+            }
+        }
         // A fully-qualified stdlib receiver (`java.util.Arrays.sort(x)`) names
         // exactly the class its simple name does — javars keys every type on the
         // simple name, so the package qualifier is dropped and the call re-enters
@@ -7087,6 +7098,44 @@ impl Compiler {
     /// Everything *inside* that body still dispatches virtually: a `super.m()`
     /// whose body calls an unqualified `n()` reaches the subclass's `n`, because
     /// only this one call site is de-virtualized — which is Java's rule.
+    /// `I.super.method(args)`: `I`'s own (default) body for `method`, run on
+    /// `this` with no virtual dispatch.
+    fn interface_super_call(
+        &mut self,
+        iface: &str,
+        method: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Result<(), String> {
+        if self.this_class.is_none() {
+            return Err(format!(
+                "javars: `{iface}.super` used outside an instance method (line {line})"
+            ));
+        }
+        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let resolved = self
+            .resolve_instance_call(iface, method, &arg_tys)
+            .ok_or_else(|| {
+                format!(
+                    "javars: interface `{iface}` has no method `{method}` taking {} argument(s) (line {line})",
+                    args.len()
+                )
+            })?;
+        let param_tys = resolved.param_tys;
+        let packed = Self::effective_args(args, &param_tys, resolved.vararg_from);
+        let (mangled, _) = self
+            .resolve_instance_sig(iface, method, &param_tys)
+            .ok_or_else(|| {
+                format!("javars: `{iface}.{method}` has no default body to call (line {line})")
+            })?;
+        self.emit_this(line);
+        self.call_args_targeted(&packed, &param_tys)?;
+        let idx = self.b.add_name(&mangled);
+        self.b.emit(Op::Call(idx, packed.len() as u8 + 1), line);
+        self.emit_exc_check(line);
+        Ok(())
+    }
+
     fn super_call(&mut self, method: &str, args: &[Expr], line: u32) -> Result<(), String> {
         let this_class = self.this_class.clone().ok_or_else(|| {
             format!("javars: `super` used outside an instance method (line {line})")
@@ -8933,8 +8982,10 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "ArrayList" | "LinkedList" | "ArrayDeque" => "list",
         "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
-        "HashMap" | "LinkedHashMap" | "TreeMap" | "EnumMap" | "Map" => "map",
-        "HashSet" | "LinkedHashSet" | "TreeSet" | "EnumSet" | "Set" => "set",
+        "HashMap" | "LinkedHashMap" | "TreeMap" | "EnumMap" | "Map" | "SortedMap"
+        | "NavigableMap" => "map",
+        "HashSet" | "LinkedHashSet" | "TreeSet" | "EnumSet" | "Set" | "SortedSet"
+        | "NavigableSet" => "set",
         // Not a `List`: it has no `remove(int)`, so an integral argument is an
         // element there, never an index.
         "PriorityQueue" => "pq",
@@ -8998,6 +9049,20 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         // `subList` resolves through the collection path rather than falling
         // through to the `String` methods.
         ("subList", 2) if kind == "list" => "List",
+        // The navigable range and descending views, which chain as the
+        // collections they are.
+        ("headMap" | "tailMap", 1 | 2) | ("subMap", 2 | 4) | ("descendingMap", 0)
+            if kind == "map" =>
+        {
+            "NavigableMap"
+        }
+        ("navigableKeySet" | "descendingKeySet", 0) if kind == "map" => "NavigableSet",
+        ("headSet" | "tailSet", 1 | 2) | ("subSet", 2 | 4) | ("descendingSet", 0)
+            if kind == "set" =>
+        {
+            "NavigableSet"
+        }
+        ("removeAll", 1) | ("retainAll", 1) | ("containsAll", 1) => "boolean",
         _ => return None,
     })
 }
