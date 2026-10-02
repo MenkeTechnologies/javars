@@ -384,7 +384,8 @@ Implemented and checked against the reference `java`:
   constructors, `Arrays.asList`, `List.of`/`Set.of`, `EnumMap` and
   `EnumSet.of`/`noneOf`/`allOf`/`copyOf` (ordinal order, as the `TreeMap`/
   `TreeSet` they behave as), `Map.Entry.comparingByKey`/`comparingByValue`,
-  `removeAll`/`retainAll`/`containsAll`, and
+  `removeAll`/`retainAll`/`containsAll`, `Collections.addAll`, `java.util.BitSet`
+  (a port of the JDK's word vector, its growth rule, `hashCode` and messages), and
   `Collections.sort`/`reverse`/`max`/`min`. A removal through a map's
   `keySet()`/`values()`/`entrySet()` reaches the map. A `TreeMap` navigates by key
   (`firstKey`, `floorKey`, `ceilingEntry`, `pollFirstEntry`, …) and a `TreeSet`

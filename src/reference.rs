@@ -1009,6 +1009,20 @@ pub const REFERENCE: &[Entry] = &[
     ),
     // ── Static Library: the `(class, method, arity)` arms of `static_method` ──
     (
+        "BitSet",
+        "Static Library",
+        "new BitSet([int nbits])",
+        "`java.util.BitSet`, ported from the JDK: `set`/`clear`/`flip`/`get` by index or `[from, to)` range, `cardinality`, `length`, `size` (the JDK's doubling capacity), `isEmpty`, `nextSetBit`/`nextClearBit`/`previousSetBit`/`previousClearBit`, `and`/`or`/`xor`/`andNot`/`intersects`, `stream()`, `clone`, `equals`/`hashCode`, and the `{1, 3, 5}` rendering, with the JDK's index messages (`bitIndex < 0: -1`).",
+        "BitSet b = new BitSet();\nb.set(1, 4);\nSystem.out.println(b);   // {1, 2, 3}",
+    ),
+    (
+        "Collections.addAll",
+        "Collection Statics",
+        "boolean Collections.addAll(Collection<T> c, T... elements)",
+        "Adds each element through the collection's own `add` and answers whether any call changed it.",
+        "Collections.addAll(xs, 1, 2, 3);",
+    ),
+    (
         "Pattern",
         "Static Library",
         "Pattern.compile(String regex [, int flags])   |   Pattern.matches(regex, input)   |   Pattern.quote(s)",

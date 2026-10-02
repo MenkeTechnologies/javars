@@ -13,6 +13,7 @@ pub mod compiler;
 pub mod dap;
 pub mod fdlibm;
 pub mod host;
+pub mod jbitset;
 pub mod jio;
 pub mod jrandom;
 pub mod lexer;

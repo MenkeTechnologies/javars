@@ -457,6 +457,8 @@ enum HostObj {
     Random(crate::jrandom::Random),
     /// An `Int`/`Long`/`DoubleSummaryStatistics`.
     Stats(SummaryStats),
+    /// A `java.util.BitSet` (see [`crate::jbitset`]).
+    Bits(crate::jbitset::BitSet),
     /// A `java.util.regex.Pattern`: the source as written, its flags, and the
     /// source the engine compiles (see [`regex_source`]).
     RegexPattern {
@@ -1012,6 +1014,111 @@ impl SummaryStats {
         }
         s
     }
+}
+
+/// Run `f` on the `BitSet` a handle names; `None` for any other value.
+fn with_bits<R>(v: &Value, f: impl FnOnce(&mut crate::jbitset::BitSet) -> R) -> Option<R> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Bits(b)) => Some(f(b)),
+        _ => None,
+    })
+}
+
+/// A method call on a `java.util.BitSet` receiver; `None` for any other.
+///
+/// The methods that read a second set copy it out first, and the ones that
+/// answer a new object (`get(from, to)`, `clone`, `stream`) allocate it after
+/// the receiver's borrow is released.
+fn bitset_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jbitset::BitSet;
+    let refuse = |(class, msg): crate::jbitset::Refusal| Fault::java(class, msg);
+    let other = match (method, args) {
+        ("and" | "or" | "xor" | "andNot" | "intersects" | "equals", [o]) => {
+            Some(with_bits(o, |b| b.clone()))
+        }
+        _ => None,
+    };
+    let me = with_bits(recv, |b| b.clone())?;
+    let alloc = |b: BitSet| Value::Obj(heap_alloc(HostObj::Bits(b)));
+    match (method, args) {
+        ("get", [f, t]) => return Some(me.slice(f.jint(), t.jint()).map(alloc).map_err(refuse)),
+        ("clone", []) => return Some(Ok(alloc(me.cloned()))),
+        ("stream", []) => {
+            let items = me.ones().into_iter().map(Value::Int).collect();
+            return Some(Ok(stream_of(items, StreamKind::Int)));
+        }
+        _ => {}
+    }
+    let npe = || Fault::java("NullPointerException", String::new());
+    with_bits(recv, |b| match (method, args) {
+        ("get", [i]) => b.get(i.jint()).map(Value::bool).map_err(refuse),
+        ("set", [i]) => b.set(i.jint(), true).map(|()| Value::Undef).map_err(refuse),
+        ("set", [i, Value::Bool(on)]) => {
+            b.set(i.jint(), *on).map(|()| Value::Undef).map_err(refuse)
+        }
+        ("set", [f, t]) => b
+            .range(f.jint(), t.jint(), |_| true)
+            .map(|()| Value::Undef)
+            .map_err(refuse),
+        ("set", [f, t, on]) => {
+            let on = matches!(on, Value::Bool(true));
+            b.range(f.jint(), t.jint(), move |_| on)
+                .map(|()| Value::Undef)
+                .map_err(refuse)
+        }
+        ("clear", [i]) => b
+            .set(i.jint(), false)
+            .map(|()| Value::Undef)
+            .map_err(refuse),
+        ("clear", [f, t]) => b
+            .range(f.jint(), t.jint(), |_| false)
+            .map(|()| Value::Undef)
+            .map_err(refuse),
+        ("clear", []) => {
+            b.clear_all();
+            Ok(Value::Undef)
+        }
+        ("flip", [i]) => b.flip(i.jint()).map(|()| Value::Undef).map_err(refuse),
+        ("flip", [f, t]) => b
+            .range(f.jint(), t.jint(), |v| !v)
+            .map(|()| Value::Undef)
+            .map_err(refuse),
+        ("cardinality", []) => Ok(Value::Int(b.cardinality())),
+        ("length", []) => Ok(Value::Int(b.length())),
+        ("size", []) => Ok(Value::Int(b.size())),
+        ("isEmpty", []) => Ok(Value::bool(b.is_empty())),
+        ("nextSetBit", [i]) => b.next_set(i.jint()).map(Value::Int).map_err(refuse),
+        ("nextClearBit", [i]) => b.next_clear(i.jint()).map(Value::Int).map_err(refuse),
+        ("previousSetBit", [i]) => b.previous(i.jint(), true).map(Value::Int).map_err(refuse),
+        ("previousClearBit", [i]) => b.previous(i.jint(), false).map(Value::Int).map_err(refuse),
+        ("and" | "or" | "xor" | "andNot", [_]) => {
+            let o = other.clone().flatten().ok_or_else(npe)?;
+            let op: fn(u64, u64) -> u64 = match method {
+                "and" => |a, b| a & b,
+                "or" => |a, b| a | b,
+                "xor" => |a, b| a ^ b,
+                _ => |a, b| a & !b,
+            };
+            b.combine(&o, op);
+            Ok(Value::Undef)
+        }
+        ("intersects", [_]) => {
+            let o = other.clone().flatten().ok_or_else(npe)?;
+            Ok(Value::bool(b.intersects(&o)))
+        }
+        ("equals", [_]) => Ok(Value::bool(
+            other.clone().flatten().is_some_and(|o| b.same_bits(&o)),
+        )),
+        ("hashCode", []) => Ok(Value::Int(i64::from(b.hash()))),
+        ("toString", []) => Ok(Value::str(b.render())),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported BitSet method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
 }
 
 /// Run `f` on the summary statistics a handle names; `None` for any other
@@ -5138,6 +5245,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
+                    HostObj::Bits(_) => "java.util.BitSet".to_string(),
                     HostObj::RegexPattern { .. } => "java.util.regex.Pattern".to_string(),
                     HostObj::RegexMatcher(_) => "java.util.regex.Matcher".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
@@ -8679,6 +8787,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = bitset_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = stats_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -9642,6 +9756,12 @@ fn system_static(
         ("Random", "#new", [seed]) => Ok(Value::Obj(heap_alloc(HostObj::Random(
             crate::jrandom::Random::new(seed.jint()),
         )))),
+        ("BitSet", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Bits(
+            crate::jbitset::BitSet::new(),
+        )))),
+        ("BitSet", "#new", [n]) => crate::jbitset::BitSet::with_bits(n.jint())
+            .map(|b| Value::Obj(heap_alloc(HostObj::Bits(b))))
+            .map_err(|(class, msg)| Fault::java(class, msg)),
         ("IntSummaryStatistics", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Stats(
             SummaryStats::new(StreamKind::Int),
         )))),
@@ -10352,6 +10472,24 @@ fn collection_static(
                 let _ = array_mutate(&args[0], |a| *a = items);
                 Value::Undef
             })
+        }
+        // `Collections.addAll(c, e…)`: `result |= c.add(e)` for each element,
+        // through the collection's own `add`, so a set keeps its rules and an
+        // immutable list refuses.
+        ("Collections", "addAll") if !args.is_empty() => {
+            let target = args[0].clone();
+            if matches!(target, Value::Undef) {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            }
+            let mut changed = false;
+            for e in varargs_items(&args[1..]) {
+                let r = coll_method(vm, &target, "add", std::slice::from_ref(&e));
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                changed |= matches!(r, Value::Bool(true));
+            }
+            Ok(Value::bool(changed))
         }
         ("Collections", "sort") if !args.is_empty() => {
             let items = match sequence_items(&args[0]) {
@@ -14787,6 +14925,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
+            Some(HostObj::Bits(b)) => b.render(),
             // `Pattern.toString()` is its source; `Matcher.toString()` names the
             // pattern, the region and the last match.
             Some(HostObj::RegexPattern { shown, .. }) => shown.clone(),

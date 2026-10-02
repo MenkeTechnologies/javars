@@ -8555,6 +8555,7 @@ fn is_static_class(name: &str) -> bool {
             | "DoubleSummaryStatistics"
             | "Pattern"
             | "Matcher"
+            | "BitSet"
     )
 }
 
@@ -8680,6 +8681,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("StringReader", "#new") => "StringReader",
         ("StringTokenizer", "#new") => "StringTokenizer",
         ("Random", "#new") => "Random",
+        ("BitSet", "#new") => "BitSet",
         ("Pattern", "compile") => "Pattern",
         ("Pattern", "matches") => "boolean",
         ("Pattern", "quote") | ("Matcher", "quoteReplacement") => "String",
@@ -8727,6 +8729,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
         ("Boolean", "parseBoolean") => "boolean",
+        ("Collections", "addAll") => "boolean",
         // `Character.toUpperCase(char)` returns a `char`, so its result keeps
         // rendering as a character rather than as a code point.
         ("Character", "toUpperCase") | ("Character", "toLowerCase") => "char",
@@ -9504,7 +9507,11 @@ fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
 fn is_host_value_class(name: &str) -> bool {
     matches!(
         name,
-        "Random" | "IntSummaryStatistics" | "LongSummaryStatistics" | "DoubleSummaryStatistics"
+        "Random"
+            | "IntSummaryStatistics"
+            | "LongSummaryStatistics"
+            | "DoubleSummaryStatistics"
+            | "BitSet"
     )
 }
 
@@ -9536,6 +9543,9 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "nextToken") => "String",
         ("StringTokenizer", "hasMoreTokens" | "hasMoreElements") => "boolean",
         ("StringTokenizer", "countTokens") => "int",
+        ("BitSet", "cardinality" | "length" | "size" | "nextSetBit" | "nextClearBit") => "int",
+        ("BitSet", "previousSetBit" | "previousClearBit" | "hashCode") => "int",
+        ("BitSet", "isEmpty" | "intersects") => "boolean",
         ("Pattern", "matcher") => "Matcher",
         ("Pattern", "pattern" | "toString") => "String",
         ("Pattern", "split") => "String[]",
