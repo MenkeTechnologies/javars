@@ -8706,6 +8706,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // must NOT be treated as `int` — that is exactly the case where the
         // wrap would be wrong.
         ("Long", "parseLong") | ("Math", "round") => "long",
+        ("Long", "parseUnsignedLong") => "long",
         // The `double`-returning `Math` statics: the exactly specified ones (an
         // IEEE operation or a bit-pattern walk) and the transcendentals answered
         // from the fdlibm port (`crate::fdlibm`); `sin`/`cos` stay out (see

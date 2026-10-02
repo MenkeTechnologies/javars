@@ -11059,6 +11059,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             ((args[0].jfloat() as f32).to_bits() as i32).into(),
         )),
         ("Long", "toString", 1) => Ok(Value::str(args[0].jint().to_string())),
+        ("Long", "toString", 2) => Ok(Value::str(int_to_radix_string(
+            args[0].jint(),
+            args[1].jint(),
+        ))),
         ("Long", "valueOf", 1) => match &args[0] {
             Value::Str(s) => parse_int_radix(s, 10, false),
             Value::Undef => Err(null_number_fault()),
@@ -11156,6 +11160,13 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Integer", "parseUnsignedInt", n @ (1 | 2)) => {
             let radix = if n == 2 { args[1].jint() } else { 10 };
             parse_unsigned_int(&args[0].as_str_cow(), radix)
+        }
+        ("Long", "parseUnsignedLong", 1 | 2) if matches!(args[0], Value::Undef) => {
+            Err(null_number_fault())
+        }
+        ("Long", "parseUnsignedLong", n @ (1 | 2)) => {
+            let radix = if n == 2 { args[1].jint() } else { 10 };
+            parse_unsigned_long(&args[0].as_str_cow(), radix)
         }
         ("Integer", "toUnsignedLong", 1) => Ok(Value::Int(args[0].jint() as u32 as i64)),
         ("Integer", "toUnsignedString", 1) => Ok(Value::str((args[0].jint() as u32).to_string())),
@@ -14496,6 +14507,35 @@ fn parse_unsigned_int(s: &str, radix: i64) -> Result<Value, Fault> {
         )));
     }
     Ok(Value::Int(i64::from(n as u32 as i32)))
+}
+
+/// `Long.parseUnsignedLong(s, radix)`: the digits read as an unsigned 64-bit
+/// value and returned as its two's-complement `long`. A value that fits a
+/// signed `long` is parsed (and refused) exactly as `Long.parseLong` does; one
+/// past it is accepted up to `2^64 - 1`, as the JDK's last-digit step does.
+fn parse_unsigned_long(s: &str, radix: i64) -> Result<Value, Fault> {
+    let nfe = |m: String| Fault::java("NumberFormatException", m);
+    if s.starts_with('-') {
+        return Err(nfe(format!(
+            "Illegal leading minus sign on unsigned string {s}."
+        )));
+    }
+    if let Ok(v) = parse_int_radix(s, radix, false) {
+        return Ok(v);
+    }
+    let digits = s.strip_prefix('+').unwrap_or(s);
+    let all_digits = (2..=36).contains(&radix)
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_digit(radix as u32));
+    if !all_digits {
+        return parse_int_radix(s, radix, false);
+    }
+    match u64::from_str_radix(digits, radix as u32) {
+        Ok(n) => Ok(Value::Int(n as i64)),
+        Err(_) => Err(nfe(format!(
+            "String value {s} exceeds range of unsigned long."
+        ))),
+    }
 }
 
 /// `Integer.decode`: an optional sign, then a `0x`/`0X`/`#` hexadecimal or a
