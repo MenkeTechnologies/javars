@@ -1298,23 +1298,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   handled nothing. `new` and `throw` already enforced the same rule; only `catch`
   did not. Each alternative of a multi-catch is checked separately, so a good
   first alternative does not launder a bad second one.
-- **Streams** — `Arrays.stream(a)`, `list.stream()`, `IntStream.range`,
-  `Stream.of`, the intermediate operations (`map`, `filter`, `sorted`,
-  `distinct`, `limit`), and the terminals (`collect`, `count`, `sum`, `reduce`,
-  `findFirst`, `anyMatch`). Naming any of them is a compile error, not a wrong
-  answer — measured on `openjdk 21.0.12`'s side and javars's, one probe each:
-  `list.stream()` is
-  ``javars: unsupported List method `stream` with 0 argument(s)``,
-  `Arrays.stream(a)` is
-  ``javars: unsupported static method `Arrays.stream` with 1 argument(s)``, and
-  a bare `IntStream.range(0, 3)` / `Stream.of(1, 2)` under
-  `import java.util.stream.*;` is ``javars: cannot find symbol: `IntStream` `` /
-  ``javars: cannot find symbol: `Stream` ``. That last one was *not* true
-  until the undeclared-name check landed — `IntStream.range(0, 3).sum()` used to
-  reach the runtime and report
-  `NullPointerException: Cannot read field "util"` / `Cannot invoke
-  "String.range()"`, because an unmodeled class name was just an undeclared
-  variable reading `null`.
+- ~~**Streams**~~ — implemented: the sources, the intermediate stages with
+  Java's laziness, the terminals, the `Collectors` factories, and
+  `Optional`/`OptionalInt`/`OptionalLong`/`OptionalDouble` (see README). The
+  note below is kept for the reasoning about how a host object drives user
+  lambdas.
 
   This entry used to say the obstacle was *where a lambda can be called from* —
   that "a host builtin cannot re-enter the VM", so a stream could not be a host
@@ -1341,14 +1329,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   and the terminal drives the elements through the chain with `invoke_closure`,
   exactly as `forEach` already does. Compile-time fusion is one way to build
   this, not the only way.
-
-  What is genuinely not built is the surface: the sources, the intermediate ops
-  with Java's laziness (a `peek` before a `limit` must see only the elements the
-  `limit` demands, and `sorted` is a full barrier), the terminals, and
-  `Optional`/`OptionalInt`/`OptionalDouble` for the four terminals that return
-  one. Half of that would be worse than none — a pipeline that silently drops a
-  stage is exactly the failure mode this file exists to prevent — so it stays a
-  compile error until it is whole.
 
   The `default` and `static` members the JDK's functional interfaces carry are
   all implemented, `Comparator.comparing`/`naturalOrder`/`reverseOrder`
@@ -1478,9 +1458,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `false`.
 - **`return <value>` from `main`.** `main` is `void`; only a bare `return;`
   (which ends the program) is accepted there. Value returns work in methods.
-- **`switch` *patterns*** (`case Integer i ->`, `case null`, guarded
-  `when` clauses). The arrow form itself is implemented (above); it is pattern
-  labels that are not.
+- ~~**`switch` *patterns***~~ — implemented: type patterns, record
+  deconstruction patterns (nested, with `var`), `case null`, and guarded `when`
+  labels, in switch statements and expressions, and record patterns in
+  `instanceof`.
 - **`EnumSet.range` and `EnumSet.complementOf`.** `new EnumMap<>(K.class)`
   (and the copy constructor), `EnumSet.of`/`noneOf`/`allOf`/`copyOf` run: an
   `EnumMap` or `EnumSet` iterates in ordinal order, which is an enum's natural
@@ -1489,7 +1470,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   answers every query the same. Two things show the model: `getClass()` names
   `java.util.TreeMap`/`TreeSet`, and `range`/`complementOf` are refused,
   because they need the element type, which an erased receiver does not carry.
-- **Sealed types.**
+- ~~**Sealed types.**~~ — implemented: `sealed`, `permits` and `non-sealed`
+  are accepted, and a pattern switch over a sealed hierarchy needs no `default`.
 - **A type *parameter* that shadows a class name.** `class Box<T>` inside a
   program that also declares a class `T` reads the declared return type `T` as
   that class, so `box.get().length()` is rejected as ``class `T` has no method
