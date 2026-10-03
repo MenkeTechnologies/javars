@@ -1404,7 +1404,7 @@ pub const REFERENCE: &[Entry] = &[
         "String.format",
         "Static Library",
         "String String.format(String fmt, Object... args)",
-        "printf-style formatting — a faithful subset of `java.util.Formatter` covering the conversions `d s S f e E g G b B h H x X o c %` and `%n`, all seven flags `-` `#` `+` ` ` `0` `,` `(`, an optional width, an optional `.precision`, and explicit argument indexes (`%2$s`). `%f` rounds HALF_UP on the double's exact value, as Java does. `System.out.printf` is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.",
+        "printf-style formatting — a faithful subset of `java.util.Formatter` covering the conversions `d s S f e E g G a A b B h H x X o c %` and `%n`, all seven flags `-` `#` `+` ` ` `0` `,` `(`, an optional width, an optional `.precision`, explicit argument indexes (`%2$s`), and the relative index `%<s`. `%f` rounds HALF_UP on the double's exact value, as Java does. `System.out.printf` is the same formatter with no trailing newline. An unsupported conversion is reported rather than rendered wrong.",
         "System.out.println(String.format(\"%05.2f|%-6s|%+d\", 3.14159, \"ab\", 7));   // 03.14|ab    |+7",
     ),
     (

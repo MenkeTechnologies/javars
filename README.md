@@ -89,15 +89,17 @@ instance methods, `this`, `new`, field access, single inheritance with
 `extends`, `super(…)` chaining and non-virtual `super.member` access,
 `instanceof`, virtual method dispatch, and `toString()`
 overrides). **Interfaces** (abstract + `default` methods, multiple
-implements, interface inheritance, polymorphic dispatch), **method overloading
-by parameter type** (most-specific resolution for methods and constructors,
-including Java's variable-arity phase so `T...` parameters take loose
-arguments), and
+implements, interface inheritance, polymorphic dispatch, implicitly `static`
+interface constants), **method overloading by parameter type** (Java's three
+phases — strict widening, then boxing/unboxing, then variable arity — with a
+cost tie settled by most-specific, so `f(1)` picks `f(int)` over `f(Integer)`
+and `f(null)` picks `f(String)` over `f(Object)`), annotations (parsed and
+dropped: none has a run-time effect without reflection), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
 X>`, the diamond, erased library type args) all run. `String.format` and
-`System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %b
-%B %h %H %x %X %o %c`, all seven `-`/`#`/`+`/` `/`0`/`,`/`(` flags, width,
-precision, and argument indexes), the mutable **`StringBuilder`/`StringBuffer`**
+`System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %a %A
+%b %B %h %H %x %X %o %c`, all seven `-`/`#`/`+`/` `/`0`/`,`/`(` flags, width,
+precision, and explicit and relative `%<s` argument indexes), the mutable **`StringBuilder`/`StringBuffer`**
 (the full method surface, with `capacity()`'s growth modeled because it is
 observable), and the `Arrays` statics round out the stdlib essentials; the
 wider standard library is the next wave (see [`BUGS.md`](BUGS.md)). **Exceptions**

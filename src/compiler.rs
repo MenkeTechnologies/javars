@@ -1229,6 +1229,36 @@ impl Compiler {
         }
     }
 
+    /// An unqualified `values()` / `valueOf(s)` written inside an enum's own
+    /// code, rewritten to the qualified `Color.values()` it means. Every enum
+    /// has the two as implicit `static` members (JLS 8.9.3), so its methods,
+    /// constructors and constant bodies may call them bare; javars generates
+    /// them at the qualified call site, so the bare form is routed there. A
+    /// constant with a body lowers under a subclass of the enum, which is why
+    /// the superclass is consulted too.
+    fn implicit_enum_static(&self, name: &str, args: &[Expr], line: u32) -> Option<Expr> {
+        if !matches!((name, args.len()), ("values", 0) | ("valueOf", 1))
+            || self.methods.contains_key(name)
+        {
+            return None;
+        }
+        let enclosing = [self.this_class.as_deref(), self.current_class.as_deref()];
+        let class = enclosing.into_iter().flatten().find_map(|c| {
+            let info = self.classes.get(c)?;
+            if info.is_enum {
+                return Some(c.to_string());
+            }
+            let sup = info.superclass.as_deref()?;
+            self.classes.get(sup)?.is_enum.then(|| sup.to_string())
+        })?;
+        Some(Expr::MethodCall {
+            recv: Box::new(Expr::Var(class)),
+            method: name.to_string(),
+            args: args.to_vec(),
+            line,
+        })
+    }
+
     /// The user class named by a bare receiver (`Counter.reset()`), or `None`
     /// when the receiver is a value rather than a type name. A declared variable
     /// of the same name always wins.
@@ -1420,6 +1450,10 @@ impl Compiler {
             } if method == "values" && args.is_empty() => {
                 self.enum_type_ref(recv).map(|c| format!("{c}[]"))
             }
+            Expr::Call { name, args, line } => {
+                let call = self.implicit_enum_static(name, args, *line)?;
+                self.expr_array_type(&call)
+            }
             // A row of a multi-dimensional array: `int[][]` indexed once is an
             // `int[]`, so `g[i][j]` types its element as `int`.
             Expr::Index { array, .. } => {
@@ -1477,9 +1511,11 @@ impl Compiler {
                 self.classes.contains_key(elem).then(|| elem.to_string())
             }
             // A bare call to a user `static` method: its declared return type.
-            Expr::Call { name, args, .. } => {
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+            Expr::Call { name, args, line } => {
+                if let Some(call) = self.implicit_enum_static(name, args, *line) {
+                    return self.expr_class(&call);
+                }
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 let ret = self.resolve_static_call(name, &arg_tys)?.ret_name;
                 self.classes.contains_key(&ret).then_some(ret)
             }
@@ -1490,14 +1526,12 @@ impl Compiler {
                     return self.classes.contains_key(&t).then_some(t);
                 }
                 if let Some(class) = self.user_class_ref(recv) {
-                    let arg_tys: Vec<Option<String>> =
-                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let arg_tys: Vec<Option<String>> = self.arg_types(args);
                     let ret = self.resolve_static_on(&class, method, &arg_tys)?.ret_name;
                     return self.classes.contains_key(&ret).then_some(ret);
                 }
                 let rc = self.expr_class(recv)?;
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 let ret_name = self.resolve_instance_call(&rc, method, &arg_tys)?.ret_name;
                 self.classes.contains_key(&ret_name).then_some(ret_name)
             }
@@ -1566,6 +1600,21 @@ impl Compiler {
             return c.binary.clone();
         }
         crate::host::qualify_class_name(name)
+    }
+
+    /// The static types of a call's arguments, as overload resolution sees
+    /// them. A bare `null` is the null type (JLS 4.1): assignable to every
+    /// reference parameter and to no primitive one, which is what lets
+    /// `f(null)` pick `f(String)` over `f(Object)`. It is typed here rather
+    /// than in [`Compiler::expr_java_type`] because only a call site asks
+    /// "which reference parameters can this reach".
+    fn arg_types(&self, args: &[Expr]) -> Vec<Option<String>> {
+        args.iter()
+            .map(|a| match a {
+                Expr::Var(n) if n == NULL_LITERAL => Some(NULL_LITERAL.to_string()),
+                _ => self.expr_java_type(a),
+            })
+            .collect()
     }
 
     fn expr_java_type(&self, e: &Expr) -> Option<String> {
@@ -1699,9 +1748,11 @@ impl Compiler {
             Expr::IncDec { target, .. } => self.expr_java_type(target),
             // An assignment's value has the target's type (JLS 15.26).
             Expr::Assign { target, .. } => self.expr_java_type(target),
-            Expr::Call { name, args, .. } => {
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+            Expr::Call { name, args, line } => {
+                if let Some(call) = self.implicit_enum_static(name, args, *line) {
+                    return self.expr_java_type(&call);
+                }
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 self.resolve_static_call(name, &arg_tys).map(|s| s.ret_name)
             }
             Expr::MethodCall {
@@ -1713,8 +1764,7 @@ impl Compiler {
                 // `T.helper(x)` — the named class's `static` method, resolved in
                 // that class's own inheritance chain.
                 if let Some(class) = self.user_class_ref(recv) {
-                    let arg_tys: Vec<Option<String>> =
-                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let arg_tys: Vec<Option<String>> = self.arg_types(args);
                     return self
                         .resolve_static_on(&class, method, &arg_tys)
                         .map(|s| s.ret_name);
@@ -1768,8 +1818,7 @@ impl Compiler {
                         return None;
                     }
                 }
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 if let Some(rc) = self.expr_class(recv) {
                     if let Some(r) = self.resolve_instance_call(&rc, method, &arg_tys) {
                         return Some(r.ret_name);
@@ -1874,8 +1923,12 @@ impl Compiler {
         if from == to {
             return Some(0);
         }
-        if let (Some(f), Some(t)) = (numeric_rank(from), numeric_rank(to)) {
-            return (f <= t).then(|| t - f);
+        // Phase 1 is *primitive* widening only (JLS 5.1.2). A wrapper is not a
+        // primitive here: `Integer` reaching an `int` parameter is unboxing,
+        // which belongs to phase 2 below, so `f(1)` against `f(int)`/`f(Integer)`
+        // picks `f(int)` at cost 0 instead of tying with the wrapper.
+        if !is_reference_type(from) && !is_reference_type(to) {
+            return primitive_widening_cost(from, to);
         }
         if from == "null" {
             return is_reference_type(to).then_some(50);
@@ -1905,6 +1958,20 @@ impl Compiler {
             let numeric = numeric_rank(from).is_some();
             if to == "Object" || to == "Comparable" || (to == "Number" && numeric) {
                 return Some(BOX + 1);
+            }
+        }
+        let prim = unwrapped_ty(from);
+        if prim != from {
+            // A wrapper is a class: it widens to its own supertypes in phase 1
+            // (`Long` reaches `Number` without unboxing, so `n(Long)` picks
+            // `n(Number)` over `n(double)`).
+            if to == "Comparable" || (to == "Number" && numeric_rank(prim).is_some()) {
+                return Some(1);
+            }
+            // Unboxing, then primitive widening (JLS 5.3): `Integer` reaches
+            // `int` and `long`, never `short` and never another wrapper.
+            if !is_reference_type(to) {
+                return primitive_widening_cost(prim, to).map(|c| BOX + c);
             }
         }
         None
@@ -1963,11 +2030,37 @@ impl Compiler {
         if matches!(cands, [(_, false)]) {
             return Ok(0);
         }
-        let scored = cands
+        let scored: Vec<(usize, u32)> = cands
             .iter()
             .enumerate()
-            .filter_map(|(i, (ptys, _))| self.signature_cost(ptys, arg_tys).map(|c| (i, c)));
-        Self::most_specific(scored)
+            .filter_map(|(i, (ptys, _))| self.signature_cost(ptys, arg_tys).map(|c| (i, c)))
+            .collect();
+        match Self::most_specific(scored.iter().copied()) {
+            Err(NoPick::Ambiguous) if arg_tys.iter().all(Option::is_some) => {
+                // A cost tie is settled by JLS 15.12.2.5 specificity: `f(null)`
+                // against `f(Object)`/`f(String)` costs the same for both, and
+                // `f(String)` wins because `String` converts to `Object` and not
+                // the reverse. Only when every argument's static type is known —
+                // an unknown one would let the tie-break pick for a type javars
+                // never saw, turning a refusal into a guess.
+                let best = scored.iter().map(|&(_, c)| c).min().unwrap_or(0);
+                let tied: Vec<usize> = scored
+                    .iter()
+                    .filter(|&&(_, c)| c == best)
+                    .map(|&(i, _)| i)
+                    .collect();
+                let n = arg_tys.len();
+                let mut winners = tied.iter().filter(|&&i| {
+                    tied.iter()
+                        .all(|&j| self.at_least_as_specific(cands[i].0, cands[j].0, n))
+                });
+                match (winners.next(), winners.next()) {
+                    (Some(&i), None) => Ok(i),
+                    _ => Err(NoPick::Ambiguous),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Java's three resolution phases over one candidate set, in order: the
@@ -2672,7 +2765,7 @@ impl Compiler {
     ) -> Result<(), String> {
         // Resolve which overload the static argument types select, then dispatch
         // that exact signature virtually on the receiver's runtime class.
-        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let arg_tys: Vec<Option<String>> = self.arg_types(args);
         let resolved = self
             .resolve_instance_call(rc, method, &arg_tys)
             .or_else(|| self.resolve_on_implementor(rc, method, &arg_tys))
@@ -3451,8 +3544,7 @@ impl Compiler {
                 }
             }
             Expr::Call { name, args, .. } => {
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 self.resolve_static_call(name, &arg_tys)
                     .map(|s| s.ret)
                     .unwrap_or(NumType::Other)
@@ -3462,8 +3554,7 @@ impl Compiler {
             } => {
                 // `T.helper(x)` — the named class's declared return type.
                 if let Some(class) = self.user_class_ref(recv) {
-                    let arg_tys: Vec<Option<String>> =
-                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let arg_tys: Vec<Option<String>> = self.arg_types(args);
                     return self
                         .resolve_static_on(&class, method, &arg_tys)
                         .map(|s| s.ret)
@@ -3484,8 +3575,7 @@ impl Compiler {
                 }
                 // A user-class instance method's declared return type.
                 if let Some(rc) = self.expr_class(recv) {
-                    let arg_tys: Vec<Option<String>> =
-                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let arg_tys: Vec<Option<String>> = self.arg_types(args);
                     if let Some(r) = self.resolve_instance_call(&rc, method, &arg_tys) {
                         return r.ret;
                     }
@@ -6257,7 +6347,10 @@ impl Compiler {
                 value,
                 line,
             } => self.assign_value(target, *op, value, *line)?,
-            Expr::Call { name, args, line } => self.call(name, args, *line)?,
+            Expr::Call { name, args, line } => match self.implicit_enum_static(name, args, *line) {
+                Some(call) => self.expr(&call)?,
+                None => self.call(name, args, *line)?,
+            },
             Expr::MethodCall {
                 recv,
                 method,
@@ -6470,8 +6563,7 @@ impl Compiler {
         // static on an unrelated class can never be selected.
         if let Some(class) = self.user_class_ref(recv) {
             if self.methods.contains_key(method) {
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 if let Some(resolved) = self.resolve_static_on(&class, method, &arg_tys) {
                     let args =
                         Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
@@ -6755,8 +6847,7 @@ impl Compiler {
         // wrong number rather than the compile error it was; for a plain class
         // the identity hash IS `Object`'s specified answer.
         if let Some(rc) = self.expr_class(recv) {
-            let arg_tys: Vec<Option<String>> =
-                args.iter().map(|a| self.expr_java_type(a)).collect();
+            let arg_tys: Vec<Option<String>> = self.arg_types(args);
             let inherited = matches!(
                 (method, args.len()),
                 ("equals", 1) | ("toString", 0) | ("hashCode", 0)
@@ -7190,7 +7281,7 @@ impl Compiler {
                 "javars: `{iface}.super` used outside an instance method (line {line})"
             ));
         }
-        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let arg_tys: Vec<Option<String>> = self.arg_types(args);
         let resolved = self
             .resolve_instance_call(iface, method, &arg_tys)
             .ok_or_else(|| {
@@ -7218,7 +7309,7 @@ impl Compiler {
         let this_class = self.this_class.clone().ok_or_else(|| {
             format!("javars: `super` used outside an instance method (line {line})")
         })?;
-        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let arg_tys: Vec<Option<String>> = self.arg_types(args);
         if let Some(sup) = self.super_class() {
             if let Some(resolved) = self.resolve_instance_call(&sup, method, &arg_tys) {
                 let param_tys = resolved.param_tys;
@@ -7519,7 +7610,7 @@ impl Compiler {
 
         // Run the constructor (resolving the overload by argument type). A class
         // with no declared ctor accepts only `new C()`.
-        let arg_tys: Vec<Option<String>> = args.iter().map(|a| self.expr_java_type(a)).collect();
+        let arg_tys: Vec<Option<String>> = self.arg_types(args);
         let ctor_sig = self.resolve_ctor(ctor_class, &arg_tys);
         if let Some((param_tys, vararg_from)) = ctor_sig {
             let args = Self::effective_args(args, &param_tys, vararg_from);
@@ -7851,8 +7942,7 @@ impl Compiler {
                     let this0 = Expr::Var(OUTER_THIS.to_string());
                     let args = self.with_captures(&sup, args, Some(&this0));
                     let args: &[Expr] = &args;
-                    let arg_tys: Vec<Option<String>> =
-                        args.iter().map(|a| self.expr_java_type(a)).collect();
+                    let arg_tys: Vec<Option<String>> = self.arg_types(args);
                     if let Some((param_tys, vararg_from)) = self.resolve_ctor(&sup, &arg_tys) {
                         let args = Self::effective_args(args, &param_tys, vararg_from);
                         self.emit_this(line); // this
@@ -7890,8 +7980,7 @@ impl Compiler {
                 let this0 = Expr::Var(OUTER_THIS.to_string());
                 let args = self.with_captures(&this_class, args, Some(&this0));
                 let args: &[Expr] = &args;
-                let arg_tys: Vec<Option<String>> =
-                    args.iter().map(|a| self.expr_java_type(a)).collect();
+                let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 let (param_tys, vararg_from) =
                     self.resolve_ctor(&this_class, &arg_tys).ok_or_else(|| {
                         format!(
@@ -7914,8 +8003,7 @@ impl Compiler {
         // A user-defined static method resolves to the native call-frame ABI,
         // choosing the overload that matches the argument types.
         if self.methods.contains_key(name) {
-            let arg_tys: Vec<Option<String>> =
-                args.iter().map(|a| self.expr_java_type(a)).collect();
+            let arg_tys: Vec<Option<String>> = self.arg_types(args);
             let resolved = self.resolve_static_call(name, &arg_tys).ok_or_else(|| {
                 format!(
                     "javars: no `{name}` overload matches {} argument(s) (line {line})",
@@ -8525,6 +8613,21 @@ fn rank_name(rank: u32) -> &'static str {
 /// rather than a primitive or `void`.
 /// A primitive type's wrapper class, or `None` when `ty` is not a primitive.
 /// `void` has no boxing conversion, so it is deliberately absent.
+/// The cost of JLS 5.1.2 widening primitive conversion from `from` to `to`
+/// (both primitives): `Some(0)` for identity, the rank distance for a widening,
+/// `None` otherwise. `char` is unsigned, so it widens to `int` and up but not
+/// to `short`, and neither `byte` nor `short` widens to `char`.
+fn primitive_widening_cost(from: &str, to: &str) -> Option<u32> {
+    if from == to {
+        return Some(0);
+    }
+    if matches!((from, to), ("char", "short") | ("byte" | "short", "char")) {
+        return None;
+    }
+    let (f, t) = (numeric_rank(from)?, numeric_rank(to)?);
+    (f <= t).then(|| t - f)
+}
+
 fn wrapper_of(ty: &str) -> Option<&'static str> {
     Some(match ty {
         "int" => "Integer",

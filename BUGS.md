@@ -415,9 +415,12 @@ at the bottom, and are summarized in the section right after this one.
   `key ^ value` — so an `ArrayList` and an `Arrays.asList` holding the same
   elements hash alike and a `HashMap` equals a `LinkedHashMap` holding the same
   entries. `String.format` covers `%d %s %S %f
-  %e %E %g %G %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
-  (`-`/`#`/`+`/` `/`0`/`,`/`(`), width, `.precision`, and explicit argument
-  indexes (`%2$s`); `%f` rounds
+  %e %E %g %G %a %A %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
+  (`-`/`#`/`+`/` `/`0`/`,`/`(`), width, `.precision`, explicit argument
+  indexes (`%2$s`), and the relative index `%<s` that re-reads the previous
+  specifier's argument; `%a` is `Formatter`'s own hex-float rendering
+  (`hexDouble`'s half-even rounding to the precision, and its zero padding
+  placed after the `0x`); `%f` rounds
   the value's shortest round-trip decimal HALF_UP, as Java's `Formatter` does.
   The ` ` and `#` flags used to be *parsed and discarded*, so `% d` of 42
   answered `42` where Java answers ` 42` and `%#x` of 255 answered `ff` where
@@ -914,7 +917,7 @@ at the bottom, and are summarized in the section right after this one.
   type; javars has no target-typing pass, so the arity comes from the referenced
   member's own declaration — which resolves every unambiguous form and rejects
   an overloaded name with a diagnostic rather than guessing an overload.
-- **`final` on a local or enhanced-`for` variable.** Parsed and dropped: it
+- **`final` on a local, a parameter, or an enhanced-`for` variable.** Parsed and dropped: it
   constrains reassignment, which `javac` has already checked.
 - **`java.util` collections.** `List`/`ArrayList`/`LinkedList`,
   `Map`/`HashMap`/`LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/

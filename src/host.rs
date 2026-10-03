@@ -13792,9 +13792,9 @@ fn arrays_to_string(v: &Value) -> String {
 }
 
 /// `String.format(fmt, args…)` — a faithful subset of `java.util.Formatter`:
-/// conversions `d s S f b B x X o c %` and `%n`, with `-` (left-justify), `0`
-/// (zero-pad), `+` (leading sign) flags, an optional width, and an optional
-/// `.precision` (decimals for `f`, max length for `s`). Unsupported conversions
+/// conversions `d s S f e E g G a A b B h H x X o c %` and `%n`, all seven
+/// flags, an optional width, an optional `.precision`, and explicit (`%2$s`)
+/// and relative (`%<s`) argument indexes. Unsupported conversions
 /// surface an error rather than a wrong string.
 fn java_format(
     fmt: &str,
@@ -13805,6 +13805,9 @@ fn java_format(
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     let mut argi = 0usize;
+    // The index the previous argument-consuming specifier used, which a `<`
+    // flag (`%<s`) reads again. `Formatter.format` keeps it as `last`.
+    let mut last: Option<usize> = None;
     while let Some(c) = chars.next() {
         if c != '%' {
             out.push(c);
@@ -13847,6 +13850,8 @@ fn java_format(
         // (Java: ` 42`) and `%#x` of 255 answered `ff` (Java: `0xff`).
         let mut space = false;
         let mut alt = false;
+        // `<` re-uses the previous specifier's argument.
+        let mut relative = false;
         // A leading `0` already consumed as part of `lead` is the zero-pad flag,
         // not a width digit — Java has no zero-width conversion.
         if lead.starts_with('0') {
@@ -13862,6 +13867,7 @@ fn java_format(
                 '(' => parens = true,
                 ' ' => space = true,
                 '#' => alt = true,
+                '<' => relative = true,
                 _ => break,
             }
             spec.push(f);
@@ -13931,26 +13937,36 @@ fn java_format(
             _ => {
                 // An explicit `%n$` index does not advance the implicit cursor,
                 // which is what lets `%2$s %1$s` repeat and reorder arguments.
-                let idx = explicit_index.unwrap_or(argi);
+                // `<` wins over an explicit index, as in `Formatter.format`,
+                // whose relative case is checked first.
+                let idx = if relative {
+                    last
+                } else {
+                    Some(explicit_index.unwrap_or(argi))
+                };
                 // Java's `MissingFormatArgumentException`, naming the specifier
                 // that had no argument — not an internal javars error, which
-                // aborted the run where Java lets the program catch it.
-                let arg = args.get(idx).ok_or_else(|| {
+                // aborted the run where Java lets the program catch it. A `%<s`
+                // with no previous specifier is the same failure.
+                let missing = || {
                     Fault::java(
                         "MissingFormatArgumentException",
                         format!("Format specifier '{spec}'"),
                     )
-                })?;
-                if explicit_index.is_none() {
+                };
+                let idx = idx.ok_or_else(missing)?;
+                let arg = args.get(idx).ok_or_else(missing)?;
+                if !relative && explicit_index.is_none() {
                     argi += 1;
                 }
+                last = Some(idx);
                 let tag = tags.get(idx).copied().unwrap_or("");
                 check_conversion(conv, arg, tag)?;
                 let Rendered {
                     mut prefix,
                     mut body,
                     numeric,
-                } = format_conversion(conv, arg, prec, &flags, tag, vm.as_deref_mut())?;
+                } = format_conversion(conv, arg, width_n, prec, &flags, tag, vm.as_deref_mut())?;
                 if group && numeric {
                     body = group_digits(&body);
                 }
@@ -14227,6 +14243,11 @@ fn check_format_flags(
                     }
                 }
                 'e' | 'E' => mismatch(&[','])?,
+                // `checkFloat`: `checkBadFlags(PARENTHESES, GROUP)`, in that order.
+                'a' | 'A' => {
+                    mismatch(&['('])?;
+                    mismatch(&[','])?;
+                }
                 'g' | 'G' => mismatch(&['#'])?,
                 _ => {}
             }
@@ -14259,6 +14280,7 @@ impl Rendered {
 fn format_conversion(
     conv: char,
     arg: &Value,
+    width: Option<usize>,
     prec: Option<usize>,
     flags: &FmtFlags,
     tag: &str,
@@ -14437,6 +14459,15 @@ fn format_conversion(
             };
             Ok(num(float_sign(x), body))
         }
+        // `%a` is the hexadecimal floating-point form `Double.toHexString`
+        // writes, rounded to the precision's hex digits.
+        'a' | 'A' => Ok(Rendered::text(format_hex_float(
+            arg.jfloat(),
+            width,
+            prec,
+            flags,
+            conv == 'A',
+        ))),
         // `%h` is the argument's `hashCode()` in hex, or "null".
         'h' | 'H' => {
             let s = match arg {
@@ -14460,6 +14491,135 @@ fn format_conversion(
             format!("Conversion = '{other}'"),
         )),
     }
+}
+
+/// `Formatter`'s `%a`/`%A` of a `double`, ported from `print(double, …)` and
+/// its `HEXADECIMAL_FLOAT` branch. The whole field is one piece of text: its
+/// zero padding is computed here, after the `0x`, from the *unpadded* digit
+/// string — so a precision that appends zeros makes the field wider than the
+/// width, exactly as the JDK does — and any remaining width is filled with
+/// spaces by the caller.
+fn format_hex_float(
+    value: f64,
+    width: Option<usize>,
+    prec: Option<usize>,
+    flags: &FmtFlags,
+    upper: bool,
+) -> String {
+    if value.is_nan() {
+        return if upper { "NAN" } else { "NaN" }.to_string();
+    }
+    // `Double.compare(value, 0.0) == -1`, so `-0.0` takes the minus sign.
+    let neg = value.is_sign_negative();
+    let mut sb = String::new();
+    if neg {
+        sb.push('-');
+    } else if flags.plus {
+        sb.push('+');
+    } else if flags.space {
+        sb.push(' ');
+    }
+    let v = value.abs();
+    if v.is_infinite() {
+        sb.push_str(if upper { "INFINITY" } else { "Infinity" });
+        return sb;
+    }
+    // An absent precision means "every digit", and an explicit 0 means 1.
+    let prec = match prec {
+        None => 0,
+        Some(0) => 1,
+        Some(p) => p,
+    };
+    let s = hex_double(v, prec);
+    sb.push_str(if upper { "0X" } else { "0x" });
+    if flags.zero {
+        let lead = if flags.space || flags.plus || neg {
+            3
+        } else {
+            2
+        };
+        let width = width.unwrap_or(0) as isize;
+        let zeros = width - s.len() as isize - lead;
+        sb.extend(std::iter::repeat_n('0', zeros.max(0) as usize));
+    }
+    let idx = s.find('p').unwrap_or(s.len());
+    let mut va = if upper {
+        s[..idx].to_uppercase()
+    } else {
+        s[..idx].to_string()
+    };
+    if prec != 0 {
+        // `addZeros`: pad the fraction out to `prec` digits.
+        let dot = va.find('.');
+        let out_prec = dot.map_or(0, |i| va.len() - i - 1);
+        if out_prec < prec {
+            if dot.is_none() {
+                va.push('.');
+            }
+            va.extend(std::iter::repeat_n('0', prec - out_prec));
+        }
+    }
+    sb.push_str(&va);
+    sb.push(if upper { 'P' } else { 'p' });
+    sb.push_str(&s[(idx + 1).min(s.len())..]);
+    sb
+}
+
+/// `Double.toHexString(d).substring(2)` for a finite, non-negative `d`: the
+/// significand's hex digits with trailing zeros dropped, and the binary
+/// exponent (`-1022` for a subnormal).
+fn hex_string_unsigned(d: f64) -> String {
+    if d == 0.0 {
+        return "0.0p0".to_string();
+    }
+    let bits = d.to_bits();
+    let subnormal = d < f64::MIN_POSITIVE;
+    let signif = format!(
+        "{:x}",
+        (bits & 0x000F_FFFF_FFFF_FFFF) | 0x1000_0000_0000_0000
+    );
+    let digits = signif[3..16].trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let exp = if subnormal {
+        -1022
+    } else {
+        ((bits >> 52) & 0x7ff) as i64 - 1023
+    };
+    format!("{}.{digits}p{exp}", if subnormal { '0' } else { '1' })
+}
+
+/// `Formatter.hexDouble`: `d` (finite, non-negative) rounded half-even to
+/// `prec` hex digits of significand, as `Double.toHexString` would write the
+/// rounded value. A subnormal is normalized first, so its rounded form has a
+/// leading `1.` and a true exponent below -1022.
+fn hex_double(d: f64, prec: usize) -> String {
+    if d == 0.0 || prec == 0 || prec >= 13 {
+        return hex_string_unsigned(d);
+    }
+    let get_exponent = |x: f64| ((x.to_bits() >> 52) & 0x7ff) as i64 - 1023;
+    let subnormal = get_exponent(d) == -1023;
+    let d = if subnormal { d * 2f64.powi(54) } else { d };
+    let shift = 53 - (1 + prec as u32 * 4);
+    let doppel = d.to_bits();
+    let mut signif = (doppel & 0x7FFF_FFFF_FFFF_FFFF) >> shift;
+    let rounding = doppel & !(!0u64 << shift);
+    let least_zero = signif & 1 == 0;
+    let round = (1u64 << (shift - 1)) & rounding != 0;
+    let sticky = shift > 1 && (!(1u64 << (shift - 1)) & rounding) != 0;
+    if (least_zero && round && sticky) || (!least_zero && round) {
+        signif += 1;
+    }
+    let result = f64::from_bits(signif << shift);
+    if result.is_infinite() {
+        return "1.0p1024".to_string();
+    }
+    let res = hex_string_unsigned(result);
+    if !subnormal {
+        return res;
+    }
+    let idx = res.find('p').unwrap_or(res.len());
+    let exp: i64 = res[idx + 1..].parse().unwrap_or(0);
+    format!("{}p{}", &res[..idx], exp - 54)
 }
 
 /// The `NullPointerException` a `String` method raises when its first argument
