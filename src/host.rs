@@ -2003,7 +2003,7 @@ pub fn set_binary_names(map: HashMap<String, String>) {
 }
 
 /// Record each functional interface's single abstract method name. Call before
-/// running the chunk; read by [`instance_sam`].
+/// running the chunk; read by `instance_sam`.
 pub fn set_functional_sams(map: HashMap<String, String>) {
     SAMS.with(|s| *s.borrow_mut() = map);
 }

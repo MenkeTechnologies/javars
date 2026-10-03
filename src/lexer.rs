@@ -69,7 +69,7 @@ pub enum Tok {
     Arrow,
     /// `::` — the method-reference separator (`String::length`).
     ColonColon,
-    /// `@` — the start of an annotation, which [`strip_annotations`] removes
+    /// `@` — the start of an annotation, which `strip_annotations` removes
     /// before the parser sees it.
     At,
     // operators
