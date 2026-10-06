@@ -2778,11 +2778,16 @@ fn b_closure_call(vm: &mut VM, argc: u8) -> Value {
 /// heap object, whose Java hash is an identity hash javars cannot reproduce (and
 /// whose iteration order is therefore not reproducible in Java either).
 fn java_hash(v: &Value) -> Option<i32> {
-    // A wrapper hashes as its primitive. The two arms below already split
-    // `Integer` from `Long` by magnitude, which is exact: an `Integer` can hold
-    // nothing outside `i32`, so a value that does is necessarily a `Long`.
+    // A wrapper hashes as its primitive, by its own class's rule. The width
+    // matters for two of them: a `Long` folds its halves even when its value
+    // would fit an `int` (`Long.valueOf(-1).hashCode()` is 0, not -1), and a
+    // `Float` is `floatToIntBits` unfolded rather than `Double`'s fold.
     if let Some(inner) = unboxed(v) {
-        return java_hash(&inner);
+        return Some(match box_class(v) {
+            Some("Long") => long_hash(inner.jint()),
+            Some("Float") => float_hash(inner.jfloat()),
+            _ => return java_hash(&inner),
+        });
     }
     Some(match v {
         // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
@@ -2792,13 +2797,12 @@ fn java_hash(v: &Value) -> Option<i32> {
             .chars()
             .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32)),
         // `Integer.hashCode` is the value; `Long.hashCode` folds the halves.
-        Value::Int(n) => {
-            if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
-                *n as i32
-            } else {
-                (*n ^ ((*n as u64) >> 32) as i64) as i32
-            }
-        }
+        // An unboxed integer carries no width, so one in `int` range hashes as
+        // an `Integer` (a boxed `Long` is told apart above).
+        Value::Int(n) => match i32::try_from(*n) {
+            Ok(i) => i,
+            Err(_) => long_hash(*n),
+        },
         // `Double.hashCode` folds `doubleToLongBits` the way `Long` does. The
         // *canonical* bits, not the raw ones: `doubleToLongBits` collapses
         // every `NaN` encoding to one pattern, so two `NaN`s hash alike — which
@@ -2816,6 +2820,22 @@ fn java_hash(v: &Value) -> Option<i32> {
         }
         _ => return None,
     })
+}
+
+/// `Long.hashCode(n)`: the two 32-bit halves XORed, `(int) (n ^ (n >>> 32))`.
+fn long_hash(n: i64) -> i32 {
+    (n ^ ((n as u64) >> 32) as i64) as i32
+}
+
+/// `Float.hashCode(f)`: `floatToIntBits`, which collapses every `NaN` to
+/// `0x7fc00000` and is not folded.
+fn float_hash(f: f64) -> i32 {
+    let f = f as f32;
+    if f.is_nan() {
+        0x7fc0_0000
+    } else {
+        f.to_bits() as i32
+    }
 }
 
 /// The hash one *element* of a collection contributes, which is what
@@ -3972,6 +3992,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 /// An asymmetric user `equals` therefore answers here exactly as it does there.
 /// With no user body in play this is [`value_eq`].
 fn eq_call(vm: &mut VM, q: &Value, other: &Value) -> bool {
+    if let Some(same) = collection_equals(vm, q, other) {
+        return same;
+    }
     match user_equals(vm, q) {
         Some((id, entry)) => run_equals(vm, entry, id, other),
         None => value_eq(q, other),
@@ -3989,6 +4012,80 @@ fn objects_equals(vm: &mut VM, a: &Value, b: &Value) -> bool {
         (Value::Undef, _) => false,
         _ => eq_call(vm, a, b),
     }
+}
+
+/// Whether `v` is a `List`, `Set` or `Map` handle (a `subList` view included) —
+/// the shapes whose `equals` is the JDK's structural `AbstractList`/
+/// `AbstractSet`/`AbstractMap` comparison rather than identity.
+fn is_collection_handle(v: &Value) -> bool {
+    matches!(v, Value::Obj(_)) && eq_shape(v).is_some()
+}
+
+/// `q.equals(other)` when `q` is a collection: `None` for anything else.
+///
+/// The JDK's three abstract bases, each against its own kind only (a `List`
+/// never equals a `Set`):
+///
+///   * `AbstractList.equals` — same length, and position by position
+///     `o1 == null ? o2 == null : o1.equals(o2)` with this list's element as
+///     the receiver.
+///   * `AbstractSet.equals` — same size and `containsAll(other)`, which asks
+///     `e.equals(x)` with each element `e` of the *other* set as the receiver.
+///   * `AbstractMap.equals` — same size, and for every entry of this map the
+///     other's `get(key)` (the lookup key as receiver) equal to the value,
+///     a `null` value additionally requiring `containsKey`.
+///
+/// It runs outside any heap borrow, so nested collections and user `equals`
+/// bodies recurse through [`eq_call`]. A stale `subList` view compares as not
+/// equal rather than raising here.
+fn collection_equals(vm: &mut VM, q: &Value, other: &Value) -> Option<bool> {
+    let shape = eq_shape(q)?;
+    if let (Value::Obj(x), Value::Obj(y)) = (q, other) {
+        if x == y {
+            return Some(true);
+        }
+    }
+    let Some(other_shape) = eq_shape(other) else {
+        return Some(false);
+    };
+    // A lookup inside a hash container runs the probe's `equals` only when its
+    // `hashCode` agrees, which is what `trusted_equals` decides.
+    let key_eq = |vm: &mut VM, k: &Value, x: &Value| {
+        if matches!(k, Value::Undef) {
+            matches!(x, Value::Undef)
+        } else if trusted_equals(vm, k, true) {
+            eq_call(vm, k, x)
+        } else {
+            value_eq(k, x)
+        }
+    };
+    Some(match (shape, other_shape) {
+        (EqShape::List, EqShape::List) => {
+            let (Some(a), Some(b)) = (sequence_items(q), sequence_items(other)) else {
+                return Some(false);
+            };
+            a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| objects_equals(vm, x, y))
+        }
+        (EqShape::Set(_), EqShape::Set(_)) => {
+            let (Some(a), Some(b)) = (sequence_items(q), sequence_items(other)) else {
+                return Some(false);
+            };
+            a.len() == b.len() && b.iter().all(|e| a.iter().any(|x| key_eq(vm, e, x)))
+        }
+        (EqShape::Map(_), EqShape::Map(_)) => {
+            let (Some(a), Some(b)) = (map_entries(q), map_entries(other)) else {
+                return Some(false);
+            };
+            a.len() == b.len()
+                && a.iter().all(|(k, v)| {
+                    match b.iter().find(|(ok, _)| key_eq(vm, k, ok)) {
+                        Some((_, ov)) => objects_equals(vm, v, ov),
+                        None => false,
+                    }
+                })
+        }
+        _ => false,
+    })
 }
 
 /// The handle and `equals(Object)` entry ip of a value that is a class instance
@@ -4214,30 +4311,20 @@ fn eq_plan(
     args: &[Value],
     arg_seqs: &[Option<Vec<Value>>],
 ) -> Option<EqPlan> {
-    if !any_user_equals(vm) {
+    // `equals` against another collection is the JDK's structural comparison,
+    // decided whole out here: it may recurse into nested collections and user
+    // `equals` bodies, neither of which the borrowed section can reach. Against
+    // anything that is not a collection it is `false`, which the borrowed
+    // section answers itself.
+    if method == "equals" && args.len() == 1 && is_collection_handle(&args[0]) {
+        return collection_equals(vm, recv, &args[0]).map(EqPlan::Same);
+    }
+    // A collection *argument* compares structurally too (`list.contains(aList)`,
+    // `map.get(aList)`), so it needs a plan even when no class declares `equals`.
+    if !any_user_equals(vm) && !args.first().is_some_and(is_collection_handle) {
         return None;
     }
     let shape = eq_shape(recv)?;
-    // `AbstractList.equals` compares position by position with *this* list's
-    // element as the receiver, so the bodies it reaches are the receiver's.
-    if method == "equals" && args.len() == 1 && matches!(shape, EqShape::List) {
-        let mine = eq_elements(recv)?;
-        let other = arg_seqs.first()?.clone()?;
-        if !mine.iter().any(|v| user_equals(vm, v).is_some()) {
-            return None;
-        }
-        if mine.len() != other.len() {
-            return Some(EqPlan::Same(false));
-        }
-        let mut same = true;
-        for (a, b) in mine.iter().zip(&other) {
-            if !eq_call(vm, a, b) {
-                same = false;
-                break;
-            }
-        }
-        return Some(EqPlan::Same(same));
-    }
     // `Set.addAll` asks the membership question once per added element, against
     // a set that grows as the earlier ones are accepted.
     if method == "addAll" && args.len() == 1 && matches!(shape, EqShape::Set(o) if is_hashed(o)) {
@@ -4320,6 +4407,11 @@ fn eq_plan(
 /// has to exist, and a hash container additionally needs a `hashCode` it can
 /// trust (see [`hash_consistent`]).
 fn trusted_equals(vm: &VM, v: &Value, hashed: bool) -> bool {
+    // A collection's `equals` is structural and its `hashCode` is derived from
+    // the same contents, so a hash container consults it too.
+    if is_collection_handle(v) {
+        return true;
+    }
     if user_equals(vm, v).is_none() {
         return false;
     }
@@ -4742,6 +4834,24 @@ fn builder_method(
             ("append", 1) => {
                 s.push_str(&rendered[0]);
                 *count = len + rendered[0].chars().count();
+                *cap = sb_grow(*cap, *count);
+                Ok(this)
+            }
+            // `append(CharSequence, start, end)`: the window `[start, end)` of
+            // the sequence's text, a `null` sequence reading as `"null"`. The
+            // window is checked against that text's length with the JDK's
+            // `checkFromToIndex` wording.
+            ("append", 3) => {
+                let chars: Vec<char> = rendered[0].chars().collect();
+                let (start, end) = (args[1].jint(), args[2].jint());
+                if start < 0 || start > end || end > chars.len() as i64 {
+                    return Err(Fault::java(
+                        "IndexOutOfBoundsException",
+                        format!("Range [{start}, {end}) out of bounds for length {}", chars.len()),
+                    ));
+                }
+                s.extend(&chars[start as usize..end as usize]);
+                *count = len + (end - start) as usize;
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
@@ -8777,6 +8887,9 @@ fn map_method(
         // `AbstractMap.equals` — same size, and every key maps to an equal
         // value. Order does not enter into it, which is what makes a `HashMap`
         // equal to a `LinkedHashMap` holding the same entries.
+        ("equals", 1) if matches!(eq, Some(EqPlan::Same(_))) => {
+            NewColl::Value(Value::bool(matches!(eq, Some(EqPlan::Same(true)))))
+        }
         ("equals", 1) => {
             let other = arg_entries.first().cloned().flatten();
             NewColl::Value(Value::bool(match other {
@@ -8916,6 +9029,9 @@ fn set_method(
         // `AbstractSet.equals` — same size and every element present in the
         // other, again independent of order.
         ("equals", 1) => {
+            if let Some(EqPlan::Same(same)) = eq {
+                return Ok(NewColl::Value(Value::bool(*same)));
+            }
             let other = arg_seqs[0].clone();
             Value::bool(match other {
                 Some(other) => {
@@ -9619,7 +9735,16 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // receiver itself for `toString` and into the pool's object for
         // `intern`.
         ("intern", 0) | ("toString", 0) => Ok(Value::str(s.to_string())),
-        ("contentEquals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
+        // `contentEquals(CharSequence)` compares against the sequence's text —
+        // a `StringBuilder`'s contents, not its handle — and dereferences a
+        // `null` argument (`cs.length()`) before comparing anything.
+        ("contentEquals", 1) => match &args[0] {
+            Value::Undef => Err(Fault::java(
+                "NullPointerException",
+                "Cannot invoke \"java.lang.CharSequence.length()\" because \"cs\" is null",
+            )),
+            other => Ok(Value::bool(s == java_str(other))),
+        },
         // `x.getClass()` evaluates to the runtime class's *binary name*
         // ([`JBINARY_CLASS`]), so `Class`'s own two accessors land here:
         // `getName()` is that string and `getSimpleName()` drops the package
@@ -10443,6 +10568,87 @@ fn collection_static(
         // `Collections.emptySet`/`emptyMap`/`singleton`/`singletonMap`: the
         // immutable one- and zero-element collections. Unlike `Set.of`/`Map.of`
         // they accept a `null` element, key or value.
+        // `Arrays.equals(a, b)`: the same array (or both `null`) is equal, one
+        // `null` is not, and otherwise the lengths and then the elements —
+        // `Objects.equals` for a reference array, so a user `equals` and a
+        // collection's structural one decide; a `double[]` compares the
+        // `doubleToLongBits` patterns, which [`value_eq`] already does.
+        ("Arrays", "equals") if args.len() == 2 => {
+            if same_array(&args[0], &args[1]) {
+                return Some(Ok(Value::bool(true)));
+            }
+            let (Some(a), Some(b)) = (array_items(&args[0]), array_items(&args[1])) else {
+                return Some(Ok(Value::bool(false)));
+            };
+            Ok(Value::bool(a.len() == b.len() && arrays_mismatch(vm, &a, &b, false).is_none()))
+        }
+        // `deepEquals` recurses into element pairs that are both arrays.
+        ("Arrays", "deepEquals") if args.len() == 2 => {
+            if same_array(&args[0], &args[1]) {
+                return Some(Ok(Value::bool(true)));
+            }
+            let (Some(a), Some(b)) = (array_items(&args[0]), array_items(&args[1])) else {
+                return Some(Ok(Value::bool(false)));
+            };
+            Ok(Value::bool(a.len() == b.len() && arrays_mismatch(vm, &a, &b, true).is_none()))
+        }
+        // `mismatch(a, b)`: the first index whose elements differ, else the
+        // shorter length when one is a proper prefix of the other, else -1.
+        // Both lengths are read first, so a `null` array is the NPE naming the
+        // JDK's parameter.
+        ("Arrays", "mismatch") if args.len() == 2 => {
+            let Some(a) = array_items(&args[0]) else {
+                return Some(Err(array_length_npe("a")));
+            };
+            let Some(b) = array_items(&args[1]) else {
+                return Some(Err(array_length_npe("b")));
+            };
+            if same_array(&args[0], &args[1]) {
+                return Some(Ok(Value::Int(-1)));
+            }
+            let n = a.len().min(b.len());
+            let at = arrays_mismatch(vm, &a[..n], &b[..n], false);
+            if pending() {
+                return Some(Ok(Value::Undef));
+            }
+            Ok(Value::Int(match at {
+                Some(i) => i as i64,
+                None if a.len() != b.len() => n as i64,
+                None => -1,
+            }))
+        }
+        // `compare(a, b)`: lexicographic over the first mismatch, `null` first,
+        // then the length difference. The compiler appends both arrays' static
+        // types, because the element comparison is the element type's own:
+        // `Integer.compare`'s -1/0/1 for `int[]`, but the *difference* for
+        // `byte[]`, `short[]` and `char[]`, `String.compareTo`'s for `String[]`.
+        ("Arrays", "compare") if args.len() == 4 => {
+            if same_array(&args[0], &args[1]) {
+                return Some(Ok(Value::Int(0)));
+            }
+            let (a, b) = match (array_items(&args[0]), array_items(&args[1])) {
+                (Some(a), Some(b)) => (a, b),
+                (None, _) => return Some(Ok(Value::Int(-1))),
+                (_, None) => return Some(Ok(Value::Int(1))),
+            };
+            let elem = args[2].as_str_cow().trim_end_matches("[]").to_string();
+            let n = a.len().min(b.len());
+            let at = arrays_mismatch(vm, &a[..n], &b[..n], false);
+            if pending() {
+                return Some(Ok(Value::Undef));
+            }
+            match at {
+                Some(i) => match (&a[i], &b[i]) {
+                    (Value::Undef, _) => Ok(Value::Int(-1)),
+                    (_, Value::Undef) => Ok(Value::Int(1)),
+                    (x, y) => match array_element_compare(vm, x, y, &elem) {
+                        Some(c) => Ok(Value::Int(c)),
+                        None => return Some(Ok(Value::Undef)),
+                    },
+                },
+                None => Ok(Value::Int(a.len() as i64 - b.len() as i64)),
+            }
+        }
         ("Collections", "emptySet") if args.is_empty() => {
             Ok(Value::Obj(heap_alloc(HostObj::Set {
                 items: Vec::new(),
@@ -11101,6 +11307,69 @@ fn collection_static(
     })
 }
 
+/// The first index at which `a` and `b` (already cut to a common length by the
+/// caller where it matters) hold unequal elements, or `None`. Elements compare
+/// as `Objects.equals`; with `deep`, a pair of arrays compares element-wise in
+/// turn, as `Arrays.deepEquals` does. A raised `equals` stops the scan.
+/// `a == b` on two array references: the same handle, or both `null`.
+fn same_array(a: &Value, b: &Value) -> bool {
+    ref_eq(a, b) || matches!((a, b), (Value::Undef, Value::Undef))
+}
+
+fn arrays_mismatch(vm: &mut VM, a: &[Value], b: &[Value], deep: bool) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(a.len().min(b.len()));
+    }
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let same = match (deep, array_items(x), array_items(y)) {
+            (true, Some(xs), Some(ys)) => {
+                ref_eq(x, y) || arrays_mismatch(vm, &xs, &ys, true).is_none()
+            }
+            _ => objects_equals(vm, x, y),
+        };
+        if pending() || !same {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// One element comparison of `Arrays.compare`, at the element type `elem`
+/// (the static type with its `[]` removed; empty when unknown). `None` when a
+/// user `compareTo` raised.
+fn array_element_compare(vm: &mut VM, x: &Value, y: &Value, elem: &str) -> Option<i64> {
+    let sign = |o: std::cmp::Ordering| cmp_to_int(o);
+    let (dx, dy) = (deboxed(x), deboxed(y));
+    let kind = match elem {
+        "" | "Object" | "Comparable" => match box_class(x) {
+            Some(c) => c,
+            None => elem,
+        },
+        other => other,
+    };
+    Some(match kind {
+        // `Byte.compare`, `Short.compare` and `Character.compare` are `x - y`.
+        "byte" | "Byte" | "short" | "Short" | "char" | "Character" => dx.jint() - dy.jint(),
+        "double" | "Double" | "float" | "Float" => double_compare(dx.jfloat(), dy.jfloat()),
+        "boolean" | "Boolean" => sign(matches!(dx, Value::Bool(true)).cmp(&matches!(dy, Value::Bool(true)))),
+        _ => match (&dx, &dy) {
+            (Value::Str(p), Value::Str(q)) => compare_strings(p, q, false),
+            (Value::Int(p), Value::Int(q)) => sign(p.cmp(q)),
+            (Value::Float(p), Value::Float(q)) => double_compare(*p, *q),
+            _ => return rank_compare(vm, &Value::Undef, x, y),
+        },
+    })
+}
+
+/// The NPE a JDK method raises reading `.length` of its `null` array
+/// parameter `var`.
+fn array_length_npe(var: &str) -> Fault {
+    Fault::java(
+        "NullPointerException",
+        format!("Cannot read the array length because \"{var}\" is null"),
+    )
+}
+
 /// The helpful `NullPointerException` the JVM raises when a JDK method body
 /// dereferences its `null` parameter `var` by calling `target` on it — the
 /// message names the library's own parameter, as `-XX:+ShowCodeDetailsInExceptionMessages`
@@ -11309,6 +11578,14 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         }
         // `Math.toIntExact(long)` is the narrowing the `Exact` family exists
         // for: in range it is the value, out of range it is `integer overflow`.
+        // `multiplyHigh`: the upper 64 bits of the 128-bit product, signed or
+        // (`unsignedMultiplyHigh`, Java 18) unsigned.
+        ("Math", "multiplyHigh", 2) => Ok(Value::Int(
+            ((i128::from(args[0].jint()) * i128::from(args[1].jint())) >> 64) as i64,
+        )),
+        ("Math", "unsignedMultiplyHigh", 2) => Ok(Value::Int(
+            ((u128::from(args[0].jint() as u64) * u128::from(args[1].jint() as u64)) >> 64) as i64,
+        )),
         ("Math", "toIntExact", 2) => {
             let v = args[0].jint();
             match i32::try_from(v) {
@@ -11550,6 +11827,14 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             Ok(Value::Int(i64::from((args[0].jint() as i32).swap_bytes())))
         }
         ("Long", "reverseBytes", 1) => Ok(Value::Int(args[0].jint().swap_bytes())),
+        // The 16-bit pair: `Short.reverseBytes` answers a (signed) `short`,
+        // `Character.reverseBytes` an (unsigned) `char`.
+        ("Short", "reverseBytes", 1) => {
+            Ok(Value::Int(i64::from((args[0].jint() as i16).swap_bytes())))
+        }
+        ("Character", "reverseBytes", 1) => {
+            Ok(Value::Int(i64::from((char_arg(&args[0]) as u32 as u16).swap_bytes())))
+        }
         ("Integer", "rotateLeft", 2) => Ok(Value::Int(i64::from(
             (args[0].jint() as i32).rotate_left(args[1].jint() as u32),
         ))),
@@ -11567,7 +11852,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `Long` folds its halves, `Double` folds `doubleToLongBits`, and
         // `Float` is `floatToIntBits` *unfolded* — so `Float.hashCode(1.5f)` is
         // 1069547520 where `Double.hashCode(1.5)` is 1073217536.
-        ("Integer" | "Long" | "Double" | "Boolean" | "Character", "hashCode", 1) => {
+        ("Integer" | "Double" | "Boolean" | "Character", "hashCode", 1) => {
             let v = match class {
                 "Double" => Value::float(args[0].jfloat()),
                 "Boolean" => Value::bool(matches!(args[0], Value::Bool(true))),
@@ -11576,9 +11861,8 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             };
             Ok(Value::Int(java_hash(&v).unwrap_or(0).into()))
         }
-        ("Float", "hashCode", 1) => Ok(Value::Int(
-            ((args[0].jfloat() as f32).to_bits() as i32).into(),
-        )),
+        ("Long", "hashCode", 1) => Ok(Value::Int(long_hash(args[0].jint()).into())),
+        ("Float", "hashCode", 1) => Ok(Value::Int(float_hash(args[0].jfloat()).into())),
         ("Long", "toString", 1) => Ok(Value::str(args[0].jint().to_string())),
         ("Long", "toString", 2) => Ok(Value::str(int_to_radix_string(
             args[0].jint(),
@@ -11603,11 +11887,25 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         }
         ("Double", "parseDouble", 1) | ("Double", "valueOf", 1) => {
             let s = args[0].as_str_cow();
-            parse_java_double(&s)
+            parse_java_double(&s, false)
                 .map(Value::float)
                 .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
         ("Double", "toString", 1) => Ok(Value::str(format_double(args[0].jfloat()))),
+        ("Double", "toHexString", 1) => Ok(Value::str(double_hex_string(args[0].jfloat()))),
+        // `Float.toHexString` is `Double.toHexString` of the widened value,
+        // except a subnormal `float`, which is first scaled into the `double`
+        // subnormal range so its digits keep the `float`'s exponent: the JDK's
+        // `scalb(f, -896)` with the `p-1022` rewritten to `p-126`.
+        ("Float", "toHexString", 1) => {
+            let f = args[0].jfloat() as f32;
+            Ok(Value::str(if f != 0.0 && f.abs() < f32::MIN_POSITIVE {
+                let s = double_hex_string(f64::from(f) * 2f64.powi(-896));
+                s.replace("p-1022", "p-126")
+            } else {
+                double_hex_string(f64::from(f))
+            }))
+        }
 
         // ── java.lang.Float ──
         // Every one of these answers at 32-bit precision, which is the whole
@@ -11615,8 +11913,8 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Float", "toString", 1) => Ok(Value::str(format_float(args[0].jfloat() as f32))),
         ("Float", "parseFloat", 1) | ("Float", "valueOf", 1) => {
             let s = args[0].as_str_cow();
-            parse_java_double(&s)
-                .map(|f| Value::float(f as f32 as f64))
+            parse_java_double(&s, true)
+                .map(Value::float)
                 .ok_or_else(|| Fault::java("NumberFormatException", float_format_message(&s)))
         }
         ("Float", "compare", 2) => Ok(Value::Int(float_compare(
@@ -11851,6 +12149,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             char_arg(&args[0]),
             char::to_lowercase,
         ))),
+        ("Character", "toTitleCase", 1) => Ok(Value::Int(title_case(char_arg(&args[0])))),
         ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
         // `getNumericValue` is `digit(c, 36)` for every script's decimal digits
         // and the Latin letters (fullwidth included); the characters whose
@@ -11863,6 +12162,14 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Boolean", "parseBoolean", 1) => Ok(Value::bool(
             args[0].as_str_cow().eq_ignore_ascii_case("true"),
         )),
+        // `Boolean.valueOf(boolean)` is the cached box of its argument and
+        // `valueOf(String)` is `parseBoolean` boxed — a `null` string is
+        // `false`. javars does not box `Boolean`, so either is the primitive.
+        ("Boolean", "valueOf", 1) => Ok(Value::bool(match &args[0] {
+            Value::Bool(b) => *b,
+            Value::Undef => false,
+            other => other.as_str_cow().eq_ignore_ascii_case("true"),
+        })),
 
         // ── java.lang.String ──
         // `String.valueOf(x)` renders any value with Java's `println` rules —
@@ -11953,15 +12260,6 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             array_mutate(&args[0], |a| a.fill(v))?;
             Ok(Value::Undef)
         }
-        ("Arrays", "equals", 2) => match (array_items(&args[0]), array_items(&args[1])) {
-            (Some(x), Some(y)) => Ok(Value::bool(
-                x.len() == y.len()
-                    && x.iter()
-                        .zip(y.iter())
-                        .all(|(p, q)| natural_cmp(p, q) == std::cmp::Ordering::Equal),
-            )),
-            _ => Ok(Value::bool(false)),
-        },
         // `Arrays.copyOf` pads with the element type's default when it grows.
         // javars erases the element type at runtime, so the pad is inferred from
         // element 0's kind — the only evidence available — and is `null` for an
@@ -13624,6 +13922,33 @@ fn java_is_whitespace(c: char) -> bool {
         | '\u{2028}' | '\u{2029}')
 }
 
+/// `Double.toHexString`: `NaN`/`Infinity` spelled out, a signed `0x0.0p0` for
+/// zero, and otherwise `0x1.` (normal) or `0x0.` (subnormal, with the fixed
+/// exponent `p-1022`) followed by the 13-digit significand with its trailing
+/// zeros dropped — one `0` kept — and the unbiased binary exponent.
+fn double_hex_string(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".to_string();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    let sign = if d.is_sign_negative() { "-" } else { "" };
+    if d == 0.0 {
+        return format!("{sign}0x0.0p0");
+    }
+    let bits = d.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i64;
+    let digits = format!("{:013x}", bits & 0x000f_ffff_ffff_ffff);
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    if biased == 0 {
+        format!("{sign}0x0.{digits}p-1022")
+    } else {
+        format!("{sign}0x1.{digits}p{}", biased - 1023)
+    }
+}
+
 /// `Double.parseDouble` / `Float.parseFloat` — Java's accepted grammar, which is
 /// not Rust's.
 ///
@@ -13638,7 +13963,12 @@ fn java_is_whitespace(c: char) -> bool {
 /// The grammar is validated explicitly rather than delegated, so an input Rust
 /// happens to accept cannot slip through a future toolchain. `None` is the
 /// caller's `NumberFormatException`.
-fn parse_java_double(text: &str) -> Option<f64> {
+///
+/// `single` is `Float.parseFloat`: the text is rounded once, straight to 32
+/// bits, since rounding to `f64` first and then to `f32` can land an ulp off.
+/// A hexadecimal significand (`0x1.8p1`) is accepted too, as
+/// `FloatingDecimal.parseHexString` does.
+fn parse_java_double(text: &str, single: bool) -> Option<f64> {
     // `FloatingDecimal.readJavaFormatString` trims first, with `String.trim()`
     // — chars <= U+0020, not the Unicode set.
     let s = text.trim_matches(|c: char| c <= ' ');
@@ -13665,12 +13995,23 @@ fn parse_java_double(text: &str) -> Option<f64> {
         Some(b'f' | b'F' | b'd' | b'D') => &body[..body.len() - 1],
         _ => body,
     };
+    if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        // `_` is literal syntax, not part of the string grammar.
+        if hex.contains('_') {
+            return None;
+        }
+        return crate::lexer::hex_float(hex, single).map(signed);
+    }
     if !is_java_decimal_literal(digits) {
         return None;
     }
     // The grammar is now known to be a subset of Rust's, so the conversion
     // itself — correctly rounded in both — can be delegated.
-    digits.parse::<f64>().ok().map(signed)
+    if single {
+        digits.parse::<f32>().ok().map(|f| signed(f64::from(f)))
+    } else {
+        digits.parse::<f64>().ok().map(signed)
+    }
 }
 
 /// The `NumberFormatException` message `Double.parseDouble`/`Float.parseFloat`
@@ -13915,6 +14256,23 @@ fn one_to_one_case<I: Iterator<Item = char>>(c: char, map: fn(char) -> I) -> i64
     match (mapped.next(), mapped.next()) {
         (Some(m), None) => m as i64,
         _ => c as i64,
+    }
+}
+
+/// `Character.toTitleCase`: UnicodeData's simple titlecase mapping. It is the
+/// simple uppercase mapping except for the characters the table gives a
+/// titlecase of their own — the Latin digraphs, whose titlecase form is the
+/// capital-then-small letter (`ǆ` → `ǅ`), and the Georgian Mkhedruli letters,
+/// which have an uppercase (Mtavruli) since Unicode 11 but title-case to
+/// themselves.
+fn title_case(c: char) -> i64 {
+    match c as u32 {
+        0x01C4..=0x01C6 => 0x01C5,
+        0x01C7..=0x01C9 => 0x01C8,
+        0x01CA..=0x01CC => 0x01CB,
+        0x01F1..=0x01F3 => 0x01F2,
+        0x10D0..=0x10FA | 0x10FD..=0x10FF => c as i64,
+        _ => one_to_one_case(c, char::to_uppercase),
     }
 }
 

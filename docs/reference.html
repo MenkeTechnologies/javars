@@ -1357,49 +1357,79 @@ System.out.println(Arrays.deepToString(g));   // [[2, 2], [3, 1]]</code></pre>
           <pre><code class="lang-java">System.out.println(Integer.reverse(1));   // -2147483648</code></pre>
         </article>
         <article class="doc-entry" id="doc-static-library-65">
-          <h3><a class="doc-anchor" href="#doc-static-library-65">#</a> <code>Integer.highestOneBit</code></h3>
+          <h3><a class="doc-anchor" href="#doc-static-library-65">#</a> <code>Short.reverseBytes</code></h3>
+          <pre><code class="lang-java">short Short.reverseBytes(short i)   |   char Character.reverseBytes(char ch)</code></pre>
+          <p>The two bytes swapped: a signed <code>short</code> from <code>Short</code>, an unsigned <code>char</code> from <code>Character</code>.</p>
+          <pre><code class="lang-java">System.out.println(Short.reverseBytes((short) 0x80));   // -32768</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-66">
+          <h3><a class="doc-anchor" href="#doc-static-library-66">#</a> <code>Math.multiplyHigh</code></h3>
+          <pre><code class="lang-java">long Math.multiplyHigh(long x, long y)   |   long Math.unsignedMultiplyHigh(long x, long y)</code></pre>
+          <p>The upper 64 bits of the exact 128-bit product, read as signed or (the <code>unsigned</code> form) unsigned operands.</p>
+          <pre><code class="lang-java">System.out.println(Math.multiplyHigh(Long.MAX_VALUE, 3));   // 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-67">
+          <h3><a class="doc-anchor" href="#doc-static-library-67">#</a> <code>Double.toHexString</code></h3>
+          <pre><code class="lang-java">String Double.toHexString(double d)   |   String Float.toHexString(float f)</code></pre>
+          <p>The exact hexadecimal form: <code>0x1.</code> and the significand with trailing zeros dropped for a normal value, <code>0x0.</code> with the fixed <code>p-1022</code> (<code>p-126</code> for a <code>float</code>) exponent for a subnormal, and <code>NaN</code>, <code>Infinity</code> and a signed <code>0x0.0p0</code> spelled out. <code>Double.parseDouble</code>/<code>Float.parseFloat</code> and the hexadecimal floating-point literals (<code>0x1.8p1</code>) read the same notation back, rounding once.</p>
+          <pre><code class="lang-java">System.out.println(Double.toHexString(0.1));   // 0x1.999999999999ap-4</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-68">
+          <h3><a class="doc-anchor" href="#doc-static-library-68">#</a> <code>Character.toTitleCase</code></h3>
+          <pre><code class="lang-java">char Character.toTitleCase(char ch)   |   int Character.toTitleCase(int codePoint)</code></pre>
+          <p>UnicodeData's simple titlecase mapping: the uppercase mapping except for the Latin digraphs (<code>ǆ</code> becomes <code>ǅ</code>) and the Georgian letters, which title-case to themselves. Like <code>toUpperCase</code>/<code>toLowerCase</code>, the <code>int</code> overload answers an <code>int</code>.</p>
+          <pre><code class="lang-java">System.out.println(Character.toTitleCase('a'));   // A</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-69">
+          <h3><a class="doc-anchor" href="#doc-static-library-69">#</a> <code>Boolean.valueOf</code></h3>
+          <pre><code class="lang-java">Boolean Boolean.valueOf(boolean b)   |   Boolean Boolean.valueOf(String s)</code></pre>
+          <p>One of the two cached boxes <code>Boolean.TRUE</code>/<code>Boolean.FALSE</code>; the <code>String</code> form is <code>parseBoolean</code>, so only a case-insensitive <code>"true"</code> gives <code>TRUE</code> and <code>null</code> gives <code>FALSE</code>.</p>
+          <pre><code class="lang-java">System.out.println(Boolean.valueOf("TrUe"));   // true</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-static-library-70">
+          <h3><a class="doc-anchor" href="#doc-static-library-70">#</a> <code>Integer.highestOneBit</code></h3>
           <pre><code class="lang-java">int Integer.highestOneBit(int i)   |   int Integer.lowestOneBit(int i)</code></pre>
           <p>The isolated highest or lowest set bit — a value with at most one bit set, not its index. Zero has no set bit, so both answer 0 for it. <code>Long</code> overloads answer at 64 bits.</p>
           <pre><code class="lang-java">System.out.println(Integer.highestOneBit(100) + " " + Integer.lowestOneBit(12));   // 64 4</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-66">
-          <h3><a class="doc-anchor" href="#doc-static-library-66">#</a> <code>Integer.numberOfLeadingZeros</code></h3>
+        <article class="doc-entry" id="doc-static-library-71">
+          <h3><a class="doc-anchor" href="#doc-static-library-71">#</a> <code>Integer.numberOfLeadingZeros</code></h3>
           <pre><code class="lang-java">int Integer.numberOfLeadingZeros(int i)   |   int Integer.numberOfTrailingZeros(int i)</code></pre>
           <p>The count of zero bits above the highest, or below the lowest, set bit. A zero argument answers the full width — 32 for <code>Integer</code>, 64 for <code>Long</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.numberOfTrailingZeros(8));   // 3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-67">
-          <h3><a class="doc-anchor" href="#doc-static-library-67">#</a> <code>Integer.rotateLeft</code></h3>
+        <article class="doc-entry" id="doc-static-library-72">
+          <h3><a class="doc-anchor" href="#doc-static-library-72">#</a> <code>Integer.rotateLeft</code></h3>
           <pre><code class="lang-java">int Integer.rotateLeft(int i, int distance)   |   int Integer.rotateRight(int i, int distance)</code></pre>
           <p>A circular shift: bits leaving one end re-enter at the other. The distance is taken modulo the width and a negative distance rotates the other way, so <code>Integer.rotateLeft(1, 33)</code> is 2 and <code>Integer.rotateLeft(1, -1)</code> is <code>Integer.MIN_VALUE</code>.</p>
           <pre><code class="lang-java">System.out.println(Integer.rotateLeft(1, 33));   // 2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-68">
-          <h3><a class="doc-anchor" href="#doc-static-library-68">#</a> <code>Integer.sum</code></h3>
+        <article class="doc-entry" id="doc-static-library-73">
+          <h3><a class="doc-anchor" href="#doc-static-library-73">#</a> <code>Integer.sum</code></h3>
           <pre><code class="lang-java">int Integer.sum(int a, int b)   |   long Long.sum(long a, long b)</code></pre>
           <p>Addition at the declared width, which is the whole reason the two exist separately: <code>Integer.sum(Integer.MAX_VALUE, 1)</code> wraps to <code>Integer.MIN_VALUE</code> where <code>Long.sum</code> of the same operands is 2147483648. <code>max</code>/<code>min</code>/<code>signum</code>/<code>compare</code> are the same shape.</p>
           <pre><code class="lang-java">System.out.println(Integer.sum(Integer.MAX_VALUE, 1));   // -2147483648</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-69">
-          <h3><a class="doc-anchor" href="#doc-static-library-69">#</a> <code>Objects.hashCode</code></h3>
+        <article class="doc-entry" id="doc-static-library-74">
+          <h3><a class="doc-anchor" href="#doc-static-library-74">#</a> <code>Objects.hashCode</code></h3>
           <pre><code class="lang-java">int Objects.hashCode(Object o)   |   int Objects.hash(Object... values)</code></pre>
           <p><code>hashCode</code> is the argument's own hash, or 0 for a null — a collection hashes by its contents, and a user class through its own <code>hashCode()</code>. <code>hash</code> folds a varargs array the way <code>Arrays.hashCode</code> does, seeded at 1, so <code>Objects.hash()</code> is 1 and <code>Objects.hash((Object) null)</code> is 31.</p>
           <pre><code class="lang-java">System.out.println(Objects.hashCode(null) + " " + Objects.hash("a", "b"));   // 0 4066</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-70">
-          <h3><a class="doc-anchor" href="#doc-static-library-70">#</a> <code>Objects.toString</code></h3>
+        <article class="doc-entry" id="doc-static-library-75">
+          <h3><a class="doc-anchor" href="#doc-static-library-75">#</a> <code>Objects.toString</code></h3>
           <pre><code class="lang-java">String Objects.toString(Object o)   |   String Objects.toString(Object o, String nullDefault)</code></pre>
           <p>The argument rendered as <code>println</code> would render it, reaching a user <code>toString()</code>. A null renders as the four-character string <code>null</code>, or as <code>nullDefault</code> when the two-argument form supplies one.</p>
           <pre><code class="lang-java">System.out.println(Objects.toString(null, "none"));   // none</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-71">
-          <h3><a class="doc-anchor" href="#doc-static-library-71">#</a> <code>Objects.requireNonNull</code></h3>
+        <article class="doc-entry" id="doc-static-library-76">
+          <h3><a class="doc-anchor" href="#doc-static-library-76">#</a> <code>Objects.requireNonNull</code></h3>
           <pre><code class="lang-java">T Objects.requireNonNull(T o)   |   T Objects.requireNonNull(T o, String message)   |   T Objects.requireNonNullElse(T o, T other)</code></pre>
           <p><code>requireNonNull</code> returns its argument or throws <code>NullPointerException</code> — with no detail message, or with the caller's text. <code>requireNonNullElse</code> returns the first non-null of the two and throws naming <code>defaultObj</code> when both are null.</p>
           <pre><code class="lang-java">System.out.println(Objects.requireNonNullElse(null, "fallback"));   // fallback</code></pre>
         </article>
-        <article class="doc-entry" id="doc-static-library-72">
-          <h3><a class="doc-anchor" href="#doc-static-library-72">#</a> <code>Objects.isNull</code></h3>
+        <article class="doc-entry" id="doc-static-library-77">
+          <h3><a class="doc-anchor" href="#doc-static-library-77">#</a> <code>Objects.isNull</code></h3>
           <pre><code class="lang-java">boolean Objects.isNull(Object o)   |   boolean Objects.nonNull(Object o)</code></pre>
           <p>The null test as a value, for use as a predicate. <code>Objects.equals(a, b)</code> is the matching equality test: <code>a == b || (a != null &amp;&amp; a.equals(b))</code>, so it reaches a user <code>equals</code> and answers for a null receiver.</p>
           <pre><code class="lang-java">System.out.println(Objects.isNull(null) + " " + Objects.nonNull(null));   // true false</code></pre>

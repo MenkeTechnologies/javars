@@ -78,6 +78,8 @@ at the bottom, and are summarized in the section right after this one.
   not fit — `class Dog cannot be cast to class Cat`, or Java's full
   module-and-loader wording when both types are JDK ones. A cast throws exactly
   when `instanceof` is false, `Object` and `null` aside.
+  A cast may also be applied to a lambda (`(Runnable) () -> go()`, JLS 15.16),
+  which gives the lambda its target type.
   `null` casts to anything, `(Object) x` always passes, and
   a cast does not erase what the operand is (`println((Object) dog)` still finds
   `Dog`'s `toString`). The wrapper types javars's value model tells apart
@@ -139,7 +141,10 @@ at the bottom, and are summarized in the section right after this one.
   that tie the other way), and it is emitted wherever a statically-`float` value
   crosses into a String. `Float.parseFloat`/`valueOf`/`toString`/`compare`/
   `isNaN`/`isInfinite` and the `Float.MAX_VALUE`/`MIN_VALUE`/`MIN_NORMAL`/`NaN`/
-  infinity constants answer at 32 bits too.
+  infinity constants answer at 32 bits too. A `float` literal and
+  `Float.parseFloat` round the decimal text *once*, straight to 32 bits:
+  through `f64` first, `1.00000017881393432617187499f` lands on the far side of
+  the tie and prints `1.0000002` where Java prints `1.0000001`.
 - **`toString`'s two-digit widening at the subnormal floor.** `Double.toString`
   and `Float.toString` are not "shortest decimal that round-trips". The
   specification restricts the candidates to the minimal length only when that
@@ -202,13 +207,17 @@ at the bottom, and are summarized in the section right after this one.
 - **The whole integer-literal syntax.** Decimal, hex (`0x1F`), binary
   (`0b1010`), octal (`017`), and `_` digit separators. Hex and binary are read as
   a *bit pattern* at the literal's width, so `0xFFFFFFFF` is the `int` -1 and
-  `0xFFFFFFFFFFFFFFFFL` is the `long` -1.
+  `0xFFFFFFFFFFFFFFFFL` is the `long` -1. The hexadecimal *floating-point* literal
+  (`0x1.8p1`, `0x1p-149f`) is read too — see the `Double.parseDouble` entry.
 - **A `record`'s derived `hashCode`, and a user `hashCode()` a collection
   reads.** A record now supplies `hashCode()` alongside its accessors,
   `toString` and `equals`, as the `31 * h + componentHash` fold seeded at 0 —
   each component going through its own wrapper's `hashCode(x)`, because
   `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers and
-  `Long.hashCode` folds its two halves. The JLS leaves a record's hash
+  `Long.hashCode` folds its two halves. A boxed `Long` folds even inside the `int`
+  range (`Long.valueOf(-1).hashCode()` is 0) and a boxed `Float` hashes as its
+  `floatToIntBits`, wherever a box is hashed — `hashCode()`, `Objects.hash`, a
+  collection's hash, and a `HashMap`/`HashSet`'s bucket order. The JLS leaves a record's hash
   unspecified beyond "derived from the components", so this reproduces what
   openjdk 26.0.2's `ObjectMethods` bootstrap computes rather than inventing an
   algorithm a program could see disagree.
@@ -405,16 +414,26 @@ at the bottom, and are summarized in the section right after this one.
   `Float.hashCode(1.5f)` and `Double.hashCode(1.5)` are different numbers);
   `String.valueOf`/`copyValueOf`/`join`/`format`;
   `StringBuilder.append(char[], int, int)`, which is the one `append` that
-  rejects a window outside the array; and
-  `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`copyOf`/
-  `copyOfRange`/`binarySearch`/`hashCode`; `List.of`/`Set.of`/`Map.of`, each
+  rejects a window outside the array, and `append(CharSequence, int, int)`,
+  whose window is checked with `checkFromToIndex`'s `Range [s, e) out of bounds`
+  wording; `String.contentEquals` against a builder's text; and
+  `Arrays.toString`/`deepToString`/`sort`/`fill`/`equals`/`deepEquals`/
+  `mismatch`/`compare`/`copyOf`/`copyOfRange`/`binarySearch`/`hashCode`
+  (`equals`/`mismatch` compare elements as `Objects.equals`, two `null` arrays
+  are equal, and `compare` uses the element type's own comparison — the
+  difference for `byte[]`/`short[]`/`char[]`, -1/0/1 for `int[]`, taken from
+  the arrays' static types); `List.of`/`Set.of`/`Map.of`, each
   immutable and each rejecting what the JDK's factory rejects (a repeated
   element or key, a `null`); and `hashCode`/`equals` on all three collections,
   computed by the `AbstractList`/`AbstractSet`/`AbstractMap` rules — the list's
   `31 * h + e` fold, the set's order-independent sum, the map's sum of
   `key ^ value` — so an `ArrayList` and an `Arrays.asList` holding the same
   elements hash alike and a `HashMap` equals a `LinkedHashMap` holding the same
-  entries. `String.format` covers `%d %s %S %f
+  entries. The comparison is structural wherever Java's `equals` is — nested
+  collections, `Objects.equals`, `contains`/`indexOf`/`remove(Object)` with a
+  collection argument, and a `List`/`Set` element or `Map` key that is itself a
+  collection (`map.get(List.of(1))` finds an `ArrayList` key) — and a `List`
+  never equals a `Set`. `String.format` covers `%d %s %S %f
   %e %E %g %G %a %A %b %B %h %H %x %X %o %c %%` and `%n`, all seven flags
   (`-`/`#`/`+`/` `/`0`/`,`/`(`), width, `.precision`, explicit argument
   indexes (`%2$s`), and the relative index `%<s` that re-reads the previous
@@ -1418,7 +1437,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   and the unsigned family (`divideUnsigned`, `remainderUnsigned`,
   `compareUnsigned`, `toUnsignedLong`, `toUnsignedString`, `parseUnsignedInt`);
   `Integer.decode` and `valueOf(String, radix)`; `Double`/`Float`'s
-  `isFinite`/`max`/`min`/`sum`; `Boolean.logicalAnd`/`Or`/`Xor`; `Short`/`Byte`'s
+  `isFinite`/`max`/`min`/`sum`; `Boolean.logicalAnd`/`Or`/`Xor`; `Boolean.valueOf` and
+  the `Boolean.TRUE`/`FALSE` constants; the `SIZE`/`BYTES` width constants of
+  every wrapper, `Double`/`Float`'s `MAX_EXPONENT`/`MIN_EXPONENT`/`PRECISION`,
+  `Character`'s `MIN_RADIX`/`MAX_RADIX`/`MIN_CODE_POINT`/`MAX_CODE_POINT`/
+  `MIN_SUPPLEMENTARY_CODE_POINT`, and `Math.TAU`; `Short`/`Character`
+  `reverseBytes`, `Character.toTitleCase`, and `Math.multiplyHigh`/
+  `unsignedMultiplyHigh`; the `(int)` overloads of `Character.toUpperCase`/
+  `toLowerCase`/`toTitleCase` answer an `int`, as Java's do; `Short`/`Byte`'s
   `parseShort`/`parseByte`/`valueOf`/`compare`/`toUnsignedInt`/`toString`/
   `hashCode`, with the JDK's `Value out of range` message. `Character`'s
   predicates follow Unicode's general categories rather than ASCII or Rust's
@@ -1950,12 +1976,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   "<local1>" is null` on `openjdk 21.0.12`. javars has one integral value kind
   and no unboxing conversion to hang the check on, so the `null` flows into the
   `int` local unchanged. This is a missing *exception*, not a wrong message.
-- **`Double.parseDouble` rejects a hexadecimal literal.** Java's grammar admits
-  `HexFloatingPointLiteral` (`0x1p3` is 8.0); javars validates only the decimal
-  form and answers `NumberFormatException` for the hex one. Correctly-rounded
-  hex-float parsing is real work and Rust's `str::parse` does not do it either,
-  so the form is refused outright rather than approximated — the same choice the
-  `Math.sin`/`Math.cos` entry makes. No frozen record exercises it.
+- ~~**`Double.parseDouble` rejects a hexadecimal literal.**~~ — implemented.
+  `Double.parseDouble`/`valueOf` and `Float.parseFloat`/`valueOf` accept the
+  hex form (`"0x1.8p1"` is 3.0) and the source accepts the hexadecimal
+  floating-point literal (`0x1p-3`, `0x.8P0f`), both through one
+  correctly-rounded conversion (`lexer::hex_float`) that rounds once, half to
+  even, straight to 53 or 24 bits, with gradual underflow. `Double.toHexString`/
+  `Float.toHexString` render the same notation.
 - **The identity hash is javars's heap handle, not the JVM's.** It shows in
   `Object.hashCode()` and in the `@<hash>` half of the default `toString()`.
   Java's number is not reproducible either — it differs between runs of the same

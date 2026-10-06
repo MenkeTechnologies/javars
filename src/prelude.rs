@@ -208,12 +208,18 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
     (
         "UnaryOperator",
         "Object apply(Object t)",
-        "static UnaryOperator identity() { return t -> t; }",
+        // `UnaryOperator extends Function`, so it inherits `andThen`/`compose`
+        // (but not the `static identity`, which it redeclares).
+        "default Function andThen(Function after) { return t -> after.apply(this.apply(t)); } \
+         default Function compose(Function before) { return v -> this.apply(before.apply(v)); } \
+         static UnaryOperator identity() { return t -> t; }",
     ),
     (
         "BinaryOperator",
         "Object apply(Object t, Object u)",
-        "static BinaryOperator minBy(Comparator comparator) { return (a, b) -> comparator.compare(a, b) <= 0 ? a : b; } \
+        // `BinaryOperator extends BiFunction`, whose `andThen` it inherits.
+        "default BiFunction andThen(Function after) { return (t, u) -> after.apply(this.apply(t, u)); } \
+         static BinaryOperator minBy(Comparator comparator) { return (a, b) -> comparator.compare(a, b) <= 0 ? a : b; } \
          static BinaryOperator maxBy(Comparator comparator) { return (a, b) -> comparator.compare(a, b) >= 0 ? a : b; }",
     ),
     (

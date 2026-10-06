@@ -1797,6 +1797,22 @@ impl Compiler {
                         // `long` where `Math.addExact(1, 2)` is an `int` — and
                         // `Math.clamp(0.1f, 0f, 3f)` is a `float`, which is what
                         // makes it print `0.1` rather than the `double` widening.
+                        // The case maps are overloaded `(char)` and `(int)`, and
+                        // answer in the argument's type: `toUpperCase('a')` is
+                        // the `char` `A`, `toUpperCase(97)` the `int` 65. A
+                        // `byte`/`short` argument does not widen to `char`, so
+                        // it too selects the `int` overload.
+                        if class == "Character"
+                            && matches!(
+                                method.as_str(),
+                                "toUpperCase" | "toLowerCase" | "toTitleCase"
+                            )
+                            && args.len() == 1
+                        {
+                            let ty = self.expr_java_type(&args[0]);
+                            let char_arg = ty.as_deref().is_none_or(|t| matches!(t, "char" | "Character"));
+                            return Some(if char_arg { "char" } else { "int" }.to_string());
+                        }
                         if let Some(t) = self.width_overload_java_type(class, method, args) {
                             return Some(t.to_string());
                         }
@@ -6798,9 +6814,19 @@ impl Compiler {
                 // against each other and names them in its messages
                 // (`int[5]`, `object array[2]`); only the static types carry
                 // them, so both ride along as two more operands.
-                let array_tags = class == "System" && method == "arraycopy" && args.len() == 5;
-                if array_tags {
-                    for a in [&args[0], &args[2]] {
+                //
+                // `Arrays.compare` is overloaded on the element type, and the
+                // `byte[]`/`short[]` overloads answer the *difference* of the
+                // first mismatching pair where the others answer -1/0/1, so it
+                // takes the two static types the same way.
+                let tagged = match (class.as_str(), method, args.len()) {
+                    ("System", "arraycopy", 5) => Some([&args[0], &args[2]]),
+                    ("Arrays", "compare", 2) => Some([&args[0], &args[1]]),
+                    _ => None,
+                };
+                let array_tags = tagged.is_some();
+                if let Some(tagged) = tagged {
+                    for a in tagged {
                         let ty = self.expr_java_type(a).unwrap_or_default();
                         let c = self.b.add_constant(Value::str(ty));
                         self.b.emit(Op::LoadConst(c), line);
@@ -8931,6 +8957,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Float", "parseFloat") => "float",
         ("Float", "valueOf") => "Float",
         ("Float", "toString") => "String",
+        ("Double" | "Float", "toHexString") => "String",
         ("Float", "compare") => "int",
         ("Float", "isNaN") | ("Float", "isInfinite") => "boolean",
         ("Double", "doubleToLongBits" | "doubleToRawLongBits") => "long",
@@ -8939,14 +8966,22 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Float", "intBitsToFloat") => "float",
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
+        // The collection factories answer the interface type, which is what
+        // lets a call such as `l.remove(List.of(x))` select `remove(Object)`.
+        ("List", "of" | "copyOf") | ("Arrays", "asList") => "List",
+        ("Set", "of" | "copyOf") | ("Collections", "emptySet" | "singleton") => "Set",
+        ("Map", "of" | "copyOf" | "ofEntries") | ("Collections", "emptyMap" | "singletonMap") => "Map",
         ("Boolean", "parseBoolean") => "boolean",
+        ("Boolean", "valueOf") => "Boolean",
         ("Collections", "addAll" | "disjoint") => "boolean",
         ("Collections", "frequency" | "binarySearch" | "indexOfSubList" | "lastIndexOfSubList") => {
             "int"
         }
         // `Character.toUpperCase(char)` returns a `char`, so its result keeps
         // rendering as a character rather than as a code point.
-        ("Character", "toUpperCase") | ("Character", "toLowerCase") => "char",
+        ("Character", "toUpperCase" | "toLowerCase" | "toTitleCase" | "reverseBytes") => "char",
+        ("Short", "reverseBytes") => "short",
+        ("Math", "multiplyHigh" | "unsignedMultiplyHigh") => "long",
         ("Character", "toString") => "String",
         ("Character", "getNumericValue") => "int",
         (
@@ -9509,6 +9544,34 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Pattern", "UNICODE_CHARACTER_CLASS") => (Value::Int(0x100), "int"),
         ("Math", "PI") => (Value::float(std::f64::consts::PI), "double"),
         ("Math", "E") => (Value::float(std::f64::consts::E), "double"),
+        ("Math", "TAU") => (Value::float(std::f64::consts::TAU), "double"),
+        // The width constants: `SIZE` in bits, `BYTES` in bytes, both `int`.
+        ("Integer" | "Float", "SIZE") => (Value::Int(32), "int"),
+        ("Long" | "Double", "SIZE") => (Value::Int(64), "int"),
+        ("Short" | "Character", "SIZE") => (Value::Int(16), "int"),
+        ("Byte", "SIZE") => (Value::Int(8), "int"),
+        ("Integer" | "Float", "BYTES") => (Value::Int(4), "int"),
+        ("Long" | "Double", "BYTES") => (Value::Int(8), "int"),
+        ("Short" | "Character", "BYTES") => (Value::Int(2), "int"),
+        ("Byte", "BYTES") => (Value::Int(1), "int"),
+        // The IEEE 754 exponent range and significand width (`PRECISION`
+        // counts the implicit leading bit).
+        ("Double", "MAX_EXPONENT") => (Value::Int(1023), "int"),
+        ("Double", "MIN_EXPONENT") => (Value::Int(-1022), "int"),
+        ("Double", "PRECISION") => (Value::Int(53), "int"),
+        ("Float", "MAX_EXPONENT") => (Value::Int(127), "int"),
+        ("Float", "MIN_EXPONENT") => (Value::Int(-126), "int"),
+        ("Float", "PRECISION") => (Value::Int(24), "int"),
+        ("Character", "MIN_RADIX") => (Value::Int(2), "int"),
+        ("Character", "MAX_RADIX") => (Value::Int(36), "int"),
+        ("Character", "MIN_CODE_POINT") => (Value::Int(0), "int"),
+        ("Character", "MAX_CODE_POINT") => (Value::Int(0x10_FFFF), "int"),
+        ("Character", "MIN_SUPPLEMENTARY_CODE_POINT") => (Value::Int(0x1_0000), "int"),
+        // `Boolean.TRUE`/`FALSE` are the two cached boxes. javars does not box
+        // `Boolean` (see `BOX_CLASSES`), so each is its primitive, typed as the
+        // wrapper.
+        ("Boolean", "TRUE") => (Value::Bool(true), "Boolean"),
+        ("Boolean", "FALSE") => (Value::Bool(false), "Boolean"),
         _ => return None,
     })
 }

@@ -3206,7 +3206,14 @@ impl Parser {
         }
         let line = self.toks[j].line;
         self.pos = j + 1;
-        let expr = self.unary()?;
+        // JLS 15.16: a reference cast may also apply to a lambda, which gives
+        // the lambda its target type (`(Runnable) () -> go()`, `(UnaryOperator<T>)
+        // x -> x`). A lambda is not a unary operand, so it is tried first.
+        let lambda = if primitive { None } else { self.try_lambda()? };
+        let expr = match lambda {
+            Some(l) => l,
+            None => self.unary()?,
+        };
         Ok(Some(Expr::Cast {
             ty: name,
             expr: Box::new(expr),

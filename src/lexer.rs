@@ -303,7 +303,8 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             && i + 1 < bytes.len()
             && matches!(bytes[i + 1], b'x' | b'X' | b'b' | b'B')
             && i + 2 < bytes.len()
-            && (bytes[i + 2] as char).is_ascii_alphanumeric()
+            && ((bytes[i + 2] as char).is_ascii_alphanumeric()
+                || (matches!(bytes[i + 1], b'x' | b'X') && bytes[i + 2] == b'.'))
         {
             let radix = if matches!(bytes[i + 1], b'x' | b'X') {
                 16
@@ -312,6 +313,44 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             };
             i += 2;
             let start = i;
+            // A hexadecimal *floating-point* literal (`0x1.8p1`, `0x.8P0`,
+            // `0x1p-2f`): hex digits with an optional point, then the binary
+            // exponent JLS 3.10.2 makes mandatory, then an optional `f`/`d`.
+            if radix == 16 {
+                let mut j = i;
+                while j < bytes.len() && (bytes[j].is_ascii_hexdigit() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'.' {
+                    j += 1;
+                    while j < bytes.len() && (bytes[j].is_ascii_hexdigit() || bytes[j] == b'_') {
+                        j += 1;
+                    }
+                }
+                if j < bytes.len() && matches!(bytes[j], b'p' | b'P') {
+                    j += 1;
+                    if j < bytes.len() && matches!(bytes[j], b'+' | b'-') {
+                        j += 1;
+                    }
+                    while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'_') {
+                        j += 1;
+                    }
+                    let text = src[start..j].replace('_', "");
+                    let single = j < bytes.len() && matches!(bytes[j], b'f' | b'F');
+                    if j < bytes.len() && matches!(bytes[j], b'f' | b'F' | b'd' | b'D') {
+                        j += 1;
+                    }
+                    let v = hex_float(&text, single).ok_or_else(|| {
+                        format!("javars: bad floating-point literal `0x{text}` on line {line}")
+                    })?;
+                    i = j;
+                    out.push(Token {
+                        kind: if single { Tok::Float32(v) } else { Tok::Float(v) },
+                        line,
+                    });
+                    continue;
+                }
+            }
             while i < bytes.len()
                 && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
             {
@@ -399,8 +438,15 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             let text = src[start..num_end].replace('_', "");
             let text = text.as_str();
             if is_float {
-                let v: f64 = text
-                    .parse()
+                // A `float` literal is rounded once, straight from the decimal
+                // text to 32 bits; going through `f64` first rounds twice and
+                // can land one ulp off (`1.00000017881393432617187499f`).
+                let parsed = if is_f32 {
+                    text.parse::<f32>().map(f64::from)
+                } else {
+                    text.parse::<f64>()
+                };
+                let v: f64 = parsed
                     .map_err(|_| format!("javars: bad float literal `{text}` on line {line}"))?;
                 out.push(Token {
                     kind: if is_f32 {
@@ -851,4 +897,108 @@ fn unescape_block(s: &str) -> String {
         }
     }
     out
+}
+
+/// The value of a hexadecimal floating-point literal (JLS 3.10.2) — the text
+/// after the `0x`/`0X` prefix, with the sign, any `_` separators and the
+/// `f`/`d` suffix already removed: `1.8p1`, `.8P0`, `1p-2`. `single` rounds to
+/// `float` precision. `None` when the text is not `HexDigits [.] [HexDigits]`
+/// followed by a binary exponent `p [+-] Digits`, which is mandatory.
+///
+/// The significand is exact binary, so the one rounding is the final one —
+/// correctly rounded, half to even, to 53 (or 24) bits, gradually underflowing
+/// below the normal range as `Double.valueOf("0x…")` does. Rounding through
+/// `f64` first and then to `f32` would round twice.
+pub fn hex_float(text: &str, single: bool) -> Option<f64> {
+    let (sig, exp) = text.split_once(['p', 'P'])?;
+    let exp_digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // A huge exponent saturates; it can only mean zero or infinity.
+    let mut exp2: i64 = exp_digits.parse().unwrap_or(i64::from(i32::MAX)).min(i64::from(i32::MAX));
+    if exp.starts_with('-') {
+        exp2 = -exp2;
+    }
+    let (int_part, frac_part) = sig.split_once('.').unwrap_or((sig, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    // Up to 15 significant hex digits (60 bits) are kept exactly; any nonzero
+    // digit past them only matters as a sticky bit for the rounding.
+    let (mut m, mut kept, mut sticky) = (0u64, 0u32, false);
+    for (i, ch) in int_part.chars().chain(frac_part.chars()).enumerate() {
+        let d = u64::from(ch.to_digit(16)?);
+        let fractional = i >= int_part.len();
+        if m == 0 && d == 0 {
+            if fractional {
+                exp2 -= 4;
+            }
+            continue;
+        }
+        if kept < 15 {
+            m = (m << 4) | d;
+            kept += 1;
+            if fractional {
+                exp2 -= 4;
+            }
+        } else {
+            sticky |= d != 0;
+            if !fractional {
+                exp2 += 4;
+            }
+        }
+    }
+    let zero = 0.0;
+    if m == 0 {
+        return Some(zero);
+    }
+    let (precision, emin, emax) = if single { (24i64, -126i64, 127i64) } else { (53, -1022, 1023) };
+    let width = 64 - i64::from(m.leading_zeros());
+    // The value is `m * 2^exp2`, whose leading bit is `2^top`.
+    let top = exp2 + width - 1;
+    if top > emax {
+        return Some(f64::INFINITY);
+    }
+    // Below the normal range the significand loses a bit per binade.
+    let keep = if top < emin { precision - (emin - top) } else { precision };
+    let shift = width - keep;
+    let (mut r, mut e) = (m, exp2);
+    if shift > 0 {
+        if shift > 64 {
+            return Some(zero);
+        }
+        let (dropped, half) = if shift == 64 { (m, 1u64 << 63) } else { (m & ((1u64 << shift) - 1), 1u64 << (shift - 1)) };
+        r = if shift == 64 { 0 } else { m >> shift };
+        e += shift;
+        let round_up = dropped > half || (dropped == half && (sticky || r & 1 == 1));
+        if round_up {
+            r += 1;
+        }
+        if r == 0 {
+            return Some(zero);
+        }
+    } else if shift < 0 {
+        r = m << -shift;
+        e += shift;
+    }
+    // Rounding up may have carried into a new binade past the largest finite.
+    if e + 64 - i64::from(r.leading_zeros()) - 1 > emax {
+        return Some(f64::INFINITY);
+    }
+    Some(scale2(r as f64, e))
+}
+
+/// `x * 2^k`, exact whenever the result is representable — applied in steps
+/// that keep every intermediate in the normal range.
+fn scale2(mut x: f64, mut k: i64) -> f64 {
+    while k > 1000 {
+        x *= 2f64.powi(1000);
+        k -= 1000;
+    }
+    while k < -1000 {
+        x *= 2f64.powi(-1000);
+        k += 1000;
+    }
+    x * 2f64.powi(k as i32)
 }
