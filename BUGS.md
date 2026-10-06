@@ -490,7 +490,8 @@ at the bottom, and are summarized in the section right after this one.
   `repeat`, `indexOf(t, from)`, `startsWith(p, offset)`, `lastIndexOf`,
   `codePointAt`, `strip`,
   `stripLeading`, `stripTrailing`, `isBlank`, `hashCode`, `intern`,
-  `contentEquals`, `toCharArray`, `formatted`, and the four
+  `contentEquals`, `toCharArray`, `formatted`, `translateEscapes` (the JDK's
+  escape grammar and its `Invalid escape sequence` message), and the four
   `java.util.regex` methods `split`/`replaceAll`/`replaceFirst`/`matches` (see
   the regular-expression entry below).
   `x.getClass()` evaluates to the runtime class's *binary name*, over which

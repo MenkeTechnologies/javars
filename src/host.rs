@@ -9891,6 +9891,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             java_lines(s).into_iter().map(Value::str).collect(),
             StreamKind::Ref,
         )),
+        ("translateEscapes", 0) => translate_escapes(s).map(Value::str),
         // `indent(n)`: `lines()`, each given `n` leading spaces or relieved of
         // up to `-n` leading whitespace characters (all of them for
         // `Integer.MIN_VALUE`), joined with `\n` and ended with one.
@@ -17296,4 +17297,57 @@ mod cast_target_tables {
     fn object_is_not_a_checkable_target() {
         assert!(!is_checkable_cast_target("Object"));
     }
+}
+
+/// `String.translateEscapes` (Java 15): the escape sequences of a string
+/// literal, transcribed from the JDK's loop. `\s` is a space, an octal escape
+/// takes up to three digits (two more after a leading `0`-`3`, one more
+/// otherwise), a backslash before a line terminator removes both. Anything else —
+/// including a trailing lone backslash, which the JDK reads as a NUL escape —
+/// is its `IllegalArgumentException`.
+fn translate_escapes(s: &str) -> Result<String, Fault> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut from = 0;
+    while from < chars.len() {
+        let mut ch = chars[from];
+        from += 1;
+        if ch == '\\' {
+            ch = if from < chars.len() { chars[from] } else { '\0' };
+            from += 1;
+            ch = match ch {
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                's' => ' ',
+                't' => '\t',
+                '\'' | '"' | '\\' => ch,
+                '0'..='7' => {
+                    let limit = (from + if ch <= '3' { 2 } else { 1 }).min(chars.len());
+                    let mut code = ch as u32 - '0' as u32;
+                    while from < limit && ('0'..='7').contains(&chars[from]) {
+                        code = (code << 3) | (chars[from] as u32 - '0' as u32);
+                        from += 1;
+                    }
+                    char::from_u32(code).unwrap_or('\0')
+                }
+                '\n' => continue,
+                '\r' => {
+                    if from < chars.len() && chars[from] == '\n' {
+                        from += 1;
+                    }
+                    continue;
+                }
+                other => {
+                    return Err(Fault::java(
+                        "IllegalArgumentException",
+                        format!("Invalid escape sequence: \\{other} \\\\u{:04X}", other as u32),
+                    ))
+                }
+            };
+        }
+        out.push(ch);
+    }
+    Ok(out)
 }
