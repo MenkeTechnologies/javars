@@ -3348,6 +3348,13 @@ impl Parser {
                     self.ident()?
                 };
                 self.uses_functional = true;
+                // A package-qualified type (`java.util.TreeMap::new`) keys on
+                // its simple name, as it does in every other position.
+                if let Expr::Field { recv, name } = &e {
+                    if package_rooted(recv) {
+                        e = Expr::Var(name.clone());
+                    }
+                }
                 e = Expr::MethodRef {
                     recv: Box::new(e),
                     method,

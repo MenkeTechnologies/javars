@@ -11031,19 +11031,8 @@ fn collection_static(
                 3 => (args[1].jint(), args[2].jint(), &Value::Undef),
                 _ => (args[1].jint(), args[2].jint(), &args[3]),
             };
-            if from > to {
-                return Some(Err(Fault::java(
-                    "IllegalArgumentException",
-                    format!("fromIndex({from}) > toIndex({to})"),
-                )));
-            }
-            for bad in [from, to] {
-                if bad < 0 || bad > items.len() as i64 {
-                    return Some(Err(Fault::java(
-                        "ArrayIndexOutOfBoundsException",
-                        format!("Array index out of range: {bad}"),
-                    )));
-                }
+            if let Err(f) = arrays_range_check(items.len(), from, to) {
+                return Some(Err(f));
             }
             let (from, to) = (from as usize, to as usize);
             let window = items[from..to].to_vec();
@@ -12304,6 +12293,18 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Arrays", "fill", 2) => {
             let v = args[1].clone();
             array_mutate(&args[0], |a| a.fill(v))?;
+            Ok(Value::Undef)
+        }
+        // `Arrays.fill(a, from, to, v)` checks the range as `Arrays.rangeCheck`
+        // does before it writes anything.
+        ("Arrays", "fill", 4) => {
+            let len = array_items(&args[0])
+                .map(|a| a.len())
+                .ok_or_else(|| Fault::java("NullPointerException", String::new()))?;
+            let (from, to) = (args[1].jint(), args[2].jint());
+            arrays_range_check(len, from, to)?;
+            let v = args[3].clone();
+            array_mutate(&args[0], |a| a[from as usize..to as usize].fill(v))?;
             Ok(Value::Undef)
         }
         // `Arrays.copyOf` pads with the element type's default when it grows.
@@ -14355,6 +14356,30 @@ fn array_items(v: &Value) -> Option<Vec<Value>> {
 /// Run `f` over `v`'s elements *in place* — what the mutating `Arrays` statics
 /// (`sort`, `fill`) need, since they return `void` and are observed through the
 /// caller's own handle.
+/// `java.util.Arrays.rangeCheck`: the bounds every `Arrays` range method
+/// (`sort`, `fill`, …) validates, message for message, before touching `a`.
+fn arrays_range_check(len: usize, from: i64, to: i64) -> Result<(), Fault> {
+    if from > to {
+        return Err(Fault::java(
+            "IllegalArgumentException",
+            format!("fromIndex({from}) > toIndex({to})"),
+        ));
+    }
+    if from < 0 {
+        return Err(Fault::java(
+            "ArrayIndexOutOfBoundsException",
+            format!("Array index out of range: {from}"),
+        ));
+    }
+    if to > len as i64 {
+        return Err(Fault::java(
+            "ArrayIndexOutOfBoundsException",
+            format!("Array index out of range: {to}"),
+        ));
+    }
+    Ok(())
+}
+
 fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault> {
     let Value::Obj(id) = v else {
         return Err(Fault::java(

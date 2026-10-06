@@ -1154,12 +1154,9 @@ impl Compiler {
         want: Yield,
         line: u32,
     ) -> Result<(), String> {
-        let target = numtype_of_ty(ty).unwrap_or(NumType::Other);
-        let wrap = self.compound_wraps(Some(ty), value);
         self.emit_global_get(global, line);
         let old_t = self.stash_if(want == Yield::Old, line);
-        self.emit_compound(op, value, target, Some(ty), wrap, line)?;
-        self.emit_narrow_to(Some(ty), line);
+        self.emit_compound_update(op, value, Some(ty), line)?;
         self.emit_global_set(global, line);
         match (want, old_t) {
             (Yield::Old, Some(t)) => self.emit_get(&t, line),
@@ -3332,6 +3329,16 @@ impl Compiler {
         Ok(())
     }
 
+    /// Box the primitive on top of the stack back into `ty` when it is a
+    /// wrapper class — the `valueOf` that ends a wrapper's `++` or `+=` — so the
+    /// result honours the `valueOf` cache as a fresh assignment would.
+    fn emit_rebox(&mut self, ty: &str) {
+        if let Some(code) = crate::host::box_class_code(ty) {
+            self.b.emit(Op::LoadInt(code), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
+        }
+    }
+
     /// Unbox the value on top of the stack when `ty` is a wrapper class, the
     /// way Java's unboxing conversion does it: through `intValue()` (or its
     /// sibling), so a `null` raises `NullPointerException` (JLS 5.1.8) rather
@@ -4569,9 +4576,12 @@ impl Compiler {
                     return self.field_assign(&recv, name, *op, value, line);
                 }
                 let l = self.lookup_type(name);
+                // A wrapper variable is updated through its primitive (JLS
+                // 15.26.2): `Integer x; x += 1` is `x = Integer.valueOf(x + 1)`.
+                let decl = self.var_decl_type(name).map(str::to_string);
+                let prim = decl.as_deref().map(unwrapped_ty);
                 // A compound assignment back into an `int` variable wraps.
-                let wrap =
-                    *op != AssignOp::Assign && self.compound_wraps(self.var_decl_type(name), value);
+                let wrap = *op != AssignOp::Assign && self.compound_wraps(prim, value);
                 match op {
                     AssignOp::Assign => {
                         let target = self.var_decl_type(name).map(str::to_string);
@@ -4583,9 +4593,14 @@ impl Compiler {
                     // `&=`/`|=`/`^=` on booleans.
                     _ => {
                         self.emit_get(name, line);
-                        let decl = self.var_decl_type(name).map(str::to_string);
-                        self.emit_compound(*op, value, l, decl.as_deref(), wrap, line)?;
-                        self.emit_narrow_to(decl.as_deref(), line);
+                        if let Some(d) = decl.as_deref() {
+                            self.emit_checked_unbox(d);
+                        }
+                        self.emit_compound(*op, value, l, prim, wrap, line)?;
+                        self.emit_narrow_to(prim, line);
+                        if let Some(d) = decl.as_deref() {
+                            self.emit_rebox(d);
+                        }
                     }
                 }
                 self.emit_set(name, line);
@@ -5927,23 +5942,31 @@ impl Compiler {
             return self.field_assign(&recv, name, op, &Expr::Int(1), 0);
         }
         let decl = self.var_decl_type(name).map(str::to_string);
-        let wrap = decl.as_deref() == Some("int");
+        // A wrapper variable is unboxed, stepped, and reboxed (JLS 15.14.2), so
+        // a `null` one throws and the result is a fresh `valueOf` box.
+        let prim = decl.as_deref().map(unwrapped_ty);
+        let wrap = prim == Some("int");
         self.emit_get(name, 0);
+        if let Some(d) = decl.as_deref() {
+            self.emit_checked_unbox(d);
+        }
         self.b.emit(Op::LoadInt(1), 0);
         // `float f; f++;` is a 32-bit addition like every other `float`
         // operation, not a 64-bit one narrowed afterwards.
-        if decl.as_deref() == Some("float") {
+        if prim == Some("float") {
             self.emit_f32_arith(if inc { BinOp::Add } else { BinOp::Sub }, 0);
-            self.emit_set(name, 0);
-            return Ok(());
+        } else {
+            self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
+            if wrap {
+                self.emit_wrap32(0);
+            }
+            // `++` carries the same implicit narrowing cast a compound
+            // assignment does, so `char c = 65535; c++;` is 0 rather than 65536.
+            self.emit_narrow_to(prim, 0);
         }
-        self.b.emit(if inc { Op::Add } else { Op::Sub }, 0);
-        if wrap {
-            self.emit_wrap32(0);
+        if let Some(d) = decl.as_deref() {
+            self.emit_rebox(d);
         }
-        // `++` carries the same implicit narrowing cast a compound assignment
-        // does, so `char c = 65535; c++;` is 0 rather than 65536.
-        self.emit_narrow_to(decl.as_deref(), 0);
         self.emit_set(name, 0);
         Ok(())
     }
@@ -6741,8 +6764,20 @@ impl Compiler {
                     {
                         self.lambda_ret_hint = Some("Object".to_string());
                     }
+                    // `Arrays.fill`'s value is assigned into an element, so it
+                    // takes the array's element type: `fill(new double[2], 2)`
+                    // stores `2.0`.
+                    let fill_value = class == "Arrays"
+                        && method == "fill"
+                        && i > 0
+                        && i + 1 == args.len();
                     if stringify {
                         self.emit_converted_arg(a, floats)?;
+                    } else if fill_value {
+                        let elem = self
+                            .expr_array_type(&args[0])
+                            .and_then(|t| t.strip_suffix("[]").map(str::to_string));
+                        self.expr_targeted(a, elem.as_deref())?;
                     } else {
                         self.expr(a)?;
                     }
@@ -7758,13 +7793,7 @@ impl Compiler {
         self.emit_get(&idx_t, line);
         self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
         let old_t = self.stash_if(want == Yield::Old, line);
-        let elem_t = elem_ty
-            .as_deref()
-            .map(|t| numtype_of_ty(t).unwrap_or(NumType::Other))
-            .unwrap_or(NumType::Other);
-        let wrap = self.compound_wraps(elem_ty.as_deref(), value);
-        self.emit_compound(op, value, elem_t, elem_ty.as_deref(), wrap, line)?;
-        self.emit_narrow_to(elem_ty.as_deref(), line);
+        self.emit_compound_update(op, value, elem_ty.as_deref(), line)?;
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -7828,11 +7857,6 @@ impl Compiler {
         // The field's declared type drives both the compound-`/` truncation and
         // the 32-bit wrap, so it is resolved here rather than at each call site.
         let field_ty_name = self.field_type_name(recv, name);
-        let field_ty = field_ty_name
-            .as_deref()
-            .and_then(numtype_of_ty)
-            .unwrap_or(NumType::Other);
-        let wrap = self.compound_wraps(field_ty_name.as_deref(), value);
         let obj_t = self.temp();
         self.expr(recv)?;
         self.emit_set(&obj_t, line);
@@ -7840,8 +7864,7 @@ impl Compiler {
         self.emit_get(&obj_t, line);
         self.emit_field_get(name, line);
         let old_t = self.stash_if(want == Yield::Old, line);
-        self.emit_compound(op, value, field_ty, field_ty_name.as_deref(), wrap, line)?;
-        self.emit_narrow_to(field_ty_name.as_deref(), line);
+        self.emit_compound_update(op, value, field_ty_name.as_deref(), line)?;
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
@@ -7855,6 +7878,32 @@ impl Compiler {
             (Yield::Old, Some(t)) => self.emit_get(&t, line),
             (Yield::New, _) => self.emit_get(&new_t, line),
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply compound operator `op` with `value` to the target value already on
+    /// the stack, whose declared type is `ty`, leaving the value to store. The
+    /// operator runs at the target's primitive type with the implicit narrowing
+    /// cast (JLS 15.26.2); a wrapper target is unboxed first — a `null` one
+    /// throws — and the result reboxed, as `x = Integer.valueOf(x + v)` would.
+    fn emit_compound_update(
+        &mut self,
+        op: AssignOp,
+        value: &Expr,
+        ty: Option<&str>,
+        line: u32,
+    ) -> Result<(), String> {
+        let prim = ty.map(unwrapped_ty);
+        if let Some(t) = ty {
+            self.emit_checked_unbox(t);
+        }
+        let target = prim.and_then(numtype_of_ty).unwrap_or(NumType::Other);
+        let wrap = self.compound_wraps(prim, value);
+        self.emit_compound(op, value, target, prim, wrap, line)?;
+        self.emit_narrow_to(prim, line);
+        if let Some(t) = ty {
+            self.emit_rebox(t);
         }
         Ok(())
     }

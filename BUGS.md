@@ -1648,8 +1648,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   The collection *factories* — `List.of`, `Set.of`, `Map.of`, `Arrays.asList` —
   box their arguments for the same reason, so `List.of(128, 128).get(0) ==
   get(1)` is `false` and `Map.of(1, …, 1.0, …, 1L, …)` holds three entries.
-  `Arrays.fill` deliberately does not: its second argument is an *array
-  element*, and an `int[]` slot holds the primitive.
+  `Arrays.fill` deliberately does not: its value argument is an *array
+  element*, so it takes the array's element type instead — an `int[]` slot
+  holds the primitive, a `double[]` one the widened `2.0`, an `Integer[]` one
+  the box.
 
   What is left is every position javars cannot type at all: an expression whose
   static type erasure has thrown away converts neither way, so a value that
@@ -1982,7 +1984,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   half (`Cannot invoke "java.lang.Integer.intValue()"`) and, like every modeled
   null dereference, not the JVM's provenance clause (`because "<local1>" is
   null`): javars has no javac slot numbering. `==` between two wrappers still
-  compares references and does not unbox.
+  compares references and does not unbox. `++`/`--` and a compound assignment
+  on a wrapper local, field, `static` or array element unbox the same way, run
+  at the primitive type (an `Integer` wraps at 32 bits), and rebox through the
+  `valueOf` cache, so two `Integer`s stepped to 1001 are distinct objects.
 - ~~**`Double.parseDouble` rejects a hexadecimal literal.**~~ — implemented.
   `Double.parseDouble`/`valueOf` and `Float.parseFloat`/`valueOf` accept the
   hex form (`"0x1.8p1"` is 3.0) and the source accepts the hexadecimal
