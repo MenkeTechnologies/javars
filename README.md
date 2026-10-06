@@ -371,7 +371,8 @@ Implemented and checked against the reference `java`:
   `try`/`finally` and `throw` all work inside a lambda body.
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
   `Character::isLetter` and the other `Character` predicates,
-  `Point::area`, `obj::method`, `this::method`, `Point::new`,
+  `Point::area`, `obj::method` (a user, `String` or collection receiver, or a
+  string literal), `this::method`, `Point::new`,
   `System.out::println`. A constructor reference also names a modeled stdlib
   type's constructor — `ArrayList::new`, `HashMap::new`, `StringBuilder::new`,
   `String::new` — the no-argument one for a `Supplier`-shaped use and the

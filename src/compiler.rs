@@ -4082,20 +4082,41 @@ impl Compiler {
         // Otherwise the left side is a value: `obj::method`, `this::method`. The
         // receiver must be a plain name so the synthesized lambda captures it —
         // Java evaluates the receiver once, at the reference, and a captured
-        // local is exactly that.
-        if !matches!(recv, Expr::Var(_) | Expr::This) {
+        // local is exactly that. A string literal (`"*"::repeat`) qualifies
+        // too: re-reading a constant at each call is indistinguishable from
+        // reading it once.
+        if !matches!(recv, Expr::Var(_) | Expr::This | Expr::Str(_)) {
             return Err(format!(
                 "javars: a bound method reference needs a variable or `this` receiver (line {line})"
             ));
         }
-        let rc = self.expr_class(recv).ok_or_else(|| {
-            format!("javars: cannot resolve the receiver of `::{method}` (line {line})")
-        })?;
-        let arity = self.unique_method_arity(&rc, method).ok_or_else(|| {
-            format!(
-                "javars: `{rc}::{method}` has no single method reference can name (line {line})"
-            )
-        })?;
+        let arity = match self.expr_class(recv) {
+            Some(rc) => self.unique_method_arity(&rc, method).ok_or_else(|| {
+                format!(
+                    "javars: `{rc}::{method}` has no single method reference can name (line {line})"
+                )
+            })?,
+            // A `String` or modeled collection receiver names one of the JDK
+            // instance methods the unbound forms (`String::length`,
+            // `List::add`) already admit, at the same unambiguous arity.
+            None => {
+                let ty = self.expr_java_type(recv).ok_or_else(|| {
+                    format!("javars: cannot resolve the receiver of `::{method}` (line {line})")
+                })?;
+                let arity = if ty == "String" {
+                    string_instance_ref_arity(method)
+                } else if collection_kind(&ty).is_some() {
+                    collection_instance_ref_arity(method)
+                } else {
+                    None
+                };
+                arity.ok_or_else(|| {
+                    format!(
+                        "javars: `{ty}::{method}` is not a method reference javars models (line {line})"
+                    )
+                })?
+            }
+        };
         let ps = mk(arity);
         Ok(lambda(
             ps.clone(),

@@ -923,7 +923,9 @@ at the bottom, and are summarized in the section right after this one.
   function's first call rather than at composition.
 - **Method references.** `String::length` and `Integer::parseInt` (unbound
   receiver / stdlib static), `Point::area` (unbound instance), `obj::method` and
-  `this::method` (bound — the receiver is captured), `Point::new`,
+  `this::method` (bound — the receiver is captured; a `String` or collection
+  receiver, or a string literal such as `"*"::repeat`, names the same JDK
+  instance methods the unbound forms do), `Point::new`,
   `ArrayList::new`/`HashMap::new`/`StringBuilder::new`/`String::new` (a
   modeled stdlib type's constructor: the synthesized lambda takes one
   parameter and calls the no-argument constructor when it reads `null`, which
