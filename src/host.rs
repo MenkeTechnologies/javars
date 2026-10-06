@@ -6438,6 +6438,12 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
             let Some(items) = sequence_items(recv) else {
                 return raise(vm, Fault::internal("javars: `sort` needs a List receiver"));
             };
+            // `ImmutableCollections.AbstractImmutableList.sort` throws before
+            // looking at the elements — an empty or already-sorted `List.of`
+            // refuses too, and the comparator is never called.
+            if collection_fixity(recv) == Some(Fixity::Immutable) {
+                return raise(vm, unsupported());
+            }
             let sorted = match sort_with(vm, items, &args[0]) {
                 Ok(v) => v,
                 Err(f) => return raise(vm, f),
@@ -10823,15 +10829,26 @@ fn collection_static(
                     )))
                 }
             };
+            // `Collections.sort(l)` is `l.sort(null)`, which an immutable list
+            // refuses unconditionally (see the `List.sort` arm).
+            if collection_fixity(&args[0]) == Some(Fixity::Immutable) {
+                return Some(Err(unsupported()));
+            }
             let cmp = args.get(1).cloned().unwrap_or(Value::Undef);
             sort_with(vm, items, &cmp)
                 .and_then(|sorted| write_list(&args[0], sorted))
                 .map(|()| Value::Undef)
         }
+        // `reverse` is a walk of `swap`s — `set` calls — so it is refused by an
+        // immutable list once there is a pair to swap, and, being no structural
+        // change, it leaves an outstanding `subList` view valid.
         ("Collections", "reverse") if args.len() == 1 => {
             let mut items = sequence_items(&args[0]).unwrap_or_default();
+            if items.len() >= 2 && collection_fixity(&args[0]) == Some(Fixity::Immutable) {
+                return Some(Err(unsupported()));
+            }
             items.reverse();
-            write_list(&args[0], items).map(|()| Value::Undef)
+            set_all(&args[0], items).map(|()| Value::Undef)
         }
         // `max`/`min` take an optional comparator, which may be a user closure
         // — so the pick goes through the same stable sort the stream terminals
@@ -10885,10 +10902,231 @@ fn collection_static(
                     )
                 }),
             }
-            write_list(&args[0], items).map(|()| Value::Undef)
+            set_all(&args[0], items).map(|()| Value::Undef)
+        }
+        // `frequency(c, o)`: how many elements `o.equals`, or how many are
+        // `null` when `o` is — the JDK's two loops.
+        ("Collections", "frequency") if args.len() == 2 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(npe_invoke("java.util.Collection.iterator()", "c")));
+            };
+            let o = &args[1];
+            let mut n = 0i64;
+            for e in &items {
+                let hit = match o {
+                    Value::Undef => matches!(e, Value::Undef),
+                    _ => eq_call(vm, o, e),
+                };
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                n += i64::from(hit);
+            }
+            Ok(Value::Int(n))
+        }
+        // `swap(l, i, j)` is `l.set(i, l.set(j, l.get(i)))`, through the list's
+        // own methods, so the bounds message and the immutable refusal are the
+        // ones `get`/`set` give, in the order the JDK reaches them.
+        ("Collections", "swap") if args.len() == 3 => {
+            let l = &args[0];
+            if matches!(l, Value::Undef) {
+                return Some(Err(npe_invoke("java.util.List.get(int)", "l")));
+            }
+            let (i, j) = (args[1].clone(), args[2].clone());
+            let vi = coll_method(vm, l, "get", std::slice::from_ref(&i));
+            if pending() {
+                return Some(Ok(Value::Undef));
+            }
+            let vj = coll_method(vm, l, "set", &[j, vi]);
+            if pending() {
+                return Some(Ok(Value::Undef));
+            }
+            coll_method(vm, l, "set", &[i, vj]);
+            Ok(Value::Undef)
+        }
+        // `binarySearch(l, key, cmp)`: `indexedBinarySearch`'s loop, the
+        // comparator called as `cmp(midVal, key)`. The compiler supplies the
+        // natural-order comparator when the program names none, so a user
+        // `Comparable` is searched by its own `compareTo`.
+        ("Collections", "binarySearch") if args.len() == 3 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "list")));
+            };
+            let (mut low, mut high) = (0i64, items.len() as i64 - 1);
+            while low <= high {
+                let mid = (low + high) >> 1;
+                let c = match &args[2] {
+                    Value::Undef => natural_cmp(&items[mid as usize], &args[1]) as i64,
+                    cmp => invoke_closure(vm, cmp, &[items[mid as usize].clone(), args[1].clone()])
+                        .jint(),
+                };
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                match c.cmp(&0) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    std::cmp::Ordering::Greater => high = mid - 1,
+                    std::cmp::Ordering::Equal => return Some(Ok(Value::Int(mid))),
+                }
+            }
+            Ok(Value::Int(-(low + 1)))
+        }
+        // `disjoint(c1, c2)`: the JDK iterates one collection and asks the
+        // other's `contains`, choosing which by `Set`-ness and then by size, so
+        // each side's own membership rules (and refusals) apply.
+        ("Collections", "disjoint") if args.len() == 2 => {
+            let is_set = |v: &Value| {
+                matches!(v, Value::Obj(id) if HEAP.with(|h| matches!(
+                    h.borrow().get(*id as usize),
+                    Some(HostObj::Set { .. })
+                )))
+            };
+            let (c1, c2) = (&args[0], &args[1]);
+            // A `null` side fails where the JDK first touches it: `c1.size()`
+            // or `c2.size()`, unless the other side is a `Set` and the null one
+            // is the collection being iterated.
+            for (v, other, name) in [(c1, c2, "c1"), (c2, c1, "c2")] {
+                if matches!(v, Value::Undef) {
+                    return Some(Err(if is_set(other) {
+                        npe_invoke("java.util.Collection.iterator()", "iterate")
+                    } else {
+                        npe_invoke("java.util.Collection.size()", name)
+                    }));
+                }
+            }
+            let (Some(i1), Some(i2)) = (sequence_items(c1), sequence_items(c2)) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            let (iterate, contains) = if is_set(c1) {
+                (i2, c1)
+            } else if !is_set(c2) {
+                if i1.is_empty() || i2.is_empty() {
+                    return Some(Ok(Value::bool(true)));
+                }
+                if i1.len() > i2.len() {
+                    (i2, c1)
+                } else {
+                    (i1, c2)
+                }
+            } else {
+                (i1, c2)
+            };
+            for e in iterate {
+                let hit = coll_method(vm, contains, "contains", &[e]);
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                if matches!(hit, Value::Bool(true)) {
+                    return Some(Ok(Value::bool(false)));
+                }
+            }
+            Ok(Value::bool(true))
+        }
+        // `rotate(l, d)`: element `i` moves to `(i + d) mod size`. The JDK
+        // writes with `set`, so an immutable list refuses only when something
+        // actually moves, and a `subList` view stays valid.
+        ("Collections", "rotate") if args.len() == 2 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "list")));
+            };
+            let n = items.len() as i64;
+            if n == 0 {
+                return Some(Ok(Value::Undef));
+            }
+            // `distance` is an `int`; the remainder is taken at that width.
+            let d = (args[1].jint() as i32 as i64).rem_euclid(n);
+            if d == 0 {
+                return Some(Ok(Value::Undef));
+            }
+            if collection_fixity(&args[0]) == Some(Fixity::Immutable) {
+                return Some(Err(unsupported()));
+            }
+            let mut out = items.clone();
+            for (i, v) in items.into_iter().enumerate() {
+                out[((i as i64 + d) % n) as usize] = v;
+            }
+            set_all(&args[0], out).map(|()| Value::Undef)
+        }
+        // `fill(l, o)` sets every position, so only a non-empty immutable list
+        // refuses it.
+        ("Collections", "fill") if args.len() == 2 => {
+            let Some(items) = sequence_items(&args[0]) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "list")));
+            };
+            if !items.is_empty() && collection_fixity(&args[0]) == Some(Fixity::Immutable) {
+                return Some(Err(unsupported()));
+            }
+            set_all(&args[0], vec![args[1].clone(); items.len()]).map(|()| Value::Undef)
+        }
+        // `indexOfSubList`/`lastIndexOfSubList`: the JDK's brute-force scan,
+        // comparing `target.get(i).equals(source.get(j))` (or both `null`).
+        ("Collections", "indexOfSubList" | "lastIndexOfSubList") if args.len() == 2 => {
+            let Some(source) = sequence_items(&args[0]) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "source")));
+            };
+            let Some(target) = sequence_items(&args[1]) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "target")));
+            };
+            let Some(max) = source.len().checked_sub(target.len()) else {
+                return Some(Ok(Value::Int(-1)));
+            };
+            let candidates: Vec<usize> = if method == "indexOfSubList" {
+                (0..=max).collect()
+            } else {
+                (0..=max).rev().collect()
+            };
+            for c in candidates {
+                let mut all = true;
+                for (i, t) in target.iter().enumerate() {
+                    let s = &source[c + i];
+                    let eq = match t {
+                        Value::Undef => matches!(s, Value::Undef),
+                        _ => eq_call(vm, t, s),
+                    };
+                    if pending() {
+                        return Some(Ok(Value::Undef));
+                    }
+                    if !eq {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return Some(Ok(Value::Int(c as i64)));
+                }
+            }
+            Ok(Value::Int(-1))
         }
         _ => return None,
     })
+}
+
+/// The helpful `NullPointerException` the JVM raises when a JDK method body
+/// dereferences its `null` parameter `var` by calling `target` on it — the
+/// message names the library's own parameter, as `-XX:+ShowCodeDetailsInExceptionMessages`
+/// (on by default since JDK 15) does.
+fn npe_invoke(target: &str, var: &str) -> Fault {
+    Fault::java(
+        "NullPointerException",
+        format!("Cannot invoke \"{target}\" because \"{var}\" is null"),
+    )
+}
+
+/// The `UnsupportedOperationException` an unmodifiable collection answers a
+/// write with. Its message is `null`, so it prints as the bare class name.
+fn unsupported() -> Fault {
+    Fault::java("UnsupportedOperationException", String::new())
+}
+
+/// Replace a list's elements position by position, as a run of `set` calls
+/// would: no structural modification, so an outstanding `subList` view of it
+/// stays valid (`Collections.reverse`/`shuffle`/`rotate`/`fill` all write this
+/// way in the JDK). The caller has already applied the list's write refusals.
+fn set_all(target: &Value, items: Vec<Value>) -> Result<(), Fault> {
+    let Value::Obj(id) = target else {
+        return Ok(());
+    };
+    write_sequence(*id as usize, items, false)
 }
 
 /// The elements a varargs static receives. A lone *array* argument spreads —
@@ -10988,9 +11226,9 @@ fn write_list(target: &Value, items: Vec<Value>) -> Result<(), Fault> {
     let Value::Obj(id) = target else {
         return Ok(());
     };
-    // `Collections.sort`/`reverse` reorder in place; Java counts both as
-    // structural modifications, so an outstanding `subList` view of the target
-    // goes stale exactly as it does there.
+    // `Collections.sort` is `ArrayList.sort`, which bumps `modCount`, so an
+    // outstanding `subList` view of the target goes stale exactly as it does
+    // there. The `set`-based reorderings go through [`set_all`] instead.
     write_sequence(*id as usize, items, true)
 }
 

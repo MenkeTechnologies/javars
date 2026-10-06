@@ -922,7 +922,12 @@ at the bottom, and are summarized in the section right after this one.
 - **`java.util` collections.** `List`/`ArrayList`/`LinkedList`,
   `Map`/`HashMap`/`LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/
   `TreeSet`, the copy constructors (`new ArrayList<>(other)`), `Arrays.asList`,
-  `List.of`/`Set.of`, and `Collections.sort`/`reverse`/`max`/`min`. Collections
+  `List.of`/`Set.of`, and `Collections.sort`/`reverse`/`max`/`min`/`shuffle`/
+  `frequency`/`swap`/`binarySearch`/`disjoint`/`rotate`/`fill`/
+  `indexOfSubList`/`lastIndexOfSubList` (`max`, `min` and `binarySearch` with
+  no comparator order by the elements' own `compareTo`, as `sort` does; the
+  `set`-based ones refuse an immutable list exactly when the JDK's `set` would
+  run, and leave a `subList` view valid). Collections
   are heap objects like arrays and instances, so passing one to a method and
   mutating it is visible to the caller. The enhanced `for` iterates them (the
   compiler routes a non-array iterable through a snapshot builtin, so an array
@@ -1034,7 +1039,9 @@ at the bottom, and are summarized in the section right after this one.
   splice the parent), and a `subList` of a `subList` composes offsets down to
   the same backing list rather than snapshotting. A structural modification of
   the backing list made *behind* a view — including `Collections.sort`, which
-  bumps `modCount` without changing the length — invalidates it, and the next
+  bumps `modCount` without changing the length — invalidates it, while
+  `Collections.reverse`/`shuffle`/`rotate`/`fill`, which write with `set`, do
+  not; and the next
   operation on it (or rendering it) throws `ConcurrentModificationException`,
   exactly as Java's `checkForComodification` does. Bounds match Java's two
   distinct failures: an endpoint outside the list is an

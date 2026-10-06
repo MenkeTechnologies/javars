@@ -6504,6 +6504,29 @@ impl Compiler {
                 return self.method_call(recv, method, &args, line);
             }
         }
+        // `Collections.max`/`min`/`binarySearch` with no comparator (or a
+        // `null` one) order by the elements' own `compareTo`, for the reason the
+        // comparator-less sort above does: the host's natural order cannot reach
+        // a user `Comparable`, and answered "equal" for every pair of them.
+        if matches!(method, "max" | "min" | "binarySearch")
+            && matches!(recv, Expr::Var(c) if c == "Collections")
+            && !self.is_declared_var("Collections")
+        {
+            let explicit_null = |e: &Expr| matches!(e, Expr::Var(n) if n == NULL_LITERAL);
+            let nat = || natural_order_comparator(line);
+            let natural = match (method, args) {
+                ("max" | "min", [c]) => Some(vec![c.clone(), nat()]),
+                ("max" | "min", [c, n]) if explicit_null(n) => Some(vec![c.clone(), nat()]),
+                ("binarySearch", [l, k]) => Some(vec![l.clone(), k.clone(), nat()]),
+                ("binarySearch", [l, k, n]) if explicit_null(n) => {
+                    Some(vec![l.clone(), k.clone(), nat()])
+                }
+                _ => None,
+            };
+            if let Some(args) = natural {
+                return self.method_call(recv, method, &args, line);
+            }
+        }
         // `super.method(args)` is the one call that must NOT go through the
         // virtual dispatch chain: it names the superclass's implementation of a
         // method the receiver's own class overrides. It is intercepted here,
@@ -8917,7 +8940,10 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
         ("Arrays", "toString") => "String",
         ("Boolean", "parseBoolean") => "boolean",
-        ("Collections", "addAll") => "boolean",
+        ("Collections", "addAll" | "disjoint") => "boolean",
+        ("Collections", "frequency" | "binarySearch" | "indexOfSubList" | "lastIndexOfSubList") => {
+            "int"
+        }
         // `Character.toUpperCase(char)` returns a `char`, so its result keeps
         // rendering as a character rather than as a code point.
         ("Character", "toUpperCase") | ("Character", "toLowerCase") => "char",
