@@ -3326,13 +3326,27 @@ impl Compiler {
     /// native op declines is delegated to the hook, which unboxes.
     fn expr_unboxed(&mut self, e: &Expr) -> Result<(), String> {
         self.expr(e)?;
-        if self
-            .expr_java_type(e)
-            .is_some_and(|t| crate::host::box_class_code(&t).is_some())
-        {
-            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
+        if let Some(t) = self.expr_java_type(e) {
+            self.emit_checked_unbox(&t);
         }
         Ok(())
+    }
+
+    /// Unbox the value on top of the stack when `ty` is a wrapper class, the
+    /// way Java's unboxing conversion does it: through `intValue()` (or its
+    /// sibling), so a `null` raises `NullPointerException` (JLS 5.1.8) rather
+    /// than reaching the primitive it was converted for. Any other `ty` emits
+    /// nothing.
+    fn emit_checked_unbox(&mut self, ty: &str) {
+        let code = match ty {
+            "Boolean" => crate::host::BOX_CLASSES.len() as i64,
+            _ => match crate::host::box_class_code(ty) {
+                Some(code) => code,
+                None => return,
+            },
+        };
+        self.b.emit(Op::LoadInt(code), 0);
+        self.emit_raising_builtin(crate::host::JUNBOX_NONNULL, 2, 0);
     }
 
     /// The text of a compile-time constant `String` expression, or `None` when
@@ -3455,12 +3469,17 @@ impl Compiler {
         // such variables compare handles. The call is `JUNBOX`, which is the
         // identity on everything that is not a box, so a source that was never
         // boxed is unaffected.
-        let unwrapped = match self.expr_java_type(e) {
-            Some(src) => crate::host::box_class_code(&src).is_some(),
-            None => true,
-        };
-        if unwrapped {
-            self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
+        // Erasure is also why such a source unboxes as the *target's* wrapper:
+        // `javac` reaches `int v = map.get(k)` through a cast to `Integer`, so a
+        // `null` there raises the same `intValue()` fault a typed one does.
+        match self.expr_java_type(e) {
+            Some(src) => self.emit_checked_unbox(&src),
+            None => match wrapper_of(target) {
+                Some(wrapper) => self.emit_checked_unbox(wrapper),
+                None => {
+                    self.b.emit(Op::CallBuiltin(crate::host::JUNBOX, 1), 0);
+                }
+            },
         }
     }
 
@@ -4695,7 +4714,7 @@ impl Compiler {
     }
 
     fn if_stmt(&mut self, cond: &Expr, then: &[Stmt], els: &[Stmt]) -> Result<(), String> {
-        self.expr(cond)?;
+        self.expr_unboxed(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         for s in then {
             self.stmt(s)?;
@@ -4735,7 +4754,7 @@ impl Compiler {
     /// condition's code and saves one jump per iteration.
     fn while_stmt(&mut self, cond: &Expr, body: &[Stmt]) -> Result<(), String> {
         let label = self.pending_label.take();
-        self.expr(cond)?;
+        self.expr_unboxed(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         let top = self.b.current_pos();
         self.scopes.push(BreakScope::loop_scope(label));
@@ -4749,7 +4768,7 @@ impl Compiler {
         for op in &l.continue_ops {
             self.b.patch_jump(*op, test);
         }
-        self.expr(cond)?;
+        self.expr_unboxed(cond)?;
         self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
         self.b.patch_jump(jf, end);
@@ -4775,7 +4794,7 @@ impl Compiler {
         for op in &l.continue_ops {
             self.b.patch_jump(*op, test);
         }
-        self.expr(cond)?;
+        self.expr_unboxed(cond)?;
         self.b.emit(Op::JumpIfTrue(top), 0);
         let end = self.b.current_pos();
         for op in l.break_ops {
@@ -6308,14 +6327,11 @@ impl Compiler {
                 self.emit_pattern_test(&subject, class, binding, components, 0)?;
             }
             Expr::Unary { op, rhs } => {
-                // `~` is answered natively for every operand shape, so a boxed
-                // operand would be read as the handle rather than the number.
-                // `-` and `!` are safe unboxed: `Negate` delegates to the hook,
-                // and `Boolean` is not a boxed class.
-                match op {
-                    UnOp::BitNot => self.expr_unboxed(rhs)?,
-                    _ => self.expr(rhs)?,
-                }
+                // Unary numeric promotion and `!` both unbox a wrapper operand
+                // (JLS 5.6.1, 15.15.6), so a `null` one throws. `~` needs the
+                // number besides: it is answered natively for every operand
+                // shape, and a boxed operand would be read as the handle.
+                self.expr_unboxed(rhs)?;
                 match op {
                     UnOp::Neg => {
                         self.b.emit(Op::Negate, 0);
@@ -8129,7 +8145,7 @@ impl Compiler {
         // A floating conditional widens whichever branch is integral, so
         // `flag ? 1 : 2.0` yields 1.0 rather than 1 (JLS 15.25).
         let promote = self.ternary_promotion(then, els);
-        self.expr(cond)?;
+        self.expr_unboxed(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         self.expr_targeted(then, promote)?;
         let jend = self.b.emit(Op::Jump(0), 0);
@@ -8161,19 +8177,19 @@ impl Compiler {
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
             BinOp::And => {
-                self.expr(lhs)?;
+                self.expr_unboxed(lhs)?;
                 let jf = self.b.emit(Op::JumpIfFalseKeep(0), 0);
                 self.b.emit(Op::Pop, 0);
-                self.expr(rhs)?;
+                self.expr_unboxed(rhs)?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(jf, end);
                 return Ok(());
             }
             BinOp::Or => {
-                self.expr(lhs)?;
+                self.expr_unboxed(lhs)?;
                 let jt = self.b.emit(Op::JumpIfTrueKeep(0), 0);
                 self.b.emit(Op::Pop, 0);
-                self.expr(rhs)?;
+                self.expr_unboxed(rhs)?;
                 let end = self.b.current_pos();
                 self.b.patch_jump(jt, end);
                 return Ok(());
@@ -8194,8 +8210,8 @@ impl Compiler {
         ) && self.arith_result_type(lhs, rhs) == Some("float")
             && !(op == BinOp::Add && self.is_string_concat(lhs, rhs))
         {
-            self.expr(lhs)?;
-            self.expr(rhs)?;
+            self.expr_unboxed(lhs)?;
+            self.expr_unboxed(rhs)?;
             self.emit_f32_arith(op, 0);
             return Ok(());
         }
@@ -8204,8 +8220,8 @@ impl Compiler {
             let l = self.expr_type(lhs);
             let r = self.expr_type(rhs);
             let wrap = self.operands_are_int(lhs, rhs);
-            self.expr(lhs)?;
-            self.expr(rhs)?;
+            self.expr_unboxed(lhs)?;
+            self.expr_unboxed(rhs)?;
             self.emit_div(l, r, rhs, wrap, 0);
             // `Integer.MIN_VALUE / -1` is the one division that overflows.
             if wrap {
@@ -8233,9 +8249,24 @@ impl Compiler {
             }
             self.emit_stringified(lhs)?;
             self.emit_stringified(rhs)?;
+        } else if matches!(op, BinOp::Eq | BinOp::Ne) {
+            // `==` unboxes a wrapper only against a primitive (JLS 15.21.1);
+            // between two references it compares identities and must not.
+            let primitive = |t: Option<String>| t.is_some_and(|t| !is_reference_type(&t));
+            let numeric =
+                primitive(self.expr_java_type(lhs)) || primitive(self.expr_java_type(rhs));
+            for e in [lhs, rhs] {
+                if numeric {
+                    self.expr_unboxed(e)?;
+                } else {
+                    self.expr(e)?;
+                }
+            }
         } else {
-            self.expr(lhs)?;
-            self.expr(rhs)?;
+            // Every other operator here is numeric, and numeric promotion
+            // unboxes a wrapper operand first — a `null` one throws (JLS 5.6).
+            self.expr_unboxed(lhs)?;
+            self.expr_unboxed(rhs)?;
         }
         // Integral `%` by zero throws `ArithmeticException` in Java, exactly as
         // `/` does; the floating `%` yields NaN and needs no check.

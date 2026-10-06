@@ -2309,7 +2309,7 @@ pub const REFERENCE: &[Entry] = &[
         "NullPointerException",
         "Throwables",
         "class NullPointerException extends RuntimeException",
-        "Raised on every null dereference javars models: an array load, store, or `.length`; an instance field read or assignment; a method call on a null receiver; iterating a null; and invoking a null functional-interface target. Java's \"helpful\" messages name the bytecode local slot of the null reference (`because \"<local3>\" is null`), which javars has no javac slot numbering to reproduce, so it keeps the operation half of Java's wording and drops the provenance clause.",
+        "Raised on every null dereference javars models: an array load, store, or `.length`; an instance field read or assignment; a method call on a null receiver; unboxing a null wrapper; iterating a null; and invoking a null functional-interface target. Java's \"helpful\" messages name the bytecode local slot of the null reference (`because \"<local3>\" is null`), which javars has no javac slot numbering to reproduce, so it keeps the operation half of Java's wording and drops the provenance clause.",
         "String s = null;\n// s.length();   // Cannot invoke \"String.length()\" because the receiver is null",
     ),
     (

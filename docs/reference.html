@@ -2116,7 +2116,7 @@ System.out.println(s.first());   // fig</code></pre>
         <article class="doc-entry" id="doc-throwables-9">
           <h3><a class="doc-anchor" href="#doc-throwables-9">#</a> <code>NullPointerException</code></h3>
           <pre><code class="lang-java">class NullPointerException extends RuntimeException</code></pre>
-          <p>Raised on every null dereference javars models: an array load, store, or <code>.length</code>; an instance field read or assignment; a method call on a null receiver; iterating a null; and invoking a null functional-interface target. Java's "helpful" messages name the bytecode local slot of the null reference (<code>because "&lt;local3&gt;" is null</code>), which javars has no javac slot numbering to reproduce, so it keeps the operation half of Java's wording and drops the provenance clause.</p>
+          <p>Raised on every null dereference javars models: an array load, store, or <code>.length</code>; an instance field read or assignment; a method call on a null receiver; unboxing a null wrapper; iterating a null; and invoking a null functional-interface target. Java's "helpful" messages name the bytecode local slot of the null reference (<code>because "&lt;local3&gt;" is null</code>), which javars has no javac slot numbering to reproduce, so it keeps the operation half of Java's wording and drops the provenance clause.</p>
           <pre><code class="lang-java">String s = null;
 // s.length();   // Cannot invoke "String.length()" because the receiver is null</code></pre>
         </article>

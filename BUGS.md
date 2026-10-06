@@ -1971,12 +1971,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `ConcurrentModificationException` as the JDK does. The enhanced `for` is
   the one path still routed through the snapshot. A `subList` view also raises
   it, because it holds a live window rather than a copy.
-- **Unboxing a `null` wrapper yields `null` instead of throwing.** `Integer a =
-  null; int v = a;` prints `null` here and throws
-  `NullPointerException: Cannot invoke "java.lang.Integer.intValue()" because
-  "<local1>" is null` on `openjdk 21.0.12`. javars has one integral value kind
-  and no unboxing conversion to hang the check on, so the `null` flows into the
-  `int` local unchanged. This is a missing *exception*, not a wrong message.
+- ~~**Unboxing a `null` wrapper yields `null` instead of throwing.**~~ —
+  implemented. Every unboxing conversion of a wrapper-typed source — an
+  assignment, argument or `return` into a primitive slot, an arithmetic,
+  relational or unary operand, `==` against a primitive, an `if`/`while`/`for`/
+  `?:` condition, and `&&`/`||` — goes through `JUNBOX_NONNULL`, which raises
+  `NullPointerException` on `null`, as the `intValue()` call `javac` emits does.
+  A source erasure left untyped (`int v = map.get(k)`) unboxes as the target's
+  wrapper, which is the cast `javac` inserts. The message keeps the operation
+  half (`Cannot invoke "java.lang.Integer.intValue()"`) and, like every modeled
+  null dereference, not the JVM's provenance clause (`because "<local1>" is
+  null`): javars has no javac slot numbering. `==` between two wrappers still
+  compares references and does not unbox.
 - ~~**`Double.parseDouble` rejects a hexadecimal literal.**~~ — implemented.
   `Double.parseDouble`/`valueOf` and `Float.parseFloat`/`valueOf` accept the
   hex form (`"0x1.8p1"` is 3.0) and the source accepts the hexadecimal

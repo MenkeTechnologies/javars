@@ -3269,6 +3269,14 @@ impl Parser {
                 }
                 self.skip_generics();
                 let member = self.ident()?;
+                // A package-qualified functional interface or `Collections`
+                // (`java.util.Comparator.naturalOrder()`) needs the prelude
+                // exactly as its simple name does in the bare-identifier arm.
+                if package_rooted(&e)
+                    && (crate::prelude::is_functional(&member) || member == "Collections")
+                {
+                    self.uses_functional = true;
+                }
                 if self.is(&Tok::LParen) {
                     let args = self.call_args()?;
                     // `Map.Entry.comparingByKey()` / `comparingByValue()`, and
@@ -4072,5 +4080,15 @@ fn class_lit_name(e: &Expr) -> Option<String> {
         Expr::Var(n) => Some(n.clone()),
         Expr::Field { recv, name } => Some(format!("{}.{}", class_lit_name(recv)?, name)),
         _ => None,
+    }
+}
+
+/// Whether `e` is a package qualifier — a field chain rooted at `java` or
+/// `javax` (`java.util`) — so a member selected on it names a JDK type.
+fn package_rooted(e: &Expr) -> bool {
+    match e {
+        Expr::Var(v) => v == "java" || v == "javax",
+        Expr::Field { recv, .. } => package_rooted(recv),
+        _ => false,
     }
 }

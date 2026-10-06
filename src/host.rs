@@ -362,6 +362,13 @@ pub const JARRAY_EXTEND: u16 = 750;
 /// the handles they were copied from.
 pub const JUNBOX: u16 = 748;
 
+/// [`JUNBOX`] for a source whose static type is a wrapper: Java's unboxing
+/// conversion calls `intValue()` (or its sibling) on the reference, so a `null`
+/// raises `NullPointerException` instead of flowing into the primitive slot.
+/// Stack `[value, class]` (`class` on top, an index into [`BOX_CLASSES`], or
+/// `BOX_CLASSES.len()` for `Boolean`); `argc == 2`.
+pub const JUNBOX_NONNULL: u16 = 752;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -2248,6 +2255,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JBINARY_CLASS, b_binary_class);
     vm.register_builtin(JBOX, b_box);
     vm.register_builtin(JUNBOX, b_unbox);
+    vm.register_builtin(JUNBOX_NONNULL, b_unbox_nonnull);
     vm.register_builtin(JNEW_STRING, b_new_string);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
@@ -2455,6 +2463,43 @@ fn b_unbox(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let v = args.first().cloned().unwrap_or(Value::Undef);
     deboxed(&v)
+}
+
+/// [`JUNBOX_NONNULL`] — [`b_unbox`], raising the `NullPointerException` the
+/// wrapper's `xxxValue()` call raises on a `null` reference. The message keeps
+/// the operation half of the JVM's helpful text and drops the provenance
+/// clause, as every other modeled null dereference does (see `NULL_ARRAY_LOAD`).
+fn b_unbox_nonnull(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if !matches!(v, Value::Undef) {
+        return deboxed(&v);
+    }
+    let code = args.get(1).map(|c| c.jint()).unwrap_or(0);
+    let (class, prim) = match usize::try_from(code).ok().and_then(|i| BOX_CLASSES.get(i)) {
+        Some(&class) => (class, unboxed_primitive(class)),
+        None => ("Boolean", "boolean"),
+    };
+    raise(
+        vm,
+        Fault::java(
+            "NullPointerException",
+            format!("Cannot invoke \"java.lang.{class}.{prim}Value()\" because the receiver is null"),
+        ),
+    )
+}
+
+/// The primitive a [`BOX_CLASSES`] wrapper holds.
+fn unboxed_primitive(class: &str) -> &'static str {
+    match class {
+        "Integer" => "int",
+        "Long" => "long",
+        "Short" => "short",
+        "Byte" => "byte",
+        "Character" => "char",
+        "Float" => "float",
+        _ => "double",
+    }
 }
 
 /// Java `==` on two heap references: the same handle.
