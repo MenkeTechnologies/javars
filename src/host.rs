@@ -11034,11 +11034,48 @@ fn collection_static(
         // form throws with the caller's text. `requireNonNullElse` names the
         // parameter it found null — `defaultObj` — because it is the default
         // that was required, the first argument being allowed to be null.
+        // The `Supplier<String>` overload asks its supplier for the message
+        // only when it throws (a `null` supplier is a `null` message).
         ("Objects", "requireNonNull") if matches!(args.len(), 1 | 2) => match &args[0] {
-            Value::Undef => Err(Fault::java(
-                "NullPointerException",
-                args.get(1).map(|m| java_str_vm(vm, m)).unwrap_or_default(),
-            )),
+            Value::Undef => {
+                let msg = match args.get(1) {
+                    Some(s) if closure_meta(s).is_some() => {
+                        let m = invoke_closure(vm, s, &[]);
+                        if pending() {
+                            return Some(Ok(Value::Undef));
+                        }
+                        m
+                    }
+                    Some(m) => m.clone(),
+                    None => Value::Undef,
+                };
+                Err(Fault::java(
+                    "NullPointerException",
+                    match msg {
+                        Value::Undef => String::new(),
+                        m => java_str_vm(vm, &m),
+                    },
+                ))
+            }
+            v => Ok(v.clone()),
+        },
+        // `requireNonNullElseGet(obj, supplier)`: `obj` when it is not null,
+        // else `requireNonNull(requireNonNull(supplier, "supplier").get(),
+        // "supplier.get()")`.
+        ("Objects", "requireNonNullElseGet") if args.len() == 2 => match &args[0] {
+            Value::Undef => {
+                if matches!(args[1], Value::Undef) {
+                    return Some(Err(Fault::java("NullPointerException", "supplier")));
+                }
+                let got = invoke_closure(vm, &args[1], &[]);
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                match got {
+                    Value::Undef => Err(Fault::java("NullPointerException", "supplier.get()")),
+                    v => Ok(v),
+                }
+            }
             v => Ok(v.clone()),
         },
         ("Objects", "requireNonNullElse") if args.len() == 2 => match (&args[0], &args[1]) {

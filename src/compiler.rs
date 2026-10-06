@@ -6758,6 +6758,11 @@ impl Compiler {
                     // three is a predicate) and `Stream.generate`'s supplier answer
                     // the element type, a reference; `IntStream`'s take primitive
                     // functions and are not named here.
+                    // `Objects`' suppliers (`requireNonNullElseGet`'s value,
+                    // `requireNonNull`'s message) answer a reference too.
+                    if class == "Objects" && matches!(a, Expr::Lambda { .. }) {
+                        self.lambda_ret_hint = Some("Object".to_string());
+                    }
                     if class == "Stream"
                         && matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. })
                         && ((method == "iterate" && i + 1 == args.len()) || method == "generate")
@@ -9487,6 +9492,18 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Objects", "isNull")
         | ("Objects", "nonNull")
         | ("Objects", "hashCode")
+        // `Character`'s predicates and `getNumericValue` are overloaded on
+        // `char` and `int` only, and `Character` declares no instance method of
+        // the same name, so a reference to one is unambiguous. The case maps are
+        // left out: their `(int)` overload answers an `int` and their `(char)`
+        // one a `char`, which only the target type javars lacks can choose.
+        | (
+            "Character",
+            "isLetter" | "isDigit" | "isLetterOrDigit" | "isAlphabetic" | "isWhitespace"
+            | "isSpaceChar" | "isUpperCase" | "isLowerCase" | "isISOControl"
+            | "isJavaIdentifierStart" | "isJavaIdentifierPart" | "getNumericValue"
+            | "charCount",
+        )
  => 1,
         ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,
         // `Integer::sum` is the canonical `reduce`/`merge` operator and was the

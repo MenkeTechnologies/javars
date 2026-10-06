@@ -370,6 +370,7 @@ Implemented and checked against the reference `java`:
   `new PriorityQueue<>(cmp)` call the method its functional interface names. `return`, `break`/`continue`,
   `try`/`finally` and `throw` all work inside a lambda body.
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
+  `Character::isLetter` and the other `Character` predicates,
   `Point::area`, `obj::method`, `this::method`, `Point::new`,
   `System.out::println`. A constructor reference also names a modeled stdlib
   type's constructor — `ArrayList::new`, `HashMap::new`, `StringBuilder::new`,
@@ -598,7 +599,8 @@ bit-twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`,
 each answering at its declared width) and constant statics,
 `Boolean.parseBoolean`, the `Character` predicates, the `java.util.Objects`
 statics (`hashCode`/`hash`/`toString`/`isNull`/`nonNull`/`equals`/
-`requireNonNull`/`requireNonNullElse`, each answering for a `null` where the
+`requireNonNull` (with a message or a message `Supplier`)/`requireNonNullElse`/
+`requireNonNullElseGet`, each answering for a `null` where the
 instance method throws), `String.valueOf`/`join`/`format`, `String.chars`/
 `codePoints`/`lines`, `System.out.printf`, and the `Arrays`
 statics including `sort`/`fill`/`copyOf`/`deepToString`), **reference arrays** including **multi-dimensional**
