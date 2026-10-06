@@ -6779,6 +6779,34 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
         //     `ImmutableCollections` overrides each of these to throw outright.
         //   * The function (and `merge`'s value) is null-checked up front, so a
         //     null one is the NPE even when the body would never have called it.
+        // `remove(key, value)` and `replace(key, oldValue, newValue)`: `Map`'s
+        // default bodies, which `HashMap`'s overrides agree with — act only when
+        // the key is mapped (a `null` value included) and its value is
+        // `Objects.equals` to the one named, and answer whether they did.
+        ("remove", 2) | ("replace", 3) if map_entries(recv).is_some() => {
+            if map_fixity(recv) == Some(Fixity::Immutable) {
+                return raise(vm, unsupported());
+            }
+            let key = args[0].clone();
+            let cur = coll_method(vm, recv, "get", std::slice::from_ref(&key));
+            if pending() {
+                return Value::Undef;
+            }
+            if !objects_equals(vm, &cur, &args[1]) {
+                return Value::bool(false);
+            }
+            if matches!(cur, Value::Undef) {
+                let mapped = coll_method(vm, recv, "containsKey", std::slice::from_ref(&key));
+                if pending() || !matches!(mapped, Value::Bool(true)) {
+                    return Value::bool(false);
+                }
+            }
+            let _ = match method {
+                "remove" => coll_method(vm, recv, "remove", &[key]),
+                _ => coll_method(vm, recv, "put", &[key, args[2].clone()]),
+            };
+            return if pending() { Value::Undef } else { Value::bool(true) };
+        }
         ("compute", 2)
         | ("computeIfAbsent", 2)
         | ("computeIfPresent", 2)
@@ -6830,9 +6858,13 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
             let absent = matches!(old, Value::Undef);
             // `replace` is the one arm with no function: it writes only over a
             // key the map already has, and answers with the value it displaced.
+            // A key mapped to `null` is still mapped, so it is replaced too.
             if method == "replace" {
                 if absent {
-                    return Value::Undef;
+                    let mapped = coll_method(vm, recv, "containsKey", std::slice::from_ref(&key));
+                    if pending() || !matches!(mapped, Value::Bool(true)) {
+                        return Value::Undef;
+                    }
                 }
                 coll_method(vm, recv, "put", &[key, args[1].clone()]);
                 return old;

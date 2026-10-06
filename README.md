@@ -441,8 +441,9 @@ Implemented and checked against the reference `java`:
   [`BUGS.md`](BUGS.md) has the boundary. `Set.of` rejects a repeated element
   with `IllegalArgumentException` rather than dropping it. A `Map` also answers
   the compound methods that are defined in terms of the primitive ones —
-  `compute`, `computeIfAbsent`, `computeIfPresent`, `merge`, `replace`,
-  `putAll`, and the two-parameter `replaceAll` — including the detail that
+  `compute`, `computeIfAbsent`, `computeIfPresent`, `merge`, `replace` (both
+  forms), the conditional `remove(key, value)`, `putAll`, and the
+  two-parameter `replaceAll` — including the detail that
   separates them from `put`: a key one of the first three *adds* to a `HashMap`
   is linked at the **head** of its hash bin where `put` links it at the tail, so
   the same map filled two ways iterates in two different orders, exactly as

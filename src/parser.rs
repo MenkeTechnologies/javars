@@ -3330,6 +3330,18 @@ impl Parser {
                         expr: Box::new(lambda),
                         line,
                     };
+                } else if package_rooted(&e)
+                    && member.starts_with(|c: char| c.is_ascii_uppercase())
+                    && !(self.is(&Tok::Dot)
+                        && matches!(self.toks[self.pos + 1].kind, Tok::Class))
+                {
+                    // A package-qualified type (`java.util.Comparator`) is its
+                    // simple name, which every type is keyed on — so a static
+                    // call or constant through it (`java.util.Comparator
+                    // .comparing(…)`, `java.lang.Integer.MAX_VALUE`) is typed
+                    // and lowered exactly as the unqualified spelling. A class
+                    // literal keeps the qualified spelling it names.
+                    e = Expr::Var(member);
                 } else {
                     e = Expr::Field {
                         recv: Box::new(e),
