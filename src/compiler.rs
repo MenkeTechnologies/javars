@@ -1807,7 +1807,9 @@ impl Compiler {
                             && args.len() == 1
                         {
                             let ty = self.expr_java_type(&args[0]);
-                            let char_arg = ty.as_deref().is_none_or(|t| matches!(t, "char" | "Character"));
+                            let char_arg = ty
+                                .as_deref()
+                                .is_none_or(|t| matches!(t, "char" | "Character"));
                             return Some(if char_arg { "char" } else { "int" }.to_string());
                         }
                         if let Some(t) = self.width_overload_java_type(class, method, args) {
@@ -6793,10 +6795,8 @@ impl Compiler {
                     // `Arrays.fill`'s value is assigned into an element, so it
                     // takes the array's element type: `fill(new double[2], 2)`
                     // stores `2.0`.
-                    let fill_value = class == "Arrays"
-                        && method == "fill"
-                        && i > 0
-                        && i + 1 == args.len();
+                    let fill_value =
+                        class == "Arrays" && method == "fill" && i > 0 && i + 1 == args.len();
                     if stringify {
                         self.emit_converted_arg(a, floats)?;
                     } else if fill_value {
@@ -9076,7 +9076,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // lets a call such as `l.remove(List.of(x))` select `remove(Object)`.
         ("List", "of" | "copyOf") | ("Arrays", "asList") => "List",
         ("Set", "of" | "copyOf") | ("Collections", "emptySet" | "singleton") => "Set",
-        ("Map", "of" | "copyOf" | "ofEntries") | ("Collections", "emptyMap" | "singletonMap") => "Map",
+        ("Map", "of" | "copyOf" | "ofEntries") | ("Collections", "emptyMap" | "singletonMap") => {
+            "Map"
+        }
         ("Boolean", "parseBoolean") => "boolean",
         ("Boolean", "valueOf") => "Boolean",
         ("Collections", "addAll" | "disjoint") => "boolean",

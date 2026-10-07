@@ -3332,8 +3332,7 @@ impl Parser {
                     };
                 } else if package_rooted(&e)
                     && member.starts_with(|c: char| c.is_ascii_uppercase())
-                    && !(self.is(&Tok::Dot)
-                        && matches!(self.toks[self.pos + 1].kind, Tok::Class))
+                    && !(self.is(&Tok::Dot) && matches!(self.toks[self.pos + 1].kind, Tok::Class))
                 {
                     // A package-qualified type (`java.util.Comparator`) is its
                     // simple name, which every type is keyed on — so a static

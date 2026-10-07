@@ -345,7 +345,11 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
                     })?;
                     i = j;
                     out.push(Token {
-                        kind: if single { Tok::Float32(v) } else { Tok::Float(v) },
+                        kind: if single {
+                            Tok::Float32(v)
+                        } else {
+                            Tok::Float(v)
+                        },
                         line,
                     });
                     continue;
@@ -916,7 +920,10 @@ pub fn hex_float(text: &str, single: bool) -> Option<f64> {
         return None;
     }
     // A huge exponent saturates; it can only mean zero or infinity.
-    let mut exp2: i64 = exp_digits.parse().unwrap_or(i64::from(i32::MAX)).min(i64::from(i32::MAX));
+    let mut exp2: i64 = exp_digits
+        .parse()
+        .unwrap_or(i64::from(i32::MAX))
+        .min(i64::from(i32::MAX));
     if exp.starts_with('-') {
         exp2 = -exp2;
     }
@@ -953,7 +960,11 @@ pub fn hex_float(text: &str, single: bool) -> Option<f64> {
     if m == 0 {
         return Some(zero);
     }
-    let (precision, emin, emax) = if single { (24i64, -126i64, 127i64) } else { (53, -1022, 1023) };
+    let (precision, emin, emax) = if single {
+        (24i64, -126i64, 127i64)
+    } else {
+        (53, -1022, 1023)
+    };
     let width = 64 - i64::from(m.leading_zeros());
     // The value is `m * 2^exp2`, whose leading bit is `2^top`.
     let top = exp2 + width - 1;
@@ -961,14 +972,22 @@ pub fn hex_float(text: &str, single: bool) -> Option<f64> {
         return Some(f64::INFINITY);
     }
     // Below the normal range the significand loses a bit per binade.
-    let keep = if top < emin { precision - (emin - top) } else { precision };
+    let keep = if top < emin {
+        precision - (emin - top)
+    } else {
+        precision
+    };
     let shift = width - keep;
     let (mut r, mut e) = (m, exp2);
     if shift > 0 {
         if shift > 64 {
             return Some(zero);
         }
-        let (dropped, half) = if shift == 64 { (m, 1u64 << 63) } else { (m & ((1u64 << shift) - 1), 1u64 << (shift - 1)) };
+        let (dropped, half) = if shift == 64 {
+            (m, 1u64 << 63)
+        } else {
+            (m & ((1u64 << shift) - 1), 1u64 << (shift - 1))
+        };
         r = if shift == 64 { 0 } else { m >> shift };
         e += shift;
         let round_up = dropped > half || (dropped == half && (sticky || r & 1 == 1));

@@ -2484,7 +2484,9 @@ fn b_unbox_nonnull(vm: &mut VM, argc: u8) -> Value {
         vm,
         Fault::java(
             "NullPointerException",
-            format!("Cannot invoke \"java.lang.{class}.{prim}Value()\" because the receiver is null"),
+            format!(
+                "Cannot invoke \"java.lang.{class}.{prim}Value()\" because the receiver is null"
+            ),
         ),
     )
 }
@@ -4122,12 +4124,11 @@ fn collection_equals(vm: &mut VM, q: &Value, other: &Value) -> Option<bool> {
                 return Some(false);
             };
             a.len() == b.len()
-                && a.iter().all(|(k, v)| {
-                    match b.iter().find(|(ok, _)| key_eq(vm, k, ok)) {
+                && a.iter()
+                    .all(|(k, v)| match b.iter().find(|(ok, _)| key_eq(vm, k, ok)) {
                         Some((_, ov)) => objects_equals(vm, v, ov),
                         None => false,
-                    }
-                })
+                    })
         }
         _ => false,
     })
@@ -4892,7 +4893,10 @@ fn builder_method(
                 if start < 0 || start > end || end > chars.len() as i64 {
                     return Err(Fault::java(
                         "IndexOutOfBoundsException",
-                        format!("Range [{start}, {end}) out of bounds for length {}", chars.len()),
+                        format!(
+                            "Range [{start}, {end}) out of bounds for length {}",
+                            chars.len()
+                        ),
                     ));
                 }
                 s.extend(&chars[start as usize..end as usize]);
@@ -6805,7 +6809,11 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 "remove" => coll_method(vm, recv, "remove", &[key]),
                 _ => coll_method(vm, recv, "put", &[key, args[2].clone()]),
             };
-            return if pending() { Value::Undef } else { Value::bool(true) };
+            return if pending() {
+                Value::Undef
+            } else {
+                Value::bool(true)
+            };
         }
         ("compute", 2)
         | ("computeIfAbsent", 2)
@@ -10658,7 +10666,9 @@ fn collection_static(
             let (Some(a), Some(b)) = (array_items(&args[0]), array_items(&args[1])) else {
                 return Some(Ok(Value::bool(false)));
             };
-            Ok(Value::bool(a.len() == b.len() && arrays_mismatch(vm, &a, &b, false).is_none()))
+            Ok(Value::bool(
+                a.len() == b.len() && arrays_mismatch(vm, &a, &b, false).is_none(),
+            ))
         }
         // `deepEquals` recurses into element pairs that are both arrays.
         ("Arrays", "deepEquals") if args.len() == 2 => {
@@ -10668,7 +10678,9 @@ fn collection_static(
             let (Some(a), Some(b)) = (array_items(&args[0]), array_items(&args[1])) else {
                 return Some(Ok(Value::bool(false)));
             };
-            Ok(Value::bool(a.len() == b.len() && arrays_mismatch(vm, &a, &b, true).is_none()))
+            Ok(Value::bool(
+                a.len() == b.len() && arrays_mismatch(vm, &a, &b, true).is_none(),
+            ))
         }
         // `mismatch(a, b)`: the first index whose elements differ, else the
         // shorter length when one is a proper prefix of the other, else -1.
@@ -11455,7 +11467,9 @@ fn array_element_compare(vm: &mut VM, x: &Value, y: &Value, elem: &str) -> Optio
         // `Byte.compare`, `Short.compare` and `Character.compare` are `x - y`.
         "byte" | "Byte" | "short" | "Short" | "char" | "Character" => dx.jint() - dy.jint(),
         "double" | "Double" | "float" | "Float" => double_compare(dx.jfloat(), dy.jfloat()),
-        "boolean" | "Boolean" => sign(matches!(dx, Value::Bool(true)).cmp(&matches!(dy, Value::Bool(true)))),
+        "boolean" | "Boolean" => {
+            sign(matches!(dx, Value::Bool(true)).cmp(&matches!(dy, Value::Bool(true))))
+        }
         _ => match (&dx, &dy) {
             (Value::Str(p), Value::Str(q)) => compare_strings(p, q, false),
             (Value::Int(p), Value::Int(q)) => sign(p.cmp(q)),
@@ -11936,9 +11950,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Short", "reverseBytes", 1) => {
             Ok(Value::Int(i64::from((args[0].jint() as i16).swap_bytes())))
         }
-        ("Character", "reverseBytes", 1) => {
-            Ok(Value::Int(i64::from((char_arg(&args[0]) as u32 as u16).swap_bytes())))
-        }
+        ("Character", "reverseBytes", 1) => Ok(Value::Int(i64::from(
+            (char_arg(&args[0]) as u32 as u16).swap_bytes(),
+        ))),
         ("Integer", "rotateLeft", 2) => Ok(Value::Int(i64::from(
             (args[0].jint() as i32).rotate_left(args[1].jint() as u32),
         ))),
@@ -14111,7 +14125,10 @@ fn parse_java_double(text: &str, single: bool) -> Option<f64> {
         Some(b'f' | b'F' | b'd' | b'D') => &body[..body.len() - 1],
         _ => body,
     };
-    if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
         // `_` is literal syntax, not part of the string grammar.
         if hex.contains('_') {
             return None;
@@ -17371,6 +17388,66 @@ fn as_f64(v: &Value) -> f64 {
     }
 }
 
+/// `String.translateEscapes` (Java 15): the escape sequences of a string
+/// literal, transcribed from the JDK's loop. `\s` is a space, an octal escape
+/// takes up to three digits (two more after a leading `0`-`3`, one more
+/// otherwise), a backslash before a line terminator removes both. Anything else —
+/// including a trailing lone backslash, which the JDK reads as a NUL escape —
+/// is its `IllegalArgumentException`.
+fn translate_escapes(s: &str) -> Result<String, Fault> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut from = 0;
+    while from < chars.len() {
+        let mut ch = chars[from];
+        from += 1;
+        if ch == '\\' {
+            ch = if from < chars.len() {
+                chars[from]
+            } else {
+                '\0'
+            };
+            from += 1;
+            ch = match ch {
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                's' => ' ',
+                't' => '\t',
+                '\'' | '"' | '\\' => ch,
+                '0'..='7' => {
+                    let limit = (from + if ch <= '3' { 2 } else { 1 }).min(chars.len());
+                    let mut code = ch as u32 - '0' as u32;
+                    while from < limit && ('0'..='7').contains(&chars[from]) {
+                        code = (code << 3) | (chars[from] as u32 - '0' as u32);
+                        from += 1;
+                    }
+                    char::from_u32(code).unwrap_or('\0')
+                }
+                '\n' => continue,
+                '\r' => {
+                    if from < chars.len() && chars[from] == '\n' {
+                        from += 1;
+                    }
+                    continue;
+                }
+                other => {
+                    return Err(Fault::java(
+                        "IllegalArgumentException",
+                        format!(
+                            "Invalid escape sequence: \\{other} \\\\u{:04X}",
+                            other as u32
+                        ),
+                    ))
+                }
+            };
+        }
+        out.push(ch);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod cast_target_tables {
     use super::*;
@@ -17436,57 +17513,4 @@ mod cast_target_tables {
     fn object_is_not_a_checkable_target() {
         assert!(!is_checkable_cast_target("Object"));
     }
-}
-
-/// `String.translateEscapes` (Java 15): the escape sequences of a string
-/// literal, transcribed from the JDK's loop. `\s` is a space, an octal escape
-/// takes up to three digits (two more after a leading `0`-`3`, one more
-/// otherwise), a backslash before a line terminator removes both. Anything else —
-/// including a trailing lone backslash, which the JDK reads as a NUL escape —
-/// is its `IllegalArgumentException`.
-fn translate_escapes(s: &str) -> Result<String, Fault> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut from = 0;
-    while from < chars.len() {
-        let mut ch = chars[from];
-        from += 1;
-        if ch == '\\' {
-            ch = if from < chars.len() { chars[from] } else { '\0' };
-            from += 1;
-            ch = match ch {
-                'b' => '\u{8}',
-                'f' => '\u{c}',
-                'n' => '\n',
-                'r' => '\r',
-                's' => ' ',
-                't' => '\t',
-                '\'' | '"' | '\\' => ch,
-                '0'..='7' => {
-                    let limit = (from + if ch <= '3' { 2 } else { 1 }).min(chars.len());
-                    let mut code = ch as u32 - '0' as u32;
-                    while from < limit && ('0'..='7').contains(&chars[from]) {
-                        code = (code << 3) | (chars[from] as u32 - '0' as u32);
-                        from += 1;
-                    }
-                    char::from_u32(code).unwrap_or('\0')
-                }
-                '\n' => continue,
-                '\r' => {
-                    if from < chars.len() && chars[from] == '\n' {
-                        from += 1;
-                    }
-                    continue;
-                }
-                other => {
-                    return Err(Fault::java(
-                        "IllegalArgumentException",
-                        format!("Invalid escape sequence: \\{other} \\\\u{:04X}", other as u32),
-                    ))
-                }
-            };
-        }
-        out.push(ch);
-    }
-    Ok(out)
 }
