@@ -549,6 +549,10 @@ struct Compiler {
     /// `finallys.len()` when the current arm body was entered — a `yield` runs
     /// exactly the cleanup blocks opened inside the arm, and no more.
     yield_finally_depth: usize,
+    /// The type a `yield` in the current arm body is assigned to: the switch
+    /// expression's target, or its own standalone type (see
+    /// [`Compiler::switch_arm_target`]).
+    yield_target: Option<String>,
 }
 
 /// A lambda body waiting to be emitted as a subroutine.
@@ -683,6 +687,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
+        yield_target: None,
     };
     // ── main body (global scope) ──
     // Class-level state exists before any user code runs, in Java's order:
@@ -1742,10 +1747,7 @@ impl Compiler {
             // takes its type from the declaration it initializes instead.
             Expr::ArrayLit { elem_ty, .. } => elem_ty.as_ref().map(|t| format!("{t}[]")),
             Expr::InstanceOf { .. } => Some("boolean".to_string()),
-            Expr::SwitchExpr { arms, .. } => arms.iter().find_map(|a| match &a.body {
-                SwitchArmBody::Expr(e) => self.expr_java_type(e),
-                SwitchArmBody::Block(_) => None,
-            }),
+            Expr::SwitchExpr { arms, .. } => self.switch_expr_type(arms),
             Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } => {
                 self.bare_var_type(name)
             }
@@ -3684,15 +3686,13 @@ impl Compiler {
             | Expr::Lambda { .. }
             | Expr::MethodRef { .. }
             | Expr::This => NumType::Other,
-            // An arrow `switch`'s type is its arms' common type; taking the
-            // first expression arm's is enough, because `javac` has already
-            // checked they agree.
-            Expr::SwitchExpr { arms, .. } => arms
-                .iter()
-                .find_map(|a| match &a.body {
-                    SwitchArmBody::Expr(e) => Some(self.expr_type(e)),
-                    SwitchArmBody::Block(_) => None,
-                })
+            // A `switch` expression's category is that of its type (JLS
+            // 15.28.1), which promotes across *every* result expression: one
+            // `double` arm makes the whole switch `double`.
+            Expr::SwitchExpr { arms, .. } => self
+                .switch_expr_type(arms)
+                .and_then(|t| numtype_of_ty(&t))
+                .or_else(|| switch_result_exprs(arms).first().map(|e| self.expr_type(e)))
                 .unwrap_or(NumType::Other),
         }
     }
@@ -3933,6 +3933,11 @@ impl Compiler {
     /// entering a reference slot is boxed; and a bare `{…}` array literal takes
     /// its element type from the declaration it initializes.
     fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
+        // A targeted `switch` expression is a poly expression: the target
+        // reaches each result expression, which converts on its own.
+        if let (Expr::SwitchExpr { disc, arms, line }, Some(_)) = (e, target) {
+            return self.switch_expr(disc, arms, *line, target);
+        }
         if !matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             // A `char` bound to a reference-typed slot (`Object o = 'x';`, an
             // `Object` parameter, an `Object`-returning method) is *boxed* in
@@ -4717,7 +4722,8 @@ impl Compiler {
             // block opened inside this arm first, exactly as `return` does),
             // then jump to the arm's exit.
             StmtKind::Yield(e) => {
-                self.expr(e)?;
+                let target = self.yield_target.clone();
+                self.expr_targeted(e, target.as_deref())?;
                 let keep = self.yield_finally_depth;
                 self.emit_finallys_down_to(keep)?;
                 let j = self.b.emit(Op::Jump(0), line);
@@ -5387,6 +5393,56 @@ impl Compiler {
         Ok(())
     }
 
+    /// The standalone type of a `switch` expression (JLS 15.28.1), read off
+    /// every result expression — each expression arm and each `yield` of a
+    /// block arm.
+    ///
+    /// Arms of one type give that type. Numeric arms promote (JLS 5.6): one
+    /// `double` arm makes the switch `double`, so `case 1 -> 7; default -> 2.5`
+    /// yields 7.0, not 7. `char` arms mixed only with `int` constants that fit
+    /// a `char` stay `char`, as a conditional's do (JLS 15.25). Anything else —
+    /// a result javars cannot type, or reference arms of different types —
+    /// keeps the first typed arm's type, the answer this gave before.
+    fn switch_expr_type(&self, arms: &[SwitchArm]) -> Option<String> {
+        let results = switch_result_exprs(arms);
+        let types: Vec<Option<String>> = results.iter().map(|e| self.expr_java_type(e)).collect();
+        let first = types.iter().flatten().next().cloned();
+        let known: Vec<&str> = types.iter().filter_map(|t| t.as_deref()).collect();
+        if known.len() != types.len() || known.iter().all(|t| Some(*t) == first.as_deref()) {
+            return first;
+        }
+        let fits_char = |e: &Expr| matches!(e, Expr::Int(n) if (0..=0xFFFF).contains(n));
+        if known.contains(&"char")
+            && results
+                .iter()
+                .zip(&known)
+                .all(|(e, t)| *t == "char" || (*t == "int" && fits_char(e)))
+        {
+            return Some("char".to_string());
+        }
+        let ranks: Option<Vec<u32>> = known.iter().map(|t| numeric_rank(t)).collect();
+        match ranks {
+            Some(ranks) => ranks.into_iter().max().map(|r| rank_name(r).to_string()),
+            None => first,
+        }
+    }
+
+    /// The type each result expression of a `switch` expression is converted
+    /// to. In an assignment or invocation context the switch is a poly
+    /// expression and every arm is assigned to the *target* on its own (JLS
+    /// 15.28.1), which is why `Object o = switch (n) { case 2 -> 7; default ->
+    /// 2.5; }` holds the `Integer` 7. Standalone (`var`, an operand, a
+    /// concatenation), each arm takes the switch's promoted floating type, the
+    /// conversion a conditional's integral branch gets.
+    fn switch_arm_target(&self, arms: &[SwitchArm], target: Option<&str>) -> Option<String> {
+        match target {
+            Some(t) if t != "var" => Some(t.to_string()),
+            _ => self
+                .switch_expr_type(arms)
+                .filter(|t| matches!(t.as_str(), "double" | "float")),
+        }
+    }
+
     /// Lower an arrow `switch` expression:
     /// `switch (d) { case A, B -> e; default -> { … yield v; } }`.
     ///
@@ -5399,7 +5455,14 @@ impl Compiler {
     /// A block arm's value comes from its `yield`, which is compiled as "leave
     /// the value on the stack, then jump to the end" — the same shape a matching
     /// expression arm produces, so the two are indistinguishable downstream.
-    fn switch_expr(&mut self, disc: &Expr, arms: &[SwitchArm], line: u32) -> Result<(), String> {
+    fn switch_expr(
+        &mut self,
+        disc: &Expr,
+        arms: &[SwitchArm],
+        line: u32,
+        target: Option<&str>,
+    ) -> Result<(), String> {
+        let arm_target = self.switch_arm_target(arms, target);
         // Java writes `case RED ->` unqualified when switching on an enum; the
         // label's meaning comes from the discriminant's static type.
         let enum_disc = self
@@ -5448,7 +5511,7 @@ impl Compiler {
             for j in hits {
                 self.b.patch_jump(j, body_at);
             }
-            self.emit_switch_arm_body(&arm.body, line)?;
+            self.emit_switch_arm_body(&arm.body, arm_target.as_deref(), line)?;
             end_jumps.push(self.b.emit(Op::Jump(0), line));
             let next = self.b.current_pos();
             for j in miss {
@@ -5456,7 +5519,7 @@ impl Compiler {
             }
         }
         match default_arm {
-            Some(arm) => self.emit_switch_arm_body(&arm.body, line)?,
+            Some(arm) => self.emit_switch_arm_body(&arm.body, arm_target.as_deref(), line)?,
             // No `default`: `javac` only accepts that for an exhaustive `enum`
             // switch, so no value can be missing in a program it compiled. The
             // placeholder keeps the stack balanced if one somehow is.
@@ -5472,13 +5535,21 @@ impl Compiler {
     }
 
     /// Emit one arrow arm's body so that it leaves exactly one value on the
-    /// stack. An expression arm is that expression; a block arm runs its
+    /// stack, converted to `target` (see [`Compiler::switch_arm_target`]). An
+    /// expression arm is that expression; a block arm runs its
     /// statements and takes its value from `yield` (or `null` on fall-off, which
     /// is what an arrow-`switch` *statement*'s arms all do).
-    fn emit_switch_arm_body(&mut self, body: &SwitchArmBody, line: u32) -> Result<(), String> {
+    fn emit_switch_arm_body(
+        &mut self,
+        body: &SwitchArmBody,
+        target: Option<&str>,
+        line: u32,
+    ) -> Result<(), String> {
         match body {
-            SwitchArmBody::Expr(e) => self.expr(e),
+            SwitchArmBody::Expr(e) => self.expr_targeted(e, target),
             SwitchArmBody::Block(stmts) => {
+                let outer_target =
+                    std::mem::replace(&mut self.yield_target, target.map(str::to_string));
                 let outer = std::mem::take(&mut self.yield_ops);
                 let outer_depth =
                     std::mem::replace(&mut self.yield_finally_depth, self.finallys.len());
@@ -5491,6 +5562,7 @@ impl Compiler {
                 // straight past this instruction.
                 self.b.emit(Op::LoadUndef, line);
                 self.yield_finally_depth = outer_depth;
+                self.yield_target = outer_target;
                 let yields = std::mem::replace(&mut self.yield_ops, outer);
                 let end = self.b.current_pos();
                 for j in yields {
@@ -6455,7 +6527,7 @@ impl Compiler {
                 args,
                 line,
             } => self.method_call(recv, method, args, *line)?,
-            Expr::SwitchExpr { disc, arms, line } => self.switch_expr(disc, arms, *line)?,
+            Expr::SwitchExpr { disc, arms, line } => self.switch_expr(disc, arms, *line, None)?,
             Expr::Lambda { params, body, line } => self.compile_lambda(params, body, *line)?,
             Expr::MethodRef { recv, method, line } => {
                 let lambda = self.desugar_method_ref(recv, method, *line)?;
@@ -8739,6 +8811,57 @@ fn mangle_static(owner: &str, name: &str, param_tys: &[String]) -> String {
 /// The numeric widening rank of a primitive type (`byte` < `short`/`char` <
 /// `int` < `long` < `float` < `double`); `None` for non-numeric types. Used by
 /// overload resolution to score widening conversions.
+/// The result expressions of a `switch` expression, in source order: each
+/// expression arm's body and every `yield` value in a block arm (JLS 15.28.1).
+///
+/// A `yield` inside a nested `switch` *statement*, loop, `if` or `try` still
+/// belongs to this switch, so statements are walked; expressions are not,
+/// because a `yield` inside a nested `switch` expression or a lambda belongs to
+/// that.
+fn switch_result_exprs(arms: &[SwitchArm]) -> Vec<&Expr> {
+    fn walk<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Yield(e) => out.push(e),
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::For { body, .. }
+                | StmtKind::ForEach { body, .. } => walk(body, out),
+                StmtKind::If { then, els, .. } => {
+                    walk(then, out);
+                    walk(els, out);
+                }
+                StmtKind::Switch { groups, .. } => {
+                    for g in groups {
+                        walk(&g.body, out);
+                    }
+                }
+                StmtKind::Labeled { body, .. } => walk(std::slice::from_ref(&**body), out),
+                StmtKind::Try {
+                    body,
+                    catches,
+                    finally_body,
+                } => {
+                    walk(body, out);
+                    for c in catches {
+                        walk(&c.body, out);
+                    }
+                    walk(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for arm in arms {
+        match &arm.body {
+            SwitchArmBody::Expr(e) => out.push(&**e),
+            SwitchArmBody::Block(stmts) => walk(stmts, &mut out),
+        }
+    }
+    out
+}
+
 fn numeric_rank(ty: &str) -> Option<u32> {
     Some(match unwrapped_ty(ty) {
         "byte" => 1,

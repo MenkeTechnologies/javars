@@ -1125,6 +1125,14 @@ at the bottom, and are summarized in the section right after this one.
   or `throw`, so only an empty one falls through, and that just groups its labels
   onto the next arm. The classic colon form as a *statement*, with its
   fall-through, is untouched.
+  The expression's type follows JLS 15.28.1: assigned to a target (a
+  declared local, a `return`, an argument) each result expression converts to
+  that target on its own, so `double d = switch … { case 1 -> 7; … }` is 7.0
+  while `Object o = switch … { case 2 -> 7; default -> 2.5; }` holds the
+  `Integer` 7; standalone (`var`, an operand, a concatenation) numeric arms
+  promote, so one `double` arm makes `7` print as `7.0`. A result whose type
+  javars cannot see where the switch begins (a `yield` of a local declared
+  inside the arm) keeps the first typed arm's type, as before.
 - **`compareTo` on every receiver that has one.** `String.compareTo` /
   `compareToIgnoreCase` return Java's *difference* (the first differing `char`,
   else the length difference) rather than only its sign — programs print the
