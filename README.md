@@ -433,7 +433,10 @@ Implemented and checked against the reference `java`:
   exceptions and messages, and a reference array sorted with none orders by
   `compareTo` too. `HashMap`/`HashSet` iterate in Java's **real bucket
   order** — `(capacity - 1) & (h ^ (h >>> 16))` over a power-of-two table,
-  reproduced exactly rather than approximated with insertion order. A membership
+  reproduced exactly rather than approximated with insertion order, with the
+  table sized by the JDK's own history (constructor capacity, copy pre-sizing,
+  no shrinking on `remove`/`clear`, the different resize points of `put` and
+  `computeIfAbsent`/`merge`, and the resize a crowded bin forces below 64). A membership
   test compares with the element's own `equals()`, not with identity, so
   `list.contains(new R(1))` on a `record` is `true`, `map.get` finds an equal
   key, and a `Set` de-duplicates equal elements — the query is the receiver and

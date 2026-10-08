@@ -7670,11 +7670,12 @@ impl Compiler {
             let kind_c = self.b.add_constant(Value::str(class.to_string()));
             self.b.emit(Op::LoadConst(kind_c), line);
             match args.first() {
-                // `new ArrayList<>(other)` copies; `new ArrayList<>(16)` is a
-                // capacity hint with no observable effect, so an integral
-                // argument seeds nothing.
-                Some(a) if self.expr_java_type(a).as_deref() != Some("int") => self.expr(a)?,
-                _ => {
+                // `new ArrayList<>(other)` copies; `new HashMap<>(64)` is an
+                // initial capacity, which the host turns into the table a hash
+                // container starts with (it decides the iteration order) and
+                // into the JDK's refusal of a negative one.
+                Some(a) => self.expr(a)?,
+                None => {
                     self.b.emit(Op::LoadUndef, line);
                 }
             }

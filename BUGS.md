@@ -967,7 +967,16 @@ at the bottom, and are summarized in the section right after this one.
   contents — a `record`, a class declaring `hashCode()`, a `List`/`Set`/`Map`,
   a `Map.Entry` — is hashed once as it is inserted, which is when `HashMap`
   calls `hashCode()`, so it lands in its real bucket too; only a key whose hash
-  is the JVM identity hash keeps insertion order, Java's being unreproducible. `LinkedHashMap`/`LinkedHashSet` keep insertion
+  is the JVM identity hash keeps insertion order, Java's being unreproducible.
+  The table itself is sized the way the JDK sizes it over the container's
+  history: `new HashMap<>(n)`/`new HashSet<>(n)` start at `tableSizeFor(n)`
+  (a negative `n` is the JDK's `Illegal initial capacity`), a copy constructor
+  pre-sizes (`HashSet(c)` to `ceil(max(c.size(), 12) / 0.75)`), `putAll` into an
+  empty map pre-sizes, nothing ever shrinks it, `put`/`add` resize after the
+  insertion that crosses the threshold while `computeIfAbsent`/`compute`/`merge`
+  resize before the next call once it is crossed, and a bin crowded to the
+  treeify threshold doubles a table below 64. A bin that actually treeifies (a
+  table of 64+) is not modeled. `LinkedHashMap`/`LinkedHashSet` keep insertion
   order and `TreeMap`/`TreeSet` sort, each because Java does, not by default.
   A `TreeMap` navigates by key — `firstKey`/`lastKey`, `floorKey`/`ceilingKey`/
   `lowerKey`/`higherKey`, the matching `…Entry` forms and

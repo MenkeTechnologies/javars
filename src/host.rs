@@ -1480,7 +1480,16 @@ impl KeyIndex {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Order {
     /// `HashMap`/`HashSet` — Java's bucket order (see [`hash_order`]).
-    Hash,
+    ///
+    /// `table` is the length of the JDK's bucket array, 0 while none is
+    /// allocated; `init` is the capacity the first allocation will take, which
+    /// is what `HashMap.threshold` holds until then (0 for the default 16).
+    /// They follow the JDK's own sizing — see [`HashTable`] — because the order
+    /// depends on the table, and the table on the container's history: a
+    /// `new HashMap<>(64)`, a set that grew and then shrank, and a `HashSet`
+    /// copied from a collection each iterate differently from one that merely
+    /// holds the same keys.
+    Hash { table: u32, init: u32 },
     /// `LinkedHashMap`/`LinkedHashSet` — insertion order.
     Insertion,
     /// `TreeMap`/`TreeSet`. Ordered by the keys' natural order, or — when
@@ -1493,6 +1502,11 @@ enum Order {
     /// located exactly as its ascending source is, presented in reverse, and
     /// navigated with first/last, floor/ceiling and lower/higher swapped.
     Sorted { by_cmp: bool, desc: bool },
+}
+
+impl Order {
+    /// A `HashMap`/`HashSet` with no table allocated yet and default sizing.
+    const HASH: Order = Order::Hash { table: 0, init: 0 };
 }
 
 /// Whether a `Set` on the heap is one of its own or a view a `Map` handed out.
@@ -1537,7 +1551,7 @@ impl ViewOf {
     fn of(order: Order, fixed: Fixity) -> ViewOf {
         match (fixed, order) {
             (Fixity::Immutable, _) => ViewOf::Immutable,
-            (_, Order::Hash) => ViewOf::Hash,
+            (_, Order::Hash { .. }) => ViewOf::Hash,
             (_, Order::Insertion) => ViewOf::Linked,
             (_, Order::Sorted { .. }) => ViewOf::Tree,
         }
@@ -1670,6 +1684,9 @@ thread_local! {
     /// The hash a heap-object key was filed under when it last entered a
     /// `HashMap`/`HashSet`, by handle. See [`file_key_hash`].
     static FILED_HASH: RefCell<HashMap<u32, i32>> = RefCell::new(HashMap::new());
+    /// The hash containers a `merge`/`compute`/`computeIfAbsent` is running on,
+    /// by handle. See [`coll_method`].
+    static COMPUTING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
@@ -1891,6 +1908,7 @@ pub fn heap_reset() {
     ENTRIES_LIVE.with(|e| e.set(false));
     MAP_VIEWS.with(|m| m.borrow_mut().clear());
     FILED_HASH.with(|f| f.borrow_mut().clear());
+    COMPUTING.with(|c| c.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     SORT_CMP.with(|s| s.borrow_mut().clear());
@@ -3873,12 +3891,19 @@ fn map_hash(entries: &[(Value, Value)]) -> i64 {
 /// verified against OpenJDK 26 for `String` and `Integer` keys, including across
 /// the resize at 13 entries.
 ///
+/// `table` is the bucket array's length as [`HashTable`] tracked it; 0 — a
+/// container no history was replayed for, such as `Set.of` — falls back to the
+/// smallest table the default sizing would hold `keys` in.
+///
 /// Two things are not modeled, and neither is reproducible in Java either: a bin
 /// that treeifies (8 collisions in one bucket with a table of 64+) and a key
 /// whose `hashCode` is the JVM identity hash. A key with no modeled hash keeps
 /// insertion order.
-fn hash_order(keys: &[Value]) -> Vec<usize> {
-    let cap = hash_capacity(keys.len());
+fn hash_order(keys: &[Value], table: u32) -> Vec<usize> {
+    let cap = match table {
+        0 => hash_capacity(keys.len()),
+        t => t as usize,
+    };
     let mut idx: Vec<usize> = (0..keys.len()).collect();
     idx.sort_by_key(|&i| hash_bucket(&keys[i], cap));
     idx
@@ -3892,6 +3917,234 @@ fn hash_capacity(n: usize) -> usize {
         cap *= 2;
     }
     cap
+}
+
+/// `HashMap`'s table sizing, replayed over a container's history so the bucket
+/// order is read off the table the JDK would actually have.
+///
+/// The JDK never shrinks a table — not on `remove`, not on `clear` — and grows
+/// it on two different schedules: `putVal` (`put`, `putIfAbsent`, `putAll`,
+/// `HashSet.add`) resizes *after* the insertion that takes the size past the
+/// threshold, while `computeIfAbsent`/`compute`/`merge` resize *before* any
+/// work, whenever the size is already past it. A constructor capacity and
+/// `putAll` into an empty map pre-size the first allocation. Each method below
+/// is the corresponding JDK 21 code path, the load factor being the default
+/// 0.75 (javars accepts no other).
+#[derive(Clone, Copy)]
+struct HashTable {
+    table: u32,
+    init: u32,
+}
+
+impl HashTable {
+    const MAX: u32 = 1 << 30;
+    /// `MIN_TREEIFY_CAPACITY`. A table this long never grows for a crowded
+    /// bin, so no bin needs counting once one is reached.
+    const MIN_TREEIFY: u32 = 64;
+
+    /// `HashMap.threshold`: the initial capacity until a table exists, then
+    /// `(int) (capacity * 0.75f)`.
+    fn threshold(self) -> u64 {
+        match self.table {
+            0 => self.init as u64,
+            t => t as u64 * 3 / 4,
+        }
+    }
+
+    /// `HashMap.resize`: double the table, or allocate the pending initial
+    /// capacity, or the default 16.
+    fn resize(&mut self) {
+        self.table = match (self.table, self.init) {
+            (0, 0) => 16,
+            (0, init) => init,
+            (t, _) => (t * 2).min(Self::MAX),
+        };
+    }
+
+    /// `HashMap.tableSizeFor`: the smallest power of two at least `cap`, and
+    /// at least 1.
+    fn size_for(cap: u64) -> u32 {
+        cap.clamp(1, Self::MAX as u64).next_power_of_two() as u32
+    }
+
+    /// `new HashMap<>(n)`: the first table will hold `tableSizeFor(n)` buckets.
+    fn with_capacity(n: u64) -> HashTable {
+        HashTable {
+            table: 0,
+            init: Self::size_for(n),
+        }
+    }
+
+    /// `putVal` adding a new key that makes the size `size`; `mates(table)`
+    /// counts the keys already in the new key's bin under a table that long.
+    ///
+    /// `putVal` appends to a bin and calls `treeifyBin` when the bin already
+    /// held `TREEIFY_THRESHOLD` (8) nodes; see [`HashTable::treeify`].
+    fn put_new(&mut self, size: usize, mates: impl Fn(u32) -> usize) {
+        if self.table == 0 {
+            self.resize();
+        }
+        if self.table < Self::MIN_TREEIFY && mates(self.table) >= 8 {
+            self.treeify();
+        }
+        if size as u64 > self.threshold() {
+            self.resize();
+        }
+    }
+
+    /// `computeIfAbsent`/`compute`/`merge` having added a key to a bin that
+    /// held `mates` other nodes. They count the bin differently from `putVal`
+    /// and call `treeifyBin` once it held 7 (`TREEIFY_THRESHOLD - 1`).
+    fn compute_inserted(&mut self, mates: usize) {
+        if mates >= 7 {
+            self.treeify();
+        }
+    }
+
+    /// `treeifyBin`: below `MIN_TREEIFY_CAPACITY` (64) a crowded bin is
+    /// relieved by a resize rather than turned into a tree. At 64 and above the
+    /// bin does become a tree, which reorders it; that is not modeled.
+    fn treeify(&mut self) {
+        if self.table < Self::MIN_TREEIFY {
+            self.resize();
+        }
+    }
+
+    /// The check `computeIfAbsent`/`compute`/`merge` open with, made whether or
+    /// not the key turns out to be present; `size` is the size before the call.
+    fn compute_pre(&mut self, size: usize) {
+        if size as u64 > self.threshold() || self.table == 0 {
+            self.resize();
+        }
+    }
+
+    /// `putMapEntries` sizing for a source of `s` mappings: pre-size the first
+    /// table to `ceil(s / 0.75)`, or resize an existing one until `s` fits.
+    fn presize(&mut self, s: usize) {
+        if s == 0 {
+            return;
+        }
+        if self.table == 0 {
+            let t = (s as u64 * 4).div_ceil(3);
+            if t > self.init as u64 {
+                self.init = Self::size_for(t);
+            }
+        } else {
+            while s as u64 > self.threshold() && self.table < Self::MAX {
+                self.resize();
+            }
+        }
+    }
+}
+
+/// The table of a `HashMap`/`HashSet` and its current size; `None` for any
+/// other receiver.
+fn hash_table(v: &Value) -> Option<(HashTable, usize)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map {
+            order: Order::Hash { table, init },
+            entries,
+            ..
+        }) => Some((
+            HashTable {
+                table: *table,
+                init: *init,
+            },
+            entries.len(),
+        )),
+        Some(HostObj::Set {
+            order: Order::Hash { table, init },
+            items,
+            ..
+        }) => Some((
+            HashTable {
+                table: *table,
+                init: *init,
+            },
+            items.len(),
+        )),
+        _ => None,
+    })
+}
+
+/// Write back a table [`hash_table`] read and the caller grew.
+fn store_hash_table(v: &Value, t: HashTable) {
+    let Value::Obj(id) = v else {
+        return;
+    };
+    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+        Some(HostObj::Map { order, .. } | HostObj::Set { order, .. }) => {
+            if let Order::Hash { table, init } = order {
+                *table = t.table;
+                *init = t.init;
+            }
+        }
+        _ => {}
+    })
+}
+
+/// Replay `putVal`'s growth for the keys that took a container from `before`
+/// entries to its current size.
+///
+/// A `put` appends a new key, so the keys this replays are the last
+/// `after - before` in storage order, each inserted after every key before it.
+fn hash_grow_put(v: &Value, before: usize) {
+    let Some((mut t, after)) = hash_table(v) else {
+        return;
+    };
+    if after <= before {
+        return;
+    }
+    // Only a table below `MIN_TREEIFY_CAPACITY` reads its bins, and it holds
+    // at most 48 keys, so the copy is small exactly when it is taken.
+    let keys = match t.table < HashTable::MIN_TREEIFY {
+        true => hash_keys(v),
+        false => Vec::new(),
+    };
+    for size in before + 1..=after {
+        t.put_new(size, |table| {
+            bin_mates(&keys[..size - 1], &keys[size - 1], table)
+        });
+    }
+    store_hash_table(v, t);
+}
+
+/// Replay the treeify check of a `computeIfAbsent`/`compute`/`merge` that
+/// added `key` (see [`HashTable::compute_inserted`]).
+fn hash_grow_compute(v: &Value, key: &Value) {
+    let Some((mut t, _)) = hash_table(v) else {
+        return;
+    };
+    if t.table >= HashTable::MIN_TREEIFY {
+        return;
+    }
+    let keys = hash_keys(v);
+    let others: Vec<Value> = keys.into_iter().filter(|k| !value_eq(k, key)).collect();
+    t.compute_inserted(bin_mates(&others, key, t.table));
+    store_hash_table(v, t);
+}
+
+/// How many of `keys` share `key`'s bin in a table of length `table`.
+fn bin_mates(keys: &[Value], key: &Value, table: u32) -> usize {
+    let bin = hash_bucket(key, table as usize);
+    keys.iter()
+        .filter(|k| hash_bucket(k, table as usize) == bin)
+        .count()
+}
+
+/// A `HashMap`'s keys or a `HashSet`'s elements, in storage order.
+fn hash_keys(v: &Value) -> Vec<Value> {
+    let Value::Obj(id) = v else {
+        return Vec::new();
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Map { entries, .. }) => entries.iter().map(|(k, _)| k.clone()).collect(),
+        Some(HostObj::Set { items, .. }) => items.clone(),
+        _ => Vec::new(),
+    })
 }
 
 /// Which bin `key` lands in for a table of `cap` — Java's
@@ -3963,28 +4216,6 @@ fn file_key_hash(vm: &mut VM, key: &Value) {
     }
 }
 
-/// True when `v` is a `HashMap`/`HashSet` — a container whose order
-/// [`hash_order`] decides.
-fn is_hash_ordered(v: &Value) -> bool {
-    let Value::Obj(id) = v else {
-        return false;
-    };
-    HEAP.with(|h| {
-        matches!(
-            h.borrow().get(*id as usize),
-            Some(
-                HostObj::Map {
-                    order: Order::Hash,
-                    ..
-                } | HostObj::Set {
-                    order: Order::Hash,
-                    ..
-                }
-            )
-        )
-    })
-}
-
 /// File the keys an insertion method is about to add to a hash container (see
 /// [`file_key_hash`]): the first argument of the single-key methods, and every
 /// element or key of the source of `addAll`/`putAll`.
@@ -4033,7 +4264,7 @@ fn file_inserted_keys(vm: &mut VM, method: &str, args: &[Value]) {
 /// Only a hash map has bins; an insertion-ordered or sorted map derives nothing
 /// from the vector's order and is left alone.
 fn hash_bucket_head_insert(recv: &Value, key: &Value) {
-    if map_order(recv) != Order::Hash {
+    if !matches!(map_order(recv), Order::Hash { .. }) {
         return;
     }
     let Some(entries) = map_entries(recv) else {
@@ -4042,7 +4273,13 @@ fn hash_bucket_head_insert(recv: &Value, key: &Value) {
     let Some(at) = entries.iter().rposition(|(k, _)| value_eq(k, key)) else {
         return;
     };
-    let cap = hash_capacity(entries.len());
+    // The bin is the one the key went into, in the table it went into — not
+    // one sized after the fact, which a `computeIfAbsent` that left the size
+    // past the threshold has not grown yet.
+    let cap = match hash_table(recv) {
+        Some((HashTable { table, .. }, _)) if table > 0 => table as usize,
+        _ => hash_capacity(entries.len()),
+    };
     let bin = hash_bucket(&entries[at].0, cap);
     let Some(first) = entries.iter().position(|(k, _)| hash_bucket(k, cap) == bin) else {
         return;
@@ -4080,7 +4317,7 @@ fn write_map_entries(recv: &Value, entries: Vec<(Value, Value)>) {
 fn present_order(items: &[Value], order: Order) -> Vec<usize> {
     match order {
         Order::Insertion => (0..items.len()).collect(),
-        Order::Hash => hash_order(items),
+        Order::Hash { table, .. } => hash_order(items, table),
         Order::Sorted { by_cmp, desc } => {
             let mut idx: Vec<usize> = (0..items.len()).collect();
             if !by_cmp {
@@ -4455,7 +4692,7 @@ fn hash_consistent(vm: &VM, class: &str) -> bool {
 /// `Order::Sorted` is a `TreeMap`/`TreeSet`, which locates by `compareTo` rather
 /// than by `equals` — a different question, and one javars does not answer here.
 fn is_hashed(order: Order) -> bool {
-    matches!(order, Order::Hash | Order::Insertion)
+    matches!(order, Order::Hash { .. } | Order::Insertion)
 }
 
 /// Resolve the comparisons a user `equals()` decides for one collection call.
@@ -4636,6 +4873,23 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         SORT_CMP.with(|s| s.borrow_mut().insert(id, seed.clone()));
         return Ok(Value::Obj(id));
     }
+    // A negative initial capacity is refused by every constructor that takes
+    // one, in its class's own words; `ArrayDeque` alone accepts it.
+    if let Value::Int(n @ ..0) = seed {
+        let what = match kind {
+            "ArrayList" | "List" => Some("Illegal Capacity"),
+            "HashMap" | "Map" | "HashSet" | "Set" | "LinkedHashMap" | "LinkedHashSet" => {
+                Some("Illegal initial capacity")
+            }
+            _ => None,
+        };
+        if let Some(what) = what {
+            return Err(Fault::java(
+                "IllegalArgumentException",
+                format!("{what}: {n}"),
+            ));
+        }
+    }
     let obj = match kind {
         // `ArrayDeque`/`Deque`/`Queue` join `LinkedList` on the mutable-list
         // shape. The `Deque` methods work on the same `Vec` (head at index 0),
@@ -4653,7 +4907,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         "HashMap" | "Map" => HostObj::Map {
             fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
-            order: Order::Hash,
+            order: Order::HASH,
             index: KeyIndex::default(),
         },
         "LinkedHashMap" => HostObj::Map {
@@ -4673,7 +4927,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         },
         "HashSet" | "Set" => HostObj::Set {
             items: distinct(vm, &sequence_items(seed).unwrap_or_default()),
-            order: Order::Hash,
+            order: Order::HASH,
             fixed: Fixity::Mutable,
             view: SetView::Own,
             index: KeyIndex::default(),
@@ -4701,16 +4955,40 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             )))
         }
     };
+    // The table a hash container starts with. `new HashMap<>(n)` and
+    // `new HashSet<>(n)` size the first allocation to `tableSizeFor(n)`;
+    // `new HashMap<>(m)` is a `putAll` into an empty map; `new HashSet<>(c)` is
+    // `HashMap.newHashMap(max(c.size(), 12))` followed by an `add` per element.
+    let mut table = None;
+    if matches!(kind, "HashSet" | "Set" | "HashMap" | "Map") {
+        if let Value::Int(n) = seed {
+            table = Some(HashTable::with_capacity(*n as u64));
+        }
+    }
     if matches!(kind, "HashSet" | "Set") {
-        for v in sequence_items(seed).unwrap_or_default() {
-            file_key_hash(vm, &v);
+        if let Some(seq) = sequence_items(seed) {
+            let n = seq.len().max(12) as u64;
+            table = Some(HashTable::with_capacity((n * 4).div_ceil(3)));
+            for v in &seq {
+                file_key_hash(vm, v);
+            }
         }
     } else if matches!(kind, "HashMap" | "Map") {
-        for (k, _) in map_entries(seed).unwrap_or_default() {
-            file_key_hash(vm, &k);
+        if let Some(entries) = map_entries(seed) {
+            let mut t = HashTable { table: 0, init: 0 };
+            t.presize(entries.len());
+            table = Some(t);
+            for (k, _) in &entries {
+                file_key_hash(vm, k);
+            }
         }
     }
     let id = heap_alloc(obj);
+    if let Some(t) = table {
+        let v = Value::Obj(id);
+        store_hash_table(&v, t);
+        hash_grow_put(&v, 0);
+    }
     // A copy of user objects that order themselves is ranked by their
     // `compareTo` from the start.
     if matches!(kind, "TreeMap" | "TreeSet") {
@@ -5693,7 +5971,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::PQueue { .. } => "PriorityQueue".to_string(),
                     HostObj::Map { order, fixed, .. } => match (fixed, order) {
                         (Fixity::Immutable, _) => "Map$immutable".to_string(),
-                        (_, Order::Hash) => "HashMap".to_string(),
+                        (_, Order::Hash { .. }) => "HashMap".to_string(),
                         (_, Order::Insertion) => "LinkedHashMap".to_string(),
                         (_, Order::Sorted { .. }) => "TreeMap".to_string(),
                     },
@@ -5714,7 +5992,9 @@ fn value_class(v: &Value) -> Option<String> {
                         ..
                     } => format!("Set$entries${}", of.tag()),
                     HostObj::Set { order, fixed, .. } => match (fixed, order) {
-                        (Fixity::Mutable | Fixity::FixedSize, Order::Hash) => "HashSet".to_string(),
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Hash { .. }) => {
+                            "HashSet".to_string()
+                        }
                         (Fixity::Mutable | Fixity::FixedSize, Order::Insertion) => {
                             "LinkedHashSet".to_string()
                         }
@@ -6017,14 +6297,62 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     )
     .then(|| map_view_snapshot(recv))
     .flatten();
-    if is_hash_ordered(recv) {
+    // A hash container's table grows on the schedule of the JDK method that
+    // inserted (see [`HashTable`]). `merge`/`compute`/`computeIfAbsent` insert
+    // through `put`, so the receiver is marked while one runs and that inner
+    // `put` leaves the table to the outer call's own schedule.
+    let computing = matches!(method, "merge" | "compute" | "computeIfAbsent");
+    let grow = hash_table(recv).filter(|_| !in_compute(recv));
+    if let Some((mut t, size)) = grow {
         file_inserted_keys(vm, method, args);
+        if computing {
+            t.compute_pre(size);
+        } else if method == "putAll" {
+            t.presize(args.first().and_then(map_entries).map_or(0, |e| e.len()));
+        }
+        store_hash_table(recv, t);
+    }
+    let marked = computing && grow.is_some();
+    if marked {
+        if let Value::Obj(id) = recv {
+            COMPUTING.with(|c| c.borrow_mut().push(*id));
+        }
     }
     let out = coll_method_ranked(vm, recv, method, args);
+    if marked {
+        COMPUTING.with(|c| c.borrow_mut().pop());
+        if hash_table(recv).is_some_and(|(_, now)| now > grow.map_or(0, |(_, s)| s)) {
+            hash_grow_compute(recv, &args[0]);
+        }
+    } else if let Some((_, size)) = grow {
+        hash_grow_put(recv, size);
+    }
     if let Some((map, before)) = through {
         write_through(vm, map, recv, before);
     }
     out
+}
+
+/// Insert a new `key` the way `computeIfAbsent` does once its table check has
+/// run: through `put`, with the table left to the caller, then moved to the
+/// head of its hash bin.
+fn put_as_compute(vm: &mut VM, map: &Value, key: Value, value: Value) {
+    let Value::Obj(id) = map else {
+        return;
+    };
+    COMPUTING.with(|c| c.borrow_mut().push(*id));
+    coll_method(vm, map, "put", &[key.clone(), value]);
+    COMPUTING.with(|c| c.borrow_mut().pop());
+    hash_bucket_head_insert(map, &key);
+    hash_grow_compute(map, &key);
+}
+
+/// True while a `merge`/`compute`/`computeIfAbsent` on `recv` is running.
+fn in_compute(recv: &Value) -> bool {
+    let Value::Obj(id) = recv else {
+        return false;
+    };
+    COMPUTING.with(|c| c.borrow().contains(id))
 }
 
 /// The map a `keySet()`/`entrySet()`/`values()` result was taken from, and the
@@ -8014,13 +8342,15 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
             for v in &items {
                 file_key_hash(vm, v);
             }
-            Value::Obj(heap_alloc(HostObj::Set {
+            let set = Value::Obj(heap_alloc(HostObj::Set {
                 items: distinct(vm, &items),
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Mutable,
                 view: SetView::Own,
                 index: KeyIndex::default(),
-            }))
+            }));
+            hash_grow_put(&set, 0);
+            set
         }
         "counting" => Value::Int(items.len() as i64),
         "joining" => {
@@ -8105,12 +8435,15 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
                         "element cannot be mapped to a null key".to_string(),
                     ));
                 }
+                if let Some((mut t, size)) = hash_table(&map) {
+                    t.compute_pre(size);
+                    store_hash_table(&map, t);
+                }
                 match coll_method(vm, &map, "get", std::slice::from_ref(&key)) {
                     Value::Int(at) => groups[at as usize].1.push(v),
                     _ => {
                         let at = Value::Int(groups.len() as i64);
-                        coll_method(vm, &map, "put", &[key.clone(), at]);
-                        hash_bucket_head_insert(&map, &key);
+                        put_as_compute(vm, &map, key.clone(), at);
                         groups.push((key, vec![v]));
                     }
                 }
@@ -10738,7 +11071,7 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Set {
                 items: unique,
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Immutable,
                 view: SetView::Own,
                 index: KeyIndex::default(),
@@ -10766,7 +11099,7 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Set {
                 items: distinct(vm, &items),
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Immutable,
                 view: SetView::Own,
                 index: KeyIndex::default(),
@@ -10784,7 +11117,7 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Map {
                 entries,
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             })))
@@ -11101,7 +11434,7 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Map {
                 entries,
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             })))
@@ -11135,7 +11468,7 @@ fn collection_static(
             }
             Ok(Value::Obj(heap_alloc(HostObj::Map {
                 entries,
-                order: Order::Hash,
+                order: Order::HASH,
                 fixed: Fixity::Immutable,
                 index: KeyIndex::default(),
             })))
