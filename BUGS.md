@@ -336,7 +336,14 @@ at the bottom, and are summarized in the section right after this one.
   `sorted` are *stateful barriers*: neither can answer for an element without
   having seen every element before it, so the pipeline is evaluated in segments
   split at them, which is why a `peek` before a `sorted` does run for every
-  element. The stream's *shape* is tracked, because it decides what the
+  element. `count()` follows JDK 9+: when the source knows its size (a
+  collection, an array, `Stream.of`, a range, `String.chars()`) and no stage
+  between it and `count()` can drop or add elements (`filter`, `flatMap`,
+  `distinct`, `takeWhile`, `dropWhile`), the size is answered without running
+  the pipeline, so a `peek` or `map` there never fires; `skip`/`limit` adjust
+  that size. `lines()`, `splitAsStream`, `Matcher.results()`, the
+  three-argument `iterate`, `StringBuilder.codePoints()` and a non-Latin-1
+  `String.codePoints()` report no size and are walked. The stream's *shape* is tracked, because it decides what the
   terminals answer: `IntStream.max()` is an `OptionalInt` and
   `DoubleStream.max()` an `OptionalDouble` where `Stream.max(cmp)` is a plain
   `Optional`. `Arrays.stream(a)` reads its shape off the elements, the element

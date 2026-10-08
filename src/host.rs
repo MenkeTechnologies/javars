@@ -739,6 +739,10 @@ enum HostObj {
 #[derive(Clone)]
 enum Source {
     Items(Vec<Value>),
+    /// A finite source whose JDK spliterator does not report `SIZED`
+    /// (`String.lines()`, `Pattern.splitAsStream`, the three-argument
+    /// `iterate`, …): `count()` has to run the pipeline to learn its length.
+    Unsized(Vec<Value>),
     Iterate {
         seed: Value,
         f: Value,
@@ -751,7 +755,7 @@ enum Source {
 impl Source {
     fn cursor(self) -> SourceCursor {
         match self {
-            Source::Items(v) => SourceCursor::Items(v.into_iter()),
+            Source::Items(v) | Source::Unsized(v) => SourceCursor::Items(v.into_iter()),
             Source::Iterate { seed, f } => SourceCursor::Iterate {
                 prev: None,
                 seed: Some(seed),
@@ -5461,12 +5465,16 @@ fn builder_method(
             Some(HostObj::Builder { s, len, .. }) => Some(s.chars().take(*len).collect::<Vec<_>>()),
             _ => None,
         })?;
-        return Some(Ok(stream_of(
-            text.into_iter()
-                .map(|c| Value::Int(i64::from(c as u32)))
-                .collect(),
-            StreamKind::Int,
-        )));
+        let items = text
+            .into_iter()
+            .map(|c| Value::Int(i64::from(c as u32)))
+            .collect();
+        // `AbstractStringBuilder.codePoints()` reports no size; `chars()` does.
+        return Some(Ok(if method == "codePoints" {
+            unsized_stream_of(items, StreamKind::Int)
+        } else {
+            stream_of(items, StreamKind::Int)
+        }));
     }
     Some(HEAP.with(|h| {
         let mut heap = h.borrow_mut();
@@ -8120,8 +8128,18 @@ fn as_stream(v: &Value) -> Option<(Source, Vec<Stage>, StreamKind)> {
     })
 }
 
-/// Allocate a stream over `source`.
+/// Allocate a stream over `source`, whose size is known up front (`SIZED`).
 fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
+    stream_over(source, kind, true)
+}
+
+/// Allocate a stream over `source` as a spliterator that does not report its
+/// size, so `count()` runs the pipeline; see [`Source::Unsized`].
+fn unsized_stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
+    stream_over(source, kind, false)
+}
+
+fn stream_over(source: Vec<Value>, kind: StreamKind, sized: bool) -> Value {
     // A `DoubleStream` holds doubles whatever its source spelled:
     // `DoubleStream.of(4, 3)` is `4.0, 3.0`.
     let source = if kind == StreamKind::Double {
@@ -8133,10 +8151,45 @@ fn stream_of(source: Vec<Value>, kind: StreamKind) -> Value {
         source
     };
     Value::Obj(heap_alloc(HostObj::Stream {
-        source: Source::Items(source),
+        source: if sized {
+            Source::Items(source)
+        } else {
+            Source::Unsized(source)
+        },
         stages: Vec::new(),
         kind,
     }))
+}
+
+/// The element count a stream knows without running its pipeline, as the
+/// JDK's `count()` reads it: the source is `SIZED` and every stage keeps it so.
+/// `map`, `peek`, `sorted` and the shape changes keep the size; `skip` and
+/// `limit` adjust it (JDK 21 slices a `SIZED` stream exactly); `filter`,
+/// `flatMap`, `distinct`, `takeWhile` and `dropWhile` lose it. When this
+/// answers, `count()` runs no stage at all, so a `peek` before it never fires.
+fn known_size(source: &Source, stages: &[Stage]) -> Option<i64> {
+    let mut n = match source {
+        Source::Items(v) => v.len() as i64,
+        Source::Concat(parts) => {
+            let (a, b) = &**parts;
+            let size = |s: &Value| as_stream(s).and_then(|(src, st, _)| known_size(&src, &st));
+            size(a)?.checked_add(size(b)?)?
+        }
+        Source::Unsized(_) | Source::Iterate { .. } | Source::Generate(_) => return None,
+    };
+    for stage in stages {
+        n = match stage {
+            Stage::Map(_) | Stage::Peek(_) | Stage::Sorted(_) | Stage::Widen => n,
+            Stage::Limit(max) => n.min(*max),
+            Stage::Skip(k) => (n - k).max(0),
+            Stage::Filter(_)
+            | Stage::FlatMap(_)
+            | Stage::TakeWhile(_)
+            | Stage::DropWhile(_)
+            | Stage::Distinct => return None,
+        };
+    }
+    Some(n)
 }
 
 /// Allocate the stream `recv` becomes with `stage` appended.
@@ -8450,7 +8503,9 @@ fn stream_method(
             let items = all(vm);
             collection_to_array(vm, items, Some(&args[0]))
         }
-        ("count", 0) => Ok(Value::Int(all(vm).len() as i64)),
+        ("count", 0) => Ok(Value::Int(
+            known_size(&source, &stages).unwrap_or_else(|| all(vm).len() as i64),
+        )),
         ("forEach" | "forEachOrdered", 1) => {
             let f = args[0].clone();
             stream_drive(vm, source, &stages, &mut |vm, v| {
@@ -10740,10 +10795,18 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // javars stores a `String` as Unicode scalars, the same simplification
         // `length` and `charAt` already make, so both read the same values here
         // and `"é".chars().sum()` is 233 on either side.
-        ("chars" | "codePoints", 0) => Ok(stream_of(
-            s.chars().map(|c| Value::Int(i64::from(c as u32))).collect(),
-            StreamKind::Int,
-        )),
+        // `String.codePoints()` is `SIZED` only for a Latin-1 string, whose
+        // code points are its chars; a UTF-16 one is walked to be counted.
+        ("chars" | "codePoints", 0) => {
+            let items = s.chars().map(|c| Value::Int(i64::from(c as u32))).collect();
+            Ok(
+                if method == "codePoints" && s.chars().any(|c| c as u32 > 0xFF) {
+                    unsized_stream_of(items, StreamKind::Int)
+                } else {
+                    stream_of(items, StreamKind::Int)
+                },
+            )
+        }
         // `lines()` splits on *terminators*, not separators: a trailing newline
         // ends the last line rather than starting an empty one, so `"a\n"` is
         // one line and `""` is none. All three of `\n`, `\r\n` and a lone `\r`
@@ -10798,7 +10861,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             let n = char::decode_utf16(units[b as usize..e as usize].iter().copied()).count();
             Ok(Value::Int(n as i64))
         }
-        ("lines", 0) => Ok(stream_of(
+        ("lines", 0) => Ok(unsized_stream_of(
             java_lines(s).into_iter().map(Value::str).collect(),
             StreamKind::Ref,
         )),
@@ -11298,7 +11361,7 @@ fn io_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value,
         Ok(Out::Float(f)) => Ok(Value::float(f)),
         Ok(Out::Bool(b)) => Ok(Value::bool(b)),
         Ok(Out::Null | Out::Unit) => Ok(Value::Undef),
-        Ok(Out::Lines(ls)) => Ok(stream_of(
+        Ok(Out::Lines(ls)) => Ok(unsized_stream_of(
             ls.into_iter().map(Value::str).collect(),
             StreamKind::Ref,
         )),
@@ -11702,7 +11765,7 @@ fn collection_static(
                 items.push(cur.clone());
                 cur = invoke_closure(vm, &args[2], &[cur]);
             }
-            Ok(stream_of(
+            Ok(unsized_stream_of(
                 items,
                 if class == "Stream" {
                     StreamKind::Ref
@@ -13815,7 +13878,7 @@ fn pattern_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<V
         ("splitAsStream", [t]) => regex_compiled(&source, MatchMode::Search).and_then(|c| {
             let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
             let parts = pat.split(&t.as_str_cow(), 0).map_err(engine_fault)?;
-            Ok(stream_of(
+            Ok(unsized_stream_of(
                 parts.into_iter().map(Value::str).collect(),
                 StreamKind::Ref,
             ))
@@ -13900,7 +13963,7 @@ fn matcher_method(
             .into_iter()
             .map(|s| Value::Obj(heap_alloc(HostObj::RegexMatcher(Box::new(s)))))
             .collect();
-        return Some(Ok(stream_of(items, StreamKind::Ref)));
+        return Some(Ok(unsized_stream_of(items, StreamKind::Ref)));
     }
     // `pattern()` allocates a `Pattern`, which cannot happen under the
     // matcher's borrow.
