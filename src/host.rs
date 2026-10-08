@@ -11435,8 +11435,38 @@ fn collection_static(
         // run time, so the shape is read off the elements — which is exact for
         // every array a program can build, an `int[]` holding `Value::Int` and
         // a `double[]` holding `Value::Float`.
-        ("Arrays", "stream") if args.len() == 1 => {
-            let items = array_items(&args[0]).unwrap_or_default();
+        //
+        // `Arrays.stream(a, from, to)` streams a slice, bounds-checked first by
+        // `Spliterators.checkFromToBounds` with its own messages.
+        ("Arrays", "stream") if args.len() == 1 || args.len() == 3 => {
+            let mut items = array_items(&args[0])
+                .ok_or_else(|| Fault::java("NullPointerException", String::new()));
+            if let (Ok(all), [_, from, to]) = (&mut items, args) {
+                let (from, to) = (from.jint(), to.jint());
+                let out_of_range = |i: i64| {
+                    Fault::java(
+                        "ArrayIndexOutOfBoundsException",
+                        format!("Array index out of range: {i}"),
+                    )
+                };
+                if from > to {
+                    return Some(Err(Fault::java(
+                        "ArrayIndexOutOfBoundsException",
+                        format!("origin({from}) > fence({to})"),
+                    )));
+                }
+                if from < 0 {
+                    return Some(Err(out_of_range(from)));
+                }
+                if to > all.len() as i64 {
+                    return Some(Err(out_of_range(to)));
+                }
+                *all = all[from as usize..to as usize].to_vec();
+            }
+            let items = match items {
+                Ok(items) => items,
+                Err(f) => return Some(Err(f)),
+            };
             let kind = if items.iter().any(|v| matches!(v, Value::Float(_))) {
                 StreamKind::Double
             } else if !items.is_empty() && items.iter().all(|v| matches!(v, Value::Int(_))) {
@@ -11555,6 +11585,36 @@ fn collection_static(
         // `Objects.equals(a, b)` — `a == b || (a != null && a.equals(b))`. It is
         // here rather than in the VM-less `static_method` because the `a.equals`
         // half runs a user body, which needs the VM.
+        // `Objects.compare(a, b, c)`: `a == b ? 0 : c.compare(a, b)`. The
+        // identity test comes first, so two `null`s are equal without the
+        // comparator ever seeing them.
+        ("Objects", "compare") if args.len() == 3 => {
+            let same = match (&args[0], &args[1]) {
+                (Value::Undef, Value::Undef) => true,
+                (Value::Obj(a), Value::Obj(b)) => a == b,
+                _ => false,
+            };
+            if same {
+                return Some(Ok(Value::Int(0)));
+            }
+            Ok(invoke_closure(vm, &args[2], &args[..2]))
+        }
+        // `Arrays.setAll(a, f)`: `a[i] = f.apply(i)` for every index, in order.
+        ("Arrays", "setAll") if args.len() == 2 => {
+            let Some(len) = array_items(&args[0]).map(|a| a.len()) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            for i in 0..len {
+                let v = invoke_closure(vm, &args[1], &[Value::Int(i as i64)]);
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                if let Err(f) = array_mutate(&args[0], |a| a[i] = v) {
+                    return Some(Err(f));
+                }
+            }
+            Ok(Value::Undef)
+        }
         ("Objects", "equals") if args.len() == 2 => {
             Ok(Value::bool(objects_equals(vm, &args[0], &args[1])))
         }
@@ -12922,6 +12982,38 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Arrays", "sort", 1) => {
             array_mutate(&args[0], |a| a.sort_by(natural_cmp))?;
             Ok(Value::Undef)
+        }
+        // `Objects.checkIndex`/`checkFromToIndex`/`checkFromIndexSize`: answer
+        // the index, or `Preconditions.outOfBounds`'s message for the form.
+        ("Objects", "checkIndex", 2) => {
+            let (i, n) = (args[0].jint(), args[1].jint());
+            if i < 0 || i >= n {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Index {i} out of bounds for length {n}"),
+                ));
+            }
+            Ok(Value::Int(i))
+        }
+        ("Objects", "checkFromToIndex", 3) => {
+            let (from, to, n) = (args[0].jint(), args[1].jint(), args[2].jint());
+            if from < 0 || from > to || to > n {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Range [{from}, {to}) out of bounds for length {n}"),
+                ));
+            }
+            Ok(Value::Int(from))
+        }
+        ("Objects", "checkFromIndexSize", 3) => {
+            let (from, size, n) = (args[0].jint(), args[1].jint(), args[2].jint());
+            if (n | from | size) < 0 || size > n - from {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Range [{from}, {from} + {size}) out of bounds for length {n}"),
+                ));
+            }
+            Ok(Value::Int(from))
         }
         ("Arrays", "fill", 2) => {
             let v = args[1].clone();

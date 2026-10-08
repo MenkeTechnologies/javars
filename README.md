@@ -604,10 +604,11 @@ each answering at its declared width) and constant statics,
 `Boolean.parseBoolean`, the `Character` predicates, the `java.util.Objects`
 statics (`hashCode`/`hash`/`toString`/`isNull`/`nonNull`/`equals`/
 `requireNonNull` (with a message or a message `Supplier`)/`requireNonNullElse`/
-`requireNonNullElseGet`, each answering for a `null` where the
-instance method throws), `String.valueOf`/`join`/`format`, `String.chars`/
+`requireNonNullElseGet`, `compare`, and the `checkIndex`/`checkFromToIndex`/
+`checkFromIndexSize` bounds checks with the JDK's messages, each answering for a
+`null` where the instance method throws), `String.valueOf`/`join`/`format`, `String.chars`/
 `codePoints`/`lines`, `System.out.printf`, and the `Arrays`
-statics including `sort`/`fill`/`copyOf`/`deepToString`), **reference arrays** including **multi-dimensional**
+statics including `sort`/`fill`/`setAll`/`copyOf`/`deepToString`), **reference arrays** including **multi-dimensional**
 (default-valued `new T[n]` / `new T[m][n]`, `{…}` and nested `{{…},{…}}` literals,
 get/set indexing, `.length` at each level, and reference/aliasing semantics on a
 host-owned object heap keyed by `Value::Obj`), a **class/object model** (instance

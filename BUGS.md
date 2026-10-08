@@ -340,7 +340,9 @@ at the bottom, and are summarized in the section right after this one.
   terminals answer: `IntStream.max()` is an `OptionalInt` and
   `DoubleStream.max()` an `OptionalDouble` where `Stream.max(cmp)` is a plain
   `Optional`. `Arrays.stream(a)` reads its shape off the elements, the element
-  type being erased at run time — exact for every array a program can build.
+  type being erased at run time — exact for every array a program can build;
+  `Arrays.stream(a, from, to)` streams the slice after
+  `Spliterators.checkFromToBounds`' own checks and messages.
 
   A stream is single-use in Java; javars does not enforce that, and an
   intermediate operation appends to a *copy* of the pipeline, so a program that
