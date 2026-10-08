@@ -2297,7 +2297,7 @@ System.out.println(eq.test("a", "a"));   // true</code></pre>
         </article>
         <article class="doc-entry" id="doc-functional-interfaces-12">
           <h3><a class="doc-anchor" href="#doc-functional-interfaces-12">#</a> <code>Comparator</code></h3>
-          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); }</code></pre>
+          <pre><code class="lang-java">interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); static Comparator comparing(Function key, Comparator keyCmp); static Comparator nullsFirst(Comparator c); static Comparator nullsLast(Comparator c); }</code></pre>
           <p>An ordering, and the type <code>List.sort</code> and the two-argument <code>Collections.sort</code> accept. The <code>int</code> return is kept rather than erased, because the sort reads its sign. The three statics order elements by their own <code>compareTo</code>, which reaches a user <code>Comparable</code>'s body through the receiver's runtime class. A sort naming no comparator uses <code>naturalOrder()</code>.</p>
           <pre><code class="lang-java">xs.sort(Comparator.comparing(P::name).reversed());</code></pre>
         </article>

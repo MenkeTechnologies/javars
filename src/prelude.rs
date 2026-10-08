@@ -249,6 +249,7 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
         // which javars does not track, so they share one body.
         "default Comparator reversed() { return (a, b) -> this.compare(b, a); } \
          default Comparator thenComparing(Object other) { Comparator c = Comparator.asComparator(other); return (a, b) -> { int r = this.compare(a, b); if (r != 0) { return r; } return c.compare(a, b); }; } \
+         default Comparator thenComparing(Function key, Comparator keyCmp) { return this.thenComparing(Comparator.comparing(key, keyCmp)); } \
          default Comparator thenComparingInt(Function key) { return this.thenComparing(key); } \
          default Comparator thenComparingLong(Function key) { return this.thenComparing(key); } \
          default Comparator thenComparingDouble(Function key) { return this.thenComparing(key); } \
@@ -256,6 +257,9 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
          static Comparator naturalOrder() { return (a, b) -> a.compareTo(b); } \
          static Comparator reverseOrder() { return (a, b) -> b.compareTo(a); } \
          static Comparator comparing(Function key) { return (a, b) -> key.apply(a).compareTo(key.apply(b)); } \
+         static Comparator comparing(Function key, Comparator keyCmp) { return (a, b) -> keyCmp.compare(key.apply(a), key.apply(b)); } \
+         static Comparator nullsFirst(Comparator c) { return (a, b) -> { if (a == null) { return b == null ? 0 : -1; } if (b == null) { return 1; } return c == null ? 0 : c.compare(a, b); }; } \
+         static Comparator nullsLast(Comparator c) { return (a, b) -> { if (a == null) { return b == null ? 0 : 1; } if (b == null) { return -1; } return c == null ? 0 : c.compare(a, b); }; } \
          static Comparator comparingInt(Function key) { return Comparator.comparing(key); } \
          static Comparator comparingLong(Function key) { return Comparator.comparing(key); } \
          static Comparator comparingDouble(Function key) { return Comparator.comparing(key); } \

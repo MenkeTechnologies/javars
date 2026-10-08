@@ -2500,7 +2500,7 @@ pub const REFERENCE: &[Entry] = &[
     (
         "Comparator",
         "Functional Interfaces",
-        "interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); }",
+        "interface Comparator { int compare(Object a, Object b); default Comparator reversed(); default Comparator thenComparing(Comparator other); static Comparator naturalOrder(); static Comparator reverseOrder(); static Comparator comparing(Function key); static Comparator comparing(Function key, Comparator keyCmp); static Comparator nullsFirst(Comparator c); static Comparator nullsLast(Comparator c); }",
         "An ordering, and the type `List.sort` and the two-argument `Collections.sort` accept. The `int` return is kept rather than erased, because the sort reads its sign. The three statics order elements by their own `compareTo`, which reaches a user `Comparable`'s body through the receiver's runtime class. A sort naming no comparator uses `naturalOrder()`.",
         "xs.sort(Comparator.comparing(P::name).reversed());",
     ),

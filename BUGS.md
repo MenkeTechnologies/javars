@@ -277,9 +277,12 @@ at the bottom, and are summarized in the section right after this one.
 - **The enhanced `for` over a user `Iterable`.** A class implementing
   `Iterable<T>` is walked through its own `iterator()` (`hasNext`/`next`), as
   JLS 14.14.2 specifies.
-- **`Comparator`'s combinators.** `naturalOrder`, `reverseOrder`, `comparing`,
-  `comparingInt`/`comparingLong`/`comparingDouble`, `reversed`,
-  `thenComparing`, `thenComparingInt`/`Long`/`Double`. They are written in Java
+- **`Comparator`'s combinators.** `naturalOrder`, `reverseOrder`, `comparing`
+  (with and without a key comparator), `comparingInt`/`comparingLong`/
+  `comparingDouble`, `nullsFirst`/`nullsLast` (a `null` comparator ranking
+  every non-null alike, as the JDK's `NullComparator` does), `reversed`,
+  `thenComparing` (including the key-and-comparator form),
+  `thenComparingInt`/`Long`/`Double`. They are written in Java
   in the prelude, the way the other functional interfaces' defaults are.
   `Collections.reverseOrder()` and `reverseOrder(cmp)` lower to
   `Comparator.reverseOrder()` and `cmp.reversed()`, a `null` argument meaning
