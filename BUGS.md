@@ -868,7 +868,10 @@ at the bottom, and are summarized in the section right after this one.
   Desugared into the nested `try`/`finally` shape Java specifies it as, so
   resources close in reverse declaration order, close before any `catch`/
   `finally` of the outer statement runs, and close on the exceptional path and on
-  a `return` out of the block. `close()` is called on the declared type through
+  a `return` out of the block. A `close()` that throws while the body's exception is
+  already propagating is recorded on it with `addSuppressed` (JLS 14.20.3.1)
+  rather than replacing it; one that throws after a normal completion is the
+  exception the statement completes with. `close()` is called on the declared type through
   ordinary dispatch; javars has no `java.lang.AutoCloseable`, so implementing it
   is optional (an unknown interface name is inert).
 - **`enum` types.** `enum Color { RED, GREEN, BLUE }`, with or without a body of
@@ -1326,13 +1329,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   stores and continues, where the JDK throws `ArrayStoreException:
   java.lang.Integer`. Measured on `openjdk 21.0.12`. The array's element type
   would have to be recorded on the host object and checked on every store.
-- **`Throwable.getSuppressed()`, `addSuppressed`, and `getStackTrace()`, and
-  the frames of `printStackTrace()`.** javars keeps no call-site table (see the
-  uncaught-report entry above), so a stack trace has no frames to print:
-  `printStackTrace()` writes the throwable's `toString()` and a `Caused by: `
-  line per cause to standard error, without the `\tat …` lines between them; the suppressed list has
-  no such obstacle and is simply not built, so try-with-resources suppression is
-  not observable. Cause chaining *is* implemented: `getCause()`, `initCause`
+- **`Throwable.getStackTrace()` and the frames of `printStackTrace()`.** javars
+  keeps no call-site table (see the uncaught-report entry above), so a stack
+  trace has no frames to print: `printStackTrace()` writes the throwable's
+  `toString()`, a `\tSuppressed: ` line per suppressed exception and a
+  `Caused by: ` line per cause to standard error, without the `\tat …` lines
+  between them. Suppression *is* implemented: `addSuppressed` (with the JDK's
+  `Self-suppression not permitted` and `Cannot suppress a null exception.`
+  refusals) and `getSuppressed()`, which try-with-resources fills. Cause chaining *is* implemented: `getCause()`, `initCause`
   (with the JDK's `Can't overwrite cause with …` and `Self-causation not
   permitted` refusals), and the `(String, Throwable)` and `(Throwable)`
   constructors on exactly the modeled throwables that declare them in the JDK —
@@ -2029,9 +2033,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   program — so no deterministic program can print it, and the properties one
   *can* rely on hold here: stable within a run, equal for equal references,
   different for the objects a `HashMap`/`HashSet` has to keep apart.
-- **A throwing `close()` replaces the body's exception rather than being
-  suppressed.** Java records it via `Throwable.addSuppressed`; javars has no
-  suppression list, so the later exception wins.
 - **A lambda's own `toString()` is a marker, not Java's.** Java renders one as
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not

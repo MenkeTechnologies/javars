@@ -2434,15 +2434,30 @@ impl Parser {
         Ok(out)
     }
 
-    /// Desugar try-with-resources into the plain `try` nodes Java itself
-    /// specifies it as: each resource declaration is followed by a
-    /// `try { … } finally { if (r != null) r.close(); }` wrapping everything
-    /// inside it, so resources close in reverse declaration order and close
-    /// before any `catch`/`finally` of the outer statement runs.
+    /// Desugar try-with-resources into the plain `try` nodes JLS 14.20.3.1
+    /// specifies it as, one level per resource, innermost last declared:
     ///
-    /// Java additionally records a close-thrown exception as *suppressed* on the
-    /// body's exception; javars has no `addSuppressed`, so a throwing `close`
-    /// replaces it (documented in BUGS.md).
+    /// ```text
+    /// final R r = init;
+    /// Throwable #primary = null;
+    /// try { <inner> }
+    /// catch (Throwable #t) { #primary = #t; throw #t; }
+    /// finally {
+    ///     if (r != null) {
+    ///         if (#primary != null) {
+    ///             try { r.close(); } catch (Throwable #s) { #primary.addSuppressed(#s); }
+    ///         } else {
+    ///             r.close();
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// So resources close in reverse declaration order, before any
+    /// `catch`/`finally` of the outer statement runs, and an exception a
+    /// `close` throws while another is already propagating is recorded on that
+    /// one rather than replacing it. The synthetic names contain `#`, which no
+    /// identifier javars lexes from source can.
     fn with_resources(
         resources: Vec<Resource>,
         body: Vec<Stmt>,
@@ -2451,47 +2466,107 @@ impl Parser {
     ) -> StmtKind {
         let mut inner = body;
         for r in resources.into_iter().rev() {
-            let close = Stmt::new(
-                r.line,
+            let line = r.line;
+            let primary = format!("#twr_primary#{}", r.name);
+            let thrown = format!("#twr_thrown#{}", r.name);
+            let suppressed = format!("#twr_suppressed#{}", r.name);
+            let var = |n: &str| Expr::Var(n.to_string());
+            let not_null = |n: &str| Expr::Binary {
+                op: BinOp::Ne,
+                lhs: Box::new(var(n)),
+                rhs: Box::new(var("null")),
+            };
+            let close = || {
+                Stmt::new(
+                    line,
+                    StmtKind::Expr(Expr::MethodCall {
+                        recv: Box::new(var(&r.name)),
+                        method: "close".to_string(),
+                        args: Vec::new(),
+                        line,
+                    }),
+                )
+            };
+            let close_suppressing = Stmt::new(
+                line,
+                StmtKind::Try {
+                    body: vec![close()],
+                    catches: vec![CatchArm {
+                        types: vec!["Throwable".to_string()],
+                        name: suppressed.clone(),
+                        body: vec![Stmt::new(
+                            line,
+                            StmtKind::Expr(Expr::MethodCall {
+                                recv: Box::new(var(&primary)),
+                                method: "addSuppressed".to_string(),
+                                args: vec![var(&suppressed)],
+                                line,
+                            }),
+                        )],
+                    }],
+                    finally_body: Vec::new(),
+                },
+            );
+            let finally_close = Stmt::new(
+                line,
                 StmtKind::If {
-                    cond: Expr::Binary {
-                        op: BinOp::Ne,
-                        lhs: Box::new(Expr::Var(r.name.clone())),
-                        rhs: Box::new(Expr::Var("null".to_string())),
-                    },
+                    cond: not_null(&r.name),
                     then: vec![Stmt::new(
-                        r.line,
-                        StmtKind::Expr(Expr::MethodCall {
-                            recv: Box::new(Expr::Var(r.name.clone())),
-                            method: "close".to_string(),
-                            args: Vec::new(),
-                            line: r.line,
-                        }),
+                        line,
+                        StmtKind::If {
+                            cond: not_null(&primary),
+                            then: vec![close_suppressing],
+                            els: vec![close()],
+                        },
                     )],
                     els: Vec::new(),
                 },
             );
+            let record_primary = CatchArm {
+                types: vec!["Throwable".to_string()],
+                name: thrown.clone(),
+                body: vec![
+                    Stmt::new(
+                        line,
+                        StmtKind::Assign {
+                            name: primary.clone(),
+                            op: AssignOp::Assign,
+                            value: var(&thrown),
+                        },
+                    ),
+                    Stmt::new(line, StmtKind::Throw(var(&thrown))),
+                ],
+            };
+            let primary_decl = Stmt::new(
+                line,
+                StmtKind::Local {
+                    ty: "Throwable".to_string(),
+                    name: primary.clone(),
+                    init: Some(var("null")),
+                },
+            );
             let guarded = Stmt::new(
-                r.line,
+                line,
                 StmtKind::Try {
                     body: inner,
-                    catches: Vec::new(),
-                    finally_body: vec![close],
+                    catches: vec![record_primary],
+                    finally_body: vec![finally_close],
                 },
             );
             inner = match r.decl {
                 Some((ty, init)) => vec![
                     Stmt::new(
-                        r.line,
+                        line,
                         StmtKind::Local {
                             ty,
                             name: r.name,
                             init: Some(init),
                         },
                     ),
+                    primary_decl,
                     guarded,
                 ],
-                None => vec![guarded],
+                None => vec![primary_decl, guarded],
             };
         }
         if catches.is_empty() && finally_body.is_empty() {

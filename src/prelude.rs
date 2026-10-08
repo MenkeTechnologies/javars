@@ -380,6 +380,9 @@ fn prelude_source(declared: &[String]) -> String {
             // succeed once on a `(String)` throwable and refuse on one
             // constructed with a cause.
             src.push_str("  Throwable cause;\n  boolean causeSet;\n");
+            // The exceptions `addSuppressed` recorded, in order; `null` until
+            // the first, as the JDK's list is the shared empty one until then.
+            src.push_str("  ArrayList suppressed;\n");
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ detailMessage = m; }}\n"));
             src.push_str(&format!(
@@ -408,6 +411,30 @@ fn prelude_source(declared: &[String]) -> String {
                      cause = c; causeSet = true; return this; }\n",
                 );
             }
+            // `addSuppressed` is always declared, because try-with-resources
+            // lowers to a call of it. Its two refusals, with the JDK's
+            // messages, name prelude throwables, so they are left out when the
+            // program declares its own class under either name.
+            let refusals = if declared
+                .iter()
+                .any(|d| d == "IllegalArgumentException" || d == "NullPointerException")
+            {
+                ""
+            } else {
+                "if (e == this) { throw new IllegalArgumentException(\"Self-suppression not permitted\", e); } \
+                 if (e == null) { throw new NullPointerException(\"Cannot suppress a null exception.\"); } "
+            };
+            src.push_str(&format!(
+                "  void addSuppressed(Throwable e) {{ {refusals}\
+                 if (suppressed == null) {{ suppressed = new ArrayList<>(); }} \
+                 suppressed.add(e); }}\n"
+            ));
+            src.push_str(
+                "  Throwable[] getSuppressed() { int n = suppressed == null ? 0 : suppressed.size(); \
+                 Throwable[] out = new Throwable[n]; \
+                 for (int i = 0; i < n; i++) { out[i] = (Throwable) suppressed.get(i); } \
+                 return out; }\n",
+            );
             src.push_str("  String getMessage() { return detailMessage; }\n");
             // `getLocalizedMessage()` is `Throwable`'s own one-liner
             // (`return getMessage();`), overridable but never overridden here.
@@ -417,7 +444,10 @@ fn prelude_source(declared: &[String]) -> String {
             // keeps no call-site table, so the `\tat …` frame lines between
             // them are absent; standard output is untouched either way.
             src.push_str(
-                "  void printStackTrace() { System.err.println(this); Throwable c = getCause(); \
+                "  void printStackTrace() { System.err.println(this); \
+                 Throwable[] s = getSuppressed(); \
+                 for (int i = 0; i < s.length; i++) { System.err.println(\"\\tSuppressed: \" + s[i]); } \
+                 Throwable c = getCause(); \
                  while (c != null && c != this) { System.err.println(\"Caused by: \" + c); \
                  c = c.getCause(); } }\n",
             );
