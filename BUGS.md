@@ -1455,6 +1455,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   intrinsic disagrees with fdlibm on 7,725 and 6,507 of 200,000 arguments, so a
   port would print a different last digit than the program's own JVM. They stay
   unregistered — a clear error rather than a silently different digit.
+  `StrictMath.sin`/`cos` are supported: `StrictMath` *is* fdlibm, so the same
+  port answers them exactly, and every other `StrictMath` member is read as
+  its `Math` namesake.
   `sqrt`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
   `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
   as are the `Math.PI`/`Math.E` constants — and so are `rint`, `copySign`,

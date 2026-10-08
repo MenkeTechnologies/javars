@@ -12385,6 +12385,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // intrinsic disagrees with fdlibm on 3.9% of arguments — so they stay
         // unregistered: a clear error rather than a silently different last
         // digit.
+        // `StrictMath.sin`/`cos` are fdlibm by specification, unlike the
+        // `Math` pair above.
+        ("StrictMath", "sin", 1) => Ok(Value::float(crate::fdlibm::sin(args[0].jfloat()))),
+        ("StrictMath", "cos", 1) => Ok(Value::float(crate::fdlibm::cos(args[0].jfloat()))),
         ("Math", "tan", 1) => Ok(Value::float(crate::fdlibm::tan(args[0].jfloat()))),
         ("Math", "asin", 1) => Ok(Value::float(crate::fdlibm::asin(args[0].jfloat()))),
         ("Math", "acos", 1) => Ok(Value::float(crate::fdlibm::acos(args[0].jfloat()))),

@@ -17,11 +17,11 @@
 //! of a `double`'s bit pattern, read as signed `int`s. Integer arithmetic on
 //! them wraps, as Java's `int` does.
 //!
-//! `sin` and `cos` are not here: on the JDK's own platforms `Math.sin` and
-//! `Math.cos` are answered by an intrinsic that is not fdlibm (measured on
-//! openjdk 27, aarch64: 7,725 of 200,000 `Math.sin` results differ from
-//! `StrictMath.sin`), so an fdlibm port would answer the last digit
-//! differently from the program's own `Math` calls.
+//! `sin` and `cos` are here only for `StrictMath`: on the JDK's own platforms
+//! `Math.sin` and `Math.cos` are answered by an intrinsic that is not fdlibm
+//! (measured on openjdk 27, aarch64: 7,725 of 200,000 `Math.sin` results
+//! differ from `StrictMath.sin`), so `Math` keeps them unregistered rather than
+//! answer the last digit differently from the reference.
 
 /// `0x7ff0_0000`: the exponent bits of a high word.
 const EXP_BITS: i32 = 0x7ff0_0000;
@@ -97,6 +97,101 @@ pub fn scalb(d: f64, scale_factor: i32) -> f64 {
 #[allow(clippy::eq_op)]
 fn nan_of(x: f64) -> f64 {
     (x - x) / (x - x)
+}
+
+/// `FdLibm.Sin.compute` — `StrictMath.sin`.
+pub fn sin(x: f64) -> f64 {
+    let ix = hi(x) & EXP_SIGNIF_BITS;
+    if ix <= 0x3fe9_21fb {
+        kernel_sin(x, 0.0, 0)
+    } else if ix >= EXP_BITS {
+        #[allow(clippy::eq_op)]
+        let nan = x - x;
+        nan
+    } else {
+        let mut y = [0.0; 2];
+        match rem_pio2(x, &mut y) & 3 {
+            0 => kernel_sin(y[0], y[1], 1),
+            1 => kernel_cos(y[0], y[1]),
+            2 => -kernel_sin(y[0], y[1], 1),
+            _ => -kernel_cos(y[0], y[1]),
+        }
+    }
+}
+
+/// `FdLibm.Cos.compute` — `StrictMath.cos`.
+pub fn cos(x: f64) -> f64 {
+    let ix = hi(x) & EXP_SIGNIF_BITS;
+    if ix <= 0x3fe9_21fb {
+        kernel_cos(x, 0.0)
+    } else if ix >= EXP_BITS {
+        #[allow(clippy::eq_op)]
+        let nan = x - x;
+        nan
+    } else {
+        let mut y = [0.0; 2];
+        match rem_pio2(x, &mut y) & 3 {
+            0 => kernel_cos(y[0], y[1]),
+            1 => -kernel_sin(y[0], y[1], 1),
+            2 => -kernel_cos(y[0], y[1]),
+            _ => kernel_sin(y[0], y[1], 1),
+        }
+    }
+}
+
+/// `FdLibm.Sin.__kernel_sin`: sin on [-pi/4, pi/4], `y` the tail of `x` and
+/// `iy` whether that tail is meaningful.
+fn kernel_sin(x: f64, y: f64, iy: i32) -> f64 {
+    const S1: f64 = -f64::from_bits(0x3fc5_5555_5555_5549); // -0x1.5555555555549p-3
+    const S2: f64 = f64::from_bits(0x3f81_1111_1110_f8a6); // 0x1.111111110f8a6p-7
+    const S3: f64 = -f64::from_bits(0x3f2a_01a0_19c1_61d5); // -0x1.a01a019c161d5p-13
+    const S4: f64 = f64::from_bits(0x3ec7_1de3_57b1_fe7d); // 0x1.71de357b1fe7dp-19
+    const S5: f64 = -f64::from_bits(0x3e5a_e5e6_8a2b_9ceb); // -0x1.ae5e68a2b9cebp-26
+    const S6: f64 = f64::from_bits(0x3de5_d93a_5acf_d57c); // 0x1.5d93a5acfd57cp-33
+    let ix = hi(x) & EXP_SIGNIF_BITS;
+    if ix < 0x3e40_0000 && x as i32 == 0 {
+        // |x| < 2**-27
+        return x;
+    }
+    let z = x * x;
+    let v = z * x;
+    let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
+    if iy == 0 {
+        x + v * (S1 + z * r)
+    } else {
+        x - ((z * (0.5 * y - v * r) - y) - v * S1)
+    }
+}
+
+/// `FdLibm.Cos.__kernel_cos`: cos on [-pi/4, pi/4], `y` the tail of `x`.
+fn kernel_cos(x: f64, y: f64) -> f64 {
+    const C1: f64 = f64::from_bits(0x3fa5_5555_5555_554c); // 0x1.555555555554cp-5
+    const C2: f64 = -f64::from_bits(0x3f56_c16c_16c1_5177); // -0x1.6c16c16c15177p-10
+    const C3: f64 = f64::from_bits(0x3efa_01a0_19cb_1590); // 0x1.a01a019cb159p-16
+    const C4: f64 = -f64::from_bits(0x3e92_7e4f_809c_52ad); // -0x1.27e4f809c52adp-22
+    const C5: f64 = f64::from_bits(0x3e21_ee9e_bdb4_b1c4); // 0x1.1ee9ebdb4b1c4p-29
+    const C6: f64 = -f64::from_bits(0x3da8_fae9_be88_38d4); // -0x1.8fae9be8838d4p-37
+    let ix = hi(x) & EXP_SIGNIF_BITS;
+    if ix < 0x3e40_0000 && x as i32 == 0 {
+        // |x| < 2**-27
+        return 1.0;
+    }
+    let z = x * x;
+    let r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))));
+    if ix < 0x3FD3_3333 {
+        // |x| < 0.3
+        1.0 - (0.5 * z - (z * r - x * y))
+    } else {
+        let qx = if ix > 0x3fe9_0000 {
+            // |x| > 0.78125
+            0.28125
+        } else {
+            hi_lo(ix - 0x0020_0000, 0)
+        };
+        let hz = 0.5 * z - qx;
+        let a = 1.0 - qx;
+        a - (hz - (z * r - x * y))
+    }
 }
 
 /// `FdLibm.Tan.compute` — `StrictMath.tan`.

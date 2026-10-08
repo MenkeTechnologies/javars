@@ -1058,6 +1058,13 @@ pub const REFERENCE: &[Entry] = &[
         "Matcher m = p.matcher(\"bob@site\");\nwhile (m.find()) System.out.println(m.group(2));",
     ),
     (
+        "StrictMath",
+        "Static Library",
+        "StrictMath.sin(double)   |   StrictMath.cos(double)   |   every other `Math` member",
+        "`java.lang.StrictMath`. `sin` and `cos` are the JDK's fdlibm (`java.lang.FdLibm`), bit for bit; every other member is read as the `Math` member of the same name, which javars already answers from fdlibm or an exact IEEE operation, so the two classes agree wherever the JDK's do.",
+        "System.out.println(StrictMath.sin(1.0) + \" \" + StrictMath.cos(2.0));",
+    ),
+    (
         "Math.tan",
         "Static Library",
         "double Math.tan(double a)",

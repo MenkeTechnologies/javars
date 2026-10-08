@@ -8876,6 +8876,7 @@ fn is_static_class(name: &str) -> bool {
     matches!(
         name,
         "Math"
+            | "StrictMath"
             | "Integer"
             | "Long"
             | "Short"
@@ -9081,6 +9082,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
             | "log" | "log10" | "log1p" | "expm1" | "cbrt" | "hypot" | "sinh" | "cosh" | "tanh"
             | "asinh" | "acosh" | "atanh" | "IEEEremainder",
         ) => "double",
+        // `StrictMath`'s own two; every other `StrictMath` member is aliased
+        // to `Math` by the parser (see `strict_math_alias`).
+        ("StrictMath", "sin" | "cos") => "double",
         ("Float", "parseFloat") => "float",
         ("Float", "valueOf") => "Float",
         ("Float", "toString") => "String",
@@ -9506,6 +9510,7 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
             "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "log1p" | "expm1"
             | "cbrt" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh",
         )
+        | ("StrictMath", "sin" | "cos")
         | ("Math", "abs")
         | ("Math", "signum")
         | ("Math", "toRadians")

@@ -3344,6 +3344,9 @@ impl Parser {
                 }
                 self.skip_generics();
                 let member = self.ident()?;
+                if strict_math_alias(&e, &member) {
+                    e = Expr::Var("Math".to_string());
+                }
                 // A package-qualified functional interface or `Collections`
                 // (`java.util.Comparator.naturalOrder()`) needs the prelude
                 // exactly as its simple name does in the bare-identifier arm.
@@ -3440,6 +3443,9 @@ impl Parser {
                     if package_rooted(recv) {
                         e = Expr::Var(name.clone());
                     }
+                }
+                if strict_math_alias(&e, &method) {
+                    e = Expr::Var("Math".to_string());
                 }
                 e = Expr::MethodRef {
                     recv: Box::new(e),
@@ -4174,6 +4180,19 @@ fn class_lit_name(e: &Expr) -> Option<String> {
         Expr::Field { recv, name } => Some(format!("{}.{}", class_lit_name(recv)?, name)),
         _ => None,
     }
+}
+
+/// `StrictMath.m` read as `Math.m`, for every member but `sin` and `cos`.
+///
+/// The JDK's `Math` delegates to `StrictMath` for everything javars models
+/// except where HotSpot has an intrinsic, and the intrinsics javars answers
+/// from agree with `StrictMath` bit for bit (see `host::static_method`). The
+/// two exceptions are `sin` and `cos`, whose `Math` intrinsic is not fdlibm:
+/// those keep their own `StrictMath` receiver and are answered by the fdlibm
+/// port. Everything else — constants, overload typing, the `Exact` family,
+/// method references — then needs no second table.
+fn strict_math_alias(e: &Expr, member: &str) -> bool {
+    matches!(e, Expr::Var(c) if c == "StrictMath") && !matches!(member, "sin" | "cos")
 }
 
 /// Whether `e` is a package qualifier — a field chain rooted at `java` or
