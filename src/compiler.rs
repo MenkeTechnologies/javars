@@ -1447,10 +1447,10 @@ impl Compiler {
             } if method == "values" && args.is_empty() => {
                 self.enum_type_ref(recv).map(|c| format!("{c}[]"))
             }
-            Expr::Call { name, args, line } => {
-                let call = self.implicit_enum_static(name, args, *line)?;
-                self.expr_array_type(&call)
-            }
+            Expr::Call { name, args, line } => match self.implicit_enum_static(name, args, *line) {
+                Some(call) => self.expr_array_type(&call),
+                None => self.expr_java_type(e).filter(|t| t.ends_with("[]")),
+            },
             // A row of a multi-dimensional array: `int[][]` indexed once is an
             // `int[]`, so `g[i][j]` types its element as `int`.
             Expr::Index { array, .. } => {
@@ -1458,7 +1458,11 @@ impl Compiler {
                 let inner = outer.strip_suffix("[]")?;
                 inner.ends_with("[]").then(|| inner.to_string())
             }
-            _ => None,
+            // Any other expression whose static type is an array — a call such
+            // as `Character.toChars(66)` or `s.toCharArray()` — so indexing its
+            // result straight away types the element (`toChars(66)[0]` is the
+            // `char` `B`, not the code point 66).
+            _ => self.expr_java_type(e).filter(|t| t.ends_with("[]")),
         }
     }
 
