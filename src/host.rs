@@ -5484,6 +5484,31 @@ fn builder_method(
             // (Java 11+); `equals` is NOT — it stays reference identity, which
             // is why it is left to `object_method`.
             ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &rendered[0], false))),
+            // `AbstractStringBuilder.codePointAt`/`codePointBefore` check the
+            // index they read — `index - 1` for `codePointBefore` — against
+            // the count, so `codePointBefore(0)` reports index -1.
+            ("codePointAt", 1) | ("codePointBefore", 1) => {
+                let at = args[0].jint() - i64::from(method == "codePointBefore");
+                match usize::try_from(at).ok().and_then(|i| char_at(s, i)) {
+                    Some(c) if (at as usize) < len => Ok(Value::Int(i64::from(c as u32))),
+                    _ => Err(Fault::java(
+                        "StringIndexOutOfBoundsException",
+                        format!("Index {at} out of bounds for length {len}"),
+                    )),
+                }
+            }
+            // Characters are stored as Unicode scalars, so every one in range
+            // is one code point.
+            ("codePointCount", 2) => {
+                let (b, e) = (args[0].jint(), args[1].jint());
+                if b < 0 || e > len as i64 || b > e {
+                    return Err(Fault::java(
+                        "IndexOutOfBoundsException",
+                        format!("Range [{b}, {e}) out of bounds for length {len}"),
+                    ));
+                }
+                Ok(Value::Int(e - b))
+            }
             _ => Err(Fault::internal(format!(
                 "javars: unsupported StringBuilder method `{method}` with {} argument(s)",
                 args.len()
@@ -10342,8 +10367,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             &args[0].as_str_cow(),
             args[1].jint(),
         ))),
-        ("codePointAt", 1) => {
-            let i = args[0].jint();
+        // `codePointBefore` checks `index - 1`, the position it reads.
+        ("codePointAt", 1) | ("codePointBefore", 1) => {
+            let i = args[0].jint() - i64::from(method == "codePointBefore");
             match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
                 Some(c) => Ok(Value::Int(c as i64)),
                 None => Err(Fault::java(

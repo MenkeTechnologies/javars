@@ -9422,6 +9422,9 @@ fn builder_call_java_type(recv_ty: &str, method: &str, argc: usize) -> Option<&'
         | ("indexOf", 2)
         | ("lastIndexOf", 1)
         | ("lastIndexOf", 2)
+        | ("codePointAt", 1)
+        | ("codePointBefore", 1)
+        | ("codePointCount", 2)
         | ("compareTo", 1) => "int",
         ("charAt", 1) => "char",
         ("isEmpty", 0) | ("equals", 1) => "boolean",
