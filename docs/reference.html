@@ -1696,13 +1696,19 @@ System.out.println(s);   // [a, z]</code></pre>
           <pre><code class="lang-java">Iterable&lt;String&gt; it = new ArrayList&lt;&gt;();</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-types-16">
-          <h3><a class="doc-anchor" href="#doc-collection-types-16">#</a> <code>Map</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-types-16">#</a> <code>AbstractMap.SimpleEntry</code></h3>
+          <pre><code class="lang-java">new AbstractMap.SimpleEntry&lt;&gt;(k, v)   |   new AbstractMap.SimpleEntry&lt;&gt;(entry)   |   new AbstractMap.SimpleImmutableEntry&lt;&gt;(…)</code></pre>
+          <p>A <code>Map.Entry</code> that belongs to no map: <code>getKey</code>/<code>getValue</code>, <code>equals</code>/<code>hashCode</code>/<code>toString</code> as every entry has them, and <code>null</code> accepted on either side. <code>SimpleEntry.setValue</code> replaces its own value and answers the old one; <code>SimpleImmutableEntry.setValue</code> is <code>UnsupportedOperationException</code>. The one-argument form copies any entry's key and value.</p>
+          <pre><code class="lang-java">var e = new AbstractMap.SimpleEntry&lt;&gt;("k", 1);\ne.setValue(2);\nSystem.out.println(e);   // k=2</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-17">
+          <h3><a class="doc-anchor" href="#doc-collection-types-17">#</a> <code>Map</code></h3>
           <pre><code class="lang-java">Map&lt;K,V&gt; name = …;</code></pre>
           <p>Declaration-only. The map methods available on the variable are the ones the modeled implementations provide, <code>entrySet</code> among them — it answers a set of <code>Map.Entry</code> objects, one per key, that read through to the map.</p>
           <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new HashMap&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-17">
-          <h3><a class="doc-anchor" href="#doc-collection-types-17">#</a> <code>Set</code></h3>
+        <article class="doc-entry" id="doc-collection-types-18">
+          <h3><a class="doc-anchor" href="#doc-collection-types-18">#</a> <code>Set</code></h3>
           <pre><code class="lang-java">Set&lt;T&gt; name = …;   |   Set.of(…)</code></pre>
           <p>Declaration-only as a type, though <code>Set.of</code> is a usable static factory.</p>
           <pre><code class="lang-java">Set&lt;String&gt; s = new HashSet&lt;&gt;();</code></pre>

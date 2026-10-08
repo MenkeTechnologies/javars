@@ -1696,6 +1696,13 @@ pub const REFERENCE: &[Entry] = &[
         "Iterable<String> it = new ArrayList<>();",
     ),
     (
+        "AbstractMap.SimpleEntry",
+        "Collection Types",
+        "new AbstractMap.SimpleEntry<>(k, v)   |   new AbstractMap.SimpleEntry<>(entry)   |   new AbstractMap.SimpleImmutableEntry<>(…)",
+        "A `Map.Entry` that belongs to no map: `getKey`/`getValue`, `equals`/`hashCode`/`toString` as every entry has them, and `null` accepted on either side. `SimpleEntry.setValue` replaces its own value and answers the old one; `SimpleImmutableEntry.setValue` is `UnsupportedOperationException`. The one-argument form copies any entry's key and value.",
+        "var e = new AbstractMap.SimpleEntry<>(\"k\", 1);\\ne.setValue(2);\\nSystem.out.println(e);   // k=2",
+    ),
+    (
         "Map",
         "Collection Types",
         "Map<K,V> name = …;",

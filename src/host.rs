@@ -1694,6 +1694,19 @@ thread_local! {
     static COMPUTING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Which class an entry with no map behind it belongs to. A map's own nodes
+/// and `Map.entry(k, v)` are [`PairKind::Node`]; the other two are the public
+/// `java.util.AbstractMap` implementations a program constructs itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairKind {
+    /// A map's node, or `Map.entry`'s `KeyValueHolder` when ownerless.
+    Node,
+    /// `AbstractMap.SimpleEntry`: `setValue` writes the entry itself.
+    Simple,
+    /// `AbstractMap.SimpleImmutableEntry`: `setValue` is refused.
+    SimpleImmutable,
+}
+
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
 #[derive(Clone)]
 struct Pair {
@@ -1725,10 +1738,26 @@ struct Pair {
     /// to. While it matches, the copy is known current and costs nothing to
     /// read; when it lags, one keyed lookup repairs it.
     seen: u64,
+    /// The entry's class when it belongs to no map; see [`PairKind`].
+    kind: PairKind,
 }
 
 /// Give an entry a heap handle of its own and record its pair in [`PAIRS`].
 fn alloc_entry(key: Value, value: Value, owner: Option<u32>) -> Value {
+    alloc_pair(key, value, owner, PairKind::Node)
+}
+
+/// The [`PairKind`] of the `AbstractMap` entry class named `class`.
+fn simple_pair_kind(class: &str) -> PairKind {
+    if class == "SimpleEntry" {
+        PairKind::Simple
+    } else {
+        PairKind::SimpleImmutable
+    }
+}
+
+/// [`alloc_entry`] for an entry of any [`PairKind`].
+fn alloc_pair(key: Value, value: Value, owner: Option<u32>, kind: PairKind) -> Value {
     let id = heap_alloc(HostObj::Entry);
     PAIRS.with(|p| {
         let mut p = p.borrow_mut();
@@ -1739,6 +1768,7 @@ fn alloc_entry(key: Value, value: Value, owner: Option<u32>) -> Value {
             owner,
             detached: false,
             seen: 0,
+            kind,
         });
     });
     Value::Obj(id)
@@ -2190,6 +2220,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         | "List$values$tree"
         | "List$values$immutable" => &["AbstractCollection"],
         "Entry$hash" | "Entry$linked" | "Entry$tree" | "Entry$immutable" => &["Entry"],
+        // The two public `AbstractMap` entries are `Serializable`, unlike the
+        // map nodes.
+        "Entry$simple" | "Entry$simpleImmutable" => &["Entry", "Serializable"],
         _ => &[],
     }
 }
@@ -2957,6 +2990,15 @@ fn entry_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Val
     Some(match (method, args.len()) {
         ("getKey", 0) => Ok(pair.key),
         ("getValue", 0) => Ok(pair.value),
+        // `AbstractMap.SimpleEntry` holds its own value; the immutable one
+        // refuses with a bare `UnsupportedOperationException`, not the
+        // `"not supported"` of `KeyValueHolder`.
+        ("setValue", 1) if pair.kind == PairKind::Simple => {
+            Ok(store_entry_value(*id, args[0].clone()))
+        }
+        ("setValue", 1) if pair.kind == PairKind::SimpleImmutable => {
+            Err(Fault::java("UnsupportedOperationException", String::new()))
+        }
         ("setValue", 1) => match pair.owner {
             // A live entry writes through to its map, which is the whole point
             // of the method.
@@ -6091,10 +6133,17 @@ fn value_class(v: &Value) -> Option<String> {
                     // ownerless one (`Map.entry(k, v)`) is a `KeyValueHolder` —
                     // which is also what an *immutable* map's entries are, so
                     // the two share `ViewOf::Immutable` here.
-                    HostObj::Entry => format!(
-                        "Entry${}",
-                        entry_view(entry_pair(v).and_then(|p| p.owner)).tag()
-                    ),
+                    HostObj::Entry => match entry_pair(v) {
+                        Some(Pair {
+                            kind: PairKind::Simple,
+                            ..
+                        }) => "Entry$simple".to_string(),
+                        Some(Pair {
+                            kind: PairKind::SimpleImmutable,
+                            ..
+                        }) => "Entry$simpleImmutable".to_string(),
+                        pair => format!("Entry${}", entry_view(pair.and_then(|p| p.owner)).tag()),
+                    },
                     HostObj::Builder { buffer, .. } => if *buffer {
                         "StringBuffer"
                     } else {
@@ -10829,6 +10878,19 @@ fn system_static(
             &sty.as_str_cow(),
             &dty.as_str_cow(),
         ),
+        // `new AbstractMap.SimpleEntry<>(k, v)` and its immutable sibling, and
+        // the copy constructor of each, which reads `getKey`/`getValue` off
+        // any `Map.Entry`. Both accept `null` for either half.
+        ("SimpleEntry" | "SimpleImmutableEntry", "#new", [k, v]) => Ok(alloc_pair(
+            k.clone(),
+            v.clone(),
+            None,
+            simple_pair_kind(class),
+        )),
+        ("SimpleEntry" | "SimpleImmutableEntry", "#new", [e]) => match entry_pair(e) {
+            Some(p) => Ok(alloc_pair(p.key, p.value, None, simple_pair_kind(class))),
+            None => npe(),
+        },
         ("Scanner", "#new", [a]) if null(a) => npe(),
         ("Scanner", "#new", [Value::Str(s)]) => Ok(Value::Obj(heap_alloc(HostObj::Reader(
             Reader::text(Kind::Scanner, s),
@@ -17892,6 +17954,8 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
         "Entry$linked" => "java.util.LinkedHashMap$Entry".to_string(),
         "Entry$tree" => "java.util.TreeMap$Entry".to_string(),
         "Entry$immutable" => "java.util.KeyValueHolder".to_string(),
+        "Entry$simple" => "java.util.AbstractMap$SimpleEntry".to_string(),
+        "Entry$simpleImmutable" => "java.util.AbstractMap$SimpleImmutableEntry".to_string(),
         "List$sub" => match sublist_root_fixity(v) {
             Some(Fixity::Mutable) => "java.util.ArrayList$SubList".to_string(),
             Some(Fixity::FixedSize) => "java.util.AbstractList$RandomAccessSubList".to_string(),

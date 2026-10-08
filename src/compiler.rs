@@ -9065,6 +9065,8 @@ fn is_static_class(name: &str) -> bool {
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
+            | "SimpleEntry"
+            | "SimpleImmutableEntry"
     )
 }
 
@@ -9189,6 +9191,8 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("InputStreamReader", "#new") => "InputStreamReader",
         ("StringReader", "#new") => "StringReader",
         ("StringTokenizer", "#new") => "StringTokenizer",
+        ("SimpleEntry", "#new") => "SimpleEntry",
+        ("SimpleImmutableEntry", "#new") => "SimpleImmutableEntry",
         ("Random", "#new") => "Random",
         ("BitSet", "#new") => "BitSet",
         ("AtomicInteger", "#new") => "AtomicInteger",
@@ -9533,7 +9537,7 @@ fn collection_kind(ty: &str) -> Option<&'static str> {
         // not a collection, but it reaches the host down the same route: the
         // dispatch builtin takes any receiver whose methods the host models,
         // and `entry_method` answers before the collection tables are consulted.
-        "Entry" => "entry",
+        "Entry" | "SimpleEntry" | "SimpleImmutableEntry" => "entry",
         _ => return None,
     })
 }
@@ -10093,6 +10097,10 @@ fn is_host_value_class(name: &str) -> bool {
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
+            // `AbstractMap.SimpleEntry`/`SimpleImmutableEntry`, which the type
+            // parser flattens to their simple names.
+            | "SimpleEntry"
+            | "SimpleImmutableEntry"
     )
 }
 
