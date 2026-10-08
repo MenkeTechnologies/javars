@@ -431,6 +431,11 @@ struct FinallyScope {
     /// targeting scope index `i` must run exactly the finallys entered *inside*
     /// that construct — the ones whose depth is greater than `i`.
     scope_depth: usize,
+    /// `Compiler::tries.len()` when the `try` was entered: the handlers this
+    /// `finally` is *not* covered by. A copy emitted at a jump runs outside its
+    /// own `try`, so an exception it raises must reach the handler enclosing
+    /// the whole statement, never the statement's own `catch` arms.
+    tries_depth: usize,
 }
 
 struct Compiler {
@@ -5058,6 +5063,7 @@ impl Compiler {
             self.finallys.push(FinallyScope {
                 body: finally_body.to_vec(),
                 scope_depth: self.scopes.len(),
+                tries_depth: self.tries.len(),
             });
         }
 
@@ -5191,6 +5197,13 @@ impl Compiler {
     /// is lowered so a `return` *inside* a cleanup block does not re-emit that
     /// same block, then restored — the statements after the jump are still
     /// inside the same `try`.
+    ///
+    /// The handler stack is shortened the same way, to the depth each block's
+    /// `try` was entered at (JLS 14.20.2: an exception from a `finally` is
+    /// not handled by that statement's `catch` clauses). Lowered under the
+    /// full stack, a throw from `try { return 1; } catch (RuntimeException e)
+    /// { … } finally { throw … }` landed in the `catch`, which ran and then
+    /// ran the `finally` a second time.
     fn emit_finallys_down_to(&mut self, keep: usize) -> Result<(), String> {
         if self.finallys.len() <= keep {
             return Ok(());
@@ -5198,12 +5211,15 @@ impl Compiler {
         let pending = self.finallys.split_off(keep);
         let mut result = Ok(());
         'outer: for f in pending.iter().rev() {
+            let inner_tries = self.tries.split_off(f.tries_depth.min(self.tries.len()));
             for s in &f.body {
                 if let Err(e) = self.stmt(s) {
                     result = Err(e);
+                    self.tries.extend(inner_tries);
                     break 'outer;
                 }
             }
+            self.tries.extend(inner_tries);
         }
         self.finallys.extend(pending);
         result

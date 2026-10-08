@@ -860,7 +860,9 @@ at the bottom, and are summarized in the section right after this one.
   before the cleanup runs (a `finally` that reassigns the variable cannot change
   it), and a `return` inside a `finally` replaces the pending one, both like
   Java. An exception raised inside a `catch` arm also runs the `finally` on its
-  way out to the enclosing handler.
+  way out to the enclosing handler. An exception the cleanup block itself raises on such a
+  jump goes to the handler *enclosing* the statement, never to the statement's
+  own `catch` arms (JLS 14.20.2), exactly as on the other two paths.
 - **Try-with-resources.** `try (T r = e; U s = f) { … }` — with or without
   `catch`/`finally` arms, and the Java 9 bare-name form `try (existing)`.
   Desugared into the nested `try`/`finally` shape Java specifies it as, so
