@@ -1023,6 +1023,20 @@ pub const REFERENCE: &[Entry] = &[
         "System.out.println(List.copyOf(new ArrayList<>(List.of(1, 2))));   // [1, 2]",
     ),
     (
+        "Collections.nCopies",
+        "Collection Statics",
+        "Collections.nCopies(n, o)   |   emptySortedSet()   |   emptyNavigableSet()",
+        "`nCopies` is an immutable list of `n` references to `o` (`IllegalArgumentException: List length = n` for a negative `n`); `emptySortedSet`/`emptyNavigableSet` are the immutable empty sorted set, whose `first()` is `NoSuchElementException`.",
+        "System.out.println(String.join(\"\", Collections.nCopies(3, \"ab\")));   // ababab",
+    ),
+    (
+        "Collections.enumeration",
+        "Collection Statics",
+        "Collections.enumeration(c)   |   list(e)   |   emptyIterator()   |   emptyListIterator()   |   emptyEnumeration()",
+        "`enumeration(c)` walks `c` through its iterator (`hasMoreElements`/`nextElement`/`asIterator`), so a change to `c` behind it is `ConcurrentModificationException`; `list(e)` drains what an enumeration has left into an `ArrayList`. The empty iterators answer `hasNext()` false, `next()` `NoSuchElementException` and `remove()` `IllegalStateException`.",
+        "System.out.println(Collections.list(Collections.enumeration(List.of(1, 2))));   // [1, 2]",
+    ),
+    (
         "Collections.singleton",
         "Collection Statics",
         "Collections.singleton(o)   |   singletonMap(k, v)   |   emptySet()   |   emptyMap()",

@@ -3304,6 +3304,15 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
         items.reverse();
     }
     let stale = || iter_mods(source) != exp_mods;
+    // `Collections.enumeration`/`emptyEnumeration` hand out this same cursor;
+    // an `Enumeration` names its two moves differently and its `asIterator()`
+    // walks on from where it stands.
+    let method = match method {
+        "hasMoreElements" => "hasNext",
+        "nextElement" => "next",
+        "asIterator" if argc == 0 => return Some(Ok(recv.clone())),
+        other => other,
+    };
     Some(match (method, argc, bidi) {
         ("hasNext", 0, _) => Ok(Value::bool(pos < items.len())),
         ("next", 0, _) => {
@@ -3426,6 +3435,19 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
             if bidi { "ListIterator" } else { "Iterator" }
         ))),
     })
+}
+
+/// A fresh forward iterator over the collection at `source` — a
+/// `ListIterator` when `bidi`.
+fn new_iterator(source: u32, bidi: bool) -> Value {
+    Value::Obj(heap_alloc(HostObj::Iterator {
+        source,
+        pos: 0,
+        last: None,
+        exp_mods: iter_mods(source),
+        bidi,
+        desc: false,
+    }))
 }
 
 /// Store an iterator's cursor state after a move or a write.
@@ -11383,6 +11405,72 @@ fn collection_static(
                 view: SetView::Own,
                 index: KeyIndex::default(),
             })))
+        }
+        // `emptySortedSet`/`emptyNavigableSet`: an immutable sorted set, so
+        // `first()` is `NoSuchElementException` and `add` is
+        // `UnsupportedOperationException`.
+        ("Collections", "emptySortedSet" | "emptyNavigableSet") if args.is_empty() => {
+            Ok(Value::Obj(heap_alloc(HostObj::Set {
+                items: Vec::new(),
+                order: Order::Sorted {
+                    by_cmp: false,
+                    desc: false,
+                },
+                fixed: Fixity::Immutable,
+                view: SetView::Own,
+                index: KeyIndex::default(),
+            })))
+        }
+        // `nCopies(n, o)`: an immutable list of `n` references to `o`. A
+        // negative length is refused with `CopiesList`'s own message.
+        ("Collections", "nCopies") if args.len() == 2 => {
+            let n = args[0].jint();
+            if n < 0 {
+                return Some(Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("List length = {n}"),
+                )));
+            }
+            list(vec![args[1].clone(); n as usize], Fixity::Immutable)
+        }
+        // The empty iterators: a cursor over an empty immutable list, so
+        // `hasNext` is false, `next` is `NoSuchElementException` and `remove`
+        // is `IllegalStateException`, as `Collections.EmptyIterator` answers.
+        // An `Enumeration` is the same cursor under its own two method names.
+        ("Collections", "emptyIterator" | "emptyEnumeration" | "emptyListIterator")
+            if args.is_empty() =>
+        {
+            let Ok(Value::Obj(source)) = list(Vec::new(), Fixity::Immutable) else {
+                unreachable!("`list` allocates a handle");
+            };
+            Ok(new_iterator(source, method == "emptyListIterator"))
+        }
+        // `enumeration(c)` walks `c` through its own iterator, so a change to
+        // `c` behind it is a `ConcurrentModificationException`, as the JDK's
+        // is.
+        ("Collections", "enumeration") if args.len() == 1 => match &args[0] {
+            Value::Obj(source) if sequence_items(&args[0]).is_some() => {
+                Ok(new_iterator(*source, false))
+            }
+            _ => Err(Fault::java("NullPointerException", String::new())),
+        },
+        // `list(e)`: the elements the enumeration has left, in an `ArrayList`.
+        ("Collections", "list") if args.len() == 1 => {
+            let mut items = Vec::new();
+            loop {
+                match iterator_method(&args[0], "hasMoreElements", &[]) {
+                    Some(Ok(more)) if more.is_truthy() => {}
+                    Some(Ok(_)) => break,
+                    Some(Err(f)) => return Some(Err(f)),
+                    None => return Some(Err(Fault::java("NullPointerException", String::new()))),
+                }
+                match iterator_method(&args[0], "nextElement", &[]) {
+                    Some(Ok(v)) => items.push(v),
+                    Some(Err(f)) => return Some(Err(f)),
+                    None => break,
+                }
+            }
+            list(items, Fixity::Mutable)
         }
         ("Collections", "emptyMap") if args.is_empty() => {
             Ok(Value::Obj(heap_alloc(HostObj::Map {

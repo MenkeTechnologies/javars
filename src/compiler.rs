@@ -9248,7 +9248,11 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         // The collection factories answer the interface type, which is what
         // lets a call such as `l.remove(List.of(x))` select `remove(Object)`.
         ("List", "of" | "copyOf") | ("Arrays", "asList") => "List",
-        ("Set", "of" | "copyOf") | ("Collections", "emptySet" | "singleton") => "Set",
+        ("Set", "of" | "copyOf")
+        | ("Collections", "emptySet" | "singleton" | "emptySortedSet" | "emptyNavigableSet") => {
+            "Set"
+        }
+        ("Collections", "nCopies" | "list") => "List",
         ("Map", "of" | "copyOf" | "ofEntries") | ("Collections", "emptyMap" | "singletonMap") => {
             "Map"
         }

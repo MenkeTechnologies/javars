@@ -1451,135 +1451,147 @@ System.out.println(Arrays.deepToString(g));   // [[2, 2], [3, 1]]</code></pre>
           <pre><code class="lang-java">System.out.println(List.copyOf(new ArrayList&lt;&gt;(List.of(1, 2))));   // [1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-statics-2">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-2">#</a> <code>Collections.singleton</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-statics-2">#</a> <code>Collections.nCopies</code></h3>
+          <pre><code class="lang-java">Collections.nCopies(n, o)   |   emptySortedSet()   |   emptyNavigableSet()</code></pre>
+          <p><code>nCopies</code> is an immutable list of <code>n</code> references to <code>o</code> (<code>IllegalArgumentException: List length = n</code> for a negative <code>n</code>); <code>emptySortedSet</code>/<code>emptyNavigableSet</code> are the immutable empty sorted set, whose <code>first()</code> is <code>NoSuchElementException</code>.</p>
+          <pre><code class="lang-java">System.out.println(String.join("", Collections.nCopies(3, "ab")));   // ababab</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-3">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-3">#</a> <code>Collections.enumeration</code></h3>
+          <pre><code class="lang-java">Collections.enumeration(c)   |   list(e)   |   emptyIterator()   |   emptyListIterator()   |   emptyEnumeration()</code></pre>
+          <p><code>enumeration(c)</code> walks <code>c</code> through its iterator (<code>hasMoreElements</code>/<code>nextElement</code>/<code>asIterator</code>), so a change to <code>c</code> behind it is <code>ConcurrentModificationException</code>; <code>list(e)</code> drains what an enumeration has left into an <code>ArrayList</code>. The empty iterators answer <code>hasNext()</code> false, <code>next()</code> <code>NoSuchElementException</code> and <code>remove()</code> <code>IllegalStateException</code>.</p>
+          <pre><code class="lang-java">System.out.println(Collections.list(Collections.enumeration(List.of(1, 2))));   // [1, 2]</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-statics-4">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-4">#</a> <code>Collections.singleton</code></h3>
           <pre><code class="lang-java">Collections.singleton(o)   |   singletonMap(k, v)   |   emptySet()   |   emptyMap()</code></pre>
           <p>The immutable one- and zero-element sets and maps; unlike <code>Set.of</code>/<code>Map.of</code> they accept <code>null</code>.</p>
           <pre><code class="lang-java">System.out.println(Collections.singletonMap("k", 1));   // {k=1}</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-3">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-3">#</a> <code>Collections.addAll</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-5">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-5">#</a> <code>Collections.addAll</code></h3>
           <pre><code class="lang-java">boolean Collections.addAll(Collection&lt;T&gt; c, T... elements)</code></pre>
           <p>Adds each element through the collection's own <code>add</code> and answers whether any call changed it.</p>
           <pre><code class="lang-java">Collections.addAll(xs, 1, 2, 3);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-4">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-4">#</a> <code>Arrays.asList</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-6">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-6">#</a> <code>Arrays.asList</code></h3>
           <pre><code class="lang-java">List&lt;T&gt; Arrays.asList(T... a)</code></pre>
           <p>A *fixed-size* list view: <code>set</code> replaces an element, but <code>add</code>, <code>remove</code>, and <code>clear</code> raise <code>UnsupportedOperationException</code> exactly as Java's does. A lone array argument spreads into its elements rather than becoming a one-element list, matching Java's varargs rule for reference arrays.</p>
           <pre><code class="lang-java">List&lt;Integer&gt; xs = Arrays.asList(1, 2, 3);
 xs.set(0, 9);   // fine
 // xs.add(4);   // UnsupportedOperationException</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-5">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-5">#</a> <code>List.of</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-7">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-7">#</a> <code>List.of</code></h3>
           <pre><code class="lang-java">List&lt;T&gt; List.of(T... elements)</code></pre>
           <p>A fully immutable list: every structural change *and* every element replacement raises <code>UnsupportedOperationException</code>.</p>
           <pre><code class="lang-java">System.out.println(List.of(1, 2, 3));   // [1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-6">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-6">#</a> <code>Set.of</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-8">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-8">#</a> <code>Set.of</code></h3>
           <pre><code class="lang-java">Set&lt;T&gt; Set.of(T... elements)</code></pre>
           <p>An immutable set with <code>HashSet</code> iteration order, keeping the first of each repeated element.</p>
           <pre><code class="lang-java">System.out.println(Set.of("p"));   // [p]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-7">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-7">#</a> <code>Collections.sort</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-9">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-9">#</a> <code>Collections.sort</code></h3>
           <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list)</code></pre>
           <p>Sorts the list in place into ascending natural order — the elements' own <code>compareTo</code>, so a list of a user <code>Comparable</code> sorts by its method — and the change is visible through every reference to it.</p>
           <pre><code class="lang-java">Collections.sort(xs);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-8">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-8">#</a> <code>Collections.sort</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-10">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-10">#</a> <code>Collections.sort</code></h3>
           <pre><code class="lang-java">void Collections.sort(List&lt;T&gt; list, Comparator&lt;T&gt; cmp)</code></pre>
           <p>Sorts in place with a comparator lambda. The sort is a bottom-up merge sort that never panics on an inconsistent comparator and is stable, as Java guarantees for <code>List.sort</code>. A <code>null</code> comparator means natural order.</p>
           <pre><code class="lang-java">Collections.sort(xs, (a, b) -&gt; a.length() - b.length());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-9">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-9">#</a> <code>Collections.reverse</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-11">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-11">#</a> <code>Collections.reverse</code></h3>
           <pre><code class="lang-java">void Collections.reverse(List&lt;T&gt; list)</code></pre>
           <p>Reverses the list in place.</p>
           <pre><code class="lang-java">Collections.reverse(xs);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-10">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-10">#</a> <code>EnumSet</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-12">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-12">#</a> <code>EnumSet</code></h3>
           <pre><code class="lang-java">EnumSet.of(E e, E... rest)   |   EnumSet.noneOf(Class&lt;E&gt;)   |   EnumSet.allOf(Class&lt;E&gt;)   |   EnumSet.copyOf(Collection&lt;E&gt;)</code></pre>
           <p>An enum set, iterating in ordinal order. javars models it as the <code>TreeSet</code> it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; <code>getClass()</code> names <code>java.util.TreeSet</code>. <code>range</code> and <code>complementOf</code> are not modeled.</p>
           <pre><code class="lang-java">System.out.println(EnumSet.of(Day.SUN, Day.MON));   // [MON, SUN]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-11">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-11">#</a> <code>EnumMap</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-13">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-13">#</a> <code>EnumMap</code></h3>
           <pre><code class="lang-java">new EnumMap&lt;&gt;(Class&lt;K&gt; keyType)   |   new EnumMap&lt;&gt;(Map&lt;K, V&gt; m)</code></pre>
           <p>A map keyed by an enum, iterating in ordinal order — modeled as the <code>TreeMap</code> it behaves as.</p>
           <pre><code class="lang-java">Map&lt;Day, Integer&gt; h = new EnumMap&lt;&gt;(Day.class);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-12">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-12">#</a> <code>Map.Entry.comparingByKey</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-14">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-14">#</a> <code>Map.Entry.comparingByKey</code></h3>
           <pre><code class="lang-java">Comparator Map.Entry.comparingByKey([Comparator cmp])   |   Map.Entry.comparingByValue([Comparator cmp])</code></pre>
           <p>The comparators that order map entries by key or by value — natural order, or <code>cmp</code> applied to the key or value.</p>
           <pre><code class="lang-java">entries.sort(Map.Entry.comparingByValue());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-13">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-13">#</a> <code>Collections.shuffle</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-15">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-15">#</a> <code>Collections.shuffle</code></h3>
           <pre><code class="lang-java">void Collections.shuffle(List&lt;?&gt; list [, Random rnd])</code></pre>
           <p>Permutes the list in place by the JDK's walk — <code>swap(list, i - 1, rnd.nextInt(i))</code> from the size down to 2 — so a seeded <code>Random</code> gives the JDK's order. Without one, an unseeded generator of its own is used.</p>
           <pre><code class="lang-java">Collections.shuffle(xs, new Random(7));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-14">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-14">#</a> <code>Collections.frequency</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-16">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-16">#</a> <code>Collections.frequency</code></h3>
           <pre><code class="lang-java">int Collections.frequency(Collection&lt;?&gt; c, Object o)</code></pre>
           <p>How many elements <code>o.equals</code> — or how many are <code>null</code> when <code>o</code> is — calling the element class's own <code>equals</code>.</p>
           <pre><code class="lang-java">int twos = Collections.frequency(xs, 2);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-15">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-15">#</a> <code>Collections.swap</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-17">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-17">#</a> <code>Collections.swap</code></h3>
           <pre><code class="lang-java">void Collections.swap(List&lt;?&gt; list, int i, int j)</code></pre>
           <p>Exchanges two positions as <code>l.set(i, l.set(j, l.get(i)))</code>, so an out-of-range index and an immutable list fail exactly as <code>get</code>/<code>set</code> do.</p>
           <pre><code class="lang-java">Collections.swap(xs, 0, xs.size() - 1);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-16">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-16">#</a> <code>Collections.binarySearch</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-18">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-18">#</a> <code>Collections.binarySearch</code></h3>
           <pre><code class="lang-java">int Collections.binarySearch(List&lt;T&gt; list, T key [, Comparator&lt;T&gt; cmp])</code></pre>
           <p>The index of <code>key</code> in a list sorted by <code>cmp</code> (natural order when absent or <code>null</code>, through the elements' own <code>compareTo</code>), or <code>-(insertion point) - 1</code> when it is absent.</p>
           <pre><code class="lang-java">int at = Collections.binarySearch(List.of(1, 3, 5), 4);   // -3</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-17">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-17">#</a> <code>Collections.disjoint</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-19">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-19">#</a> <code>Collections.disjoint</code></h3>
           <pre><code class="lang-java">boolean Collections.disjoint(Collection&lt;?&gt; c1, Collection&lt;?&gt; c2)</code></pre>
           <p>True when the two collections share no element. One side is iterated and the other's <code>contains</code> asked, chosen as the JDK chooses (a <code>Set</code> is the one asked), so each side's own membership rules apply.</p>
           <pre><code class="lang-java">boolean none = Collections.disjoint(xs, Set.of(9));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-18">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-18">#</a> <code>Collections.rotate</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-20">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-20">#</a> <code>Collections.rotate</code></h3>
           <pre><code class="lang-java">void Collections.rotate(List&lt;?&gt; list, int distance)</code></pre>
           <p>Moves the element at <code>i</code> to <code>(i + distance) mod size</code>; a negative distance rotates left. Written with <code>set</code>, so a <code>subList</code> view of the list stays valid.</p>
           <pre><code class="lang-java">Collections.rotate(xs, 2);   // [1, 2, 3, 4, 5] → [4, 5, 1, 2, 3]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-19">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-19">#</a> <code>Collections.fill</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-21">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-21">#</a> <code>Collections.fill</code></h3>
           <pre><code class="lang-java">void Collections.fill(List&lt;? super T&gt; list, T obj)</code></pre>
           <p>Sets every position to <code>obj</code>.</p>
           <pre><code class="lang-java">Collections.fill(xs, 0);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-20">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-20">#</a> <code>Collections.indexOfSubList</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-22">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-22">#</a> <code>Collections.indexOfSubList</code></h3>
           <pre><code class="lang-java">int Collections.indexOfSubList(List&lt;?&gt; source, List&lt;?&gt; target)   |   Collections.lastIndexOfSubList(List&lt;?&gt; source, List&lt;?&gt; target)</code></pre>
           <p>The first (or last) position at which <code>target</code> occurs as a contiguous run of <code>source</code>, compared by <code>equals</code>; <code>-1</code> when it does not occur. An empty <code>target</code> matches at 0 (or at <code>source.size()</code>).</p>
           <pre><code class="lang-java">int at = Collections.indexOfSubList(List.of(1, 2, 3, 2, 3), List.of(2, 3));   // 1</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-21">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-21">#</a> <code>Collections.reverseOrder</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-23">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-23">#</a> <code>Collections.reverseOrder</code></h3>
           <pre><code class="lang-java">Comparator&lt;T&gt; Collections.reverseOrder()   |   Collections.reverseOrder(Comparator&lt;T&gt; cmp)</code></pre>
           <p>The comparator that imposes the reverse of natural order — <code>Comparator.reverseOrder()</code> — or the reverse of <code>cmp</code> (<code>cmp.reversed()</code>). A <code>null</code> argument means natural order, as the JDK specifies.</p>
           <pre><code class="lang-java">xs.sort(Collections.reverseOrder());</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-22">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-22">#</a> <code>Collections.max</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-24">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-24">#</a> <code>Collections.max</code></h3>
           <pre><code class="lang-java">T Collections.max(Collection&lt;T&gt; c [, Comparator&lt;T&gt; cmp])</code></pre>
           <p>The largest element in ascending natural order — the elements' own <code>compareTo</code>, so a user <code>Comparable</code> orders by its body — or by <code>cmp</code>. An empty collection raises <code>java.util.NoSuchElementException</code>, catchable like any modeled throwable.</p>
           <pre><code class="lang-java">System.out.println(Collections.max(xs));</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-statics-23">
-          <h3><a class="doc-anchor" href="#doc-collection-statics-23">#</a> <code>Collections.min</code></h3>
+        <article class="doc-entry" id="doc-collection-statics-25">
+          <h3><a class="doc-anchor" href="#doc-collection-statics-25">#</a> <code>Collections.min</code></h3>
           <pre><code class="lang-java">T Collections.min(Collection&lt;T&gt; c [, Comparator&lt;T&gt; cmp])</code></pre>
           <p>The smallest element in ascending natural order; empty raises the same <code>NoSuchElementException</code> as <code>Collections.max</code>.</p>
           <pre><code class="lang-java">System.out.println(Collections.min(xs));</code></pre>
