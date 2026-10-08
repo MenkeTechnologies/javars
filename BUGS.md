@@ -781,7 +781,8 @@ at the bottom, and are summarized in the section right after this one.
   parse and run with type arguments erased at runtime, exactly like `javac`.
 - **Exceptions.** `throw <expr>;`, `try`/`catch`/`finally`, multiple `catch`
   arms (first matching type wins) including the multi-catch `catch (A | B e)`
-  (whose alternatives are tested in order against the throwable's class), and a
+  (whose alternatives are tested in order against the throwable's class, and
+  whose parameter is typed as their nearest common superclass, JLS 14.20), and a
   `throws` clause (parsed and discarded —
   javars has no checked-exception analysis). The thrown object unwinds real
   fusevm call frames: a `throw` several methods deep lands in the caller's

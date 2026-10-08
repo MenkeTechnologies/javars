@@ -2662,6 +2662,27 @@ impl Compiler {
         })
     }
 
+    /// The nearest class every one of `types` extends: the first class on the
+    /// superclass chain of `types[0]` that each of the others is a subclass of.
+    /// For a multi-catch's alternatives that chain always reaches `Throwable`,
+    /// which is therefore the answer when nothing nearer is shared.
+    fn superclass_lub(&self, types: &[String]) -> String {
+        let mut cur = types[0].as_str();
+        loop {
+            if types[1..].iter().all(|t| self.is_subclass(t, cur)) {
+                return cur.to_string();
+            }
+            match self
+                .classes
+                .get(cur)
+                .and_then(|ci| ci.superclass.as_deref())
+            {
+                Some(sup) => cur = sup,
+                None => return "Throwable".to_string(),
+            }
+        }
+    }
+
     /// True when `class` is `base`, a (transitive) subclass of it, or a type
     /// that implements/extends the interface `base` — walking the full supertype
     /// graph (superclass + interfaces).
@@ -5132,10 +5153,14 @@ impl Compiler {
             for h in hits {
                 self.b.patch_jump(h, body_start);
             }
-            // The bound variable's static type is the first alternative; Java
-            // types a multi-catch parameter as the alternatives' least upper
-            // bound, which javars does not compute.
-            self.declare_local(&arm.name, &arm.types[0], NumType::Other);
+            // A multi-catch parameter is typed as the alternatives' least upper
+            // bound (JLS 14.20). Typing it as the first alternative instead
+            // built `"" + e`'s `toString` dispatch over that alternative's
+            // subclasses only, so a caught `UnsupportedOperationException` in
+            // `catch (IllegalArgumentException | UnsupportedOperationException
+            // e)` printed as `java.lang.UnsupportedOperationException@1`.
+            let ty = self.superclass_lub(&arm.types);
+            self.declare_local(&arm.name, &ty, NumType::Other);
             self.emit_get(&exc_t, line);
             self.emit_set(&arm.name, line);
             for s in &arm.body {
