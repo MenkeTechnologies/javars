@@ -466,6 +466,8 @@ enum HostObj {
     Stats(SummaryStats),
     /// A `java.util.BitSet` (see [`crate::jbitset`]).
     Bits(crate::jbitset::BitSet),
+    /// A `java.util.StringJoiner`.
+    Joiner(Box<Joiner>),
     /// An `AtomicInteger`, `AtomicLong` or `AtomicBoolean`.
     Atomic { kind: AtomicKind, value: Value },
     /// A `java.util.regex.Pattern`: the source as written, its flags, and the
@@ -1153,6 +1155,125 @@ fn atomic_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Opt
                 args.len()
             )),
         ),
+    })
+}
+
+/// `java.util.StringJoiner`: the elements added so far, kept apart until the
+/// joiner is read, exactly as the JDK's `elts` array is.
+#[derive(Clone)]
+struct Joiner {
+    prefix: String,
+    delimiter: String,
+    suffix: String,
+    parts: Vec<String>,
+    /// `setEmptyValue`'s text, answered while no element has been added.
+    empty_value: Option<String>,
+}
+
+impl Joiner {
+    /// The elements joined by the delimiter, without prefix or suffix — what
+    /// `merge` adds to another joiner as one element.
+    fn joined(&self) -> String {
+        self.parts.join(&self.delimiter)
+    }
+
+    /// `toString()`: the empty value while nothing was added, if one was set;
+    /// otherwise prefix, joined elements, suffix.
+    fn render(&self) -> String {
+        match (&self.empty_value, self.parts.is_empty()) {
+            (Some(empty), true) => empty.clone(),
+            _ => format!("{}{}{}", self.prefix, self.joined(), self.suffix),
+        }
+    }
+}
+
+/// `new StringJoiner(delimiter)` / `new StringJoiner(delimiter, prefix,
+/// suffix)`, each `null` refused with the JDK's own message.
+fn new_joiner(args: &[Value]) -> Result<Value, Fault> {
+    let text = |v: &Value, what: &str| match v {
+        Value::Undef => Err(Fault::java(
+            "NullPointerException",
+            format!("The {what} must not be null"),
+        )),
+        v => Ok(java_str(v)),
+    };
+    let (delimiter, prefix, suffix) = match args {
+        [d] => (text(d, "delimiter")?, String::new(), String::new()),
+        // The JDK checks the prefix first, then the delimiter, then the suffix.
+        [d, p, s] => {
+            let prefix = text(p, "prefix")?;
+            (text(d, "delimiter")?, prefix, text(s, "suffix")?)
+        }
+        _ => return Err(Fault::internal(
+            "javars: `new StringJoiner(…)` takes a delimiter, or a delimiter, prefix and suffix",
+        )),
+    };
+    Ok(Value::Obj(heap_alloc(HostObj::Joiner(Box::new(Joiner {
+        prefix,
+        delimiter,
+        suffix,
+        parts: Vec::new(),
+        empty_value: None,
+    })))))
+}
+
+/// A method call on a `StringJoiner` receiver; `None` for any other.
+///
+/// `add` renders its argument as `String.valueOf` does (`null` is `"null"`);
+/// `merge` adds the other joiner's elements as *one* element joined by that
+/// joiner's own delimiter, and nothing at all when it has none.
+fn joiner_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let with = |id: u32, f: &mut dyn FnMut(&mut Joiner) -> Result<Value, Fault>| {
+        HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
+            Some(HostObj::Joiner(j)) => Some(f(j)),
+            _ => None,
+        })
+    };
+    // `merge` reads a second joiner, so it is copied out before the receiver
+    // is borrowed.
+    let other = match (method, args) {
+        ("merge", [Value::Obj(o)]) => with(*o, &mut |j| {
+            Ok(if j.parts.is_empty() {
+                Value::Undef
+            } else {
+                Value::str(j.joined())
+            })
+        }),
+        _ => None,
+    };
+    let rendered: Vec<String> = args.iter().map(java_str).collect();
+    with(*id, &mut |j| match (method, args.len()) {
+        ("add", 1) => {
+            j.parts.push(rendered[0].clone());
+            Ok(recv.clone())
+        }
+        ("merge", 1) => match &other {
+            Some(Ok(Value::Undef)) => Ok(recv.clone()),
+            Some(Ok(part)) => {
+                j.parts.push(java_str(part));
+                Ok(recv.clone())
+            }
+            _ => Err(Fault::java("NullPointerException", String::new())),
+        },
+        ("setEmptyValue", 1) => match &args[0] {
+            Value::Undef => Err(Fault::java(
+                "NullPointerException",
+                "The empty value must not be null",
+            )),
+            _ => {
+                j.empty_value = Some(rendered[0].clone());
+                Ok(recv.clone())
+            }
+        },
+        ("toString", 0) => Ok(Value::str(j.render())),
+        ("length", 0) => Ok(Value::Int(j.render().encode_utf16().count() as i64)),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported StringJoiner method `{method}` with {} argument(s)",
+            args.len()
+        ))),
     })
 }
 
@@ -6060,6 +6181,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
                     HostObj::Bits(_) => "java.util.BitSet".to_string(),
+                    HostObj::Joiner(_) => "java.util.StringJoiner".to_string(),
                     HostObj::Atomic { kind, .. } => match kind {
                         AtomicKind::Int => "java.util.concurrent.atomic.AtomicInteger",
                         AtomicKind::Long => "java.util.concurrent.atomic.AtomicLong",
@@ -9905,6 +10027,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     if let Some(v) = atomic_method(vm, &recv, &method, &args) {
         return v;
     }
+    if let Some(r) = joiner_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = bitset_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -10925,6 +11053,7 @@ fn system_static(
                 value: atomic_norm(kind, &init),
             })))
         }
+        ("StringJoiner", "#new", _) => new_joiner(args),
         ("BitSet", "#new", []) => Ok(Value::Obj(heap_alloc(HostObj::Bits(
             crate::jbitset::BitSet::new(),
         )))),
@@ -17078,6 +17207,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Bits(b)) => b.render(),
+            Some(HostObj::Joiner(j)) => j.render(),
             Some(HostObj::Atomic { value, .. }) => java_str(value),
             // `Pattern.toString()` is its source; `Matcher.toString()` names the
             // pattern, the region and the last match.

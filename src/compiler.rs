@@ -9067,6 +9067,7 @@ fn is_static_class(name: &str) -> bool {
             | "AtomicBoolean"
             | "SimpleEntry"
             | "SimpleImmutableEntry"
+            | "StringJoiner"
     )
 }
 
@@ -9195,6 +9196,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("SimpleImmutableEntry", "#new") => "SimpleImmutableEntry",
         ("Random", "#new") => "Random",
         ("BitSet", "#new") => "BitSet",
+        ("StringJoiner", "#new") => "StringJoiner",
         ("AtomicInteger", "#new") => "AtomicInteger",
         ("AtomicLong", "#new") => "AtomicLong",
         ("AtomicBoolean", "#new") => "AtomicBoolean",
@@ -10101,6 +10103,7 @@ fn is_host_value_class(name: &str) -> bool {
             // parser flattens to their simple names.
             | "SimpleEntry"
             | "SimpleImmutableEntry"
+            | "StringJoiner"
     )
 }
 
@@ -10135,6 +10138,9 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("BitSet", "cardinality" | "length" | "size" | "nextSetBit" | "nextClearBit") => "int",
         ("BitSet", "previousSetBit" | "previousClearBit" | "hashCode") => "int",
         ("BitSet", "isEmpty" | "intersects") => "boolean",
+        ("StringJoiner", "add" | "merge" | "setEmptyValue") => "StringJoiner",
+        ("StringJoiner", "toString") => "String",
+        ("StringJoiner", "length") => "int",
         (
             "AtomicInteger",
             "get" | "intValue" | "incrementAndGet" | "decrementAndGet" | "getAndIncrement"

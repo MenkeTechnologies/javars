@@ -1044,6 +1044,13 @@ pub const REFERENCE: &[Entry] = &[
         "System.out.println(Collections.singletonMap(\"k\", 1));   // {k=1}",
     ),
     (
+        "StringJoiner",
+        "Static Library",
+        "new StringJoiner(delimiter)   |   new StringJoiner(delimiter, prefix, suffix)",
+        "`java.util.StringJoiner`: `add` appends `String.valueOf` of its argument, `toString`/`length` give prefix + elements joined by the delimiter + suffix, `setEmptyValue` replaces that while nothing has been added, and `merge(other)` adds the other joiner's elements as one element joined by its own delimiter (nothing when it has none). A `null` delimiter, prefix, suffix or empty value is `NullPointerException` with the JDK's message.",
+        "StringJoiner j = new StringJoiner(\", \", \"[\", \"]\");\\nj.add(\"a\").add(\"b\");\\nSystem.out.println(j);   // [a, b]",
+    ),
+    (
         "BitSet",
         "Static Library",
         "new BitSet([int nbits])",

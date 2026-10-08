@@ -394,6 +394,7 @@ Implemented and checked against the reference `java`:
   read-modify-write, javars running one thread),
   `AbstractMap.SimpleEntry`/`SimpleImmutableEntry` (pairs of their own, the
   first writable through `setValue`),
+  `java.util.StringJoiner`,
   `removeAll`/`retainAll`/`containsAll`, `Collections.addAll`, `java.util.BitSet`
   (a port of the JDK's word vector, its growth rule, `hashCode` and messages), and
   `Collections.sort`/`reverse`/`max`/`min`. A removal through a map's
