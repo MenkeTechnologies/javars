@@ -3993,9 +3993,10 @@ fn file_inserted_keys(vm: &mut VM, method: &str, args: &[Value]) {
         return;
     };
     match method {
-        "add" | "put" | "putIfAbsent" | "merge" | "compute" | "computeIfAbsent" => {
-            file_key_hash(vm, first)
-        }
+        // `merge`/`compute`/`computeIfAbsent` insert through `put`, which
+        // files the key then; filing it here as well would run a user
+        // `hashCode()` twice for the one call Java makes.
+        "add" | "put" | "putIfAbsent" => file_key_hash(vm, first),
         "addAll" => {
             for v in sequence_items(first).unwrap_or_default() {
                 file_key_hash(vm, &v);
@@ -8008,15 +8009,13 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
     Ok(match kind {
         "toList" => list_value(items, Fixity::Mutable),
         "toSet" => {
-            let mut out: Vec<Value> = Vec::new();
-            for v in items {
-                file_key_hash(vm, &v);
-                if !out.iter().any(|x| value_eq(x, &v)) {
-                    out.push(v);
-                }
+            // `HashSet::add` per element: the first of equal elements stays,
+            // compared through a user `equals` where one is declared.
+            for v in &items {
+                file_key_hash(vm, v);
             }
             Value::Obj(heap_alloc(HostObj::Set {
-                items: out,
+                items: distinct(vm, &items),
                 order: Order::Hash,
                 fixed: Fixity::Mutable,
                 view: SetView::Own,
@@ -8076,14 +8075,23 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
             map
         }
         // `groupingBy(k)`, `groupingBy(k, downstream)`, and
-        // `groupingBy(k, mapFactory, downstream)`: the groups keep encounter
-        // order, each is reduced by its downstream collector (`toList` when
-        // none is named), and the results are `put` into the map.
+        // `groupingBy(k, mapFactory, downstream)`. The JDK's accumulator is
+        // `m.computeIfAbsent(key, k -> downstream.supplier().get())`, so the
+        // *map* decides which keys are the same group — a user `equals`, a
+        // `TreeMap`'s comparator — and a new key takes `computeIfAbsent`'s
+        // place in its hash bin. Each group is held in the map as its index
+        // into `groups` until every element is placed, then reduced by its
+        // downstream collector (`toList` when none is named) and written back
+        // over its own key.
         "groupingBy" => {
             let (factory, downstream) = match cargs.len() {
                 3 => (Some(&cargs[1]), Some(&cargs[2])),
                 2 => (None, Some(&cargs[1])),
                 _ => (None, None),
+            };
+            let map = match factory {
+                Some(f) => invoke_closure(vm, f, &[]),
+                None => new_collection(vm, "HashMap", &Value::Undef)?,
             };
             let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
             for v in items {
@@ -8097,15 +8105,19 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
                         "element cannot be mapped to a null key".to_string(),
                     ));
                 }
-                match groups.iter_mut().find(|(k, _)| value_eq(k, &key)) {
-                    Some((_, g)) => g.push(v),
-                    None => groups.push((key, vec![v])),
+                match coll_method(vm, &map, "get", std::slice::from_ref(&key)) {
+                    Value::Int(at) => groups[at as usize].1.push(v),
+                    _ => {
+                        let at = Value::Int(groups.len() as i64);
+                        coll_method(vm, &map, "put", &[key.clone(), at]);
+                        hash_bucket_head_insert(&map, &key);
+                        groups.push((key, vec![v]));
+                    }
+                }
+                if pending() {
+                    return Ok(Value::Undef);
                 }
             }
-            let map = match factory {
-                Some(f) => invoke_closure(vm, f, &[]),
-                None => new_collection(vm, "HashMap", &Value::Undef)?,
-            };
             for (key, group) in groups {
                 let reduced = match downstream {
                     Some(d) => collect_with(vm, group, d)?,

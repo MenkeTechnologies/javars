@@ -316,11 +316,13 @@ at the bottom, and are summarized in the section right after this one.
   stream's `sum`/`average` use the JDK's compensated (Kahan) summation, so
   `DoubleStream.of(0.1, 0.2, 0.3).sum()` is `0.6`; an `int` stream's `sum`
   wraps at 32 bits and an integral `average` divides a `long` total.
-  Collectors: `toList`, `toSet`, `joining` (all three arities), `counting`,
+  Collectors: `toList`, `toSet` (de-duplicating through a user `equals`), `joining` (all three arities), `counting`,
   `toMap` (two, three, and four arguments — a repeated key without a merge
   function is the JDK's `IllegalStateException: Duplicate key k (attempted
   merging values a and b)`), `groupingBy` (with a downstream collector and a
-  map factory), `partitioningBy`, `mapping`, `filtering`, `flatMapping`,
+  map factory; a key joins a group by the map's own `computeIfAbsent`, so a
+  user `equals`, a `TreeMap` comparator and the hash-bin placement all decide as
+  in the JDK), `partitioningBy`, `mapping`, `filtering`, `flatMapping`,
   `collectingAndThen`, `summingInt`/`Long`/`Double`,
   `averagingInt`/`Long`/`Double`, `minBy`, `maxBy`, `reducing` (all three
   arities), `toCollection`, and `teeing`.
