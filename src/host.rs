@@ -1667,6 +1667,9 @@ thread_local! {
     /// handle, to the collection it was taken from and whether it is one of
     /// the navigable kind. See [`write_through`] and [`navigable_view`].
     static MAP_VIEWS: RefCell<HashMap<u32, (u32, bool)>> = RefCell::new(HashMap::new());
+    /// The hash a heap-object key was filed under when it last entered a
+    /// `HashMap`/`HashSet`, by handle. See [`file_key_hash`].
+    static FILED_HASH: RefCell<HashMap<u32, i32>> = RefCell::new(HashMap::new());
 }
 
 /// A `Map.Entry`'s payload — see [`HostObj::Entry`].
@@ -1887,6 +1890,7 @@ pub fn heap_reset() {
     ENTRY_INDEX.with(|x| x.borrow_mut().clear());
     ENTRIES_LIVE.with(|e| e.set(false));
     MAP_VIEWS.with(|m| m.borrow_mut().clear());
+    FILED_HASH.with(|f| f.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
     SUPERS.with(|s| s.borrow_mut().clear());
     SORT_CMP.with(|s| s.borrow_mut().clear());
@@ -3893,8 +3897,117 @@ fn hash_capacity(n: usize) -> usize {
 /// Which bin `key` lands in for a table of `cap` — Java's
 /// `(capacity - 1) & (h ^ (h >>> 16))`.
 fn hash_bucket(key: &Value, cap: usize) -> usize {
-    let h = java_hash(key).unwrap_or(0) as u32;
+    let h = java_hash(key).or_else(|| filed_hash(key)).unwrap_or(0) as u32;
     ((cap as u32 - 1) & (h ^ (h >> 16))) as usize
+}
+
+/// The hash [`file_key_hash`] recorded for a heap-object key, if any.
+fn filed_hash(key: &Value) -> Option<i32> {
+    let Value::Obj(id) = key else {
+        return None;
+    };
+    FILED_HASH.with(|f| f.borrow().get(id).copied())
+}
+
+/// Record the hash a heap-object `key` is filed under as it enters a
+/// `HashMap`/`HashSet`.
+///
+/// Java's `HashMap.putVal` calls `key.hashCode()` once, at insertion, and keeps
+/// the answer in the node; the bucket order is decided by that stored number.
+/// For a `String` or a boxed primitive [`java_hash`] reproduces it from the
+/// value alone, but a `record`, a user class declaring `hashCode()`, a
+/// collection used as a key, and a `Map.Entry` all hash through a body or
+/// through their contents — which needs the VM, and the ordering readers
+/// ([`present_order`]) run without one, often under a heap borrow. So the hash
+/// is computed here, where an insertion still has the VM, exactly when the JDK
+/// computes it. Before this, every such key landed in bucket 0, so a
+/// `HashSet<Point>` iterated in insertion order instead of Java's.
+///
+/// The record is per object, not per container: a key mutated *after* being
+/// filed and then filed again elsewhere moves in both. That needs a key whose
+/// hash changes while it sits in a hash container, which the `HashMap` contract
+/// already leaves undefined.
+///
+/// A key whose `hashCode` is the JVM identity hash (an array, a plain instance,
+/// a `PriorityQueue`) is not filed and keeps insertion order — Java's order for
+/// one is not reproducible from run to run either.
+fn file_key_hash(vm: &mut VM, key: &Value) {
+    let Value::Obj(id) = key else {
+        return;
+    };
+    if java_hash(key).is_some() {
+        return;
+    }
+    let structural = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(
+                HostObj::List { .. }
+                    | HostObj::SubList { .. }
+                    | HostObj::Set { .. }
+                    | HostObj::Map { .. }
+                    | HostObj::Entry
+            )
+        )
+    });
+    let h = if structural {
+        match collection_hash(vm, key, "hashCode", 0) {
+            Some(Value::Int(h)) => Some(h as i32),
+            _ => entry_pair(key).map(|_| element_hash(key)),
+        }
+    } else {
+        user_element_hash(vm, key)
+    };
+    if let Some(h) = h {
+        FILED_HASH.with(|f| f.borrow_mut().insert(*id, h));
+    }
+}
+
+/// True when `v` is a `HashMap`/`HashSet` — a container whose order
+/// [`hash_order`] decides.
+fn is_hash_ordered(v: &Value) -> bool {
+    let Value::Obj(id) = v else {
+        return false;
+    };
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(
+                HostObj::Map {
+                    order: Order::Hash,
+                    ..
+                } | HostObj::Set {
+                    order: Order::Hash,
+                    ..
+                }
+            )
+        )
+    })
+}
+
+/// File the keys an insertion method is about to add to a hash container (see
+/// [`file_key_hash`]): the first argument of the single-key methods, and every
+/// element or key of the source of `addAll`/`putAll`.
+fn file_inserted_keys(vm: &mut VM, method: &str, args: &[Value]) {
+    let Some(first) = args.first() else {
+        return;
+    };
+    match method {
+        "add" | "put" | "putIfAbsent" | "merge" | "compute" | "computeIfAbsent" => {
+            file_key_hash(vm, first)
+        }
+        "addAll" => {
+            for v in sequence_items(first).unwrap_or_default() {
+                file_key_hash(vm, &v);
+            }
+        }
+        "putAll" => {
+            for (k, _) in map_entries(first).unwrap_or_default() {
+                file_key_hash(vm, &k);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Move the entry for `key` to the head of its hash bin.
@@ -4587,6 +4700,15 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             )))
         }
     };
+    if matches!(kind, "HashSet" | "Set") {
+        for v in sequence_items(seed).unwrap_or_default() {
+            file_key_hash(vm, &v);
+        }
+    } else if matches!(kind, "HashMap" | "Map") {
+        for (k, _) in map_entries(seed).unwrap_or_default() {
+            file_key_hash(vm, &k);
+        }
+    }
     let id = heap_alloc(obj);
     // A copy of user objects that order themselves is ranked by their
     // `compareTo` from the start.
@@ -5894,6 +6016,9 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     )
     .then(|| map_view_snapshot(recv))
     .flatten();
+    if is_hash_ordered(recv) {
+        file_inserted_keys(vm, method, args);
+    }
     let out = coll_method_ranked(vm, recv, method, args);
     if let Some((map, before)) = through {
         write_through(vm, map, recv, before);
@@ -7885,6 +8010,7 @@ fn collect_with(vm: &mut VM, items: Vec<Value>, collector: &Value) -> Result<Val
         "toSet" => {
             let mut out: Vec<Value> = Vec::new();
             for v in items {
+                file_key_hash(vm, &v);
                 if !out.iter().any(|x| value_eq(x, &v)) {
                     out.push(v);
                 }

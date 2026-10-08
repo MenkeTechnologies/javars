@@ -961,7 +961,11 @@ at the bottom, and are summarized in the section right after this one.
   appends within a bucket, and preserves relative order across a resize, so the
   order is a stable sort of the insertion sequence by bucket index — reproduced
   exactly, and checked against OpenJDK for `String` and `Integer` keys including
-  across the resize at 13 entries. `LinkedHashMap`/`LinkedHashSet` keep insertion
+  across the resize at 13 entries. A key that hashes through a body or its
+  contents — a `record`, a class declaring `hashCode()`, a `List`/`Set`/`Map`,
+  a `Map.Entry` — is hashed once as it is inserted, which is when `HashMap`
+  calls `hashCode()`, so it lands in its real bucket too; only a key whose hash
+  is the JVM identity hash keeps insertion order, Java's being unreproducible. `LinkedHashMap`/`LinkedHashSet` keep insertion
   order and `TreeMap`/`TreeSet` sort, each because Java does, not by default.
   A `TreeMap` navigates by key — `firstKey`/`lastKey`, `floorKey`/`ceilingKey`/
   `lowerKey`/`higherKey`, the matching `…Entry` forms and
