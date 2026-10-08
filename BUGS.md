@@ -1011,6 +1011,8 @@ at the bottom, and are summarized in the section right after this one.
   `comparator()` (`null` for natural order), and an iterator whose `remove()`
   follows `PriorityQueue.Itr`, including the elements it defers to the end of
   the walk. `List.listIterator` walks both ways and writes at its cursor.
+  `descendingIterator()` on a `LinkedList`, `ArrayDeque` or `TreeSet` walks from
+  the end, and its `remove()` deletes the element it returned.
   `Collection.toArray()`/`toArray(T[])`/`toArray(generator)` follow
   `AbstractCollection`: a long-enough array is filled in place and
   `null`-terminated. `remove(int)` is by index only on a `List` static type; on

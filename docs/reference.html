@@ -1854,13 +1854,19 @@ System.out.println(l);   // [10, 99, 30, 40]</code></pre>
           <pre><code class="lang-java">Deque&lt;Integer&gt; q = new ArrayDeque&lt;&gt;(List.of(1, 2, 3));\nSystem.out.println(q.pollFirst() + " " + q.pollLast());   // 1 3</code></pre>
         </article>
         <article class="doc-entry" id="doc-list-methods-26">
-          <h3><a class="doc-anchor" href="#doc-list-methods-26">#</a> <code>listIterator</code></h3>
+          <h3><a class="doc-anchor" href="#doc-list-methods-26">#</a> <code>descendingIterator</code></h3>
+          <pre><code class="lang-java">Iterator&lt;T&gt; descendingIterator()</code></pre>
+          <p><code>Deque</code>'s and <code>NavigableSet</code>'s reverse walk, on a <code>LinkedList</code>, an <code>ArrayDeque</code> or a <code>TreeSet</code>: <code>next</code> returns the elements last to first, and <code>remove</code> deletes the one it returned. A structural change behind it is <code>ConcurrentModificationException</code>.</p>
+          <pre><code class="lang-java">Deque&lt;Integer&gt; q = new ArrayDeque&lt;&gt;(List.of(1, 2, 3));\nIterator&lt;Integer&gt; it = q.descendingIterator();\nwhile (it.hasNext()) System.out.print(it.next());   // 321</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-list-methods-27">
+          <h3><a class="doc-anchor" href="#doc-list-methods-27">#</a> <code>listIterator</code></h3>
           <pre><code class="lang-java">ListIterator&lt;T&gt; listIterator()   |   ListIterator&lt;T&gt; listIterator(int index)</code></pre>
           <p>A cursor over the list that walks both ways (<code>next</code>/<code>previous</code>, <code>nextIndex</code>/<code>previousIndex</code>) and writes at the cursor: <code>set</code> replaces the element last returned, <code>add</code> inserts before the cursor, <code>remove</code> deletes. A start outside <code>[0, size]</code> is <code>IndexOutOfBoundsException: Index: n, Size: s</code>; a structural change behind it is <code>ConcurrentModificationException</code>.</p>
           <pre><code class="lang-java">List&lt;Integer&gt; l = new ArrayList&lt;&gt;(List.of(1, 2, 3));\nListIterator&lt;Integer&gt; it = l.listIterator(l.size());\nwhile (it.hasPrevious()) { int v = it.previous(); it.set(v * 10); }\nSystem.out.println(l);   // [10, 20, 30]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-list-methods-27">
-          <h3><a class="doc-anchor" href="#doc-list-methods-27">#</a> <code>toArray</code></h3>
+        <article class="doc-entry" id="doc-list-methods-28">
+          <h3><a class="doc-anchor" href="#doc-list-methods-28">#</a> <code>toArray</code></h3>
           <pre><code class="lang-java">Object[] toArray()   |   T[] toArray(T[] a)   |   T[] toArray(IntFunction&lt;T[]&gt; gen)</code></pre>
           <p>The elements as an array, on any <code>List</code>, <code>Set</code>, <code>Deque</code>, or <code>PriorityQueue</code>. An argument at least as long as the collection is filled in place and returned, with the slot past the last element set to <code>null</code>; a shorter one only names the type.</p>
           <pre><code class="lang-java">String[] arr = List.of("a", "b").toArray(String[]::new);\nSystem.out.println(arr.length);   // 2</code></pre>

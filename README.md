@@ -454,7 +454,8 @@ Implemented and checked against the reference `java`:
   the same map filled two ways iterates in two different orders, exactly as
   Java's does.
   `PriorityQueue` is the JDK's own binary heap (so it prints in heap order, not
-  sorted), `List.listIterator` walks both ways and writes at its cursor, and a
+  sorted), `List.listIterator` walks both ways and writes at its cursor,
+  `descendingIterator()` walks a deque or a `TreeSet` from the end, and a
   local `record`/`enum`/`interface`/`class` declared in a method body runs
   under `javac`'s binary name (`T$1Point`).
 - **`Object.clone()`** — `super.clone()` in a `Cloneable` class is a field-by-field

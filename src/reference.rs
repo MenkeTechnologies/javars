@@ -2014,6 +2014,13 @@ pub const REFERENCE: &[Entry] = &[
         "Deque<Integer> q = new ArrayDeque<>(List.of(1, 2, 3));\\nSystem.out.println(q.pollFirst() + \" \" + q.pollLast());   // 1 3",
     ),
     (
+        "descendingIterator",
+        "List Methods",
+        "Iterator<T> descendingIterator()",
+        "`Deque`'s and `NavigableSet`'s reverse walk, on a `LinkedList`, an `ArrayDeque` or a `TreeSet`: `next` returns the elements last to first, and `remove` deletes the one it returned. A structural change behind it is `ConcurrentModificationException`.",
+        "Deque<Integer> q = new ArrayDeque<>(List.of(1, 2, 3));\\nIterator<Integer> it = q.descendingIterator();\\nwhile (it.hasNext()) System.out.print(it.next());   // 321",
+    ),
+    (
         "listIterator",
         "List Methods",
         "ListIterator<T> listIterator()   |   ListIterator<T> listIterator(int index)",

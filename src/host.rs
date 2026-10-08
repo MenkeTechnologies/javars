@@ -650,6 +650,11 @@ enum HostObj {
         /// queries, and the `set`/`add` writes. A plain `iterator()` answers
         /// none of them, exactly as `java.util.Iterator` declares none.
         bidi: bool,
+        /// `true` for a `descendingIterator()`: `pos` and `last` then count
+        /// from the *end* of the source, so the cursor arithmetic (and
+        /// `remove()` leaving the cursor on the gap) is the forward walk's,
+        /// read through the mirror.
+        desc: bool,
     },
     /// A `java.util.PriorityQueue`: the binary heap array itself, laid out by
     /// the JDK's own `siftUp`/`siftDown`, so iteration and `toString` show the
@@ -3288,12 +3293,16 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
             last,
             exp_mods,
             bidi,
-        }) => Some((*source, *pos, *last, *exp_mods, *bidi)),
+            desc,
+        }) => Some((*source, *pos, *last, *exp_mods, *bidi, *desc)),
         _ => None,
     })?;
-    let (source, pos, last, exp_mods, bidi) = state;
+    let (source, pos, last, exp_mods, bidi, desc) = state;
     let argc = args.len();
-    let items = sequence_items(&Value::Obj(source)).unwrap_or_default();
+    let mut items = sequence_items(&Value::Obj(source)).unwrap_or_default();
+    if desc {
+        items.reverse();
+    }
     let stale = || iter_mods(source) != exp_mods;
     Some(match (method, argc, bidi) {
         ("hasNext", 0, _) => Ok(Value::bool(pos < items.len())),
@@ -3374,16 +3383,30 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
             if stale() {
                 return Some(Err(comodification()));
             }
+            // A descending cursor counts from the end, so the element it names
+            // sits at the mirrored index of the source.
+            let gone = if desc { items.len() - 1 - at } else { at };
             let removed = HEAP.with(|h| {
                 let mut heap = h.borrow_mut();
                 match heap.get_mut(source as usize) {
-                    Some(HostObj::List { items, mods, .. }) if at < items.len() => {
-                        items.remove(at);
+                    Some(HostObj::List { items, mods, .. }) if gone < items.len() => {
+                        items.remove(gone);
                         *mods += 1;
                         Some(*mods)
                     }
-                    Some(HostObj::Set { items, index, .. }) if at < items.len() => {
-                        items.remove(at);
+                    // A set *presents* its elements in its order (sorted for a
+                    // `TreeSet`, bucket order for a `HashSet`) but stores them
+                    // in insertion order, so the element the cursor returned
+                    // is found by value rather than by position.
+                    Some(HostObj::Set {
+                        items: stored,
+                        index,
+                        ..
+                    }) if at < items.len() => {
+                        let Some(slot) = stored.iter().position(|v| value_eq(v, &items[at])) else {
+                            return None;
+                        };
+                        stored.remove(slot);
                         index.invalidate();
                         Some(0)
                     }
@@ -7553,8 +7576,21 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 last: None,
                 exp_mods: iter_mods(*id),
                 bidi: false,
+                desc: false,
             }));
         }
+    }
+    // `descendingIterator()` — `Deque`'s (`LinkedList`, `ArrayDeque`) and
+    // `NavigableSet`'s (`TreeSet`): the same iterator walked from the end.
+    if method == "descendingIterator" && args.is_empty() && is_descending_source(id) {
+        return Value::Obj(heap_alloc(HostObj::Iterator {
+            source: id as u32,
+            pos: 0,
+            last: None,
+            exp_mods: iter_mods(id as u32),
+            bidi: false,
+            desc: true,
+        }));
     }
     // `listIterator()` / `listIterator(n)` — the same second object, starting
     // its cursor at `n`. `ArrayList.listIterator` rejects a start outside
@@ -7577,6 +7613,7 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 last: None,
                 exp_mods: iter_mods(id as u32),
                 bidi: true,
+                desc: false,
             }));
         }
     }
@@ -7831,6 +7868,20 @@ fn list_mods(id: usize) -> Option<u64> {
 }
 
 /// The length of a plain `List` (not a view), or `None` for anything else.
+/// Whether the collection at `id` answers `descendingIterator()`: a list shape
+/// that is not a view (javars models `LinkedList` and `ArrayDeque` as one), or
+/// a sorted set (`TreeSet`). `javac` has already refused the call on a type
+/// that does not declare it.
+fn is_descending_source(id: usize) -> bool {
+    HEAP.with(|h| match h.borrow().get(id) {
+        Some(HostObj::List { view: None, .. }) => true,
+        Some(HostObj::Set { order, view, .. }) => {
+            matches!(order, Order::Sorted { .. }) && matches!(view, SetView::Own)
+        }
+        _ => false,
+    })
+}
+
 fn list_size(id: usize) -> Option<usize> {
     HEAP.with(|h| match h.borrow().get(id) {
         Some(HostObj::List { items, .. }) => Some(items.len()),
