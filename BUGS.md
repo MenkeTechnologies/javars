@@ -984,6 +984,10 @@ at the bottom, and are summarized in the section right after this one.
   `floor`/`ceiling`/`lower`/`higher`, `pollFirst`/`pollLast`), each with the JDK's
   empty-collection split (`firstKey`/`first` throw `NoSuchElementException`,
   everything else answers `null`) and its `null`-probe `NullPointerException`.
+  Without a comparator a `null` key is refused everywhere it would be compared
+  — `put`, `get`, `containsKey`, `remove`, the `compute`/`merge` family, `add`,
+  `contains`, and a copy constructor — even on an empty map, and an
+  `addAll`/`putAll` keeps the elements ahead of the `null` before it throws.
   An `…Entry` answer is an immutable snapshot pair, as Java's is, whose class
   is `java.util.KeyValueHolder` rather than Java's
   `java.util.AbstractMap$SimpleImmutableEntry`. The range views (`headMap`,

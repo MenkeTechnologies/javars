@@ -4873,6 +4873,20 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         SORT_CMP.with(|s| s.borrow_mut().insert(id, seed.clone()));
         return Ok(Value::Obj(id));
     }
+    // A `TreeMap`/`TreeSet` copy of a collection holding a `null` key throws
+    // as its first `null` insertion would (see [`natural_order_null`]).
+    let null_key = match kind {
+        "TreeSet" => {
+            sequence_items(seed).is_some_and(|s| s.iter().any(|v| matches!(v, Value::Undef)))
+        }
+        "TreeMap" => {
+            map_entries(seed).is_some_and(|e| e.iter().any(|(k, _)| matches!(k, Value::Undef)))
+        }
+        _ => false,
+    };
+    if null_key {
+        return Err(Fault::java("NullPointerException", String::new()));
+    }
     // A negative initial capacity is refused by every constructor that takes
     // one, in its class's own words; `ArrayDeque` alone accepts it.
     if let Value::Int(n @ ..0) = seed {
@@ -6291,6 +6305,11 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     if let Some(f) = refused_view_write(recv, method) {
         return raise(vm, f);
     }
+    if naturally_ordered(recv) {
+        if let Some(out) = natural_order_null(vm, recv, method, args) {
+            return out;
+        }
+    }
     let through = matches!(
         method,
         "remove" | "removeObject" | "removeIf" | "removeAll" | "retainAll" | "clear"
@@ -6345,6 +6364,66 @@ fn put_as_compute(vm: &mut VM, map: &Value, key: Value, value: Value) {
     COMPUTING.with(|c| c.borrow_mut().pop());
     hash_bucket_head_insert(map, &key);
     hash_grow_compute(map, &key);
+}
+
+/// True when `v` is a `TreeMap`/`TreeSet` with no comparator — ordered by its
+/// keys' own `compareTo`.
+fn naturally_ordered(v: &Value) -> bool {
+    let Value::Obj(id) = v else {
+        return false;
+    };
+    HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(
+                HostObj::Map {
+                    order: Order::Sorted { by_cmp: false, .. },
+                    ..
+                } | HostObj::Set {
+                    order: Order::Sorted { by_cmp: false, .. },
+                    ..
+                }
+            )
+        )
+    })
+}
+
+/// A `null` key reaching a `TreeMap`/`TreeSet` that has no comparator.
+///
+/// The JDK cannot place it: `TreeMap.put` compares it (`compare(key, key)` on
+/// an empty map, `Objects.requireNonNull(key)` otherwise) and `getEntry` — which
+/// `get`, `containsKey`, `remove`, `replace` and `getOrDefault` share — requires
+/// it non-null, so every one of them is a `NullPointerException`, on an empty
+/// map too. `addAll`/`putAll` from an unsorted source insert one element at a
+/// time, so the elements ahead of the `null` are added before it throws.
+///
+/// `None` lets the call proceed; `Some` is the call's whole answer.
+fn natural_order_null(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let npe = |vm: &mut VM| raise(vm, Fault::java("NullPointerException", String::new()));
+    match method {
+        "put" | "get" | "containsKey" | "remove" | "removeObject" | "putIfAbsent" | "merge"
+        | "compute" | "computeIfAbsent" | "computeIfPresent" | "getOrDefault" | "replace"
+        | "add" | "contains" => matches!(args.first(), Some(Value::Undef)).then(|| npe(vm)),
+        "addAll" => {
+            let items = sequence_items(args.first()?)?;
+            let at = items.iter().position(|v| matches!(v, Value::Undef))?;
+            for v in &items[..at] {
+                coll_method(vm, recv, "add", std::slice::from_ref(v));
+            }
+            Some(npe(vm))
+        }
+        "putAll" => {
+            let entries = map_entries(args.first()?)?;
+            let at = entries
+                .iter()
+                .position(|(k, _)| matches!(k, Value::Undef))?;
+            for (k, v) in &entries[..at] {
+                coll_method(vm, recv, "put", &[k.clone(), v.clone()]);
+            }
+            Some(npe(vm))
+        }
+        _ => None,
+    }
 }
 
 /// True while a `merge`/`compute`/`computeIfAbsent` on `recv` is running.
