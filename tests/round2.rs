@@ -573,3 +573,48 @@ null i h str h str
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Float.toString` decides between two nearest candidates on the exact expansion (ties to even), and `distinct()` passes an element the first time it is seen so a short-circuiting terminal stops the upstream early while `sorted()` stays a barrier.
+#[test]
+fn float_to_string_breaks_ties_to_even_and_distinct_streams() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] args) {
+        // Float.toString picks the nearest candidate, ties to even, on the exact expansion.
+        for (int bits : new int[]{0xB9800000, 0x39800000, 0x3F800001, 0x4B800001, 0x33800000, 0x00000001, 0x7F7FFFFF, 0x3DCCCCCD}) {
+            float f = Float.intBitsToFloat(bits);
+            System.out.println(f + " " + (double) f);
+        }
+        System.out.println(2.44140625E-4f + " " + (0.1f + 0.2f) + " " + 16777217.0f * 0.2f + " " + 3.4e38f * 10);
+        // distinct() is streaming: a short-circuiting terminal stops the upstream early.
+        StringBuilder sb = new StringBuilder();
+        boolean any = Stream.of(1, 0, 0, 0).peek(x -> sb.append('<').append(x).append('>')).distinct().anyMatch(x -> x > 0);
+        System.out.println(any + " " + sb);
+        sb.setLength(0);
+        List<Integer> l = Stream.of(3, 1, 3, 2, 1).peek(x -> sb.append(x)).distinct().peek(x -> sb.append('!')).limit(2).collect(Collectors.toList());
+        System.out.println(l + " " + sb);
+        sb.setLength(0);
+        Object first = Stream.of(5, 3, 8).peek(x -> sb.append(x)).sorted().findFirst().get();
+        System.out.println(first + " " + sb);
+    }
+}
+"####;
+    let expected = r####"-2.4414062E-4 -2.44140625E-4
+2.4414062E-4 2.44140625E-4
+1.0000001 1.0000001192092896
+1.6777218E7 1.6777218E7
+5.9604645E-8 5.960464477539063E-8
+1.4E-45 1.401298464324817E-45
+3.4028235E38 3.4028234663852886E38
+0.1 0.10000000149011612
+2.4414062E-4 0.3 3355443.2 Infinity
+true <1>
+[3, 1] 3!1!
+3 538
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

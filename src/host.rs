@@ -872,7 +872,8 @@ enum Stage {
     /// `dropWhile(p)` — drop elements while `p` accepts them, then pass
     /// everything; the stage's counter records that the prefix is over.
     DropWhile(Value),
-    /// `distinct()` — a barrier.
+    /// `distinct()` — passes an element the first time it is seen; it streams
+    /// on a sequential pipeline, so it is not a barrier.
     Distinct,
     /// `sorted()` / `sorted(cmp)` — a barrier.
     Sorted(Option<Value>),
@@ -6093,8 +6094,8 @@ fn b_iter_token(vm: &mut VM, _argc: u8) -> Value {
 }
 
 /// [`JITER_HAS`].
-fn b_iter_has(vm: &mut VM, argc: u8) -> Value {
-    let args = pop_args(vm, argc);
+fn b_iter_has(vm: &mut VM, _argc: u8) -> Value {
+    let args = pop_array::<3>(vm);
     let at = as_i64(&args[1]) as usize;
     let (Value::Obj(src), Value::Obj(arr)) = (&args[0], &args[2]) else {
         return Value::bool(false);
@@ -6115,8 +6116,8 @@ fn b_iter_has(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// [`JITER_GET`].
-fn b_iter_get(vm: &mut VM, argc: u8) -> Value {
-    let args = pop_args(vm, argc);
+fn b_iter_get(vm: &mut VM, _argc: u8) -> Value {
+    let args = pop_array::<5>(vm);
     let at = as_i64(&args[1]) as usize;
     let token = as_i64(&args[4]);
     if token >= 0 && iter_token_of(&args[3]) != token {
@@ -6172,6 +6173,16 @@ fn run_sub(vm: &mut VM, entry: usize, stack_base: usize) -> Value {
             Value::Undef
         }
     }
+}
+
+/// [`pop_args`] for a builtin of fixed arity, without the allocation: the hot
+/// per-iteration builtins (an enhanced `for`'s two) pop through this.
+fn pop_array<const N: usize>(vm: &mut VM) -> [Value; N] {
+    let mut out: [Value; N] = std::array::from_fn(|_| Value::Undef);
+    for slot in out.iter_mut().rev() {
+        *slot = vm.stack.pop().unwrap_or(Value::Undef);
+    }
+    out
 }
 
 /// Pop `argc` values off the VM stack, restoring source (deepest-first) order.
@@ -8577,17 +8588,26 @@ fn stream_with(
 /// `counters` is one slot per stage, so a `limit` or a `skip` keeps its own
 /// count across elements. It is split alongside `stages` so each stage reads its
 /// own slot and never another's.
+/// What one pipeline stage remembers while elements flow through it: a counter
+/// (`limit`, `skip`, `dropWhile`) and, for `distinct`, the values already passed.
+#[derive(Default)]
+struct StageState {
+    count: i64,
+    seen: Vec<Value>,
+}
+
 fn stream_push(
     vm: &mut VM,
     v: Value,
     stages: &[Stage],
-    counters: &mut [i64],
+    counters: &mut [StageState],
     sink: &mut dyn FnMut(&mut VM, Value) -> bool,
 ) -> bool {
     let (Some(stage), rest) = (stages.first(), &stages[stages.len().min(1)..]) else {
         return sink(vm, v);
     };
-    let (count, rest_counts) = counters.split_first_mut().expect("one counter per stage");
+    let (state, rest_counts) = counters.split_first_mut().expect("one state per stage");
+    let count = &mut state.count;
     match stage {
         Stage::Filter(p) => {
             if matches!(
@@ -8680,7 +8700,17 @@ fn stream_push(
             let go = stream_push(vm, v, rest, rest_counts, sink);
             go && *count < *n
         }
-        Stage::Distinct | Stage::Sorted(_) => {
+        // `distinct()` streams on a sequential pipeline: an element is passed on
+        // the first time it is seen, so a downstream short-circuit stops the
+        // upstream early (it is `sorted` that is the barrier).
+        Stage::Distinct => {
+            if state.seen.iter().any(|x| value_eq(x, &v)) {
+                return true;
+            }
+            state.seen.push(v.clone());
+            stream_push(vm, v, rest, rest_counts, sink)
+        }
+        Stage::Sorted(_) => {
             unreachable!("a barrier is split off before the element-wise walk")
         }
     }
@@ -8689,42 +8719,30 @@ fn stream_push(
 /// Run `source` through `stages`, calling `sink` for each surviving element
 /// until it answers `false` or the source is exhausted.
 ///
-/// A stateful barrier — `distinct` or `sorted` — cannot answer for an element
-/// without having seen every element before it, so the pipeline is evaluated in
+/// A stateful barrier — `sorted` — cannot answer for an element without
+/// having seen every element before it, so the pipeline is evaluated in
 /// segments split at the first one. That is Java's own shape, and it is why a
 /// `peek` before a `sorted` runs for every element while a `peek` before a
-/// `limit` does not.
+/// `limit` does not. (`distinct` is stateful but streams: it is [`StageState`].)
 fn stream_drive(
     vm: &mut VM,
     source: Source,
     stages: &[Stage],
     sink: &mut dyn FnMut(&mut VM, Value) -> bool,
 ) {
-    if let Some(i) = stages
-        .iter()
-        .position(|s| matches!(s, Stage::Distinct | Stage::Sorted(_)))
-    {
+    if let Some(i) = stages.iter().position(|s| matches!(s, Stage::Sorted(_))) {
         let mut buf = Vec::new();
         stream_drive(vm, source, &stages[..i], &mut |_vm, v| {
             buf.push(v);
             true
         });
         let buf = match &stages[i] {
-            Stage::Distinct => {
-                let mut seen: Vec<Value> = Vec::new();
-                for v in buf {
-                    if !seen.iter().any(|x| value_eq(x, &v)) {
-                        seen.push(v);
-                    }
-                }
-                seen
-            }
             Stage::Sorted(cmp) => sort_values(vm, buf, cmp.as_ref()),
             _ => unreachable!("the position above found a barrier"),
         };
         return stream_drive(vm, Source::Items(buf), &stages[i + 1..], sink);
     }
-    let mut counters = vec![0i64; stages.len()];
+    let mut counters: Vec<StageState> = stages.iter().map(|_| StageState::default()).collect();
     // `Stream.concat(a, b)`: drive `a`'s whole pipeline into this one, then
     // `b`'s — each part is pulled only as far as this pipeline still wants.
     if let Source::Concat(parts) = source {
@@ -17852,6 +17870,21 @@ fn format_double(f: f64) -> String {
 /// neighbouring candidate round-trips — with a single candidate there is
 /// nothing to choose between, and that is the common case.
 fn nearest_shortest(v: f64, sci: &str) -> Option<(String, i32)> {
+    nearest_shortest_by(v, sci, &|text: &str| {
+        text.parse::<f64>()
+            .is_ok_and(|c| c.to_bits() == v.to_bits())
+    })
+}
+
+/// [`nearest_shortest`] with the round-trip test supplied: `parses_back` says
+/// whether a decimal rendering reads back as the value *in the type being
+/// printed*, which is what lets `Float.toString` share the selection with
+/// `Double.toString`. `v` is the exact value (an `f32` widens losslessly).
+fn nearest_shortest_by(
+    v: f64,
+    sci: &str,
+    parses_back: &dyn Fn(&str) -> bool,
+) -> Option<(String, i32)> {
     let (mantissa, exp) = sci.split_once('e')?;
     let exp: i32 = exp.parse().ok()?;
     let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
@@ -17859,9 +17892,7 @@ fn nearest_shortest(v: f64, sci: &str) -> Option<(String, i32)> {
     let sign = if v < 0.0 { "-" } else { "" };
     let round_trips = |d: &[u8], e: i32| {
         let text = String::from_utf8_lossy(d).into_owned();
-        format!("{sign}{}", sci_form(&text, e))
-            .parse::<f64>()
-            .is_ok_and(|c| c.to_bits() == v.to_bits())
+        parses_back(&format!("{sign}{}", sci_form(&text, e)))
     };
     // Is there a second candidate at all? Only the two neighbours can be one.
     let mut lower = digits.clone();
@@ -18013,100 +18044,17 @@ fn java_shortest_f32(v: f32) -> (String, i32) {
     let sci = format!("{v:e}");
     let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
     let exp: i32 = exp.parse().unwrap_or(0);
-    let neg = mantissa.starts_with('-');
     let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
-
-    // The only other candidate of the same length is one decimal ulp away, on
-    // whichever side of the value Rust's answer is not.
-    let here = rebuild(&digits, exp, neg);
-    let delta = here - f64::from(v);
-    if delta == 0.0 {
-        return (digits, exp);
-    }
-    let toward = if (delta > 0.0) != neg { -1 } else { 1 };
-    let Some((other_digits, other_exp)) = step_last_digit(&digits, exp, toward) else {
-        return (digits, exp);
+    // The same nearest-candidate rule `Double.toString` uses, decided on the
+    // value's exact decimal expansion rather than on `f64` distances: two
+    // candidates one decimal ulp apart sit about 5e-12 either side of a tie,
+    // where a candidate parsed to `f64` is already off by more than that
+    // relative to the gap.
+    let parses_back = |text: &str| {
+        text.parse::<f32>()
+            .is_ok_and(|c| c.to_bits() == v.to_bits())
     };
-    // A candidate that does not round-trip is not a candidate.
-    let other = rebuild(&other_digits, other_exp, neg);
-    if other as f32 != v {
-        return (digits, exp);
-    }
-    let (d_here, d_other) = (delta.abs(), (other - f64::from(v)).abs());
-    // Both distances sum to one decimal ulp, so "equidistant" is a comparison at
-    // that scale; f64 carries eight more digits than the nine at stake here.
-    let tie = (d_here - d_other).abs() <= (d_here + d_other) * 1e-9;
-    if tie {
-        let even = |d: &str| d.as_bytes().last().is_some_and(|b| (b - b'0') % 2 == 0);
-        return if even(&digits) {
-            (digits, exp)
-        } else {
-            (other_digits, other_exp)
-        };
-    }
-    if d_other < d_here {
-        (other_digits, other_exp)
-    } else {
-        (digits, exp)
-    }
-}
-
-/// The value of `d.ddd × 10^exp`, signed.
-fn rebuild(digits: &str, exp: i32, neg: bool) -> f64 {
-    let mut s = String::new();
-    if neg {
-        s.push('-');
-    }
-    s.push_str(&digits[..1]);
-    if digits.len() > 1 {
-        s.push('.');
-        s.push_str(&digits[1..]);
-    }
-    s.push('e');
-    s.push_str(&exp.to_string());
-    s.parse().unwrap_or(f64::NAN)
-}
-
-/// Add `step` (±1) to the last significant digit, carrying through. A carry out
-/// of the leading digit shortens the digit string and bumps the exponent, which
-/// keeps the candidate the same *length* as the one it came from.
-fn step_last_digit(digits: &str, exp: i32, step: i8) -> Option<(String, i32)> {
-    let mut d: Vec<u8> = digits.bytes().map(|b| b - b'0').collect();
-    let mut i = d.len();
-    if step > 0 {
-        loop {
-            if i == 0 {
-                // 999… + 1 → 100… one decimal place up.
-                let mut out = vec![1u8];
-                out.resize(d.len(), 0);
-                return Some((to_digits(&out), exp + 1));
-            }
-            i -= 1;
-            if d[i] < 9 {
-                d[i] += 1;
-                break;
-            }
-            d[i] = 0;
-        }
-    } else {
-        loop {
-            if i == 0 {
-                // 100… - 1 → 999… one decimal place down.
-                return Some((("9").repeat(d.len()), exp - 1));
-            }
-            i -= 1;
-            if d[i] > 0 {
-                d[i] -= 1;
-                break;
-            }
-            d[i] = 9;
-        }
-    }
-    Some((to_digits(&d), exp))
-}
-
-fn to_digits(d: &[u8]) -> String {
-    d.iter().map(|b| (b + b'0') as char).collect()
+    nearest_shortest_by(f64::from(v), &sci, &parses_back).unwrap_or((digits, exp))
 }
 
 /// `d.ddd × 10^exp` written out in full, the form Java uses inside

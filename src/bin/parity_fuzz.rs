@@ -2528,6 +2528,9 @@ enum Mode {
     View,
     Erased,
     Lru,
+    BitsFloat,
+    RecHash,
+    StreamOps,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2617,6 +2620,9 @@ const CONCRETE: &[Mode] = &[
     Mode::View,
     Mode::Erased,
     Mode::Lru,
+    Mode::BitsFloat,
+    Mode::RecHash,
+    Mode::StreamOps,
 ];
 
 /// The `Integer`/`Long` bit-twiddling statics, at the boundaries where the two
@@ -3342,6 +3348,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::View => "view",
         Mode::Erased => "erased",
         Mode::Lru => "lru",
+        Mode::BitsFloat => "bitsfloat",
+        Mode::RecHash => "rechash",
+        Mode::StreamOps => "streamops",
     }
 }
 
@@ -3445,6 +3454,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::View => round2::g_view(r),
         Mode::Erased => round2::g_erased(r),
         Mode::Lru => round2::g_lru(r),
+        Mode::BitsFloat => round2::g_bitsfloat(r),
+        Mode::RecHash => round2::g_rechash(r),
+        Mode::StreamOps => round2::g_streamops(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

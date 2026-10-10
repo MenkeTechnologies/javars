@@ -213,6 +213,7 @@ pub const SUPPORT_CLASS: &str = concat!(
     "class ZiK implements ZiJ {\n",
     "    static int k = ZLog.note(\"K\");\n",
     "}\n",
+    "record Rv(int i, long l, double dbl, float flt, boolean b, char ch, String s, Object o) { }\n",
     "enum ZiE {\n",
     "    P, Q;\n",
     "    ZiE() { ZLog.note(\"Ector\"); }\n",
@@ -1035,4 +1036,112 @@ pub fn g_lru(r: &mut Rng) -> String {
     }
     s.push_str("System.out.println(m + \" \" + m.keySet() + \" \" + m.values()); }");
     s
+}
+
+/// Floating-point values built from raw bit patterns, so the shortest
+/// round-trip rendering is exercised across the whole exponent range rather
+/// than at the hand-picked literals the other pools hold.
+pub fn g_bitsfloat(r: &mut Rng) -> String {
+    // A 64-bit pattern whose exponent field is drawn uniformly (so subnormals,
+    // the decimal/scientific boundary and the huge end are all reached) and
+    // whose mantissa is full-width or deliberately short.
+    let exp = r.below(0x7FF) as u64;
+    let mant = match r.below(4) {
+        0 => 0,
+        1 => (r.next() & 0xFFF) << 40,
+        _ => r.next() & 0x000F_FFFF_FFFF_FFFF,
+    };
+    let sign = (r.below(2) as u64) << 63;
+    let bits = sign | (exp << 52) | mant;
+    let fexp = r.below(0xFF) as u32;
+    let fmant = match r.below(3) {
+        0 => 0,
+        _ => (r.next() & 0x7F_FFFF) as u32,
+    };
+    let fbits = ((r.below(2) as u32) << 31) | (fexp << 23) | fmant;
+    match r.below(7) {
+        0 | 1 => format!("System.out.println(Double.longBitsToDouble(0x{bits:016X}L));"),
+        2 | 3 => format!("System.out.println(Float.intBitsToFloat(0x{fbits:08X}));"),
+        4 => format!(
+            "{{ double d = Double.longBitsToDouble(0x{bits:016X}L); System.out.println(\"\" + d + \"|\" + (float) d + \"|\" + (long) d + \"|\" + (int) d + \"|\" + Math.round(d) + \"|\" + Double.toString(d).length()); }}"
+        ),
+        5 => format!(
+            "{{ float f = Float.intBitsToFloat(0x{fbits:08X}); System.out.println(\"\" + f + \"|\" + (double) f + \"|\" + (int) f + \"|\" + f * 2 + \"|\" + (f + 1.0f) + \"|\" + Float.toString(f)); }}"
+        ),
+        _ => format!(
+            "{{ double d = Double.longBitsToDouble(0x{bits:016X}L); System.out.println(String.valueOf(d) + \"|\" + Math.nextUp(d) + \"|\" + Math.ulp(d) + \"|\" + Math.abs(d) + \"|\" + d * 3 + \"|\" + d / 7); }}"
+        ),
+    }
+}
+
+/// Records over every component type: the derived `toString`, `equals` and
+/// `hashCode`, including the corners (`NaN`, `-0.0`, `null`) where the
+/// component-wise comparison differs from `==`.
+pub fn g_rechash(r: &mut Rng) -> String {
+    let int = pick(r, &["0", "1", "-7", "2147483647"]);
+    let long = pick(r, &["0L", "5000000000L", "-1L", "Long.MIN_VALUE"]);
+    let dbl = pick(r, &["0.0", "-0.0", "1.5", "Double.NaN", "1e300"]);
+    let flt = pick(r, &["0f", "-0f", "0.1f", "Float.NaN"]);
+    let boo = pick(r, &["true", "false"]);
+    let ch = pick(r, &["'a'", "'\\u0000'", "'Z'"]);
+    let st = pick(r, &["null", "\"\"", "\"hi\""]);
+    let make = |r: &mut Rng| {
+        format!(
+            "new Rv({int}, {long}, {dbl}, {flt}, {boo}, {ch}, {st}, {})",
+            pick(r, &["null", "7", "\"o\""])
+        )
+    };
+    let a = make(r);
+    match r.below(4) {
+        0 => format!("{{ Rv a = {a}; System.out.println(a + \" \" + a.hashCode()); }}"),
+        1 => format!("{{ Rv a = {a}; Rv b = {a}; System.out.println(a.equals(b) + \" \" + (a.hashCode() == b.hashCode())); }}"),
+        2 => format!(
+            "{{ Rv a = {a}; Rv b = {}; System.out.println(a.equals(b) + \" \" + a.dbl() + \" \" + a.flt() + \" \" + a.ch()); }}",
+            make(r)
+        ),
+        _ => format!(
+            "{{ Set<Rv> s = new HashSet<>(); s.add({a}); s.add({a}); s.add({}); System.out.println(s.size()); }}",
+            make(r)
+        ),
+    }
+}
+
+/// Random stream pipelines: lazy, element-at-a-time, with `peek` exposing the
+/// order operations run in and `sorted` as the barrier.
+pub fn g_streamops(r: &mut Rng) -> String {
+    let src = *pick(
+        r,
+        &[
+            "IntStream.rangeClosed(1, 8).map(x -> 9 - x).boxed()",
+            "Stream.of(5, 3, 8, 3, 1, 9, 2)",
+            "Arrays.asList(4, 4, 2, 7, 7, 7).stream()",
+            "Stream.iterate(1, x -> x * 2).limit(6)",
+        ],
+    );
+    let mut ops = String::new();
+    for _ in 0..(1 + r.below(3)) {
+        let op = match r.below(9) {
+            0 => ".filter(x -> x % 2 == 1)",
+            1 => ".map(x -> x * 3)",
+            2 => ".sorted()",
+            3 => ".distinct()",
+            4 => ".limit(4)",
+            5 => ".skip(2)",
+            6 => ".peek(x -> sb.append('<').append(x).append('>'))",
+            7 => ".sorted(Comparator.reverseOrder())",
+            _ => ".flatMap(x -> Stream.of(x, -x))",
+        };
+        ops.push_str(op);
+    }
+    let term = match r.below(8) {
+        0 => ".collect(Collectors.toList())",
+        1 => ".count()",
+        2 => ".reduce(0, Integer::sum)",
+        3 => ".findFirst().orElse(-1)",
+        4 => ".anyMatch(x -> x > 6)",
+        5 => ".map(String::valueOf).collect(Collectors.joining(\",\"))",
+        6 => ".max(Integer::compare).orElse(-1)",
+        _ => ".mapToInt(x -> x).summaryStatistics().toString()",
+    };
+    format!("{{ StringBuilder sb = new StringBuilder(); Object res = {src}{ops}{term}; System.out.println(res + \" \" + sb); }}")
 }
