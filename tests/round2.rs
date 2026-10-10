@@ -289,3 +289,237 @@ false true true
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Collections.unmodifiableX` is a read-only view: writes through the target show, writes through the wrapper are `UnsupportedOperationException`, and an immutable collection's iterator refuses `remove()` before checking its cursor.
+#[test]
+fn unmodifiable_wrappers_show_their_target_and_refuse_writes() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    static String attempt(Runnable r) { try { r.run(); return "ok"; } catch (UnsupportedOperationException e) { return "UOE"; } }
+    public static void main(String[] args) {
+        List<Integer> src = new ArrayList<>(List.of(3, 1, 2));
+        List<Integer> view = Collections.unmodifiableList(src);
+        System.out.println(view + " " + view.size() + " " + view.get(1) + " " + view.contains(2) + " " + view.indexOf(2));
+        src.add(9); src.set(0, 7);
+        System.out.println(view + " " + view.size() + " " + (view != src) + " " + view.equals(src) + " " + src.equals(view) + " " + view.hashCode());
+        System.out.println(attempt(() -> view.add(1)) + attempt(() -> view.remove(0)) + attempt(() -> view.set(0, 1)) + attempt(() -> view.clear()) + attempt(() -> view.sort(null)) + attempt(() -> view.iterator().remove()) + attempt(() -> view.addAll(List.of(1))));
+        int sum = 0; for (int v : view) sum += v; System.out.println(sum + " " + view.stream().map(x -> x * 2).collect(Collectors.toList()) + new ArrayList<>(view) + Collections.max(view));
+        Set<String> s = new TreeSet<>(Set.of("b", "a"));
+        Set<String> sv = Collections.unmodifiableSet(s);
+        s.add("c");
+        System.out.println(sv + " " + sv.contains("c") + " " + attempt(() -> sv.add("d")) + attempt(() -> sv.remove("a")) + sv.size());
+        Map<String, Integer> m = new LinkedHashMap<>();
+        Map<String, Integer> mv = Collections.unmodifiableMap(m);
+        m.put("x", 1); m.put("y", 2);
+        System.out.println(mv + " " + mv.get("y") + " " + mv.keySet() + " " + mv.values() + " " + mv.containsKey("x") + " " + mv.size() + " " + mv.getOrDefault("z", -1));
+        System.out.println(attempt(() -> mv.put("z", 3)) + attempt(() -> mv.remove("x")) + attempt(() -> mv.clear()) + attempt(() -> mv.merge("x", 1, Integer::sum)) + attempt(() -> mv.putIfAbsent("q", 1)));
+        for (Map.Entry<String, Integer> e : mv.entrySet()) System.out.print(e.getKey() + e.getValue());
+        System.out.println();
+        Collection<Integer> c = Collections.unmodifiableCollection(src);
+        System.out.println(c + " " + c.size() + attempt(() -> c.add(1)));
+        List<Integer> nested = Collections.unmodifiableList(Collections.unmodifiableList(src));
+        src.add(100);
+        System.out.println(nested.size() + " " + nested.get(nested.size() - 1));
+        List<Integer> empty = Collections.emptyList();
+        System.out.println(empty + " " + attempt(() -> empty.add(1)) + Collections.singletonList(5) + Collections.synchronizedList(new ArrayList<>(List.of(1))));
+        try { Collections.unmodifiableList(null); } catch (NullPointerException e) { System.out.println("npe"); }
+    }
+}
+"####;
+    let expected = r####"[3, 1, 2] 3 1 true 2
+[7, 1, 2, 9] 4 true true true 1133090
+UOEUOEUOEUOEUOEUOEUOE
+19 [14, 2, 4, 18][7, 1, 2, 9]9
+[a, b, c] true UOEUOE3
+{x=1, y=2} 2 [x, y] [1, 2] true 2 -1
+UOEUOEUOEUOEUOE
+x1y2
+[7, 1, 2, 9] 4UOE
+5 100
+[] UOE[5][1]
+npe
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A call through an erased receiver converts an `int` argument for a `double` parameter, an anonymous class that names its own `this` or recurses stays a class, a user `Iterable` inherits `forEach`, private interface methods are statically bound, and the primitive optionals have factories.
+#[test]
+fn erased_calls_widen_anonymous_classes_keep_this_and_iterable_inherits_for_each() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    interface Account { void deposit(double amt); double balance(); }
+    static class Acct implements Account {
+        double bal;
+        public void deposit(double amt) { bal += amt; System.out.println("deposit " + amt); }
+        public double balance() { return bal; }
+    }
+    interface WithPriv { private int helper() { return 41; } default int val() { return helper() + 1; } }
+    static class Bag implements Iterable<String> {
+        final List<String> xs = new ArrayList<>(List.of("a", "b", "c"));
+        public Iterator<String> iterator() { return xs.iterator(); }
+    }
+    static class Tree<E extends Comparable<E>> implements Iterable<E> {
+        private final TreeSet<E> items = new TreeSet<>();
+        void add(E e) { items.add(e); }
+        public Iterator<E> iterator() { return items.iterator(); }
+    }
+    static float half(float f) { return f / 2; }
+    static double twice(double d) { return d * 2; }
+    public static void main(String[] args) {
+        Map<String, Account> accts = new HashMap<>();
+        accts.put("a", new Acct());
+        accts.get("a").deposit(5);
+        accts.get("a").deposit(-5);
+        Object o = new Acct();
+        ((Account) o).deposit(2);
+        System.out.println(accts.get("a").balance() + " " + new WithPriv() {}.val());
+        BiFunction<Integer, Integer, Integer> gcd = new BiFunction<>() {
+            public Integer apply(Integer a, Integer b) { return b == 0 ? a : this.apply(b, a % b); }
+        };
+        Function<Integer, Integer> fact = new Function<>() {
+            public Integer apply(Integer n) { return n <= 1 ? 1 : n * apply(n - 1); }
+        };
+        System.out.println(gcd.apply(84, 36) + " " + fact.apply(6));
+        Bag bag = new Bag();
+        List<String> got = new ArrayList<>();
+        bag.forEach(got::add);
+        bag.forEach(x -> System.out.print(x.toUpperCase()));
+        System.out.println(" " + got);
+        Tree<Integer> t = new Tree<>();
+        for (int v : new int[]{5, 1, 3}) t.add(v);
+        StringBuilder sb = new StringBuilder();
+        t.forEach(v -> sb.append(v).append(';'));
+        System.out.println(sb);
+        System.out.println(OptionalInt.of(3) + " " + OptionalDouble.of(2) + " " + OptionalLong.empty() + " " + OptionalInt.empty().isPresent() + " " + OptionalInt.of(7).getAsInt());
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        System.out.println(l.addAll(1, List.of(8, 9)) + " " + l + " " + l.addAll(0, List.of()));
+        try { l.addAll(9, List.of(1)); } catch (IndexOutOfBoundsException e) { System.out.println(e.getMessage()); }
+        System.out.println(half(5) + " " + twice(3) + " " + (float) twice(0.1) + " " + (double) half(0.1f));
+    }
+}
+"####;
+    let expected = r####"deposit 5.0
+deposit -5.0
+deposit 2.0
+0.0 42
+12 720
+ABC [a, b, c]
+1;3;5;
+OptionalInt[3] OptionalDouble[2.0] OptionalLong.empty false 7
+true [1, 8, 9, 2, 3] false
+Index: 9, Size: 5
+2.5 6.0 0.2 0.05000000074505806
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A small bank: interfaces, an abstract base, a checked exception, `String.format`, streams over an erased map, and an unmodifiable history view.
+#[test]
+fn a_bank_program_with_exceptions_interfaces_and_unmodifiable_history() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+
+public class T {
+    interface Account { String id(); double balance(); void deposit(double amt); void withdraw(double amt) throws InsufficientFunds; default String summary() { return String.format("%s[%s: %.2f]", getClass().getSimpleName(), id(), balance()); } }
+    static class InsufficientFunds extends Exception {
+        final double shortBy;
+        InsufficientFunds(String id, double shortBy) { super("Insufficient funds in " + id + ": short by " + String.format("%.2f", shortBy)); this.shortBy = shortBy; }
+    }
+    static abstract class Base implements Account {
+        private final String id; protected double bal; private final List<String> log = new ArrayList<>();
+        Base(String id, double open) { this.id = id; this.bal = open; log("open " + open); }
+        public String id() { return id; }
+        public double balance() { return bal; }
+        protected void log(String s) { log.add(s); }
+        List<String> history() { return Collections.unmodifiableList(log); }
+        public void deposit(double amt) { if (amt <= 0) throw new IllegalArgumentException("Deposit must be positive: " + amt); bal += amt; log("dep " + amt); }
+        public void withdraw(double amt) throws InsufficientFunds { if (amt > available()) throw new InsufficientFunds(id, amt - available()); bal -= amt; log("wd " + amt); }
+        abstract double available();
+    }
+    static class Checking extends Base { final double overdraft; Checking(String id, double open, double od) { super(id, open); overdraft = od; } double available() { return bal + overdraft; } }
+    static class Savings extends Base { final double rate; Savings(String id, double open, double rate) { super(id, open); this.rate = rate; } double available() { return bal; } void accrue() { double i = bal * rate / 12; bal += i; log("int " + String.format("%.4f", i)); } }
+    public static void main(String[] args) {
+        Map<String, Account> accts = new LinkedHashMap<>();
+        accts.put("C1", new Checking("C1", 100, 50));
+        accts.put("S1", new Savings("S1", 1000, 0.05));
+        try {
+            accts.get("C1").withdraw(120);
+            accts.get("C1").withdraw(50);
+        } catch (InsufficientFunds e) {
+            System.out.println(e.getMessage() + " / " + e.shortBy);
+        }
+        try { accts.get("S1").deposit(-5); } catch (IllegalArgumentException e) { System.out.println("IAE " + e.getMessage()); }
+        ((Savings) accts.get("S1")).accrue();
+        ((Savings) accts.get("S1")).accrue();
+        for (Account a : accts.values()) System.out.println(a.summary());
+        double total = accts.values().stream().mapToDouble(Account::balance).sum();
+        System.out.printf("total=%.3f avg=%8.2f max=%s%n", total, total / accts.size(), accts.values().stream().max(Comparator.comparingDouble(Account::balance)).get().id());
+        System.out.println(((Base) accts.get("S1")).history());
+    }
+}
+"####;
+    let expected = r####"Insufficient funds in C1: short by 20.00 / 20.0
+IAE Deposit must be positive: -5.0
+Checking[C1: -20.00]
+Savings[S1: 1008.35]
+total=988.351 avg=  494.18 max=S1
+[open 1000.0, int 4.1667, int 4.1840]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A generic binary search tree with an anonymous iterator, a generic linked stack, composed functions and an anonymous recursive `BiFunction`.
+#[test]
+fn generic_bst_with_iterator_and_functional_helpers() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+
+public class T {
+    static class Node<T extends Comparable<T>> { T val; Node<T> left, right; Node(T v) { val = v; } }
+    static class Bst<T extends Comparable<T>> implements Iterable<T> {
+        Node<T> root; int size;
+        boolean add(T v) { if (root == null) { root = new Node<>(v); size++; return true; } Node<T> c = root; while (true) { int cmp = v.compareTo(c.val); if (cmp == 0) return false; Node<T> nx = cmp < 0 ? c.left : c.right; if (nx == null) { if (cmp < 0) c.left = new Node<>(v); else c.right = new Node<>(v); size++; return true; } c = nx; } }
+        int height(Node<T> n) { return n == null ? 0 : 1 + Math.max(height(n.left), height(n.right)); }
+        public Iterator<T> iterator() { Deque<Node<T>> st = new ArrayDeque<>(); for (Node<T> c = root; c != null; c = c.left) st.push(c); return new Iterator<T>() { public boolean hasNext() { return !st.isEmpty(); } public T next() { Node<T> n = st.pop(); for (Node<T> c = n.right; c != null; c = c.left) st.push(c); return n.val; } }; }
+    }
+    static class LinkedStack<E> { private static class N<E> { E v; N<E> next; N(E v, N<E> n) { this.v = v; next = n; } } private N<E> head; private int n; void push(E e) { head = new N<>(e, head); n++; } E pop() { if (head == null) throw new RuntimeException("empty"); E v = head.v; head = head.next; n--; return v; } boolean isEmpty() { return head == null; } int size() { return n; } }
+    static <A, B, C> Function<A, C> compose(Function<A, B> f, Function<B, C> g) { return a -> g.apply(f.apply(a)); }
+    static <T> void bubble(T[] a, Comparator<? super T> c) { for (int i = 0; i < a.length; i++) for (int j = 0; j + 1 < a.length - i; j++) if (c.compare(a[j], a[j + 1]) > 0) { T t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; } }
+    public static void main(String[] args) {
+        Bst<Integer> t = new Bst<>(); for (int v : new int[]{50, 30, 70, 20, 40, 60, 80, 30, 65}) t.add(v);
+        StringBuilder sb = new StringBuilder(); for (int v : t) sb.append(v).append(' '); System.out.println(sb + "size=" + t.size + " h=" + t.height(t.root));
+        Bst<String> ts = new Bst<>(); for (String s : "kiwi apple mango banana cherry apple".split(" ")) ts.add(s); List<String> l = new ArrayList<>(); ts.forEach(l::add); System.out.println(l);
+        LinkedStack<String> st = new LinkedStack<>(); for (String s : "a b c".split(" ")) st.push(s); System.out.println(st.pop() + st.pop() + st.size()); try { st.pop(); st.pop(); } catch (RuntimeException e) { System.out.println(e.getMessage() + st.isEmpty()); }
+        System.out.println(compose((String s) -> s.length(), (Integer n) -> n * n).apply("hello") + " " + T.<Integer, Integer, String>compose(x -> x + 1, x -> "v" + x).apply(4));
+        String[] names = {"delta", "Alpha", "charlie", "Bravo"}; bubble(names, String.CASE_INSENSITIVE_ORDER); System.out.println(Arrays.toString(names)); Integer[] nums = {5, 2, 9, 1}; bubble(nums, Comparator.reverseOrder()); System.out.println(Arrays.toString(nums));
+        BiFunction<Integer, Integer, Integer> gcd = new BiFunction<>() { public Integer apply(Integer a, Integer b) { return b == 0 ? a : this.apply(b, a % b); } }; System.out.println(gcd.apply(84, 36));
+        Supplier<Supplier<String>> ss = () -> () -> "deep"; System.out.println(ss.get().get());
+    }
+}
+"####;
+    let expected = r####"20 30 40 50 60 65 70 80 size=8 h=4
+[apple, banana, cherry, kiwi, mango]
+cb1
+emptytrue
+25 v5
+[Alpha, Bravo, charlie, delta]
+[9, 5, 2, 1]
+12
+deep
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

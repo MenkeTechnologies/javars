@@ -389,7 +389,9 @@ Implemented and checked against the reference `java`:
   `EnumSet.of`/`noneOf`/`allOf`/`copyOf` (ordinal order, as the `TreeMap`/
   `TreeSet` they behave as), `Map.Entry.comparingByKey`/`comparingByValue`,
   `List.copyOf`/`Set.copyOf`/`Map.copyOf`, `Collections.emptySet`/`emptyMap`/
-  `singleton`/`singletonMap`/`emptySortedSet`/`nCopies`, the empty iterators and
+  `singleton`/`singletonMap`/`emptySortedSet`/`nCopies`/`emptyList`/`singletonList`,
+  the read-only wrappers `Collections.unmodifiableList`/`Set`/`Map`/`Collection`
+  (views that follow their target and refuse writes), the empty iterators and
   enumerations, `Collections.enumeration`/`list`, `AtomicInteger`/`AtomicLong`/`AtomicBoolean` (plain
   read-modify-write, javars running one thread),
   `AbstractMap.SimpleEntry`/`SimpleImmutableEntry` (pairs of their own, the

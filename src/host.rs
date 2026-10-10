@@ -3632,6 +3632,14 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
         // element that shifted into it. Calling it twice, or before any move,
         // is Java's `IllegalStateException`.
         ("remove", 0, _) => {
+            // An immutable collection's iterator refuses before it looks at
+            // where the cursor is.
+            if collection_fixity(&Value::Obj(source)) == Some(Fixity::Immutable) {
+                return Some(Err(Fault::java(
+                    "UnsupportedOperationException",
+                    String::new(),
+                )));
+            }
             let Some(at) = last else {
                 return Some(Err(Fault::java("IllegalStateException", String::new())));
             };
@@ -5348,12 +5356,119 @@ fn first_repeat(vm: &mut VM, vals: &[Value]) -> Option<Value> {
     None
 }
 
+thread_local! {
+    /// `Collections.unmodifiableX` views: view handle → the collection it
+    /// shows. The view is an immutable copy that [`sync_view`] re-copies from
+    /// its target whenever it is read, which is what makes it a *view*.
+    static VIEWS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Refresh the `unmodifiableX` view at `id` from the collection it shows. A
+/// no-op for every handle that is not one, and for the whole program when none
+/// was ever made.
+fn sync_view(id: u32) {
+    let Some(target) = VIEWS.with(|v| {
+        let v = v.borrow();
+        if v.is_empty() {
+            None
+        } else {
+            v.get(&id).copied()
+        }
+    }) else {
+        return;
+    };
+    // A view of a view reads through the inner one, so it is current first.
+    sync_view(target);
+    enum Snap {
+        List(Vec<Value>),
+        Set(Vec<Value>, Order),
+        Map(Vec<(Value, Value)>, Order),
+    }
+    let snap = HEAP.with(|h| match h.borrow().get(target as usize) {
+        Some(HostObj::Set { items, order, .. }) => Some(Snap::Set(items.clone(), *order)),
+        Some(HostObj::Map { entries, order, .. }) => Some(Snap::Map(entries.clone(), *order)),
+        _ => None,
+    });
+    let snap = snap.or_else(|| sequence_items(&Value::Obj(target)).map(Snap::List));
+    let Some(snap) = snap else {
+        return;
+    };
+    HEAP.with(|h| match (h.borrow_mut().get_mut(id as usize), snap) {
+        (Some(HostObj::List { items, .. }), Snap::List(new)) => *items = new,
+        (
+            Some(HostObj::Set {
+                items,
+                order,
+                index,
+                ..
+            }),
+            Snap::Set(new, o),
+        ) => {
+            *items = new;
+            *order = o;
+            *index = KeyIndex::default();
+        }
+        (
+            Some(HostObj::Map {
+                entries,
+                order,
+                index,
+                ..
+            }),
+            Snap::Map(new, o),
+        ) => {
+            *entries = new;
+            *order = o;
+            *index = KeyIndex::default();
+        }
+        _ => {}
+    });
+}
+
+/// `Collections.unmodifiableList`/`Set`/`Map`/`Collection` (and the sorted
+/// forms): an immutable object that shows what `target` holds now.
+fn unmodifiable_view(target: &Value) -> Option<Value> {
+    let Value::Obj(t) = target else {
+        return None;
+    };
+    sync_view(*t);
+    let shell = HEAP.with(|h| match h.borrow().get(*t as usize) {
+        Some(HostObj::Set { items, order, .. }) => Some(HostObj::Set {
+            items: items.clone(),
+            order: *order,
+            fixed: Fixity::Immutable,
+            view: SetView::Own,
+            index: KeyIndex::default(),
+        }),
+        Some(HostObj::Map { entries, order, .. }) => Some(HostObj::Map {
+            entries: entries.clone(),
+            order: *order,
+            fixed: Fixity::Immutable,
+            index: KeyIndex::default(),
+        }),
+        _ => None,
+    });
+    let shell = match shell {
+        Some(s) => s,
+        None => HostObj::List {
+            items: sequence_items(target)?,
+            fixed: Fixity::Immutable,
+            view: None,
+            mods: 0,
+        },
+    };
+    let id = heap_alloc(shell);
+    VIEWS.with(|v| v.borrow_mut().insert(id, *t));
+    Some(Value::Obj(id))
+}
+
 /// The elements of any sequence-shaped heap object — an array, a `List`, or a
 /// `Set` (in presentation order) — cloned out from under the heap borrow.
 fn sequence_items(v: &Value) -> Option<Vec<Value>> {
     let Value::Obj(id) = v else {
         return None;
     };
+    sync_view(*id);
     // A `subList` view holds no elements of its own — its window has to be read
     // out of the backing list, and only after the view is checked against it,
     // so a stale view raises rather than reporting the wrong slice.
@@ -5395,6 +5510,7 @@ fn map_entries(v: &Value) -> Option<Vec<(Value, Value)>> {
     let Value::Obj(id) = v else {
         return None;
     };
+    sync_view(*id);
     HEAP.with(|h| match h.borrow().get(*id as usize) {
         Some(HostObj::Map { entries, .. }) => Some(entries.clone()),
         _ => None,
@@ -5407,6 +5523,7 @@ fn is_collection(v: &Value) -> bool {
     let Value::Obj(id) = v else {
         return false;
     };
+    sync_view(*id);
     HEAP.with(|h| {
         matches!(
             h.borrow().get(*id as usize),
@@ -5962,6 +6079,7 @@ fn b_iter_has(vm: &mut VM, argc: u8) -> Value {
     let (Value::Obj(src), Value::Obj(arr)) = (&args[0], &args[2]) else {
         return Value::bool(false);
     };
+    sync_view(*src);
     let more = HEAP.with(|h| {
         let heap = h.borrow();
         match heap.get(*src as usize) {
@@ -6716,6 +6834,9 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
 /// `keySet()`/`entrySet()`/`values()` is carried back to the map — see
 /// [`write_through`].
 fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    if let Value::Obj(id) = recv {
+        sync_view(*id);
+    }
     if let Some(f) = refused_view_write(recv, method) {
         return raise(vm, f);
     }
@@ -9816,6 +9937,23 @@ fn list_method(
             items.extend(add);
             Value::bool(changed)
         }
+        // `addAll(index, c)` splices the collection in at `index`, which must be
+        // within `[0, size]` as `add(index, e)`'s must (`ArrayList`'s
+        // `rangeCheckForAdd`), and answers whether anything was added.
+        ("addAll", 2) => {
+            structural()?;
+            let at = args[0].jint();
+            if at < 0 || at as usize > items.len() {
+                return Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!("Index: {at}, Size: {}", items.len()),
+                ));
+            }
+            let add = arg_seqs[1].clone().unwrap_or_default();
+            let changed = !add.is_empty();
+            items.splice(at as usize..at as usize, add);
+            Value::bool(changed)
+        }
         ("equals", 1) => match eq {
             Some(EqPlan::Same(same)) => Value::bool(*same),
             _ => {
@@ -11822,6 +11960,10 @@ fn collection_static(
                 None => Ok(Value::Int(a.len() as i64 - b.len() as i64)),
             }
         }
+        ("Collections", "emptyList") if args.is_empty() => list(Vec::new(), Fixity::Immutable),
+        ("Collections", "singletonList") if args.len() == 1 => {
+            list(vec![args[0].clone()], Fixity::Immutable)
+        }
         ("Collections", "emptySet") if args.is_empty() => {
             Ok(Value::Obj(heap_alloc(HostObj::Set {
                 items: Vec::new(),
@@ -11874,7 +12016,10 @@ fn collection_static(
         ("Collections", "emptyIterator" | "emptyEnumeration" | "emptyListIterator")
             if args.is_empty() =>
         {
-            let Ok(Value::Obj(source)) = list(Vec::new(), Fixity::Immutable) else {
+            // Fixed-size rather than immutable: `add` is refused either way, but
+            // `remove()` before `next()` is `IllegalStateException` here and
+            // `UnsupportedOperationException` on an immutable list's iterator.
+            let Ok(Value::Obj(source)) = list(Vec::new(), Fixity::FixedSize) else {
                 unreachable!("`list` allocates a handle");
             };
             Ok(new_iterator(source, method == "emptyListIterator"))
@@ -11906,6 +12051,36 @@ fn collection_static(
             }
             list(items, Fixity::Mutable)
         }
+        // The read-only wrappers. The result is immutable and re-reads its
+        // target (see [`sync_view`]), so a write to the target shows through
+        // while a write through the wrapper is `UnsupportedOperationException`.
+        // `null` is `NullPointerException`, from the wrapper's constructor.
+        (
+            "Collections",
+            "unmodifiableList"
+            | "unmodifiableSet"
+            | "unmodifiableMap"
+            | "unmodifiableCollection"
+            | "unmodifiableSortedSet"
+            | "unmodifiableSortedMap"
+            | "unmodifiableNavigableSet"
+            | "unmodifiableNavigableMap"
+            | "unmodifiableSequencedCollection",
+        ) if args.len() == 1 => match unmodifiable_view(&args[0]) {
+            Some(v) => Ok(v),
+            None => Err(Fault::java("NullPointerException", String::new())),
+        },
+        // Single-threaded, so the synchronized wrappers have nothing to guard:
+        // the collection itself stands in for them.
+        (
+            "Collections",
+            "synchronizedList"
+            | "synchronizedSet"
+            | "synchronizedMap"
+            | "synchronizedCollection"
+            | "synchronizedSortedSet"
+            | "synchronizedSortedMap",
+        ) if args.len() == 1 => Ok(args[0].clone()),
         ("Collections", "emptyMap") if args.is_empty() => {
             Ok(Value::Obj(heap_alloc(HostObj::Map {
                 entries: Vec::new(),
@@ -12121,6 +12296,24 @@ fn collection_static(
             (!matches!(args[0], Value::Undef)).then(|| args[0].clone()),
         )),
         ("Optional", "empty") if args.is_empty() => Ok(optional(None)),
+        // The primitive optionals' factories: `of` converts to the stream
+        // kind's own width, so `OptionalDouble.of(3)` holds `3.0`.
+        ("OptionalInt" | "OptionalLong" | "OptionalDouble", "of") if args.len() == 1 => {
+            let (class, v) = match class {
+                "OptionalInt" => ("OptionalInt", Value::Int(as_i64(&args[0]) as i32 as i64)),
+                "OptionalLong" => ("OptionalLong", Value::Int(as_i64(&args[0]))),
+                _ => ("OptionalDouble", Value::float(as_f64(&args[0]))),
+            };
+            Ok(optional_of(class, Some(v)))
+        }
+        ("OptionalInt" | "OptionalLong" | "OptionalDouble", "empty") if args.is_empty() => {
+            let class = match class {
+                "OptionalInt" => "OptionalInt",
+                "OptionalLong" => "OptionalLong",
+                _ => "OptionalDouble",
+            };
+            Ok(optional_of(class, None))
+        }
         // `Map.of(k1, v1, k2, v2, …)` — an immutable map, rejecting a repeated
         // key rather than letting the later pair win, and rejecting a `null`
         // key outright. Both are what `java.util.ImmutableCollections` does, and
@@ -17339,6 +17532,7 @@ enum RenderShape {
 /// [`java_str_vm`]'s heap case: snapshot the shape, drop the borrow, then either
 /// run the override or recurse into the elements.
 fn obj_str_vm(vm: &mut VM, id: u32) -> String {
+    sync_view(id);
     let shape = HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
@@ -17436,6 +17630,7 @@ fn run_tostring(vm: &mut VM, entry: usize, id: u32) -> String {
 /// hash is the handle (deterministic within a run) rather than a JVM identity
 /// hash.
 fn obj_default_str(id: u32) -> String {
+    sync_view(id);
     // A wrapper renders as the primitive it holds, and two of the eight need
     // their class to do it: a `char` rides `Value::Int`, so `Character` has to
     // turn the code point back into the character, and `Float.toString` is the

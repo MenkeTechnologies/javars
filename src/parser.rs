@@ -3843,6 +3843,7 @@ impl Parser {
     /// is not exactly one method supplying an abstract one.
     fn anonymous_lambda(&mut self, ty: &str, line: u32) -> Result<Option<Expr>, String> {
         self.eat(&Tok::LBrace)?;
+        let body_start = self.pos;
         let mut methods = Vec::new();
         while !self.is(&Tok::RBrace) && !self.is(&Tok::Eof) {
             match self.try_any_method(ty)? {
@@ -3859,6 +3860,29 @@ impl Parser {
         // is a class. Desugaring one to a lambda made `println(o)` print
         // `<lambda>@e` where Java prints what the override returns.
         if matches!(m.name.as_str(), "toString" | "equals" | "hashCode") {
+            return Ok(None);
+        }
+        // A lambda's `this` is the *enclosing* instance and its name resolves
+        // outward, so a body that names its own object — `this`, `super`, or a
+        // bare call to the method it is defining (the recursion idiom) — means
+        // something else as an anonymous class and has to stay one.
+        let body = &self.toks[body_start..self.pos];
+        // The method's own declaration (`Type name(`) is in the range too, and
+        // is told from a call by the type that precedes it.
+        let names_itself = body.iter().enumerate().any(|(i, t)| match &t.kind {
+            Tok::Ident(w) if w == "this" || w == "super" => true,
+            Tok::Ident(w) => {
+                let prev = i.checked_sub(1).map(|p| &body[p].kind);
+                *w == m.name
+                    && body.get(i + 1).is_some_and(|n| n.kind == Tok::LParen)
+                    && !matches!(
+                        prev,
+                        Some(Tok::Dot | Tok::ColonColon | Tok::Ident(_) | Tok::Gt)
+                    )
+            }
+            _ => false,
+        });
+        if names_itself {
             return Ok(None);
         }
         self.uses_functional = true;

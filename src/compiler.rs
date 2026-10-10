@@ -2468,6 +2468,20 @@ impl Compiler {
         })
     }
 
+    /// The declared parameter types of the method `class` resolves to the
+    /// subroutine `mangled`, or none when it declares no such method.
+    fn instance_param_types(&self, class: &str, method: &str, mangled: &str) -> Vec<String> {
+        self.classes
+            .get(class)
+            .and_then(|ci| {
+                ci.methods.iter().find(|m| {
+                    m.name == method && mangle(&m.defining, method, &m.param_tys) == mangled
+                })
+            })
+            .map(|m| m.param_tys.clone())
+            .unwrap_or_default()
+    }
+
     /// Resolve the concrete implementation of an exact `(method, param_tys)`
     /// signature visible on `class`: the mangled subroutine name and its return
     /// type name. Used per-subclass for virtual dispatch (the overload is chosen
@@ -3056,6 +3070,12 @@ impl Compiler {
         // is the only thing a lambda receiver can run.
         let only_body = match (targets.first(), &default_arm) {
             (None, Some(d)) => Some(d.clone()),
+            // No class implements the type, so the body its own declaration
+            // supplies (a `default` or `private` interface method) is the only
+            // one a call can reach — a private one is statically bound anyway.
+            (None, None) if !lambda_arm => self
+                .resolve_instance_sig(rc, method, &param_tys)
+                .map(|(m, _)| m),
             (Some((_, m)), d) if distinct.len() == 1 && d.as_deref().unwrap_or(m) == m => {
                 Some(m.clone())
             }
@@ -7434,6 +7454,44 @@ impl Compiler {
         // wrong number rather than the compile error it was; for a plain class
         // the identity hash IS `Object`'s specified answer.
         if let Some(rc) = self.expr_class(recv) {
+            // `Iterable.forEach(action)` is a `default` method, so a user class
+            // that implements `Iterable` and declares no `forEach` inherits it:
+            // `for (T x : this) action.accept(x)`, with `action` evaluated once.
+            if method == "forEach"
+                && args.len() == 1
+                && self.is_subclass(&rc, "Iterable")
+                && !self.has_instance_method(&rc, "forEach", 1)
+            {
+                let action = format!("#fe{}", self.temp_counter);
+                self.temp_counter += 1;
+                let each = format!("#fe{}", self.temp_counter);
+                self.temp_counter += 1;
+                let accept = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(action.clone())),
+                    method: "accept".to_string(),
+                    args: vec![Expr::Var(each.clone())],
+                    line,
+                };
+                self.stmt(&Stmt::new(
+                    line,
+                    StmtKind::Local {
+                        ty: "Consumer".to_string(),
+                        name: action,
+                        init: Some(args[0].clone()),
+                    },
+                ))?;
+                self.stmt(&Stmt::new(
+                    line,
+                    StmtKind::ForEach {
+                        ty: "var".to_string(),
+                        name: each,
+                        iter: recv.clone(),
+                        body: vec![Stmt::new(line, StmtKind::Expr(accept))],
+                    },
+                ))?;
+                self.b.emit(Op::LoadUndef, line);
+                return Ok(());
+            }
             let arg_tys: Vec<Option<String>> = self.arg_types(args);
             let inherited = matches!(
                 (method, args.len()),
@@ -7669,8 +7727,23 @@ impl Compiler {
             self.b.emit(Op::StrEq, line);
             let skip = self.b.emit(Op::JumpIfFalse(0), line);
             self.emit_get(&recv_t, line);
-            for t in &arg_ts {
+            // The receiver's class was unknown when the arguments were lowered,
+            // so the method's own parameter types convert them here: an `int`
+            // reaching a `double` parameter widens, as it does on a typed call.
+            let params = self.instance_param_types(class, method, mangled);
+            for (i, t) in arg_ts.iter().enumerate() {
                 self.emit_get(t, line);
+                if let Some(p) = params
+                    .get(i)
+                    .filter(|p| matches!(p.as_str(), "double" | "float"))
+                {
+                    let arg_ty = self.expr_java_type(&args[i]);
+                    if arg_ty.as_deref().map(unwrapped_ty) != Some(p.as_str()) {
+                        let c = self.b.add_constant(Value::str(p.clone()));
+                        self.b.emit(Op::LoadConst(c), line);
+                        self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
+                    }
+                }
             }
             let idx = self.b.add_name(mangled);
             self.b.emit(Op::Call(idx, argc), line);
@@ -9594,6 +9667,9 @@ fn is_static_class(name: &str) -> bool {
             | "Set"
             | "Map"
             | "Optional"
+            | "OptionalInt"
+            | "OptionalLong"
+            | "OptionalDouble"
             | "Stream"
             | "IntStream"
             | "LongStream"
