@@ -18,8 +18,8 @@
 
 **Java in Rust** — a Java frontend that lexes and parses Java source, lowers it
 to [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode, and runs it
-on the shared three-tier Cranelift JIT — the same engine behind `zshrs`,
-`stryke`, `awkrs`, `elisp`, and `ruby`. No bespoke VM. No JVM. No `.class`
+on the shared three-tier Cranelift JIT — the same engine every other fusevm
+frontend runs on. No bespoke VM. No JVM. No `.class`
 files.
 
 ---
@@ -53,8 +53,8 @@ pure frontend over the shared engine. Highlights:
   tracing JIT needs to close a trace, so a hot loop reaches native code.
   `java --tiers` reports whether it did.
 - **fusevm-hosted, no JVM** — no local `vm.rs` / `jit.rs`, no `.class` files, no
-  `libjvm`. The same three-tier Cranelift engine that hosts zshrs, stryke,
-  awkrs, elisp, and ruby runs Java too. `jit-disk-cache` persists native code
+  `libjvm`. The same three-tier Cranelift engine that hosts the other fusevm
+  frontends runs Java too. `jit-disk-cache` persists native code
   across runs.
 - **Java print semantics** — `System.out.print[ln]` lowers to a formatting
   builtin so `boolean` prints `true`/`false`, `double` prints `3.0`, and `null`
@@ -575,7 +575,7 @@ unknown call stays an ordinary `unresolved reference` compile error.
 ## [0x05] ARCHITECTURE
 
 javars contains no virtual machine or JIT of its own. The execution path
-mirrors how `zshrs` hosts zsh and `ruby` hosts Ruby:
+mirrors how the other fusevm frontends host their languages:
 
 ```
 Java source → lexer → parser (AST) → lower to fusevm bytecode → fusevm VM + Cranelift JIT
@@ -656,13 +656,13 @@ all verified byte-for-byte against OpenJDK.
 
 The object heap lives host-side in `src/host.rs`: `Value::Obj(u32)` is an opaque
 handle into a frontend-owned slab of arrays and instances (the same pattern the
-`ruby`/`node`/`php` frontends use), so identity and aliasing are real rather than
+other fusevm frontends use), so identity and aliasing are real rather than
 value-copied.
 
 Next waves, in priority order:
 
-1. **The remaining stream surface** — `mapMulti`, `summaryStatistics` and
-   the `summarizing*` collectors, and the unmodifiable-map collectors, whose
+1. **The remaining stream surface** — `mapMulti` and the unmodifiable-map
+   collectors, whose
    iteration order the JDK randomizes per run. See [`BUGS.md`](BUGS.md) for the
    stages and collectors that do run.
 2. **Lazy class initialization** — javars runs every class's `static`
