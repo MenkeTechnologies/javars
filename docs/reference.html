@@ -108,7 +108,7 @@
         <article class="doc-entry" id="doc-keywords-8">
           <h3><a class="doc-anchor" href="#doc-keywords-8">#</a> <code>for</code></h3>
           <pre><code class="lang-java">for (init; cond; update) body   |   for (T x : iterable) body</code></pre>
-          <p>Both loop forms. The C-style form declares its own scope for the init clause; the enhanced form walks an array directly, or a collection snapshotted into an array by the <code>JITER_ARRAY</code> builtin, with a fresh binding per iteration so a lambda written in the body captures that iteration's value.</p>
+          <p>Both loop forms. The C-style form declares its own scope for the init clause; the enhanced form walks an array directly, or a collection the way a Java iterator does: a <code>List</code> is read live, a structural modification of the collection (or of the map behind a <code>keySet()</code>/<code>values()</code>/<code>entrySet()</code>) is <code>ConcurrentModificationException</code> at the next element, and the binding is fresh per iteration so a lambda written in the body captures that iteration's value.</p>
           <pre><code class="lang-java">for (int i = 0; i &lt; 3; i++) { System.out.println(i); }
 for (String s : names) { System.out.println(s); }</code></pre>
         </article>
@@ -2468,7 +2468,7 @@ System.out.println(Counter.n);</code></pre>
         <article class="doc-entry" id="doc-class-members-7">
           <h3><a class="doc-anchor" href="#doc-class-members-7">#</a> <code>static initializer</code></h3>
           <pre><code class="lang-java">static { … }</code></pre>
-          <p>A class-initialization block. Blocks and static field initializers run in textual order, eagerly, before <code>main</code> — javars initializes every class up front rather than lazily on first use.</p>
+          <p>A class-initialization block. Blocks and static field initializers run in textual order, once, when the class is first used — its first <code>new</code>, static call, or non-constant static field access — after its superclass has been initialized. The entry class initializes before <code>main</code>.</p>
           <pre><code class="lang-java">class Counter { static int n; static { n = 10; } }</code></pre>
         </article>
         <article class="doc-entry" id="doc-class-members-8">
@@ -2887,7 +2887,7 @@ xs.forEach(show);</code></pre>
         <article class="doc-entry" id="doc-runtime-builtins-34">
           <h3><a class="doc-anchor" href="#doc-runtime-builtins-34">#</a> <code>JITER_ARRAY</code></h3>
           <pre><code class="lang-java">id 732 · stack [iterable] -&gt; array</code></pre>
-          <p>The elements of an enhanced-<code>for</code> iterable, as an array. An array receiver is handed back unchanged so an array loop keeps aliasing; a collection is snapshotted. Emitted only when the compiler could not prove the iterable is already an array.</p>
+          <p>The elements of an enhanced-<code>for</code> iterable, as an array. An array receiver is handed back unchanged so an array loop keeps aliasing; a collection is snapshotted, which the loop then reads through <code>JITER_HAS</code>/<code>JITER_GET</code> — live for a <code>List</code>, with the modification check a Java iterator makes. Emitted only when the compiler could not prove the iterable is already an array.</p>
         </article>
       </section>
 

@@ -1576,15 +1576,19 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   *Resolution* is checked, though: a name nothing declares is
   `javars: cannot find symbol: \`n\``, not a `null`. It used to read the unset
   cell, so `undefinedVar` printed `null` and `undefinedVar + 1` printed `null1`.
-- **Class initialization is eager, not lazy.** Java initializes a class the
-  first time it is used; javars runs *every* class's `static` field initializers
-  and `static { … }` blocks once, before `main`, in source-declaration order
-  (after seeding every static with its type's default, and after building the
-  enum constants). The two differ only when one class's initializer reads
-  another's static: Java would force that class's initialization first, javars
-  gives whatever the declaration order already produced (the default value if
-  the other class is declared later). A `static` initializer with an observable
-  side effect (printing) also runs in a program that never touches its class.
+- ~~**Class initialization is eager, not lazy.**~~ — implemented (JLS 12.4.1).
+  A class whose static initializer is observable — a field initializer that is
+  not a literal, a `static { … }` block, an enum's constants, or a superclass or
+  `default`-method superinterface that has one — runs it once, on the class's
+  first `new`, static call or non-constant static field access, after its
+  superclass (and then the superinterfaces that declare a `default` method) has
+  been initialized. A *constant variable* (`static final` with a literal
+  initializer) is read without initializing anything. The entry class initializes
+  before `main`; a class whose initializers only store literals is seeded up
+  front, since nothing can observe when. Not modeled: a static *method
+  reference* (`C::m`) and a `Class.forName` do not trigger initialization, and
+  an exception thrown by an initializer surfaces as itself rather than as
+  `ExceptionInInitializerError`.
 - **Field *hiding* collapses to one cell.** A class's fields are resolved once,
   ancestors first, into a single per-instance map keyed by name, so a subclass
   that re-declares a field its parent already declares does not get a second
@@ -2005,27 +2009,22 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `copyOfRange` performs itself are exact: a reversed range is
   `IllegalArgumentException: 2 > 1`, and a negative length to `copyOf` is
   `NegativeArraySizeException: -1`.
-- **An enhanced `for` over a collection iterates a snapshot, so structurally
-  modifying it does not raise `ConcurrentModificationException`.** Java's
-  iterators are fail-fast on `modCount`; javars copies the elements up front and
-  walks the copy, so the loop neither sees the change nor objects to it.
-  Measured on `openjdk 21.0.12` against a two-element `ArrayList`:
-
-  ```
-  for (int x : l) l.add(9);      JDK: ConcurrentModificationException
-                                 javars: completes, size 4
-  for (int x : l) l.remove(0);   JDK: completes, size 1  (the check is
-                                       skipped when hasNext() goes false early)
-                                 javars: completes, size 0
-  ```
-
-  The second line is the sharper one: Java does not throw there either, so
-  "always throw" would be as wrong as never throwing. Both answers follow from
-  the snapshot, and matching Java needs a real iterator with `modCount`, which
-  `List.iterator()` already has: an explicit `it.next()` after `l.add(…)` raises
-  `ConcurrentModificationException` as the JDK does. The enhanced `for` is
-  the one path still routed through the snapshot. A `subList` view also raises
-  it, because it holds a live window rather than a copy.
+- ~~**An enhanced `for` over a collection iterates a snapshot, so structurally
+  modifying it does not raise `ConcurrentModificationException`.**~~ —
+  implemented for the collections javars keeps a modification token for. The
+  loop reads a `List` live and tests `cursor != size` the way `ArrayList`'s
+  iterator does, and checks the token before each element: a `List`'s
+  `modCount`, a `Set`'s or `Map`'s size (which also covers a
+  `keySet()`/`values()`/`entrySet()` loop, taken from the map behind the view).
+  Because the size stands in for `modCount` on a set or map, a loop that removes
+  one element and adds another is not detected. `LinkedList`, `ArrayDeque` and
+  `PriorityQueue` are modeled by the same list shape as `ArrayList`, so a loop
+  that shrinks one of them past its cursor follows `ArrayList`'s rule where the
+  JDK's own iterator differs (`LinkedList` ends the loop, `ArrayDeque` keeps
+  walking). The compute family of a `HashMap`/`TreeMap` (`computeIfAbsent`,
+  `compute`, `computeIfPresent`, `merge`) raises the same exception when the
+  function it ran changed the map's size, which is how a memoizing recursive
+  `computeIfAbsent` is reported.
 - ~~**Unboxing a `null` wrapper yields `null` instead of throwing.**~~ —
   implemented. Every unboxing conversion of a wrapper-typed source — an
   assignment, argument or `return` into a primitive slot, an arithmetic,

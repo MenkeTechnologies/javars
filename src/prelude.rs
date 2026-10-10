@@ -157,6 +157,21 @@ pub fn qualified_class(name: &str) -> Option<String> {
     qualified_throwable(name)
 }
 
+/// The package a modeled functional interface lives in: `java.lang.Runnable`,
+/// `java.util.concurrent.Callable`, `java.util.Comparator`, and everything else
+/// in `java.util.function`.
+pub fn qualified_functional(name: &str) -> Option<String> {
+    if !FUNCTIONAL.iter().any(|(n, _, _)| *n == name) {
+        return None;
+    }
+    Some(match name {
+        "Runnable" => format!("java.lang.{name}"),
+        "Callable" => format!("java.util.concurrent.{name}"),
+        "Comparator" => format!("java.util.{name}"),
+        _ => format!("java.util.function.{name}"),
+    })
+}
+
 /// The modeled functional interfaces: `(name, declared single abstract method,
 /// the interface's other members)`.
 ///
@@ -437,7 +452,8 @@ fn prelude_source(declared: &[String]) -> String {
             );
             src.push_str("  String getMessage() { return detailMessage; }\n");
             // `getLocalizedMessage()` is `Throwable`'s own one-liner
-            // (`return getMessage();`), overridable but never overridden here.
+            // (`return getMessage();`), and `toString()` below asks it — so a
+            // subclass that overrides either one changes the rendered text.
             src.push_str("  String getLocalizedMessage() { return getMessage(); }\n");
             // `printStackTrace()` writes to standard error: the throwable's
             // `toString()`, then a `Caused by: ` line for each cause. javars
@@ -457,7 +473,8 @@ fn prelude_source(declared: &[String]) -> String {
             // `java.lang`) and `T$MyEx` for a user-defined one.
             src.push_str(
                 "  String toString() { String n = this.getClass().getName(); \
-                 if (detailMessage == null) { return n; } return n + \": \" + detailMessage; }\n",
+                 String m = getLocalizedMessage(); \
+                 if (m == null) { return n; } return n + \": \" + m; }\n",
             );
         } else {
             src.push_str(&format!("  {name}() {{ }}\n"));

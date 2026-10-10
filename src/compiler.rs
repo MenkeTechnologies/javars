@@ -164,6 +164,8 @@ struct MethodSig {
 /// return type (numeric category + raw name).
 struct StaticResolved {
     mangled: String,
+    /// The class declaring the method, whose initialization its call triggers.
+    owner: String,
     ret: NumType,
     ret_name: String,
     /// The chosen overload's declared parameter types — the lambda target type
@@ -482,6 +484,14 @@ struct Compiler {
     /// VM-holding rendering builtin instead of fusevm's `Op::Add` — see
     /// [`Compiler::emit_host_stringified`].
     has_user_tostring: bool,
+    /// The classes whose `static` initialization is observable, so it runs on
+    /// first use (JLS 12.4.1) rather than before `main` — see
+    /// [`lazy_initialized_classes`].
+    lazy_init: HashSet<String>,
+    /// The `static final` fields that are constant variables, as their cells'
+    /// global names: seeded before `main`, and read without initializing the
+    /// class that declares them.
+    const_statics: HashSet<String>,
     /// Declared numeric types of `main`'s locals (the global/`main` scope,
     /// keyed by name). Method locals live in [`Compiler::scope`] instead.
     global_types: HashMap<String, NumType>,
@@ -669,6 +679,19 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         debug,
         has_ffi,
         has_user_tostring,
+        lazy_init: lazy_initialized_classes(prog),
+        const_statics: prog
+            .classes
+            .iter()
+            .flat_map(|cl| {
+                cl.static_fields
+                    .iter()
+                    .filter(|f| {
+                        f.is_final && constant_initializer(&cl.static_init, &f.name).is_some()
+                    })
+                    .map(|f| static_global(&cl.name, &f.name))
+            })
+            .collect(),
         global_types: HashMap::default(),
         scope: None,
         methods,
@@ -695,8 +718,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // constructed (they are the first statics of their type), then the static
     // initializers and `static { … }` blocks run in textual order.
     c.emit_static_defaults(prog);
-    c.emit_enum_prologue(prog)?;
-    c.emit_static_init(prog)?;
+    c.emit_eager_static_init(prog)?;
     // `main`'s `String[]` parameter is the real program arguments.
     c.bind_main_args(prog);
     for stmt in &prog.main {
@@ -719,6 +741,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
     // each is reached only via `Op::Call`.
     let has_subs = !prog.methods.is_empty()
         || !c.pending_lambdas.is_empty()
+        || !c.lazy_init.is_empty()
         || prog
             .classes
             .iter()
@@ -743,6 +766,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             }
             if !cl.inst_init.is_empty() {
                 c.compile_inst_init(cl)?;
+            }
+            if c.lazy_init.contains(&cl.name) {
+                c.compile_clinit(cl)?;
             }
         }
         // Lambda bodies last, and by draining rather than iterating: emitting one
@@ -1008,34 +1034,33 @@ impl Compiler {
         self.b.emit(Op::SetVar(idx), line);
     }
 
-    /// Build every enum constant's instance and park it in its global. Emitted
-    /// at the very top of `main`, before the program's first statement.
-    fn emit_enum_prologue(&mut self, prog: &Program) -> Result<(), String> {
-        for cl in &prog.classes {
-            for (ordinal, constant) in cl.enum_constants.iter().enumerate() {
-                let line = cl.line;
-                // A constant with a body is an instance of its own synthetic
-                // subclass, but it is the *enum's* constructor that runs — Java
-                // gives an anonymous enum subclass no constructor of its own.
-                let runtime_class = constant.body_class.as_deref().unwrap_or(&cl.name);
-                self.new_object_as(runtime_class, &cl.name, &constant.args, None, line)?;
-                let obj = self.temp();
-                self.emit_set(&obj, line);
-                // … then the identity every enum constant carries.
-                for (field, value) in [
-                    (ENUM_NAME, Expr::Str(constant.name.clone())),
-                    (ENUM_ORDINAL, Expr::Int(ordinal as i64)),
-                ] {
-                    self.emit_get(&obj, line);
-                    let name_c = self.b.add_constant(Value::str(field.to_string()));
-                    self.b.emit(Op::LoadConst(name_c), line);
-                    self.expr(&value)?;
-                    self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
-                    self.b.emit(Op::Pop, line);
-                }
+    /// Build an enum's constants — each one's instance parked in its global.
+    /// They are the first statics of the type, so they run ahead of its other
+    /// static initializers, as part of the type's own initialization.
+    fn emit_enum_constants(&mut self, cl: &Class) -> Result<(), String> {
+        for (ordinal, constant) in cl.enum_constants.iter().enumerate() {
+            let line = cl.line;
+            // A constant with a body is an instance of its own synthetic
+            // subclass, but it is the *enum's* constructor that runs — Java
+            // gives an anonymous enum subclass no constructor of its own.
+            let runtime_class = constant.body_class.as_deref().unwrap_or(&cl.name);
+            self.new_object_as(runtime_class, &cl.name, &constant.args, None, line)?;
+            let obj = self.temp();
+            self.emit_set(&obj, line);
+            // … then the identity every enum constant carries.
+            for (field, value) in [
+                (ENUM_NAME, Expr::Str(constant.name.clone())),
+                (ENUM_ORDINAL, Expr::Int(ordinal as i64)),
+            ] {
                 self.emit_get(&obj, line);
-                self.emit_global_set(&enum_global(&cl.name, &constant.name), line);
+                let name_c = self.b.add_constant(Value::str(field.to_string()));
+                self.b.emit(Op::LoadConst(name_c), line);
+                self.expr(&value)?;
+                self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
+                self.b.emit(Op::Pop, line);
             }
+            self.emit_get(&obj, line);
+            self.emit_global_set(&enum_global(&cl.name, &constant.name), line);
         }
         Ok(())
     }
@@ -1055,7 +1080,16 @@ impl Compiler {
     fn emit_static_defaults(&mut self, prog: &Program) {
         for cl in &prog.classes {
             for f in &cl.static_fields {
-                self.emit_type_default(&f.ty, cl.line);
+                // A constant variable (JLS 4.12.4) is read without initializing
+                // its class, so it holds its value from the start.
+                let constant = f
+                    .is_final
+                    .then(|| constant_initializer(&cl.static_init, &f.name))
+                    .flatten();
+                match constant {
+                    Some(value) => self.expr(value).expect("a literal lowers without error"),
+                    None => self.emit_type_default(&f.ty, cl.line),
+                }
                 self.emit_global_set(&static_global(&cl.name, &f.name), cl.line);
             }
         }
@@ -1064,9 +1098,13 @@ impl Compiler {
     /// Run each class's static initialization — its field initializers and
     /// `static { … }` blocks, in textual order — with the class in scope so an
     /// unqualified name resolves to its own statics.
-    fn emit_static_init(&mut self, prog: &Program) -> Result<(), String> {
+    fn emit_eager_static_init(&mut self, prog: &Program) -> Result<(), String> {
+        // A class with an observable initializer waits for its first use (see
+        // [`Compiler::emit_class_init`]). One whose initializers only store
+        // literals can be initialized up front, since nothing can tell, and it
+        // runs ahead of the entry class's so the latter sees those values.
         for cl in &prog.classes {
-            if cl.static_init.is_empty() {
+            if cl.name == prog.class_name || self.lazy_init.contains(&cl.name) {
                 continue;
             }
             let saved = self.current_class.replace(cl.name.clone());
@@ -1074,7 +1112,119 @@ impl Compiler {
             self.current_class = saved;
             result?;
         }
-        Ok(())
+        let Some(cl) = prog.classes.iter().find(|c| c.name == prog.class_name) else {
+            return Ok(());
+        };
+        if let Some(sup) = cl.superclass.clone() {
+            self.emit_clinit_guard(&sup, cl.line);
+        }
+        self.emit_enum_constants(cl)?;
+        let saved = self.current_class.replace(cl.name.clone());
+        let result = cl.static_init.iter().try_for_each(|s| self.stmt(s));
+        self.current_class = saved;
+        result
+    }
+
+    /// Initialize `class` on this use unless it already has been: the first
+    /// `new`, static call, or non-constant static field access of a class runs
+    /// its static initializer (JLS 12.4.1). Nothing is emitted for a class with
+    /// no observable initializer, or when the code being compiled belongs to
+    /// the class itself or a subclass — it can only be running once the class
+    /// has been initialized.
+    fn emit_class_init(&mut self, class: &str, line: u32) {
+        if !self.lazy_init.contains(class) {
+            return;
+        }
+        let mut cur = self.current_class.as_deref();
+        while let Some(c) = cur {
+            if c == class {
+                return;
+            }
+            cur = self.classes.get(c).and_then(|ci| ci.superclass.as_deref());
+        }
+        self.emit_clinit_guard(class, line);
+    }
+
+    /// [`Compiler::emit_class_init`] for a read or write of `class.name`, which
+    /// a constant variable (JLS 4.12.4) does not trigger.
+    fn emit_static_field_init(&mut self, class: &str, name: &str, line: u32) {
+        if !self.const_statics.contains(&static_global(class, name)) {
+            self.emit_class_init(class, line);
+        }
+    }
+
+    /// `if (!initialized(class)) class.<clinit>()`. The flag is raised on entry
+    /// to the initializer, so a use of the class from inside its own
+    /// initialization falls through, as it does in Java.
+    fn emit_clinit_guard(&mut self, class: &str, line: u32) {
+        if !self.lazy_init.contains(class) {
+            return;
+        }
+        self.emit_global_get(&clinit_flag(class), line);
+        let done = self.b.emit(Op::JumpIfTrue(0), line);
+        let idx = self.b.add_name(&clinit_name(class));
+        self.b.emit(Op::Call(idx, 0), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_exc_check(line);
+        let after = self.b.current_pos();
+        self.b.patch_jump(done, after);
+    }
+
+    /// [`default_interfaces`] over the resolved class table.
+    fn default_interfaces_of(&self, cl: &Class) -> Vec<String> {
+        fn walk(c: &Compiler, name: &str, out: &mut Vec<String>) {
+            let Some(info) = c.classes.get(name) else {
+                return;
+            };
+            for sup in &info.supertypes {
+                walk(c, sup, out);
+            }
+            let has_default = info
+                .methods
+                .iter()
+                .any(|m| m.defining == name && !m.is_abstract);
+            if info.is_interface && has_default && !out.iter().any(|o| o == name) {
+                out.push(name.to_string());
+            }
+        }
+        let mut out = Vec::new();
+        if !cl.is_interface {
+            for i in &cl.interfaces {
+                walk(self, i, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Lower a class's static initialization to the subroutine
+    /// [`Compiler::emit_clinit_guard`] calls: mark it initialized, initialize
+    /// the superclass first (JLS 12.4.2), build the enum constants, then run
+    /// the field initializers and `static { … }` blocks in textual order.
+    fn compile_clinit(&mut self, cl: &Class) -> Result<(), String> {
+        let entry = self.b.current_pos();
+        let name_idx = self.b.add_name(&clinit_name(&cl.name));
+        self.b.add_sub_entry(name_idx, entry);
+
+        self.scope = Some(MethodScope::new());
+        let saved_class = self.current_class.replace(cl.name.clone());
+
+        self.b.emit(Op::LoadTrue, cl.line);
+        self.emit_global_set(&clinit_flag(&cl.name), cl.line);
+        if let Some(sup) = cl.superclass.clone() {
+            self.emit_clinit_guard(&sup, cl.line);
+        }
+        for iface in self.default_interfaces_of(cl) {
+            self.emit_clinit_guard(&iface, cl.line);
+        }
+        let result = self
+            .emit_enum_constants(cl)
+            .and_then(|()| cl.static_init.iter().try_for_each(|s| self.stmt(s)));
+        self.b.emit(Op::LoadUndef, cl.line);
+        self.b.emit(Op::ReturnValue, cl.line);
+
+        self.scope = None;
+        self.current_class = saved_class;
+        result
     }
 
     /// Bind `main`'s `String[]` parameter to the real program arguments.
@@ -1140,6 +1290,7 @@ impl Compiler {
         value: &Expr,
         line: u32,
     ) -> Result<(), String> {
+        self.emit_static_field_init(class, name, line);
         let global = static_global(class, name);
         if op != AssignOp::Assign {
             return self.static_update(&global, ty, op, value, Yield::Nothing, line);
@@ -1306,6 +1457,7 @@ impl Compiler {
     /// Lower `EnumName.values()` — a fresh array of the constants, in
     /// declaration order, exactly as Java hands out a fresh copy each call.
     fn emit_enum_values(&mut self, class: &str, line: u32) {
+        self.emit_class_init(class, line);
         let constants = self.classes[class].enum_constants.clone();
         for (i, span) in array_build_chunks(constants.len()).into_iter().enumerate() {
             let len = span.len();
@@ -1319,6 +1471,7 @@ impl Compiler {
     /// Lower `EnumName.valueOf(s)` — a name-to-constant lookup, raising Java's
     /// `IllegalArgumentException: No enum constant Color.PINK` on a miss.
     fn emit_enum_value_of(&mut self, class: &str, arg: &Expr, line: u32) -> Result<(), String> {
+        self.emit_class_init(class, line);
         let constants = self.classes[class].enum_constants.clone();
         let key = self.temp();
         self.expr(arg)?;
@@ -1608,7 +1761,16 @@ impl Compiler {
     fn class_literal_name(&self, name: &str) -> String {
         // A qualified spelling (`java.util.List.class`) is already the name.
         if let Some(c) = self.classes.get(name) {
-            return c.binary.clone();
+            // A type the prelude declares (a functional interface, a throwable)
+            // names its JDK package, not its bare simple name.
+            let functional = if c.is_interface {
+                crate::prelude::qualified_functional(name)
+            } else {
+                None
+            };
+            return crate::prelude::qualified_class(name)
+                .or(functional)
+                .unwrap_or_else(|| c.binary.clone());
         }
         crate::host::qualify_class_name(name)
     }
@@ -1695,21 +1857,41 @@ impl Compiler {
                 if t == e2 {
                     return t;
                 }
-                // JLS 15.25: `char` paired with an `int` *constant* that fits in
-                // a `char` keeps the conditional's type at `char`, so
-                // `flag ? 'a' : 98` prints `a`/`b` rather than 97/98. A
-                // non-constant `int` promotes as usual.
-                let fits_char = |e: &Expr| matches!(e, Expr::Int(n) if (0..=0xFFFF).contains(n));
-                if (t.as_deref() == Some("char") && e2.as_deref() == Some("int") && fits_char(els))
-                    || (e2.as_deref() == Some("char")
-                        && t.as_deref() == Some("int")
-                        && fits_char(then))
-                {
-                    return Some("char".to_string());
+                // `flag ? "s" : null` has the other branch's type — boxed when
+                // that branch is a primitive (JLS 15.25, Table 15.25-A).
+                let is_null = |e: &Expr| matches!(e, Expr::Var(n) if n == NULL_LITERAL);
+                let other = match (is_null(then), is_null(els)) {
+                    (true, false) => Some(e2.as_deref()),
+                    (false, true) => Some(t.as_deref()),
+                    _ => None,
+                };
+                if let Some(other) = other {
+                    return other.map(|ty| wrapper_of(ty).unwrap_or(ty).to_string());
                 }
-                let tr = t.as_deref().and_then(numeric_rank)?;
-                let er = e2.as_deref().and_then(numeric_rank)?;
-                Some(rank_name(tr.max(er)).to_string())
+                // JLS 15.25.2, the numeric conditional. Wrappers unbox first.
+                let (tp, ep) = (unwrapped_ty(t.as_deref()?), unwrapped_ty(e2.as_deref()?));
+                let (tr, er) = (numeric_rank(tp)?, numeric_rank(ep)?);
+                if tp == ep {
+                    return Some(tp.to_string());
+                }
+                // A `byte` against a `short` is a `short`.
+                if matches!((tp, ep), ("byte", "short") | ("short", "byte")) {
+                    return Some("short".to_string());
+                }
+                // A `byte`/`short`/`char` against an `int` *constant* that fits
+                // it keeps the narrow type, so `flag ? 'a' : 98` prints `a`/`b`
+                // rather than 97/98. A non-constant `int` promotes as usual.
+                let fits = |ty: &str, e: &Expr| match (ty, e) {
+                    ("byte", Expr::Int(n)) => (-128..=127).contains(n),
+                    ("short", Expr::Int(n)) => (-32768..=32767).contains(n),
+                    ("char", Expr::Int(n)) => (0..=0xFFFF).contains(n),
+                    _ => false,
+                };
+                if (ep == "int" && fits(tp, els)) || (tp == "int" && fits(ep, then)) {
+                    return Some(if ep == "int" { tp } else { ep }.to_string());
+                }
+                // Otherwise binary numeric promotion: nothing narrower than `int`.
+                Some(rank_name(tr.max(er).max(3)).to_string())
             }
             Expr::Field { recv, name } => {
                 if let Some(class) = self.qualified_this(e) {
@@ -1964,6 +2146,13 @@ impl Compiler {
         }
         if from == "String" && matches!(to, "Object" | "CharSequence") {
             return Some(1);
+        }
+        // A modeled JDK type reaches its JDK supertypes (`StringBuilder` is a
+        // `CharSequence`, an `ArrayList` a `Collection`).
+        if !self.classes.contains_key(from) {
+            if let Some(d) = crate::host::jdk_subtype_distance(from, to) {
+                return Some(d);
+            }
         }
         if to == "Object" && is_reference_type(from) {
             return Some(40);
@@ -2399,6 +2588,7 @@ impl Compiler {
         let s = cands[i];
         Some(StaticResolved {
             mangled: mangle_static(&s.owner, name, &s.param_tys),
+            owner: s.owner.clone(),
             ret: s.ret,
             ret_name: s.ret_name.clone(),
             param_tys: s.param_tys.clone(),
@@ -2923,6 +3113,28 @@ impl Compiler {
                 self.emit_get(t, line);
             }
             self.emit_raising_builtin(crate::host::JCLOSURE_CALL, argc, line);
+            end_jumps.push(self.b.emit(Op::Jump(0), line));
+            let next = self.b.current_pos();
+            self.b.patch_jump(skip, next);
+        }
+        // A closure receiver of a functional interface whose `default` method a
+        // class overrides: the lambda runs the interface's own body, never the
+        // override of an unrelated implementor.
+        if let Some(default_body) = &default_arm {
+            self.emit_get(&class_t, line);
+            let cc = self
+                .b
+                .add_constant(Value::str(crate::host::LAMBDA_CLASS.to_string()));
+            self.b.emit(Op::LoadConst(cc), line);
+            self.b.emit(Op::StrEq, line);
+            let skip = self.b.emit(Op::JumpIfFalse(0), line);
+            self.emit_get(&recv_t, line);
+            for t in &arg_ts {
+                self.emit_get(t, line);
+            }
+            let idx = self.b.add_name(default_body);
+            self.b.emit(Op::Call(idx, argc), line);
+            self.emit_exc_check(line);
             end_jumps.push(self.b.emit(Op::Jump(0), line));
             let next = self.b.current_pos();
             self.b.patch_jump(skip, next);
@@ -5364,11 +5576,33 @@ impl Compiler {
         // into a fresh one — so `for (String s : list)` works and an array loop
         // emits exactly the ops it did before.
         let arr_t = self.temp();
+        // A collection is walked the way a Java iterator walks it: fail-fast on
+        // a structural modification, a `List` read live. `watch_t` names what
+        // the modification token is taken from — the iterable itself, or the map
+        // behind a `keySet()`/`values()`/`entrySet()` view, which is a copy here
+        // and so cannot see the map change.
+        let is_array = self.expr_array_type(iter).is_some();
+        let src_t = self.temp();
+        let watch_t = self.temp();
+        let tok_t = self.temp();
         self.expr(iter)?;
-        if self.expr_array_type(iter).is_none() {
+        if is_array {
+            self.emit_set(&arr_t, line);
+        } else {
+            self.emit_set(&src_t, line);
+            self.emit_get(&src_t, line);
             self.emit_raising_builtin(crate::host::JITER_ARRAY, 1, line);
+            self.emit_set(&arr_t, line);
+            match Self::map_view_owner(iter) {
+                Some(owner) => self.expr(owner)?,
+                None => self.emit_get(&src_t, line),
+            }
+            self.emit_set(&watch_t, line);
+            self.emit_get(&watch_t, line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JITER_TOKEN, 1), line);
+            self.emit_set(&tok_t, line);
         }
-        self.emit_set(&arr_t, line);
         let idx_t = self.temp();
         self.b.emit(Op::LoadInt(0), line);
         self.emit_set(&idx_t, line);
@@ -5376,18 +5610,22 @@ impl Compiler {
         // `i < arr.length`, as an entry guard — the loop is rotated for the
         // reason [`Compiler::while_stmt`] gives, so the same test is emitted
         // again at the bottom as the conditional backward branch.
-        self.emit_get(&idx_t, line);
-        self.emit_get(&arr_t, line);
-        self.emit_field_get("length", line);
-        self.b.emit(Op::NumLt, line);
+        self.emit_foreach_has(is_array, [&src_t, &idx_t, &arr_t], line);
         let jf = self.b.emit(Op::JumpIfFalse(0), line);
         let top = self.b.current_pos();
 
         // The loop variable is rebound from `arr[i]` at the top of every
         // iteration, before the body runs.
-        self.emit_get(&arr_t, line);
-        self.emit_get(&idx_t, line);
-        self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
+        if is_array {
+            self.emit_get(&arr_t, line);
+            self.emit_get(&idx_t, line);
+            self.emit_raising_builtin(crate::host::JARRAY_GET, 2, line);
+        } else {
+            for t in [&src_t, &idx_t, &arr_t, &watch_t, &tok_t] {
+                self.emit_get(t, line);
+            }
+            self.emit_raising_builtin(crate::host::JITER_GET, 5, line);
+        }
         self.emit_set(name, line);
 
         self.scopes.push(BreakScope::loop_scope(label));
@@ -5400,10 +5638,7 @@ impl Compiler {
         self.b.emit(Op::LoadInt(1), line);
         self.b.emit(Op::Add, line);
         self.emit_set(&idx_t, line);
-        self.emit_get(&idx_t, line);
-        self.emit_get(&arr_t, line);
-        self.emit_field_get("length", line);
-        self.b.emit(Op::NumLt, line);
+        self.emit_foreach_has(is_array, [&src_t, &idx_t, &arr_t], line);
         self.b.emit(Op::JumpIfTrue(top), line);
 
         let end = self.b.current_pos();
@@ -5416,6 +5651,43 @@ impl Compiler {
             self.b.patch_jump(op, end);
         }
         Ok(())
+    }
+
+    /// Leave "the enhanced `for` has another element" on the stack: `i <
+    /// arr.length` for an array, [`JITER_HAS`](crate::host::JITER_HAS) — the
+    /// live-size test of a Java `ArrayList` iterator — for a collection.
+    fn emit_foreach_has(&mut self, is_array: bool, [src, idx, arr]: [&str; 3], line: u32) {
+        if is_array {
+            self.emit_get(idx, line);
+            self.emit_get(arr, line);
+            self.emit_field_get("length", line);
+            self.b.emit(Op::NumLt, line);
+        } else {
+            for t in [src, idx, arr] {
+                self.emit_get(t, line);
+            }
+            self.emit_raising_builtin(crate::host::JITER_HAS, 3, line);
+        }
+    }
+
+    /// The map behind `m.keySet()`, `m.values()` or `m.entrySet()` when `m` is a
+    /// name or field chain that can be evaluated a second time without effect.
+    fn map_view_owner(iter: &Expr) -> Option<&Expr> {
+        let Expr::MethodCall {
+            recv, method, args, ..
+        } = iter
+        else {
+            return None;
+        };
+        let view = matches!(method.as_str(), "keySet" | "values" | "entrySet");
+        let pure = |mut e: &Expr| loop {
+            match e {
+                Expr::Var(_) | Expr::This => return true,
+                Expr::Field { recv, .. } => e = recv,
+                _ => return false,
+            }
+        };
+        (view && args.is_empty() && pure(recv)).then_some(recv.as_ref())
     }
 
     /// The standalone type of a `switch` expression (JLS 15.28.1), read off
@@ -5495,6 +5767,7 @@ impl Compiler {
             .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
         let disc_t = self.temp();
         self.expr(disc)?;
+        self.emit_switch_null_check(disc, arms.iter().flat_map(|a| a.labels.iter()), line);
         // See the note in `switch_stmt`: a `String` discriminant switches by
         // value, so a `new String(…)` handle is read as its text.
         if self.expr_java_type(disc).as_deref() == Some("String") {
@@ -5605,6 +5878,38 @@ impl Compiler {
     /// consecutively so control falls through into the next group unless a
     /// `break` intervenes; an unmatched discriminant jumps to `default` (or the
     /// switch exit when there is no default).
+    /// A `switch` over a reference with no `case null` label throws
+    /// `NullPointerException` on `null`, before any label is tried (JLS 14.11.3):
+    /// the lowering Java uses calls `hashCode()`/`ordinal()`/`xxxValue()` on the
+    /// discriminant, or `Objects.requireNonNull` for a pattern switch. A `case
+    /// null` label opts out, and a primitive discriminant can never be `null`.
+    fn emit_switch_null_check<'a>(
+        &mut self,
+        disc: &Expr,
+        mut labels: impl Iterator<Item = &'a Expr>,
+        line: u32,
+    ) {
+        if labels.any(|l| matches!(l, Expr::Var(n) if n == NULL_LITERAL)) {
+            return;
+        }
+        let ty = self.expr_java_type(disc);
+        let call = match ty.as_deref() {
+            Some("String") => "String.hashCode()".to_string(),
+            Some(t) if !is_reference_type(t) => return,
+            Some(t) if crate::host::box_class_code(t).is_some() => {
+                let prim = unwrapped_ty(t);
+                format!("java.lang.{t}.{prim}Value()")
+            }
+            Some(t) if self.classes.get(t).is_some_and(|ci| ci.is_enum) => {
+                format!("{}.ordinal()", self.classes[t].binary)
+            }
+            _ => String::new(),
+        };
+        let c = self.b.add_constant(Value::str(call));
+        self.b.emit(Op::LoadConst(c), line);
+        self.emit_raising_builtin(crate::host::JSWITCH_NONNULL, 2, line);
+    }
+
     fn switch_stmt(&mut self, disc: &Expr, groups: &[SwitchGroup]) -> Result<(), String> {
         let label = self.pending_label.take();
         // Evaluate the discriminant once and stash it in an internal temp. The
@@ -5618,6 +5923,7 @@ impl Compiler {
             .expr_java_type(disc)
             .filter(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum));
         self.expr(disc)?;
+        self.emit_switch_null_check(disc, groups.iter().flat_map(|g| g.labels.iter()), 0);
         // Java's `switch` on a `String` compares with `equals`, not `==`, so a
         // `new String(…)` handle must be read as its text. Unboxing once here
         // is enough: a `String`-typed discriminant can carry no pattern label,
@@ -5946,6 +6252,7 @@ impl Compiler {
             self.emit_this(0);
             self.emit_field_get(name, 0);
         } else if let Some((class, _)) = self.static_field_owner(name) {
+            self.emit_static_field_init(&class, name, 0);
             self.emit_global_get(&static_global(&class, name), 0);
         } else if let Some((recv, _)) = self.outer_field_recv(name) {
             self.emit_this_chain(&recv);
@@ -6029,7 +6336,7 @@ impl Compiler {
                 let (arr_t, idx_t, val_t) = (self.temp(), self.temp(), self.temp());
                 self.expr(array)?;
                 self.emit_set(&arr_t, line);
-                self.expr(index)?;
+                self.expr_unboxed(index)?;
                 self.emit_set(&idx_t, line);
                 self.expr_targeted(value, elem_ty.as_deref())?;
                 self.emit_set(&val_t, line);
@@ -6162,6 +6469,14 @@ impl Compiler {
         if self.is_char_expr(e) || self.is_float32_expr(e) {
             return self.emit_char_string(e);
         }
+        // A `Class` is its binary name here, but its string conversion adds the
+        // `class `/`interface ` keyword.
+        if let Some(interface) = self.class_value_kind(e) {
+            self.expr(e)?;
+            self.b.emit(Op::LoadInt(i64::from(interface)), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JCLASS_STR, 2), 0);
+            return Ok(());
+        }
         // A `List` operand's string conversion is its `toString()`, and for a
         // `subList` view that call is what reports a backing list which moved
         // underneath it. Routing a statically-known list through the collection
@@ -6183,6 +6498,29 @@ impl Compiler {
             return self.emit_host_stringified(e);
         }
         self.emit_virtual_to_string(e, &overriders)
+    }
+
+    /// Whether `e` denotes a `java.lang.Class`, and if so whether it is an
+    /// interface's: a class literal, `x.getClass()`, `e.getDeclaringClass()`, or
+    /// a variable declared `Class<…>`.
+    fn class_value_kind(&self, e: &Expr) -> Option<bool> {
+        match e {
+            Expr::ClassLit(name) => {
+                let user = self.classes.get(name).map(|c| c.is_interface);
+                Some(user.unwrap_or_else(|| crate::host::is_jdk_interface(name)))
+            }
+            Expr::MethodCall { method, args, .. }
+                if args.is_empty()
+                    && matches!(method.as_str(), "getClass" | "getDeclaringClass") =>
+            {
+                Some(false)
+            }
+            Expr::Var(name) => self
+                .var_decl_type(name)
+                .is_some_and(|t| t == "Class" || t.starts_with("Class<"))
+                .then_some(false),
+            _ => None,
+        }
     }
 
     /// The fall-through of [`Compiler::emit_stringified`]: an operand whose
@@ -6319,6 +6657,7 @@ impl Compiler {
             Expr::ClassLit(name) => {
                 let c = self.string_literal(&self.class_literal_name(name));
                 self.b.emit(Op::LoadConst(c), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::JCLASS_LIT, 1), 0);
             }
             // A pattern label carries no subject of its own — the `switch`
             // supplies its discriminant — so it is lowered by
@@ -6369,11 +6708,13 @@ impl Compiler {
                 // A bare name that is a field of `this` (not a local) reads
                 // `this.name`; otherwise it is a plain local/global.
                 else if let Some(class) = self.enclosing_enum_constant(name) {
+                    self.emit_class_init(&class, 0);
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if self.implicit_this_field(name).is_some() {
                     self.emit_this(0); // this
                     self.emit_field_get(name, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
+                    self.emit_static_field_init(&class, name, 0);
                     self.emit_global_get(&static_global(&class, name), 0);
                 } else if let Some((recv, _)) = self.outer_field_recv(name) {
                     self.emit_this_chain(&recv);
@@ -6435,7 +6776,7 @@ impl Compiler {
             }
             Expr::Index { array, index } => {
                 self.expr(array)?;
-                self.expr(index)?;
+                self.expr_unboxed(index)?;
                 self.emit_raising_builtin(crate::host::JARRAY_GET, 2, 0);
             }
             Expr::Field { recv, name } => {
@@ -6460,10 +6801,12 @@ impl Compiler {
                 // `Color.RED` names an enum constant's singleton, not a field of
                 // a value — there is no receiver to evaluate.
                 else if let Some(class) = self.enum_constant_ref(e) {
+                    self.emit_class_init(&class, 0);
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if let Some((class, _)) = self.static_field_ref(e) {
                     // `T.n` names a `static` field's shared cell — the receiver
                     // is a type, so there is nothing to evaluate.
+                    self.emit_static_field_init(&class, name, 0);
                     self.emit_global_get(&static_global(&class, name), 0);
                 } else {
                     self.expr(recv)?;
@@ -6786,6 +7129,7 @@ impl Compiler {
                     let args =
                         Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
                     self.call_args_targeted(&args, &resolved.param_tys)?;
+                    self.emit_class_init(&resolved.owner, line);
                     let name_idx = self.b.add_name(&resolved.mangled);
                     self.b.emit(Op::Call(name_idx, args.len() as u8), line);
                     self.emit_exc_check(line);
@@ -7639,6 +7983,27 @@ impl Compiler {
         }
         let args = self.with_captures(ctor_class, args, outer);
         let args: &[Expr] = &args;
+        // `new Integer(5)` and its siblings: the deprecated wrapper constructors
+        // always allocate, so the result is a fresh box outside the `valueOf`
+        // cache — `new Integer(5) == new Integer(5)` is `false`. The operand is
+        // converted exactly as `valueOf` converts it (`new Double("1.5")` parses).
+        self.emit_class_init(class, line);
+        if !self.classes.contains_key(class) && args.len() == 1 {
+            let code = crate::host::box_class_code(class).filter(|_| class != "Character");
+            if let Some(code) = code {
+                let value = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(class.to_string())),
+                    method: "valueOf".to_string(),
+                    args: args.to_vec(),
+                    line,
+                };
+                self.expr(&value)?;
+                self.b.emit(Op::LoadInt(code), line);
+                self.b.emit(Op::LoadInt(1), line);
+                self.b.emit(Op::CallBuiltin(crate::host::JBOX, 3), line);
+                return Ok(());
+            }
+        }
         // `new EnumMap<>(K.class)` / `new EnumMap<>(otherMap)`. An `EnumMap`
         // iterates its keys in ordinal order, an enum's natural order, so
         // javars models it as the `TreeMap` it behaves as; the class literal
@@ -7903,7 +8268,7 @@ impl Compiler {
             .expr_array_type(array)
             .and_then(|t| t.strip_suffix("[]").map(str::to_string));
         self.expr(array)?;
-        self.expr(index)?;
+        self.expr_unboxed(index)?;
         self.expr_targeted(value, elem_ty.as_deref())?;
         self.emit_raising_builtin(crate::host::JARRAY_SET, 3, line);
         self.b.emit(Op::Pop, line);
@@ -7930,7 +8295,7 @@ impl Compiler {
         let idx_t = self.temp();
         self.expr(array)?;
         self.emit_set(&arr_t, line);
-        self.expr(index)?;
+        self.expr_unboxed(index)?;
         self.emit_set(&idx_t, line);
         // old element
         self.emit_get(&arr_t, line);
@@ -7996,6 +8361,7 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         if let Some((class, ty)) = self.static_target(recv, name) {
+            self.emit_static_field_init(&class, name, line);
             return self.static_update(&static_global(&class, name), &ty, op, value, want, line);
         }
         // The field's declared type drives both the compound-`/` truncation and
@@ -8066,26 +8432,53 @@ impl Compiler {
     ) -> Result<(), String> {
         // `float f; f *= x;` is one 32-bit operation, not a 64-bit one narrowed
         // afterwards — the same reason the binary path routes through the host.
-        if target_ty == Some("float") {
+        // A `double` operand makes the operation a `double` one (JLS 5.6.2), which
+        // is rounded to `float` only by the implicit cast afterwards.
+        let via_double = target_ty == Some("float")
+            && self.expr_java_type(value).as_deref().map(unwrapped_ty) == Some("double");
+        if target_ty == Some("float") && !via_double {
             if let Some(bop) = compound_binop(op) {
                 self.expr(value)?;
                 self.emit_f32_arith(bop, line);
                 return Ok(());
             }
         }
+        // `long x; x += f;` with a `float` operand is a `float` operation
+        // (JLS 5.6.2: the promoted type is `float`, not `double`), narrowed back
+        // by the cast below — the same reason a `float` target runs at 32 bits.
+        if matches!(target_ty, Some("int" | "long" | "short" | "byte" | "char"))
+            && self.expr_java_type(value).as_deref().map(unwrapped_ty) == Some("float")
+        {
+            if let Some(bop) = compound_binop(op).filter(|b| {
+                matches!(
+                    b,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                )
+            }) {
+                self.expr(value)?;
+                self.emit_f32_arith(bop, line);
+                if let Some(t) = target_ty {
+                    let c = self.b.add_constant(Value::str(t.to_string()));
+                    self.b.emit(Op::LoadConst(c), line);
+                    self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
+                }
+                return Ok(());
+            }
+        }
         if matches!(op, AssignOp::Shl | AssignOp::Shr | AssignOp::Ushr) {
-            // Same width rule as the binary shifts: the distance is masked to
-            // the *target's* width, and `>>>` zero-fills at it. `wrap32` is
-            // exactly "the target is `int`-wide", and the shared narrowing
-            // below finishes the job.
+            // Same width rule as the binary shifts (JLS 15.19): the left operand
+            // is promoted to `int` or stays `long`, the distance is masked to
+            // *that* width, and `>>>` zero-fills at it. A `byte`/`short`/`char`
+            // target shifts as the `int` it promotes to and is narrowed after.
+            let wide = !matches!(target_ty, Some("int" | "short" | "byte" | "char"));
             self.expr(value)?;
-            self.b.emit(Op::LoadInt(if wrap32 { 31 } else { 63 }), line);
+            self.b.emit(Op::LoadInt(if wide { 63 } else { 31 }), line);
             self.b.emit(Op::BitAnd, line);
             match op {
                 AssignOp::Shl => self.b.emit(Op::Shl, line),
                 AssignOp::Shr => self.b.emit(Op::Shr, line),
                 _ => {
-                    self.b.emit(Op::LoadInt(if wrap32 { 32 } else { 64 }), line);
+                    self.b.emit(Op::LoadInt(if wide { 64 } else { 32 }), line);
                     self.b.emit(Op::CallBuiltin(crate::host::JUSHR, 3), line)
                 }
             };
@@ -8137,7 +8530,12 @@ impl Compiler {
             self.b.emit(Op::LoadConst(c), line);
             self.b.emit(Op::CallBuiltin(crate::host::JCAST, 2), line);
         }
-        if wrap32 {
+        if via_double {
+            self.b.emit(Op::CallBuiltin(crate::host::JF32, 1), line);
+        }
+        // An `int` target is an `int` whatever the right-hand side's width: the
+        // implicit cast of JLS 15.26.2 wraps a `long` operation back to 32 bits.
+        if wrap32 || target_ty == Some("int") {
             self.emit_wrap32(line);
         }
         Ok(())
@@ -8270,6 +8668,7 @@ impl Compiler {
             })?;
             let args = Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
             self.call_args_targeted(&args, &resolved.param_tys)?;
+            self.emit_class_init(&resolved.owner, line);
             let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
             self.emit_exc_check(line);
@@ -8334,17 +8733,46 @@ impl Compiler {
 
     /// Lower `cond ? then : els`. Evaluates `cond`, jumps to the `els` branch
     /// when false, and leaves exactly one branch's value on the stack.
+    /// Whether a conditional is a *numeric* (or boolean) conditional that
+    /// converts its operands (JLS 15.25): both are primitives or wrappers of
+    /// one, and they are not the very same wrapper type. Its operands then
+    /// unbox, so `flag ? integerOrNull : 0` throws on a `null` `Integer`
+    /// where a reference conditional would pass it through.
+    fn ternary_unboxes(&self, then: &Expr, els: &Expr) -> bool {
+        let (Some(t), Some(e)) = (self.expr_java_type(then), self.expr_java_type(els)) else {
+            return false;
+        };
+        let convertible =
+            |ty: &str| numeric_rank(ty).is_some() || matches!(ty, "boolean" | "Boolean");
+        let primitive = |ty: &str| !is_reference_type(ty);
+        convertible(&t) && convertible(&e) && (primitive(&t) || primitive(&e) || t != e)
+    }
+
+    /// The unboxing conversion for a branch of a numeric conditional.
+    fn emit_checked_unbox_of(&mut self, e: &Expr) {
+        if let Some(t) = self.expr_java_type(e) {
+            self.emit_checked_unbox(&t);
+        }
+    }
+
     fn ternary(&mut self, cond: &Expr, then: &Expr, els: &Expr) -> Result<(), String> {
         // A floating conditional widens whichever branch is integral, so
         // `flag ? 1 : 2.0` yields 1.0 rather than 1 (JLS 15.25).
         let promote = self.ternary_promotion(then, els);
+        let unbox = self.ternary_unboxes(then, els);
         self.expr_unboxed(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
         self.expr_targeted(then, promote)?;
+        if unbox {
+            self.emit_checked_unbox_of(then);
+        }
         let jend = self.b.emit(Op::Jump(0), 0);
         let else_start = self.b.current_pos();
         self.b.patch_jump(jf, else_start);
         self.expr_targeted(els, promote)?;
+        if unbox {
+            self.emit_checked_unbox_of(els);
+        }
         let end = self.b.current_pos();
         self.b.patch_jump(jend, end);
         Ok(())
@@ -8453,6 +8881,18 @@ impl Compiler {
                     self.expr_unboxed(e)?;
                 } else {
                     self.expr(e)?;
+                }
+            }
+        } else if op == BinOp::Add && self.has_user_tostring {
+            // Neither operand is statically a String or a user class, yet one may
+            // be an object at run time (an erased `get()`): a heap object that is
+            // not a box is stringified, so `+` concatenates it through its
+            // `toString()` instead of the numeric hook's default rendering.
+            for e in [lhs, rhs] {
+                self.expr_unboxed(e)?;
+                if !self.renders_without_a_class(e) {
+                    self.b
+                        .emit(Op::CallBuiltin(crate::host::JSTRINGIFY_OBJ, 1), 0);
                 }
             }
         } else {
@@ -8588,7 +9028,10 @@ impl Compiler {
             (ty, src.as_deref()),
             ("int", Some("int" | "short" | "byte"))
                 | ("long", Some("int" | "long" | "short" | "byte"))
-                | ("double" | "float", Some("double" | "float"))
+                // `(double) f` widens exactly, `(float) f` is the identity; only
+                // `(float) d` narrows, and rounds to 32-bit precision.
+                | ("double", Some("double" | "float"))
+                | ("float", Some("float"))
                 | ("boolean", Some("boolean"))
         );
         let primitive = matches!(
@@ -8822,6 +9265,117 @@ fn expr_has_ffi(e: &Expr) -> bool {
 /// is not a legal Java identifier char, so mangled names never collide with a
 /// user-declared static method. Including the parameter types disambiguates
 /// same-name/same-arity overloads. Constructors use the member name `<init>`.
+/// The global holding whether `class`'s static initializer has started.
+fn clinit_flag(class: &str) -> String {
+    format!("#clinit-done#{class}")
+}
+
+/// The subroutine that runs `class`'s static initializer.
+fn clinit_name(class: &str) -> String {
+    format!("#clinit#{class}")
+}
+
+/// The literal a `static final` field is initialized with, when it is a
+/// *constant variable* (JLS 4.12.4): its value is known to the compiler, and
+/// reading it does not initialize its class. The parser lowers the field's
+/// initializer to the assignment that seeds its cell.
+fn constant_initializer<'a>(static_init: &'a [Stmt], field: &str) -> Option<&'a Expr> {
+    static_init.iter().find_map(|st| match &st.kind {
+        StmtKind::Assign {
+            name,
+            op: AssignOp::Assign,
+            value,
+        } if name == field && is_literal(value) => Some(value),
+        _ => None,
+    })
+}
+
+/// A literal, or a negated numeric literal.
+fn is_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_)
+        | Expr::Long(_)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Str(_)
+        | Expr::Char(_)
+        | Expr::Bool(_) => true,
+        Expr::Unary { op: UnOp::Neg, rhs } => matches!(
+            rhs.as_ref(),
+            Expr::Int(_) | Expr::Long(_) | Expr::Float(_) | Expr::Float32(_)
+        ),
+        _ => false,
+    }
+}
+
+/// The classes whose static initialization has to wait for first use.
+///
+/// Java initializes a class when it is first used, so an initializer with a
+/// side effect — a call, a `static { … }` block, an enum's constructors — is
+/// observable in *when* it runs. A class whose initializers only store
+/// literals is not: the values are seeded up front and nothing can tell. The
+/// entry class is initialized before `main` and so is never lazy. A subclass
+/// of a lazy class is lazy too, because initializing it initializes the
+/// superclass first.
+/// The superinterfaces of the class `cl` that initializing it initializes, in
+/// the order JLS 12.4.2 step 7 fixes: those declaring a non-abstract instance
+/// method (a `default`), enumerated depth-first over `implements` order with an
+/// interface's own superinterfaces ahead of it. An interface itself initializes
+/// none.
+fn default_interfaces(cl: &Class, by_name: &HashMap<&str, &Class>) -> Vec<String> {
+    fn walk(name: &str, by_name: &HashMap<&str, &Class>, out: &mut Vec<String>) {
+        let Some(i) = by_name.get(name) else {
+            return;
+        };
+        for sup in &i.interfaces {
+            walk(sup, by_name, out);
+        }
+        if i.methods.iter().any(|m| !m.is_abstract) && !out.iter().any(|o| o == name) {
+            out.push(name.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    if !cl.is_interface {
+        for i in &cl.interfaces {
+            walk(i, by_name, &mut out);
+        }
+    }
+    out
+}
+
+fn lazy_initialized_classes(prog: &Program) -> HashSet<String> {
+    let by_name: HashMap<&str, &Class> =
+        prog.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let observable = |c: &Class| {
+        !c.enum_constants.is_empty()
+            || c.static_init.iter().any(|st| {
+                !matches!(&st.kind, StmtKind::Assign { op: AssignOp::Assign, value, .. } if is_literal(value))
+            })
+    };
+    let lazy = |c: &Class| {
+        let mut cur = Some(c);
+        while let Some(cl) = cur {
+            if cl.name != prog.class_name && observable(cl) {
+                return true;
+            }
+            let init_ifaces = default_interfaces(cl, &by_name);
+            if init_ifaces.iter().any(|i| observable(by_name[i.as_str()])) {
+                return true;
+            }
+            cur = cl
+                .superclass
+                .as_deref()
+                .and_then(|s| by_name.get(s).copied());
+        }
+        false
+    };
+    prog.classes
+        .iter()
+        .filter(|c| c.name != prog.class_name && lazy(c))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
 fn mangle(class: &str, member: &str, param_tys: &[String]) -> String {
     format!("{class}#{member}#{}", param_tys.join(","))
 }

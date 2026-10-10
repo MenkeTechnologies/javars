@@ -52,6 +52,11 @@
 //!     type, above all `List.remove`, which is an index for an `int` and a value
 //!     for an `Integer`. A mode that only *builds* collections cannot see it.
 //!
+//! The generators added in the second round (class initialization order,
+//! conditional promotion, `String.format` flag products, hash iteration order,
+//! fail-fast iteration, and the rest) live in the `round2` module next to this
+//! file; `--help` lists every mode.
+//!
 //! Scope + determinism invariants (mirroring the scalars/node-js harnesses):
 //!   * Only constructs javars actually implements are emitted — an unsupported
 //!     construct would be a known gap, not a parity signal.
@@ -87,6 +92,9 @@
 // need none are still written `format!` so the table reads as one shape and an
 // arm can gain an operand without being respelled.
 #![allow(clippy::useless_format)]
+
+#[path = "parity_fuzz/round2.rs"]
+mod round2;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2502,6 +2510,21 @@ enum Mode {
     ParseFn,
     TextBlock,
     Anon,
+    Clinit,
+    TernProm,
+    NullUnbox,
+    IntCache,
+    NumProm,
+    FmtFlag,
+    SBuild,
+    HashIter,
+    Exc,
+    Overload,
+    SwFall,
+    Sealed,
+    Capture,
+    Generic,
+    FailFast,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2573,6 +2596,21 @@ const CONCRETE: &[Mode] = &[
     Mode::ParseFn,
     Mode::TextBlock,
     Mode::Anon,
+    Mode::Clinit,
+    Mode::TernProm,
+    Mode::NullUnbox,
+    Mode::IntCache,
+    Mode::NumProm,
+    Mode::FmtFlag,
+    Mode::SBuild,
+    Mode::HashIter,
+    Mode::Exc,
+    Mode::Overload,
+    Mode::SwFall,
+    Mode::Sealed,
+    Mode::Capture,
+    Mode::Generic,
+    Mode::FailFast,
 ];
 
 /// The `Integer`/`Long` bit-twiddling statics, at the boundaries where the two
@@ -3280,6 +3318,21 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ParseFn => "parsefn",
         Mode::TextBlock => "textblock",
         Mode::Anon => "anon",
+        Mode::Clinit => "clinit",
+        Mode::TernProm => "ternprom",
+        Mode::NullUnbox => "nullunbox",
+        Mode::IntCache => "intcache",
+        Mode::NumProm => "numprom",
+        Mode::FmtFlag => "fmtflag",
+        Mode::SBuild => "sbuild",
+        Mode::HashIter => "hashiter",
+        Mode::Exc => "exc",
+        Mode::Overload => "overload",
+        Mode::SwFall => "swfall",
+        Mode::Sealed => "sealed",
+        Mode::Capture => "capture",
+        Mode::Generic => "generic",
+        Mode::FailFast => "failfast",
     }
 }
 
@@ -3365,6 +3418,21 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::ParseFn => g_parsefn(r),
         Mode::TextBlock => g_textblock(r),
         Mode::Anon => g_anon(r),
+        Mode::Clinit => round2::g_clinit(r),
+        Mode::TernProm => round2::g_ternprom(r),
+        Mode::NullUnbox => round2::g_nullunbox(r),
+        Mode::IntCache => round2::g_intcache(r),
+        Mode::NumProm => round2::g_numprom(r),
+        Mode::FmtFlag => round2::g_fmtflag(r),
+        Mode::SBuild => round2::g_sbuild(r),
+        Mode::HashIter => round2::g_hashiter(r),
+        Mode::Exc => round2::g_exc(r),
+        Mode::Overload => round2::g_overload(r),
+        Mode::SwFall => round2::g_swfall(r),
+        Mode::Sealed => round2::g_sealed(r),
+        Mode::Capture => round2::g_capture(r),
+        Mode::Generic => round2::g_generic(r),
+        Mode::FailFast => round2::g_failfast(r),
         Mode::All => unreachable!("resolved above"),
     }
 }
@@ -3387,8 +3455,10 @@ fn build_program(probes: &[String]) -> String {
     }
     s.push_str("    }\n");
     s.push_str(SUPPORT);
+    s.push_str(round2::SUPPORT);
     s.push_str("}\n");
     s.push_str(SUPPORT_CLASS);
+    s.push_str(round2::SUPPORT_CLASS);
     s
 }
 

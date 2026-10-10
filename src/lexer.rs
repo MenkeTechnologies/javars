@@ -499,8 +499,9 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 1;
-                    s.push(unescape(bytes[i] as char));
-                    i += 1;
+                    let (ch, used) = escape_at(bytes, i);
+                    s.push(ch);
+                    i += used;
                 } else {
                     // Decode a full UTF-8 char so multibyte literals survive.
                     let ch = src[i..].chars().next().unwrap();
@@ -530,8 +531,8 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             i += 1;
             let ch = if bytes[i] == b'\\' {
                 i += 1;
-                let c = unescape(bytes[i] as char);
-                i += 1;
+                let (c, used) = escape_at(bytes, i);
+                i += used;
                 c
             } else {
                 let c = src[i..].chars().next().unwrap();
@@ -784,11 +785,32 @@ fn keyword_or_ident(word: &str) -> Tok {
     kw.unwrap_or_else(|| Tok::Ident(word.to_string()))
 }
 
+/// Decode the escape whose backslash precedes `bytes[at]`, returning the
+/// character and how many bytes of `bytes` it consumed (JLS 3.10.7). An octal
+/// escape takes up to three digits when the first is `0`-`3`, else up to two.
+fn escape_at(bytes: &[u8], at: usize) -> (char, usize) {
+    let first = bytes[at];
+    if !(b'0'..=b'7').contains(&first) {
+        return (unescape(first as char), 1);
+    }
+    let max = if first <= b'3' { 3 } else { 2 };
+    let mut value = 0u32;
+    let mut n = 0;
+    while n < max && bytes.get(at + n).is_some_and(|b| (b'0'..=b'7').contains(b)) {
+        value = value * 8 + u32::from(bytes[at + n] - b'0');
+        n += 1;
+    }
+    (char::from_u32(value).unwrap_or('\0'), n)
+}
+
 fn unescape(c: char) -> char {
     match c {
         'n' => '\n',
         't' => '\t',
         'r' => '\r',
+        'b' => '\u{8}',
+        'f' => '\u{c}',
+        's' => ' ',
         '0' => '\0',
         '\\' => '\\',
         '"' => '"',
@@ -887,16 +909,23 @@ fn text_block(src: &str, start: usize, line: u32) -> Result<(String, usize, u32)
 /// (which has already happened by the time this runs, which is the point).
 fn unescape_block(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            let ch = s[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
             continue;
         }
-        match chars.next() {
-            Some('\n') => {}
-            Some('s') => out.push(' '),
-            Some(e) => out.push(unescape(e)),
+        i += 1;
+        match bytes.get(i) {
+            Some(b'\n') => i += 1,
+            Some(_) => {
+                let (ch, used) = escape_at(bytes, i);
+                out.push(ch);
+                i += used;
+            }
             None => out.push('\\'),
         }
     }

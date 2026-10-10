@@ -369,6 +369,48 @@ pub const JUNBOX: u16 = 748;
 /// `BOX_CLASSES.len()` for `Boolean`); `argc == 2`.
 pub const JUNBOX_NONNULL: u16 = 752;
 
+/// `T.class` — a class literal. A class is its binary name here, and `==` on
+/// two of them is reference identity, so every spelling of one class (a literal,
+/// `x.getClass()`) has to resolve to the *same* `String` handle: the name goes
+/// through one intern table. Stack `[name]`; `argc == 1`.
+pub const JCLASS_LIT: u16 = 753;
+
+/// The operand of a `+` whose static types javars could not settle: a heap
+/// object that is not a box answers its string conversion (running a user
+/// `toString()`), anything else passes through untouched so a numeric `+` is
+/// still numeric. Stack `[value]`; `argc == 1`.
+pub const JSTRINGIFY_OBJ: u16 = 754;
+
+/// A `switch` discriminant with no `case null`: Java evaluates it through
+/// `hashCode()`/`ordinal()`/`xxxValue()` (or `Objects.requireNonNull` for a
+/// pattern switch), so `null` raises `NullPointerException` before any label is
+/// tried. Stack `[value, call]` (`call` a string, the method half of the
+/// message, empty for none); `argc == 2`.
+pub const JSWITCH_NONNULL: u16 = 755;
+
+/// The modification token of the collection an enhanced `for` walks, so the
+/// loop can be fail-fast the way a Java iterator is: a `List`'s `modCount`, a
+/// `Set`'s or `Map`'s size, `-1` for anything with no token. Stack `[source]`;
+/// `argc == 1`.
+pub const JITER_TOKEN: u16 = 756;
+
+/// Whether an enhanced `for` has another element. A `List` is read live —
+/// `ArrayList`'s `hasNext()` is `cursor != size`, so a loop that shrank the list
+/// past its cursor still enters `next()` and fails there — every other source
+/// answers from the snapshot. Stack `[source, index, snapshot]`; `argc == 3`.
+pub const JITER_HAS: u16 = 757;
+
+/// The element an enhanced `for` binds next: `ConcurrentModificationException`
+/// when the token no longer matches, then the live `List` element or the
+/// snapshot's. Stack `[source, index, snapshot, token_source, token]`;
+/// `argc == 5`.
+pub const JITER_GET: u16 = 758;
+
+/// `String.valueOf(Class)` — `Class.toString()`: `class T$A`, `interface T$I`,
+/// and the bare name for a primitive. Stack `[name, is_interface]`;
+/// `argc == 2`.
+pub const JCLASS_STR: u16 = 759;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -2441,6 +2483,13 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JBOX, b_box);
     vm.register_builtin(JUNBOX, b_unbox);
     vm.register_builtin(JUNBOX_NONNULL, b_unbox_nonnull);
+    vm.register_builtin(JCLASS_LIT, b_class_lit);
+    vm.register_builtin(JSTRINGIFY_OBJ, b_stringify_obj);
+    vm.register_builtin(JSWITCH_NONNULL, b_switch_nonnull);
+    vm.register_builtin(JITER_TOKEN, b_iter_token);
+    vm.register_builtin(JITER_HAS, b_iter_has);
+    vm.register_builtin(JITER_GET, b_iter_get);
+    vm.register_builtin(JCLASS_STR, b_class_str);
     vm.register_builtin(JNEW_STRING, b_new_string);
     vm.register_builtin(JCOMPARE_TO, b_compare_to);
     vm.register_builtin(JFORMAT, b_format);
@@ -2601,6 +2650,31 @@ fn b_classof(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+thread_local! {
+    /// The one `String` handle each class name resolves to; see [`JCLASS_LIT`].
+    static CLASS_NAMES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+/// The canonical handle for the class named `name`, so that two spellings of
+/// one class compare `==` as Java's `Class` objects do.
+fn intern_class(name: String) -> Value {
+    CLASS_NAMES.with(|t| {
+        t.borrow_mut()
+            .entry(name)
+            .or_insert_with_key(|k| Value::str(k.clone()))
+            .clone()
+    })
+}
+
+/// [`JCLASS_LIT`] — resolve a class literal's name to its canonical handle.
+fn b_class_lit(vm: &mut VM, _argc: u8) -> Value {
+    let name = vm.stack.pop().unwrap_or(Value::Undef);
+    let name = name.as_str_cow().into_owned();
+    // `int[].class` names an array type, which `getName()` spells as its
+    // descriptor.
+    intern_class(array_descriptor(&name).unwrap_or(name))
+}
+
 /// [`JBINARY_CLASS`] — `x.getClass()`, as the binary name `getName()` reports.
 ///
 /// Everything the answer depends on already existed: [`value_class`] names the
@@ -2617,6 +2691,11 @@ fn b_box(vm: &mut VM, argc: u8) -> Value {
         .unwrap_or(0)
         .clamp(0, BOX_CLASSES.len() as i64 - 1) as usize;
     let v = args.first().cloned().unwrap_or(Value::Undef);
+    // A third argument asks for a box outside the cache: the deprecated
+    // `new Integer(x)` constructors, which always allocate.
+    if args.get(2).is_some_and(|f| as_i64(f) != 0) {
+        return Value::Obj(alloc_box(BOX_CLASSES[code], deboxed(&v)));
+    }
     // `null` is not boxed. Java's boxing conversion applies to a *primitive*,
     // and the one place a null can reach a boxing site is an already-reference
     // expression the compiler could not type; boxing it would turn `null` into
@@ -2718,8 +2797,8 @@ fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
     // A lambda keeps the dispatch sentinel: Java names one
     // `Class$$Lambda/0x…`, which is not reproducible (BUGS.md).
     match value_class(v) {
-        Some(class) if class == LAMBDA_CLASS => Value::str(class),
-        Some(class) => Value::str(binary_name(&class, v).unwrap_or(class)),
+        Some(class) if class == LAMBDA_CLASS => intern_class(class),
+        Some(class) => intern_class(binary_name(&class, v).unwrap_or(class)),
         None => Value::str(""),
     }
 }
@@ -5837,6 +5916,93 @@ fn b_iter_array(vm: &mut VM, argc: u8) -> Value {
     }
 }
 
+/// The token an enhanced `for` compares to detect a structural modification:
+/// see [`JITER_TOKEN`].
+fn iter_token_of(v: &Value) -> i64 {
+    let Value::Obj(id) = v else {
+        return -1;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::List { mods, .. }) => *mods as i64,
+        Some(HostObj::Set { items, .. }) => items.len() as i64,
+        Some(HostObj::Map { entries, .. }) => entries.len() as i64,
+        _ => -1,
+    })
+}
+
+/// [`JCLASS_STR`].
+fn b_class_str(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let Some(name) = args.first().filter(|v| !matches!(v, Value::Undef)) else {
+        return Value::str("null");
+    };
+    let name = name.as_str_cow().into_owned();
+    let primitive = matches!(
+        name.as_str(),
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean" | "void"
+    );
+    let interface = args.get(1).is_some_and(|f| as_i64(f) != 0);
+    Value::str(match (primitive, interface) {
+        (true, _) => name,
+        (false, true) => format!("interface {name}"),
+        (false, false) => format!("class {name}"),
+    })
+}
+
+/// [`JITER_TOKEN`].
+fn b_iter_token(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    Value::Int(iter_token_of(&v))
+}
+
+/// [`JITER_HAS`].
+fn b_iter_has(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let at = as_i64(&args[1]) as usize;
+    let (Value::Obj(src), Value::Obj(arr)) = (&args[0], &args[2]) else {
+        return Value::bool(false);
+    };
+    let more = HEAP.with(|h| {
+        let heap = h.borrow();
+        match heap.get(*src as usize) {
+            Some(HostObj::List { items, .. }) => Some(at != items.len()),
+            _ => None,
+        }
+        .or_else(|| match heap.get(*arr as usize) {
+            Some(HostObj::Array(a)) => Some(at < a.len()),
+            _ => None,
+        })
+    });
+    Value::bool(more.unwrap_or(false))
+}
+
+/// [`JITER_GET`].
+fn b_iter_get(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let at = as_i64(&args[1]) as usize;
+    let token = as_i64(&args[4]);
+    if token >= 0 && iter_token_of(&args[3]) != token {
+        return raise(vm, comodification());
+    }
+    let (Value::Obj(src), Value::Obj(arr)) = (&args[0], &args[2]) else {
+        return Value::Undef;
+    };
+    let item = HEAP.with(|h| {
+        let heap = h.borrow();
+        match heap.get(*src as usize) {
+            Some(HostObj::List { items, .. }) => items.get(at).cloned(),
+            _ => match heap.get(*arr as usize) {
+                Some(HostObj::Array(a)) => a.get(at).cloned(),
+                _ => None,
+            },
+        }
+    });
+    match item {
+        Some(v) => v,
+        None => raise(vm, Fault::java("NoSuchElementException", String::new())),
+    }
+}
+
 /// Run the subroutine at `entry` whose prologue values are already stacked above
 /// `stack_base`, in its own call frame, and return its value.
 ///
@@ -7664,6 +7830,7 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
             {
                 return old;
             }
+            let size_before = iter_token_of(recv);
             let fresh = match method {
                 "computeIfAbsent" => invoke_closure(vm, &args[1], std::slice::from_ref(&key)),
                 "computeIfPresent" | "compute" => {
@@ -7677,6 +7844,13 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
             };
             if PENDING.with(|p| p.borrow().is_some()) {
                 return Value::Undef;
+            }
+            // The JDK's `HashMap`/`TreeMap` compute family compares `modCount`
+            // around the function and throws when it structurally modified the
+            // map (a memoizing recursive `computeIfAbsent` is the usual way in).
+            // The map's size stands in for the counter here.
+            if iter_token_of(recv) != size_before {
+                return raise(vm, comodification());
             }
             if matches!(fresh, Value::Undef) {
                 // A null result removes the entry — except under
@@ -9895,6 +10069,13 @@ fn set_method(
     eq: Option<&EqPlan>,
 ) -> Result<NewColl, Fault> {
     let SetShape { fixed, view } = shape;
+    // A set has no index overload, so the by-value `remove` the compiler picks
+    // for a receiver it can only type as a `Collection` is just `remove`.
+    let method = if method == "removeObject" {
+        "remove"
+    } else {
+        method
+    };
     // See the note at the top of `map_method`: one repair point, here.
     if index.dirty {
         index.rebuild(items.iter());
@@ -16010,14 +16191,16 @@ fn check_format_flags(
         // The general conversions take neither a sign nor a numeric layout.
         // `#` is checked *after* the width, which is why `%,#s` reports `,`.
         's' | 'S' | 'b' | 'B' | 'h' | 'H' => {
-            let mut bad: Vec<char> = vec!['+', ' ', '0', ',', '('];
+            // `checkGeneral`: `#` for `%b`/`%h` first, then the width a `-`
+            // needs, then the sign/padding flags; `%s` rejects `#` last, when
+            // the argument is printed.
             if !matches!(conv, 's' | 'S') {
-                bad.push('#');
+                mismatch(&['#'])?;
             }
-            mismatch(&bad)?;
             if f.left && width.is_none() {
                 return Err(missing_width());
             }
+            mismatch(&['+', ' ', '0', ',', '('])?;
             if matches!(conv, 's' | 'S') {
                 mismatch(&['#'])?;
             }
@@ -16044,20 +16227,22 @@ fn check_format_flags(
                 return Err(bad_flags(&['-', '0']));
             }
             match conv {
+                // `checkInteger` rejects a precision before it looks at any flag,
+                // so `%,.2x` is a precision error, not a flag mismatch.
                 'd' => {
-                    mismatch(&['#'])?;
                     if prec.is_some() {
                         return Err(bad_precision());
                     }
+                    mismatch(&['#'])?;
                 }
                 // The radix conversions render a two's-complement bit pattern,
                 // which has no sign to decorate and no groups to separate.
                 'o' | 'x' | 'X' => {
-                    mismatch(&[','])?;
-                    mismatch(&['+', ' ', '('])?;
                     if prec.is_some() {
                         return Err(bad_precision());
                     }
+                    mismatch(&[','])?;
+                    mismatch(&['+', ' ', '('])?;
                 }
                 'e' | 'E' => mismatch(&[','])?,
                 // `checkFloat`: `checkBadFlags(PARENTHESES, GROUP)`, in that order.
@@ -16233,11 +16418,18 @@ fn format_conversion(
             };
             Ok(num(prefix.to_string(), body))
         }
-        'c' => Ok(Rendered::text(match arg {
-            // `%c` on an integer renders its code point as a character.
-            Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
-            other => java_str(other),
-        })),
+        'c' | 'C' => {
+            let s = match arg {
+                // `%c` on an integer renders its code point as a character.
+                Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
+                other => java_str(other),
+            };
+            Ok(Rendered::text(if conv == 'C' {
+                s.to_uppercase()
+            } else {
+                s
+            }))
+        }
         // Java's `%e` always writes a two-digit exponent with an explicit sign
         // (`1.234568e+03`), where Rust's `{:e}` writes `1.234568e3`.
         'e' | 'E' => {
@@ -16245,7 +16437,14 @@ fn format_conversion(
             // `sci_notation` carries a negative sign; the split rendering wants
             // the magnitude, so it is stripped and re-supplied as the prefix.
             let s = sci_notation(x, prec.unwrap_or(6));
-            let body = s.strip_prefix('-').unwrap_or(&s).to_string();
+            let mut body = s.strip_prefix('-').unwrap_or(&s).to_string();
+            // `#` keeps the decimal point even with no fractional digits:
+            // `%#.0e` of 12345.678 is `1.e+04`.
+            if flags.alt && !body.contains('.') {
+                if let Some(at) = body.find(['e', 'E']) {
+                    body.insert(at, '.');
+                }
+            }
             let body = if conv == 'E' {
                 body.to_uppercase()
             } else {
@@ -16627,6 +16826,12 @@ fn group_digits(s: &str) -> String {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
+    // Only the leading run of digits is an integer part: a scientific `%g`
+    // renders `1e+08`, whose exponent is not a number to group.
+    let run = int_part
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(int_part.len());
+    let (int_part, tail) = int_part.split_at(run);
     let digits: Vec<char> = int_part.chars().collect();
     let mut grouped = String::new();
     for (i, c) in digits.iter().enumerate() {
@@ -16635,7 +16840,7 @@ fn group_digits(s: &str) -> String {
         }
         grouped.push(*c);
     }
-    format!("{sign}{grouped}{frac}")
+    format!("{sign}{grouped}{tail}{frac}")
 }
 
 /// Java `%b`: `true` for a `true` Boolean, `false` for `false`/`null`, `true`
@@ -16901,6 +17106,34 @@ fn b_eprint(vm: &mut VM, argc: u8) -> Value {
 fn b_stringify(vm: &mut VM, _argc: u8) -> Value {
     let v = vm.stack.pop().unwrap_or(Value::Undef);
     Value::str(java_str_vm(vm, &v))
+}
+
+/// [`JSWITCH_NONNULL`] — pass the discriminant through, or raise on `null`.
+fn b_switch_nonnull(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if !matches!(v, Value::Undef) {
+        return v;
+    }
+    let call = args
+        .get(1)
+        .map(|c| c.as_str_cow().into_owned())
+        .unwrap_or_default();
+    let message = if call.is_empty() {
+        String::new()
+    } else {
+        format!("Cannot invoke \"{call}\" because the receiver is null")
+    };
+    raise(vm, Fault::java("NullPointerException", message))
+}
+
+/// [`JSTRINGIFY_OBJ`] — [`b_stringify`] for a heap object that is not a box.
+fn b_stringify_obj(vm: &mut VM, _argc: u8) -> Value {
+    let v = vm.stack.pop().unwrap_or(Value::Undef);
+    if matches!(v, Value::Obj(_)) && unboxed(&v).is_none() {
+        return Value::str(java_str_vm(vm, &v));
+    }
+    v
 }
 
 fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
@@ -18403,12 +18636,13 @@ fn jdk_name(n: &str) -> String {
     }
 }
 
-/// The 64-bit value a narrowing integral cast starts from: a floating operand
-/// truncates toward zero first, and a `char` (a one-character string) yields its
-/// code point.
+/// The value a `short`/`byte`/`char` cast narrows from. JLS 5.1.3: a floating
+/// operand is converted to `int` first (saturating, NaN to 0) and only that
+/// `int` is truncated, so `(short) -1e10` is `(short) Integer.MIN_VALUE`, 0.
+/// A `char` (a one-character string) yields its code point.
 fn cast_to_i64(v: &Value) -> i64 {
     match unboxed(v).as_ref().unwrap_or(v) {
-        Value::Float(f) => *f as i64,
+        Value::Float(f) => *f as i32 as i64,
         other => as_i64(other),
     }
 }
@@ -18513,6 +18747,63 @@ fn translate_escapes(s: &str) -> Result<String, Fault> {
         out.push(ch);
     }
     Ok(out)
+}
+
+/// Whether the JDK type named `n` is an interface, for `Class.toString()`
+/// (`interface java.util.List`) — the keyword is all this decides.
+pub fn is_jdk_interface(n: &str) -> bool {
+    matches!(
+        n,
+        "List"
+            | "Set"
+            | "Map"
+            | "Collection"
+            | "Queue"
+            | "Deque"
+            | "Iterator"
+            | "Iterable"
+            | "Comparable"
+            | "Comparator"
+            | "CharSequence"
+            | "Runnable"
+            | "Callable"
+            | "Cloneable"
+            | "Supplier"
+            | "Consumer"
+            | "Function"
+            | "Predicate"
+            | "BiFunction"
+            | "BiConsumer"
+            | "UnaryOperator"
+            | "BinaryOperator"
+    )
+}
+
+/// How many `extends`/`implements` edges lead from the JDK type `from` up to
+/// `to` in the modeled supertype table, for overload resolution (`f(CharSequence)` against
+/// `f(Object)` for a `StringBuilder`). `None` when `to` is not a supertype of
+/// `from` in the modeled table; `Object` is never an edge, as in that table.
+pub fn jdk_subtype_distance(from: &str, to: &str) -> Option<u32> {
+    let mut frontier = vec![from];
+    let mut seen: Vec<&str> = Vec::new();
+    let mut dist = 0;
+    while !frontier.is_empty() {
+        dist += 1;
+        let mut next = Vec::new();
+        for cur in frontier {
+            for sup in jdk_supers(cur) {
+                if *sup == to {
+                    return Some(dist);
+                }
+                if !seen.contains(sup) {
+                    seen.push(sup);
+                    next.push(*sup);
+                }
+            }
+        }
+        frontier = next;
+    }
+    None
 }
 
 #[cfg(test)]

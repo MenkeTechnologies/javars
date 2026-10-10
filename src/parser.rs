@@ -230,6 +230,25 @@ impl Parser {
                 }
             }
         }
+        // javac names an enum constant's body `Enum$1`, `Enum$2`, … in
+        // declaration order. The synthetic subclass is minted under another name
+        // while parsing, so its binary name is assigned once the enum's own is
+        // known.
+        let numbered: Vec<(String, String)> = classes
+            .iter()
+            .flat_map(|c| {
+                c.enum_constants
+                    .iter()
+                    .filter_map(|k| k.body_class.as_ref())
+                    .enumerate()
+                    .map(|(i, body)| (body.clone(), format!("{}${}", c.binary, i + 1)))
+            })
+            .collect();
+        for (body, binary) in numbered {
+            if let Some(cl) = classes.iter_mut().find(|c| c.name == body) {
+                cl.binary = binary;
+            }
+        }
         match entry {
             Some(entry) => Ok(Program {
                 class_name: entry.class_name,
@@ -1109,6 +1128,25 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         {
             methods.push(reader(method, field, ret));
         }
+    }
+    // `Enum.getDeclaringClass()` is the enum's own class even for a constant
+    // with a body, whose runtime class is the anonymous subclass.
+    if !methods
+        .iter()
+        .any(|m| m.name == "getDeclaringClass" && m.params.is_empty())
+    {
+        methods.push(Method {
+            name: "getDeclaringClass".to_string(),
+            owner: owner.to_string(),
+            params: Vec::new(),
+            ret: "Class".to_string(),
+            body: vec![Stmt::new(
+                line,
+                StmtKind::Return(Some(Expr::ClassLit(owner.to_string()))),
+            )],
+            is_abstract: false,
+            line,
+        });
     }
     // `Enum.compareTo` is the difference of the two ordinals — declaration
     // order — and is `final` in Java, so an enum never supplies its own. That
@@ -3468,6 +3506,13 @@ impl Parser {
                     self.advance();
                     self.advance();
                     ty.push_str("[]");
+                }
+                // `int[].class` — the array class literal.
+                if self.is(&Tok::Dot) && self.toks[self.pos + 1].kind == Tok::Class {
+                    self.advance();
+                    self.advance();
+                    e = Expr::ClassLit(ty);
+                    continue;
                 }
                 self.eat(&Tok::ColonColon)?;
                 if !self.is(&Tok::New) {
