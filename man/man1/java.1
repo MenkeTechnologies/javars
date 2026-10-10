@@ -23,18 +23,12 @@ in fusevm, and there are no
 .I .class
 files.
 .PP
-The current slice runs a single entry class: javars locates
+javars locates
 .B public static void main(String[] args)
-in the given file and executes its body. Statements cover local declarations,
-assignment and compound assignment, C\-style
-.BR if / while / for ,
-.BR break / continue ,
-post\-increment/decrement, and
-.BR System.out.print / println .
-Java's
-.B +
-is string concatenation when either operand is a
-.BR String .
+in the given file and executes it. Program arguments after the file become
+.IR args .
+The supported language subset is described in
+.BR javaall (1).
 .SH OPTIONS
 .TP
 .BR \-\-version ", " \-version
@@ -50,7 +44,7 @@ Print the lexer token stream for the file and exit.
 Print the parsed AST for the file and exit.
 .TP
 .B \-\-tiers
-Run it, then report which fusevm execution tier took each of its chunks.
+Run the file, then report which fusevm execution tier took each of its chunks.
 .TP
 .B \-\-disasm
 Print a fusevm bytecode disassembly listing for the file and exit.
@@ -64,9 +58,12 @@ Speak the Debug Adapter Protocol over stdio (breakpoints, single\-stepping, and
 local\-variable inspection over the running program).
 .SH EXIT STATUS
 .B java
-exits 0 on success and 1 on a lex/parse/compile error or an I/O failure. Errors
-are written to standard error in the terse form
-.IR "java: <reason>" .
+exits 0 on success, and 1 on a lex/parse/compile error, an unreadable file,
+or a missing file argument. An uncaught Java exception is reported and exits
+non\-zero;
+.B System.exit(n)
+exits with \fIn\fR modulo 256. Errors are written to standard error in the form
+.IR "javars: <reason>" .
 .SH EXAMPLES
 Run a program:
 .RS 4

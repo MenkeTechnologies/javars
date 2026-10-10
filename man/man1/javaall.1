@@ -19,7 +19,7 @@ you can grep with `/`:
 .RB "\(em " "flags, files, exit status"
 .br
 .B 2.  LANGUAGE SUBSET
-.RB "\(em " "the Java the current slice parses and runs"
+.RB "\(em " "the supported Java subset"
 .br
 .B 3.  ARCHITECTURE
 .RB "\(em " "lex \[->] parse \[->] lower \[->] fusevm VM + JIT"
@@ -38,7 +38,9 @@ of the entry class in
 .IR FILE.java .
 The introspection flags
 .RB ( \-\-dump\-tokens ", " \-\-dump\-ast ", " \-\-disasm )
-print an artifact and exit without running.
+print an artifact and exit without running;
+.B \-\-tiers
+runs the program and then reports the fusevm tier each chunk reached.
 .B \-\-lsp
 and
 .B \-\-dap
@@ -47,61 +49,73 @@ See
 .BR java (1)
 for the per\-flag table.
 .SH 2. LANGUAGE SUBSET
-The current slice is a single\-class, single\-\fBmain\fR subset. A compilation unit
-is
-.RB ` "public class Name { ... }" ';
-javars finds
+A compilation unit holds a
 .B public static void main(String[] args)
-and parses its body. Other members (fields, helper methods) are skipped by brace
-matching, and leading
-.BR package / import
-lines are tolerated.
-.SS Types
-Local declarations accept the built\-in type names
-.BR int ", " long ", " short ", " byte ", " double ", " float ", " boolean ", " char ", " String ", and " var .
-The runtime is dynamically typed on the fusevm value model, so the annotation is
-retained for diagnostics but does not gate execution yet.
+entry point; every other member (static and instance methods, fields,
+constructors, nested types) is compiled as well. See the README and
+.I BUGS.md
+in the source tree for the detailed feature list and known gaps.
+.SS Declarations
+Classes with single inheritance
+.RB ( extends ),
+interfaces (abstract and
+.B default
+methods), abstract classes,
+.BR enum " types (including constructor arguments and per\-constant bodies),"
+.B record
+types, type\-erased generics, method overloading, and
+.B static
+fields and
+.B static { }
+blocks.
 .SS Statements
-Local declarations
-.RB ( "int x = e;" ),
-plain and compound assignment
-.RB ( "x = e;" ", " "x += e;" ),
+Local declarations (including
+.BR var ),
+plain and compound assignment,
 .BR if / else ,
 .BR while ,
-the C\-style
-.B for
-.RB ( "for (init; cond; update) { ... }" ),
+C\-style and enhanced
+.BR for ,
+classic and arrow
+.BR switch ,
 .BR break ,
 .BR continue ,
-a bare
-.B return;
-(ends
-.BR main ),
-post\-increment/decrement
-.RB ( "i++" ", " "i--" ),
-and
-.B System.out.print / println
+.BR return ,
+.BR throw ,
+.BR try / catch / finally
+(including try\-with\-resources), and
+.BR System.out.print [ln]
 calls.
 .SS Expressions
-Integer, floating, boolean, string, and char literals (a char literal is modeled
-as a one\-character string); variable reads; the unary
-.BR \- " and " ! ;
-and the binary operators
-.BR + " " \- " " * " " / " " % ,
-comparisons
-.BR == " " != " " < " " > " " <= " " >= ,
-and the short\-circuiting
-.BR && " and " || .
-Java's
+Integer, floating, boolean, string, and char literals; arithmetic, comparison,
+bitwise, shift, and short\-circuit logical operators; casts; lambdas and
+method references; array creation and indexing; object creation, field access,
+and method calls. Java's
 .B +
 concatenates when either operand is a
-.BR String ,
-via the host numeric hook; whole
+.BR String ;
+an
+.B int
+operation wraps at 32 bits and whole
 .B double
 values print with a trailing
 .B .0
 to match
 .BR java .
+.SS Library
+A modeled subset of the Java standard library:
+.BR String ,
+.BR StringBuilder ,
+boxed wrappers,
+.BR Arrays ,
+.BR Collections ,
+.B java.util
+collections,
+.BR java.util.regex ,
+and
+.BR String.format / printf .
+An unsupported construct is a parse or compile error rather than a silent
+mis\-run.
 .SH 3. ARCHITECTURE
 .EX
 Java source \[->] lexer \[->] parser (AST) \[->] lower to fusevm bytecode \[->] fusevm VM + Cranelift JIT
@@ -156,13 +170,18 @@ prints the token stream,
 the parsed AST, and
 .B \-\-disasm
 a fusevm bytecode disassembly \(em each then exits.
+.PP
+.B \-\-tiers
+runs the program, then reports which fusevm execution tier took each chunk.
 .SH 5. DIAGNOSTICS
 Errors are written to standard error in the form
-.IR "java: <reason>" ,
-for example an unterminated string literal, an unexpected token, or an
-unsupported construct
-.RB ( "method/field access on X is not supported yet" ).
-The process exits 1 on any error and 0 on success.
+.IR "javars: <reason>" ,
+for example an unterminated string literal or an unexpected token.
+The process exits 1 on a lex/parse/compile error, an unreadable file, or a
+missing file argument, and 0 on success. An uncaught Java exception is reported
+and exits non\-zero;
+.B System.exit(n)
+exits with \fIn\fR modulo 256.
 .SH SEE ALSO
 .BR java (1)
 The focused invocation page. Source and issue tracker:
