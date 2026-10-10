@@ -1293,6 +1293,19 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
+- **A user class cannot extend a JDK collection.** `class Lru<K, V> extends
+  LinkedHashMap<K, V> { protected boolean removeEldestEntry(…) { … } }` — the
+  usual LRU cache — and `class Stack2 extends ArrayList<Integer>` are refused
+  at the first call that would reach the inherited method (``class `Lru` has no
+  method `size` ``). The collection shapes are host objects, not classes with
+  members a subclass can inherit or override, so there is nothing for `super`
+  to name. The access-ordered `new LinkedHashMap<>(cap, load, true)` itself is
+  modeled (a read or overwrite moves the entry to the end); only the flag's
+  literal `true`/`false` is accepted.
+- **`EnumSet.complementOf` and `EnumSet.range`** need the enum type, which the
+  `TreeSet` an `EnumSet` is modeled as does not keep. They are refused by name.
+- **`java.lang.StackOverflowError` is not modeled by name in `catch`**, and
+  unbounded recursion runs until the OS stops it (see the entry below).
 - **A `\uXXXX` escape that names a lone surrogate is refused.** JLS 3.3
   translation itself is performed (over the whole source, before tokenizing, on
   the even-preceding-backslash eligibility rule and accepting the `\uuuu0041`
@@ -1341,6 +1354,27 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
   `for (;;)` is a separate and permanent boundary: it has no test to branch on,
   so its back edge cannot be the conditional branch a trace closes with.
+- **A `HashMap` bin that treeifies is iterated in tree order by the JDK and in
+  chain order here.** Eight or more keys with the same bucket index in a table of
+  64 or more become a red-black tree whose root is moved to the front of the
+  bin, so a set such as `i * 64` for `i < 13` iterates `[192, 0, 64, 128, …]`
+  where javars lists `[0, 64, 128, 192, …]`. Keys that spread (every
+  ordinary key set) are unaffected; the sizing schedule up to the treeify
+  threshold is exact.
+- **`Collections.unmodifiableCollection(c)` answers `equals` by content.** The
+  JDK's wrapper does not override `equals`, so it is equal only to itself; the
+  wrapper here is an immutable copy refreshed from its target on every read.
+  The wrapper's class names (`getClass().getName()`) are the `List.of`/`Set.of`
+  ones, and `contains(null)` on a wrapper of a list raises
+  `NullPointerException` as `List.of(...).contains(null)` does, where the JDK's
+  unmodifiable wrapper answers `false`.
+- **A `LinkedList`, `ArrayDeque` or `PriorityQueue` iterator is `ArrayList`'s.**
+  The three share the list shape, so an enhanced `for` that shrinks one of them
+  past its cursor follows `ArrayList` (`cursor != size`, then a
+  `ConcurrentModificationException`): `LinkedList` ends the loop silently there
+  and `ArrayDeque` keeps walking its own array.
+- **`Integer.parseInt` reads ASCII digits only.** The JDK reads any Unicode
+  decimal digit (`Integer.parseInt("١٢")` is 12, as `Character.digit` does).
 - **`ArrayStoreException` is never raised.** A reference array carries no
   element type at runtime, so storing the wrong type through a widened reference
   succeeds silently: `Object[] o = new String[2]; o[0] = Integer.valueOf(3);`

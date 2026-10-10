@@ -2525,6 +2525,9 @@ enum Mode {
     Capture,
     Generic,
     FailFast,
+    View,
+    Erased,
+    Lru,
 }
 
 const CONCRETE: &[Mode] = &[
@@ -2611,6 +2614,9 @@ const CONCRETE: &[Mode] = &[
     Mode::Capture,
     Mode::Generic,
     Mode::FailFast,
+    Mode::View,
+    Mode::Erased,
+    Mode::Lru,
 ];
 
 /// The `Integer`/`Long` bit-twiddling statics, at the boundaries where the two
@@ -3333,6 +3339,9 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Capture => "capture",
         Mode::Generic => "generic",
         Mode::FailFast => "failfast",
+        Mode::View => "view",
+        Mode::Erased => "erased",
+        Mode::Lru => "lru",
     }
 }
 
@@ -3433,6 +3442,9 @@ fn gen_probe(r: &mut Rng, mode: Mode) -> String {
         Mode::Capture => round2::g_capture(r),
         Mode::Generic => round2::g_generic(r),
         Mode::FailFast => round2::g_failfast(r),
+        Mode::View => round2::g_view(r),
+        Mode::Erased => round2::g_erased(r),
+        Mode::Lru => round2::g_lru(r),
         Mode::All => unreachable!("resolved above"),
     }
 }

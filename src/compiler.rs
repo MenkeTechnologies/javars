@@ -8216,6 +8216,24 @@ impl Compiler {
         // collection, allocated by the host rather than laid out as an instance.
         // A user class of the same name wins, because `self.classes` is checked
         // by the branch below only after this one declines.
+        // `new LinkedHashMap<>(capacity, loadFactor, accessOrder)` — the access
+        // order is a property of the object, so only a literal flag is modeled.
+        if !self.classes.contains_key(class) && class == "LinkedHashMap" && args.len() == 3 {
+            let kind = match &args[2] {
+                Expr::Bool(true) => "LinkedHashMap$access",
+                Expr::Bool(false) => "LinkedHashMap",
+                _ => {
+                    return Err(format!(
+                        "javars: `new LinkedHashMap<>(…, accessOrder)` needs a `true`/`false` literal for `accessOrder` (line {line})"
+                    ))
+                }
+            };
+            let kind_c = self.b.add_constant(Value::str(kind.to_string()));
+            self.b.emit(Op::LoadConst(kind_c), line);
+            self.b.emit(Op::LoadUndef, line);
+            self.emit_raising_builtin(crate::host::JCOLL_NEW, 2, line);
+            return Ok(());
+        }
         if !self.classes.contains_key(class) && is_concrete_collection(class) {
             if args.len() > 1 {
                 return Err(format!(
@@ -8833,16 +8851,34 @@ impl Compiler {
         // `flag ? 1 : 2.0` yields 1.0 rather than 1 (JLS 15.25).
         let promote = self.ternary_promotion(then, els);
         let unbox = self.ternary_unboxes(then, els);
+        // A `char` beside a non-numeric reference (`o == null ? "null" : s.charAt(0)`)
+        // makes a reference conditional, so the `char` is boxed to a `Character`
+        // rather than left the code point it is as a primitive.
+        let char_vs_reference = |a: &Expr, b: &Expr| {
+            self.expr_java_type(a).as_deref() == Some("char")
+                && self.expr_java_type(b).is_some_and(|t| {
+                    is_reference_type(&t)
+                        && numeric_rank(&t).is_none()
+                        && t != "null"
+                        && t != "Boolean"
+                })
+        };
+        let box_then = char_vs_reference(then, els);
+        let box_els = char_vs_reference(els, then);
+        let (promote_then, promote_els) = (
+            if box_then { Some("Object") } else { promote },
+            if box_els { Some("Object") } else { promote },
+        );
         self.expr_unboxed(cond)?;
         let jf = self.b.emit(Op::JumpIfFalse(0), 0);
-        self.expr_targeted(then, promote)?;
+        self.expr_targeted(then, promote_then)?;
         if unbox {
             self.emit_checked_unbox_of(then);
         }
         let jend = self.b.emit(Op::Jump(0), 0);
         let else_start = self.b.current_pos();
         self.b.patch_jump(jf, else_start);
-        self.expr_targeted(els, promote)?;
+        self.expr_targeted(els, promote_els)?;
         if unbox {
             self.emit_checked_unbox_of(els);
         }

@@ -914,3 +914,125 @@ pub fn g_failfast(r: &mut Rng) -> String {
          catch (ConcurrentModificationException e) {{ System.out.println(\"CME \" + seen + \" \" + c.size()); }} }}"
     )
 }
+
+/// `Collections.unmodifiableX` wrappers: reads follow the target, writes
+/// through the wrapper are refused, and an iterator over one cannot `remove`.
+pub fn g_view(r: &mut Rng) -> String {
+    let coll = match r.below(3) {
+        0 => (
+            "List<Integer>",
+            "new ArrayList<>(List.of(3, 1, 2))",
+            "unmodifiableList",
+        ),
+        1 => (
+            "Set<Integer>",
+            "new TreeSet<>(List.of(3, 1, 2))",
+            "unmodifiableSet",
+        ),
+        _ => (
+            "Collection<Integer>",
+            "new LinkedList<>(List.of(3, 1, 2))",
+            "unmodifiableCollection",
+        ),
+    };
+    let (ty, init, wrap) = coll;
+    let read = pick(
+        r,
+        &[
+            "v + \" \" + v.size()",
+            "\"\" + v.contains(2) + v.isEmpty()",
+            "v.stream().mapToInt(x -> x).sum() + \"\"",
+            "new ArrayList<>(v) + \"\"",
+            "(v.isEmpty() ? \"-\" : \"\" + v.iterator().next())",
+            // `unmodifiableCollection` does not delegate `equals`, so its
+            // answer is identity; only the list and set wrappers are compared.
+            "(v instanceof List || v instanceof Set ? v.equals(c) + \",\" + c.equals(v) : \"n/a\")",
+        ],
+    );
+    let write = pick(
+        r,
+        &[
+            "v.add(9)",
+            "v.remove(3)",
+            "v.clear()",
+            "v.addAll(List.of(1))",
+            "v.removeIf(x -> x > 1)",
+            "v.iterator().remove()",
+            "v.retainAll(List.of(1))",
+        ],
+    );
+    let mutate = pick(
+        r,
+        &[
+            "c.add(7)",
+            "c.remove(1)",
+            "c.clear()",
+            "c.addAll(List.of(5, 6))",
+        ],
+    );
+    format!(
+        "{{ {ty} c = {init}; {ty} v = Collections.{wrap}(c); String before = {read}; {mutate}; \
+         String after = {read}; String w; try {{ {write}; w = \"ok\"; }} \
+         catch (UnsupportedOperationException e) {{ w = \"UOE\"; }} \
+         System.out.println(before + \" | \" + after + \" | \" + w); }}"
+    )
+}
+
+/// Calls through a receiver javars cannot type: the arguments still convert to
+/// the parameter types of whichever class answers.
+pub fn g_erased(r: &mut Rng) -> String {
+    let arg = *pick(
+        r,
+        &["3", "-7", "'a'", "2L", "1.5", "(short) 4", "(byte) -2"],
+    );
+    match r.below(5) {
+        0 => format!(
+            "{{ Map<String, Pt> m = new HashMap<>(); m.put(\"k\", new Pt(1, 2)); \
+             System.out.println(m.get(\"k\").sum() + \" \" + m.get(\"k\").equals(new Pt(1, 2))); }}"
+        ),
+        1 => format!(
+            "{{ Map<String, Calc> m = new HashMap<>(); m.put(\"k\", mkAdder(1)); \
+             System.out.println(m.get(\"k\").of(2, 3)); }}"
+        ),
+        2 => format!(
+            "{{ List<Object> l = new ArrayList<>(); l.add(new Tag(\"t\", 2.5)); Object o = l.get(0); \
+             System.out.println(((Tag) o).weight() + \" \" + o); }}"
+        ),
+        3 => format!(
+            "{{ java.util.function.DoubleUnaryOperator f = d -> d * 2; \
+             System.out.println(f.applyAsDouble({arg})); }}"
+        ),
+        _ => format!(
+            "{{ java.util.function.Function<Double, String> f = d -> \"d\" + d; \
+             java.util.function.BiFunction<Long, Double, Double> g = (a, b) -> a + b; \
+             System.out.println(f.apply(2.5) + \" \" + g.apply(3L, 0.5)); }}"
+        ),
+    }
+}
+
+/// An access-ordered `LinkedHashMap`: reads and overwrites move an entry to the
+/// end, `containsKey` and iteration do not.
+pub fn g_lru(r: &mut Rng) -> String {
+    let mut s = String::from(
+        "{ Map<Integer, String> m = new LinkedHashMap<>(16, 0.75f, true); \
+         for (int i = 0; i < 5; i++) m.put(i, \"v\" + i); ",
+    );
+    for _ in 0..(2 + r.below(5)) {
+        let k = r.below(8);
+        let op = match r.below(9) {
+            0 => format!("m.get({k});"),
+            1 => format!("m.put({k}, \"w{k}\");"),
+            2 => format!("m.getOrDefault({k}, \"d\");"),
+            3 => format!("m.containsKey({k});"),
+            4 => format!("m.remove({k});"),
+            5 => format!("m.putIfAbsent({k}, \"p\");"),
+            6 => format!("m.merge({k}, \"m\", String::concat);"),
+            7 => format!("m.computeIfAbsent({k}, x -> \"c\" + x);"),
+            _ => format!("m.replace({k}, \"r\");"),
+        };
+        s.push_str(&op);
+        s.push(' ');
+    }
+    s.push_str("System.out.println(m + \" \" + m.keySet() + \" \" + m.values()); }");
+    s
+}

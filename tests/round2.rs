@@ -523,3 +523,53 @@ deep
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// An access-ordered `LinkedHashMap` moves an entry to the end on `get`/`put`/`getOrDefault`/`merge`/`compute*`; `unmodifiableCollection` is a `Collection` and no narrower; a `char` beside a `String` in a conditional is a `Character`.
+#[test]
+fn access_ordered_linked_hash_maps_reorder_on_read_and_collection_views_are_not_lists() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] args) {
+        Map<String, Integer> m = new LinkedHashMap<>(16, 0.75f, true);
+        m.put("a", 1); m.put("b", 2); m.put("c", 3);
+        m.get("a");
+        System.out.println(m);
+        m.put("b", 20);
+        System.out.println(m + " " + m.keySet());
+        m.getOrDefault("c", 0); m.getOrDefault("zz", 0); m.containsKey("a");
+        System.out.println(m);
+        m.putIfAbsent("a", 9); m.merge("b", 1, Integer::sum); m.computeIfAbsent("z", k -> 26); m.compute("c", (k, v) -> v + 100);
+        System.out.println(m + " " + m.size());
+        String eldest = m.keySet().iterator().next();
+        m.remove(eldest);
+        System.out.println(eldest + " " + m + " " + (m instanceof LinkedHashMap));
+        Map<String, Integer> plain = new LinkedHashMap<>(16, 0.75f, false);
+        plain.put("x", 1); plain.put("y", 2); plain.get("x");
+        System.out.println(plain);
+        Collection<Integer> base = new ArrayList<>(List.of(1, 2));
+        Collection<Integer> view = Collections.unmodifiableCollection(base);
+        List<Integer> lview = Collections.unmodifiableList(new ArrayList<>(base));
+        System.out.println((view instanceof List) + " " + (view instanceof Collection) + " " + (lview instanceof List) + " " + (Collections.unmodifiableSet(new TreeSet<>(base)) instanceof Set));
+        Object o = null;
+        String s = "hi";
+        for (Object x : new Object[]{null, "str", 5}) {
+            System.out.print((x == null ? "null" : s.charAt(0)) + " " + (x == null ? s.charAt(1) : "str") + " ");
+        }
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"{b=2, c=3, a=1}
+{c=3, a=1, b=20} [c, a, b]
+{a=1, b=20, c=3}
+{a=1, b=21, z=26, c=103} 4
+a {b=21, z=26, c=103} true
+{x=1, y=2}
+false true true true
+null i h str h str 
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

@@ -1664,6 +1664,10 @@ enum Order {
     Hash { table: u32, init: u32 },
     /// `LinkedHashMap`/`LinkedHashSet` — insertion order.
     Insertion,
+    /// `new LinkedHashMap<>(cap, load, true)`: insertion order, except that a
+    /// read or an overwrite of a key moves its entry to the end (see
+    /// [`touch_access_order`]).
+    Access,
     /// `TreeMap`/`TreeSet`. Ordered by the keys' natural order, or — when
     /// `by_cmp` — by the `Comparator` the collection was constructed with
     /// ([`SORT_CMP`]). A comparator-ordered collection is *stored* in that
@@ -1724,7 +1728,7 @@ impl ViewOf {
         match (fixed, order) {
             (Fixity::Immutable, _) => ViewOf::Immutable,
             (_, Order::Hash { .. }) => ViewOf::Hash,
-            (_, Order::Insertion) => ViewOf::Linked,
+            (_, Order::Insertion | Order::Access) => ViewOf::Linked,
             (_, Order::Sorted { .. }) => ViewOf::Tree,
         }
     }
@@ -2348,6 +2352,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // already tell them apart.
         "[]" => &["Cloneable", "Serializable"],
         "List$immutable" => &["AbstractCollection", "List", "RandomAccess", "Serializable"],
+        // `Collections.unmodifiableCollection`'s wrapper: a `Collection` and
+        // nothing narrower, whatever collection it wraps.
+        "Collection$view" => &["Collection", "Serializable"],
         // `Set.of` reaches `AbstractCollection` but NOT `AbstractSet`, and is
         // not `Cloneable` — the two edges that separate it from every `new`
         // set, measured against the JDK rather than assumed from the `List.of`
@@ -4614,7 +4621,7 @@ fn write_map_entries(recv: &Value, entries: Vec<(Value, Value)>) {
 /// The order `items` are presented in under `order`, as indices into `items`.
 fn present_order(items: &[Value], order: Order) -> Vec<usize> {
     match order {
-        Order::Insertion => (0..items.len()).collect(),
+        Order::Insertion | Order::Access => (0..items.len()).collect(),
         Order::Hash { table, .. } => hash_order(items, table),
         Order::Sorted { by_cmp, desc } => {
             let mut idx: Vec<usize> = (0..items.len()).collect();
@@ -4990,7 +4997,7 @@ fn hash_consistent(vm: &VM, class: &str) -> bool {
 /// `Order::Sorted` is a `TreeMap`/`TreeSet`, which locates by `compareTo` rather
 /// than by `equals` — a different question, and one javars does not answer here.
 fn is_hashed(order: Order) -> bool {
-    matches!(order, Order::Hash { .. } | Order::Insertion)
+    matches!(order, Order::Hash { .. } | Order::Insertion | Order::Access)
 }
 
 /// Resolve the comparisons a user `equals()` decides for one collection call.
@@ -5228,6 +5235,12 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             order: Order::Insertion,
             index: KeyIndex::default(),
         },
+        "LinkedHashMap$access" => HostObj::Map {
+            fixed: Fixity::Mutable,
+            entries: map_entries(seed).unwrap_or_default(),
+            order: Order::Access,
+            index: KeyIndex::default(),
+        },
         "TreeMap" => HostObj::Map {
             fixed: Fixity::Mutable,
             entries: map_entries(seed).unwrap_or_default(),
@@ -5361,6 +5374,10 @@ thread_local! {
     /// shows. The view is an immutable copy that [`sync_view`] re-copies from
     /// its target whenever it is read, which is what makes it a *view*.
     static VIEWS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// The views made by `unmodifiableCollection`, which is neither a `List` nor
+    /// a `Set` whatever it wraps.
+    static PLAIN_VIEWS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// Refresh the `unmodifiableX` view at `id` from the collection it shows. A
@@ -5427,7 +5444,7 @@ fn sync_view(id: u32) {
 
 /// `Collections.unmodifiableList`/`Set`/`Map`/`Collection` (and the sorted
 /// forms): an immutable object that shows what `target` holds now.
-fn unmodifiable_view(target: &Value) -> Option<Value> {
+fn unmodifiable_view(target: &Value, plain: bool) -> Option<Value> {
     let Value::Obj(t) = target else {
         return None;
     };
@@ -5459,6 +5476,9 @@ fn unmodifiable_view(target: &Value) -> Option<Value> {
     };
     let id = heap_alloc(shell);
     VIEWS.with(|v| v.borrow_mut().insert(id, *t));
+    if plain {
+        PLAIN_VIEWS.with(|v| v.borrow_mut().insert(id));
+    }
     Some(Value::Obj(id))
 }
 
@@ -6463,6 +6483,9 @@ fn value_class(v: &Value) -> Option<String> {
         Value::Float(_) => "Double".to_string(),
         Value::Bool(_) => "Boolean".to_string(),
         Value::Obj(id) => {
+            if PLAIN_VIEWS.with(|p| p.borrow().contains(id)) {
+                return Some("Collection$view".to_string());
+            }
             return HEAP.with(|h| {
                 Some(match h.borrow().get(*id as usize)? {
                     // Named by its qualified class, which [`binary_name`] passes
@@ -6511,7 +6534,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Map { order, fixed, .. } => match (fixed, order) {
                         (Fixity::Immutable, _) => "Map$immutable".to_string(),
                         (_, Order::Hash { .. }) => "HashMap".to_string(),
-                        (_, Order::Insertion) => "LinkedHashMap".to_string(),
+                        (_, Order::Insertion | Order::Access) => "LinkedHashMap".to_string(),
                         (_, Order::Sorted { .. }) => "TreeMap".to_string(),
                     },
                     // `Set.of` is not a `HashSet`, exactly as `List.of` is not
@@ -6534,7 +6557,7 @@ fn value_class(v: &Value) -> Option<String> {
                         (Fixity::Mutable | Fixity::FixedSize, Order::Hash { .. }) => {
                             "HashSet".to_string()
                         }
-                        (Fixity::Mutable | Fixity::FixedSize, Order::Insertion) => {
+                        (Fixity::Mutable | Fixity::FixedSize, Order::Insertion | Order::Access) => {
                             "LinkedHashSet".to_string()
                         }
                         (Fixity::Mutable | Fixity::FixedSize, Order::Sorted { .. }) => {
@@ -6837,6 +6860,47 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     if let Value::Obj(id) = recv {
         sync_view(*id);
     }
+    if map_order(recv) == Order::Access {
+        let out = coll_method_inner(vm, recv, method, args);
+        touch_access_order(recv, method, args);
+        return out;
+    }
+    coll_method_inner(vm, recv, method, args)
+}
+
+/// An access-ordered `LinkedHashMap` moves the entry a call read or wrote to the
+/// end (`afterNodeAccess`): `get`, `getOrDefault`, `put` over an existing key,
+/// `putIfAbsent`, the compute family, `merge` and `replace`.
+fn touch_access_order(recv: &Value, method: &str, args: &[Value]) {
+    if !matches!(
+        method,
+        "get"
+            | "getOrDefault"
+            | "put"
+            | "putIfAbsent"
+            | "compute"
+            | "computeIfAbsent"
+            | "computeIfPresent"
+            | "merge"
+            | "replace"
+    ) {
+        return;
+    }
+    let (Some(key), Value::Obj(id)) = (args.first(), recv) else {
+        return;
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::Map { entries, index, .. }) = h.borrow_mut().get_mut(*id as usize) {
+            if let Some(at) = entries.iter().position(|(k, _)| value_eq(k, key)) {
+                let moved = entries.remove(at);
+                entries.push(moved);
+                index.invalidate();
+            }
+        }
+    });
+}
+
+fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
     if let Some(f) = refused_view_write(recv, method) {
         return raise(vm, f);
     }
@@ -12066,10 +12130,12 @@ fn collection_static(
             | "unmodifiableNavigableSet"
             | "unmodifiableNavigableMap"
             | "unmodifiableSequencedCollection",
-        ) if args.len() == 1 => match unmodifiable_view(&args[0]) {
-            Some(v) => Ok(v),
-            None => Err(Fault::java("NullPointerException", String::new())),
-        },
+        ) if args.len() == 1 => {
+            match unmodifiable_view(&args[0], method == "unmodifiableCollection") {
+                Some(v) => Ok(v),
+                None => Err(Fault::java("NullPointerException", String::new())),
+            }
+        }
         // Single-threaded, so the synchronized wrappers have nothing to guard:
         // the collection itself stands in for them.
         (
@@ -18533,6 +18599,7 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
         "[]" => return None,
         qualified if qualified.starts_with("java.") => qualified.to_string(),
         "List$fixed" => "java.util.Arrays$ArrayList".to_string(),
+        "Collection$view" => "java.util.Collections$UnmodifiableCollection".to_string(),
         "List$immutable" => match len() {
             1 | 2 => "java.util.ImmutableCollections$List12".to_string(),
             _ => "java.util.ImmutableCollections$ListN".to_string(),
