@@ -3579,9 +3579,7 @@ fn iterator_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<
                         index,
                         ..
                     }) if at < items.len() => {
-                        let Some(slot) = stored.iter().position(|v| value_eq(v, &items[at])) else {
-                            return None;
-                        };
+                        let slot = stored.iter().position(|v| value_eq(v, &items[at]))?;
                         stored.remove(slot);
                         index.invalidate();
                         Some(0)
@@ -4287,14 +4285,15 @@ fn store_hash_table(v: &Value, t: HashTable) {
     let Value::Obj(id) = v else {
         return;
     };
-    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
-        Some(HostObj::Map { order, .. } | HostObj::Set { order, .. }) => {
+    HEAP.with(|h| {
+        if let Some(HostObj::Map { order, .. } | HostObj::Set { order, .. }) =
+            h.borrow_mut().get_mut(*id as usize)
+        {
             if let Order::Hash { table, init } = order {
                 *table = t.table;
                 *init = t.init;
             }
         }
-        _ => {}
     })
 }
 
