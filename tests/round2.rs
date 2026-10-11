@@ -658,6 +658,63 @@ true true 994 0
     assert_eq!(out, expected);
 }
 
+/// `Iterator.forEachRemaining` on the host iterators (list, priority queue, entry set, descending deque) walks from the cursor, keeps `remove()` and comodification semantics, and stops on a thrown exception; a user `Iterator` inherits the default body with its receiver evaluated once. Expected output from openjdk 21.0.12.1.
+#[test]
+fn iterator_for_each_remaining_on_host_and_user_iterators() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static class Count implements Iterator<Integer> {
+        int i = 0;
+        public boolean hasNext() { return i < 3; }
+        public Integer next() { return i++; }
+    }
+    static int evals = 0;
+    static Count fresh() { evals++; return new Count(); }
+    public static void main(String[] args) {
+        // A host iterator: the walk starts at the cursor and leaves `remove()` pointing at the last element.
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3, 4));
+        Iterator<Integer> it = l.iterator();
+        it.next();
+        it.forEachRemaining(x -> System.out.print(x + " "));
+        System.out.println(it.hasNext());
+        it.remove();
+        System.out.println(l);
+        StringBuilder sb = new StringBuilder();
+        new PriorityQueue<>(List.of(5, 1, 3)).iterator().forEachRemaining(sb::append);
+        new TreeMap<>(Map.of("a", 1, "b", 2)).entrySet().iterator().forEachRemaining(e -> sb.append(e.getKey()).append(e.getValue()));
+        new ArrayDeque<>(List.of("p", "q")).descendingIterator().forEachRemaining(sb::append);
+        System.out.println(sb);
+        try { l.iterator().forEachRemaining(x -> l.add(x)); } catch (ConcurrentModificationException e) { System.out.println("cme " + l); }
+        try { l.iterator().forEachRemaining(null); } catch (NullPointerException e) { System.out.println("npe"); }
+        try { l.iterator().forEachRemaining(x -> { if (x == 2) throw new IllegalStateException("at " + x); System.out.println("saw " + x); }); }
+        catch (IllegalStateException e) { System.out.println(e.getMessage()); }
+        // A user Iterator inherits the default method; its receiver is evaluated once.
+        fresh().forEachRemaining(x -> System.out.print(x));
+        System.out.println(" " + evals);
+        Count c = new Count();
+        c.next();
+        c.forEachRemaining(x -> System.out.print(x));
+        System.out.println(" " + c.hasNext());
+        try { new Count().forEachRemaining(null); } catch (NullPointerException e) { System.out.println("npe"); }
+    }
+}"####;
+    let expected = r####"2 3 4 false
+[1, 2, 3]
+153a1b2qp
+cme [1, 2, 3, 1]
+npe
+saw 1
+at 2
+012 1
+12 false
+npe
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
 /// An `Optional` hash key is found by its contents and buckets by the held value's hash, so a `HashSet`/`HashMap` of them iterates in the JDK's order; `==` stays reference identity and `Optional` never equals `OptionalInt`. Expected output from openjdk 21.0.12.1.
 #[test]
 fn optional_hash_keys_are_found_by_contents_and_iterate_in_jdk_order() {

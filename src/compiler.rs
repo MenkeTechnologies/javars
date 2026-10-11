@@ -4365,9 +4365,9 @@ impl Compiler {
                     "javars: `{rc}::{method}` has no single method reference can name (line {line})"
                 )
             })?,
-            // A `String` or modeled collection receiver names one of the JDK
-            // instance methods the unbound forms (`String::length`,
-            // `List::add`) already admit, at the same unambiguous arity.
+            // A `String`, `StringBuilder` or modeled collection receiver names
+            // one of the JDK instance methods the unbound forms
+            // (`String::length`, `StringBuilder::append`, `List::add`) admit, at the same unambiguous arity.
             None => {
                 let ty = self.expr_java_type(recv).ok_or_else(|| {
                     format!("javars: cannot resolve the receiver of `::{method}` (line {line})")
@@ -4376,6 +4376,9 @@ impl Compiler {
                     string_instance_ref_arity(method)
                 } else if collection_kind(&ty).is_some() {
                     collection_instance_ref_arity(method)
+                } else if matches!(ty.as_str(), "StringBuilder" | "StringBuffer") {
+                    // `sb::append` — the collector a `forEach` writes into.
+                    builder_instance_ref_arity(method)
                 } else {
                     None
                 };
@@ -7489,6 +7492,59 @@ impl Compiler {
                         body: vec![Stmt::new(line, StmtKind::Expr(accept))],
                     },
                 ))?;
+                self.b.emit(Op::LoadUndef, line);
+                return Ok(());
+            }
+            // `Iterator.forEachRemaining(action)` is the interface's `default`
+            // body, inherited the same way: `Objects.requireNonNull(action);
+            // while (hasNext()) action.accept(next());`, with the receiver and
+            // then `action` evaluated once each, in that order.
+            if method == "forEachRemaining"
+                && args.len() == 1
+                && self.is_subclass(&rc, "Iterator")
+                && !self.has_instance_method(&rc, "forEachRemaining", 1)
+            {
+                let it = format!("#fr{}", self.temp_counter);
+                self.temp_counter += 1;
+                let action = format!("#fr{}", self.temp_counter);
+                self.temp_counter += 1;
+                let call = |recv: &str, method: &str, args: Vec<Expr>| Expr::MethodCall {
+                    recv: Box::new(Expr::Var(recv.to_string())),
+                    method: method.to_string(),
+                    args,
+                    line,
+                };
+                let body = [
+                    StmtKind::Local {
+                        ty: rc.clone(),
+                        name: it.clone(),
+                        init: Some(recv.clone()),
+                    },
+                    StmtKind::Local {
+                        ty: "Consumer".to_string(),
+                        name: action.clone(),
+                        init: Some(args[0].clone()),
+                    },
+                    StmtKind::Expr(call(
+                        "Objects",
+                        "requireNonNull",
+                        vec![Expr::Var(action.clone())],
+                    )),
+                    StmtKind::While {
+                        cond: call(&it, "hasNext", vec![]),
+                        body: vec![Stmt::new(
+                            line,
+                            StmtKind::Expr(call(
+                                &action,
+                                "accept",
+                                vec![call(&it, "next", vec![])],
+                            )),
+                        )],
+                    },
+                ];
+                for kind in body {
+                    self.stmt(&Stmt::new(line, kind))?;
+                }
                 self.b.emit(Op::LoadUndef, line);
                 return Ok(());
             }

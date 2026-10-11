@@ -4088,6 +4088,57 @@ fn pq_method(vm: &mut VM, id: u32, method: &str, args: &[Value]) -> Option<Value
     Some(result)
 }
 
+/// `Iterator.forEachRemaining(action)` on either host iterator shape, or `None`
+/// when `recv` is not one.
+///
+/// This is the interface's default body — `Objects.requireNonNull(action);
+/// while (hasNext()) action.accept(next());` — driven through the same
+/// `hasNext`/`next` the iterator answers one call at a time, so the cursor
+/// advances, `remove()` afterwards removes the last element handed out, and a
+/// list modified by `action` raises `ConcurrentModificationException` before
+/// the next element is accepted, as `ArrayList.Itr`'s override does. A
+/// throwable raised by `action` stops the walk and stays pending.
+fn iterator_for_each_remaining(
+    vm: &mut VM,
+    recv: &Value,
+    action: &Value,
+) -> Option<Result<Value, Fault>> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let is_iter = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(*id as usize),
+            Some(HostObj::Iterator { .. } | HostObj::PQIter { .. })
+        )
+    });
+    if !is_iter {
+        return None;
+    }
+    if matches!(action, Value::Undef) {
+        return Some(Err(Fault::java("NullPointerException", String::new())));
+    }
+    let step = |vm: &mut VM, m: &str| {
+        iterator_method(recv, m, &[]).or_else(|| pq_iter_method(vm, recv, m, 0))
+    };
+    loop {
+        match step(vm, "hasNext") {
+            Some(Ok(more)) if more.is_truthy() => {}
+            Some(Err(f)) => return Some(Err(f)),
+            _ => return Some(Ok(Value::Undef)),
+        }
+        let v = match step(vm, "next") {
+            Some(Ok(v)) => v,
+            Some(Err(f)) => return Some(Err(f)),
+            None => return Some(Ok(Value::Undef)),
+        };
+        invoke_closure(vm, action, &[v]);
+        if pending() {
+            return Some(Ok(Value::Undef));
+        }
+    }
+}
+
 /// `hasNext` / `next` / `remove` on a [`HostObj::PQIter`], following
 /// `PriorityQueue.Itr` line for line — including the `forgetMeNot` elements a
 /// `remove()` lifted into already-visited slots, which `next()` returns once
@@ -10567,6 +10618,14 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // An `Iterator` receiver. It is not a collection, so without this it fell
     // through to the `String` table and `it.hasNext()` was
     // ``unsupported String method `hasNext` ``.
+    if method == "forEachRemaining" && args.len() == 1 {
+        if let Some(r) = iterator_for_each_remaining(vm, &recv, &args[0]) {
+            return match r {
+                Ok(v) => v,
+                Err(f) => raise(vm, f),
+            };
+        }
+    }
     // `it.remove()` over a map view removes the entry from the map as well.
     let through = (method == "remove" && args.is_empty())
         .then(|| iterator_source(&recv))

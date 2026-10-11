@@ -377,6 +377,9 @@ at the bottom, and are summarized in the section right after this one.
   `ConcurrentModificationException` Java raises rather than a silent walk of
   stale elements. `remove()` before any `next()`, or twice in a row, is Java's
   `IllegalStateException`; walking off the end is `NoSuchElementException`.
+  `forEachRemaining(action)` is the interface's default body over the same
+  `hasNext`/`next`, on every host iterator and inherited by a user class that
+  implements `Iterator` without declaring it.
 - **Unbound method references on a wrapper class** (`Integer::intValue`,
   `Double::longValue`, `Integer::compareTo`) — `Number`'s six converters,
   `Boolean.booleanValue`, `Character.charValue`, and the `Object` methods a box
@@ -1319,6 +1322,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   or `Character.valueOf` is a code point. Lookups that mix the two
   (`Map.of('A', 1).get("A".charAt(0))`, `list.contains(Character.valueOf('b'))`
   on a stream-built list) miss where Java finds the key.
+- **`Stream.iterator()` and `IntStream.iterator()`** are refused
+  (``unsupported Stream method `iterator` ``). A JDK stream iterator pulls
+  elements lazily, one `next()` at a time, so a `peek` or a side-effecting
+  `map` interleaves with the caller and an infinite source works; javars's
+  pipeline is push-driven (`stream_drive` hands each element through every
+  stage in one call) and has no way to suspend between elements. Materializing
+  the stream at the call would reorder those side effects and hang on
+  `Stream.iterate(…)` without a `limit`, so it is not done.
 - **A hash container keyed by an `Optional` of a user class misses.**
   `Optional.equals`/`hashCode` called directly reach the held value's
   bodies, but a `HashSet`/`HashMap` lookup compares and hashes an `Optional`
