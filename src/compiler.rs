@@ -10453,6 +10453,34 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         ("Double" | "Float", "sum" | "max" | "min") => 2,
         // The radix renderings, static-only on both widths.
         ("Integer" | "Long", "toBinaryString" | "toHexString" | "toOctalString") => 1,
+        // The remaining static-only wrapper members with a single public arity.
+        ("Float", "parseFloat") | ("Double" | "Float", "isFinite") | ("Integer", "decode") => 1,
+        ("Boolean", "logicalAnd" | "logicalOr" | "logicalXor") => 2,
+        // The `Collections` factories and wrappers with one public arity — the
+        // finisher a `collectingAndThen` is written with
+        // (`Collections::unmodifiableList`). `max`/`min`/`sort`/`shuffle` are
+        // public at two arities, so only the target type could choose, and
+        // they stay out for the reason `Objects::toString` does.
+        ("Collections", "emptyList" | "emptySet" | "emptyMap") => 0,
+        (
+            "Collections",
+            "unmodifiableList"
+            | "unmodifiableSet"
+            | "unmodifiableMap"
+            | "unmodifiableCollection"
+            | "unmodifiableSortedSet"
+            | "unmodifiableSortedMap"
+            | "unmodifiableNavigableSet"
+            | "unmodifiableNavigableMap"
+            | "synchronizedList"
+            | "synchronizedSet"
+            | "synchronizedMap"
+            | "synchronizedCollection"
+            | "singletonList"
+            | "singleton"
+            | "reverse",
+        ) => 1,
+        ("Collections", "nCopies" | "frequency" | "disjoint" | "singletonMap") => 2,
         _ => return None,
     })
 }

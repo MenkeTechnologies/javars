@@ -386,6 +386,15 @@ at the bottom, and are summarized in the section right after this one.
   overrides. The set is the one [`crate::host::boxed_method`] serves, because a
   reference that desugared to a call javars cannot make would be a worse error
   than refusing the reference.
+- **Static JDK method references with one public arity**: the `Integer`/`Long`/
+  `Double`/`Math`/`Character`/`Objects` statics, `Boolean::logicalAnd`/`Or`/`Xor`,
+  `Float::parseFloat`, `Integer::decode`, and the `Collections` factories and
+  wrappers (`Collections::unmodifiableList` as a `collectingAndThen` finisher,
+  `emptyList`, `singletonList`, `nCopies`, `frequency`, `reverse`, …). A member
+  public at two arities (`Collections::max`, `Collections::sort`) is refused,
+  because only the target type — which javars does not carry — could choose. A
+  bound `sb::append` on a `StringBuilder` variable is accepted alongside the
+  `String` and collection receivers.
 - **`switch` type patterns and `when` guards.** `case Circle c ->` tests and
   binds the way an `instanceof` pattern does, in both the arrow and the colon
   form, and a `when` guard runs after its label matched — a failed guard is a

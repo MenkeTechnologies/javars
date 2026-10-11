@@ -715,6 +715,65 @@ npe
     assert_eq!(out, expected);
 }
 
+/// Static JDK members with a single public arity (`Collections::unmodifiableList`, `Collections::nCopies`, `Boolean::logicalOr`, `Integer::decode`, …) and a bound `sb::append` are method-reference targets. Expected output from openjdk 21.0.12.1.
+#[test]
+fn jdk_static_and_builder_method_references() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] args) {
+        // Static JDK members with one public arity are method-reference targets.
+        List<String> names = Stream.of("b", "a").collect(Collectors.collectingAndThen(Collectors.toList(), Collections::unmodifiableList));
+        System.out.println(names);
+        try { names.add("c"); } catch (UnsupportedOperationException e) { System.out.println("uoe"); }
+        Set<Integer> s = Stream.of(3, 1, 3).collect(Collectors.collectingAndThen(Collectors.toCollection(TreeSet::new), Collections::unmodifiableSet));
+        System.out.println(s);
+        Function<Map<String, Integer>, Map<String, Integer>> ro = Collections::unmodifiableMap;
+        System.out.println(ro.apply(new TreeMap<>(Map.of("k", 1))));
+        Supplier<List<Integer>> none = Collections::emptyList;
+        System.out.println(none.get() + " " + none.get().size());
+        Function<String, List<String>> one = Collections::singletonList;
+        System.out.println(Stream.of("x", "y").map(one).toList());
+        BiFunction<Integer, String, List<String>> rep = Collections::nCopies;
+        System.out.println(rep.apply(3, "ab"));
+        BiFunction<Collection<?>, Object, Integer> freq = Collections::frequency;
+        System.out.println(freq.apply(List.of(1, 2, 1), 1));
+        Consumer<List<Integer>> rev = Collections::reverse;
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        rev.accept(l);
+        System.out.println(l);
+        BinaryOperator<Boolean> or = Boolean::logicalOr;
+        System.out.println(Stream.of(false, true, false).reduce(false, or) + " " + Stream.of(true, true).reduce(true, Boolean::logicalAnd) + " " + Stream.of(true, true, true).reduce(false, Boolean::logicalXor));
+        System.out.println(Stream.of("1.5", "2.25").map(Float::parseFloat).toList() + " " + Stream.of("0x10", "-010", "7").map(Integer::decode).toList());
+        System.out.println(DoubleStream.of(1.0, Double.NaN, 1 / 0.0).boxed().filter(Double::isFinite).count());
+        // A bound reference to a StringBuilder variable.
+        StringBuilder sb = new StringBuilder();
+        List.of(1, 2, 3).forEach(sb::append);
+        Stream.of("x", "y").forEach(sb::append);
+        System.out.println(sb);
+    }
+}"####;
+    let expected = r####"[b, a]
+uoe
+[1, 3]
+{k=1}
+[] 0
+[[x], [y]]
+[ab, ab, ab]
+2
+[3, 2, 1]
+true true true
+[1.5, 2.25] [16, -8, 7]
+1
+123xy
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
 /// An `Optional` hash key is found by its contents and buckets by the held value's hash, so a `HashSet`/`HashMap` of them iterates in the JDK's order; `==` stays reference identity and `Optional` never equals `OptionalInt`. Expected output from openjdk 21.0.12.1.
 #[test]
 fn optional_hash_keys_are_found_by_contents_and_iterate_in_jdk_order() {
