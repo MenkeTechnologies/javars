@@ -363,6 +363,11 @@ at the bottom, and are summarized in the section right after this one.
   out of it being a heap object. `of(null)` is a `NullPointerException` and an
   empty `get()`/`orElseThrow()` is `NoSuchElementException: No value present`,
   both the JDK's.
+  `toString`, `equals` and `hashCode` are the JDK's `"Optional[" + value + "]"`,
+  `Objects.equals(value, other.value)` and `Objects.hashCode(value)`, so a
+  held record or user class renders, compares and hashes through its own
+  bodies — `Optional[Emp[name=ann, …]]` from a `groupingBy(…, maxBy(…))`, not
+  an identity string.
 - **An explicit generic method type argument** (`Optional.<String>empty()`)
   parses and is erased, like every other type-argument group.
 - **`Iterator` over a `List` or a `Set`.** `hasNext`, `next` and `remove`,
@@ -1314,6 +1319,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   or `Character.valueOf` is a code point. Lookups that mix the two
   (`Map.of('A', 1).get("A".charAt(0))`, `list.contains(Character.valueOf('b'))`
   on a stream-built list) miss where Java finds the key.
+- **A hash container keyed by an `Optional` of a user class misses.**
+  `Optional.equals`/`hashCode` called directly reach the held value's
+  bodies, but a `HashSet`/`HashMap` lookup compares and hashes an `Optional`
+  key by its contents *without* running them — the user `equals`/`hashCode`
+  plan (`eq_plan`, `file_key_hash` in `src/host.rs`) recognises a user instance or a
+  collection as the key, not one wrapped in an `Optional` — so
+  `set.contains(Optional.of(new K(5)))` is `false` where Java answers `true`
+  for a `K` with consistent `equals`/`hashCode`. An `Optional` of a `String`,
+  a boxed primitive or another `Optional` of one is found, and buckets and
+  iterates in the JDK's order.
 - **`EnumSet.complementOf` and `EnumSet.range`** need the enum type, which the
   `TreeSet` an `EnumSet` is modeled as does not keep. They are refused by name.
 - **`java.lang.StackOverflowError` is not modeled by name in `catch`**, and

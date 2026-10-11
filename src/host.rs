@@ -739,10 +739,12 @@ enum HostObj {
     /// (`OptionalInt`, `OptionalLong`, `OptionalDouble`), which differ in their
     /// rendering (`OptionalDouble[4.0]`) and in the name of their accessor
     /// (`getAsDouble` rather than `get`).
-    Optional {
-        class: &'static str,
-        value: Option<Value>,
-    },
+    ///
+    /// A marker, like [`HostObj::Boxed`]: the class and the held value live in
+    /// [`OPTIONALS`], because an `Optional` is compared and hashed by its
+    /// contents from inside a heap borrow (a `HashSet` lookup), where reading
+    /// `HEAP` again would be a double borrow.
+    Optional,
     /// A `java.util.stream.Stream` — a source and the pipeline built over it.
     ///
     /// Nothing is evaluated until a terminal operation runs, which is what Java
@@ -1546,6 +1548,8 @@ fn index_key(v: &Value) -> Option<IndexKey> {
             // replaces hits. It declines, which is what the accelerator is
             // specified to do wherever the correspondence is not provable.
             None if entry_pair(v).is_some() => return None,
+            // An `Optional` is compared by its contents, for the same reason.
+            None if as_optional_full(v).is_some() => return None,
             None => IndexKey::Obj(*id),
         },
         Value::Undef => IndexKey::Null,
@@ -1779,6 +1783,9 @@ enum Fixity {
     Immutable,
 }
 
+/// An `Optional`'s payload in [`OPTIONALS`]: its class and the value it holds.
+type OptionalSlot = (&'static str, Option<Value>);
+
 thread_local! {
     /// The host-owned Java object heap. `Value::Obj(id)` is an index into this
     /// slab; the frontend owns the objects, fusevm just carries the handle. Grows
@@ -1843,6 +1850,11 @@ thread_local! {
     /// indexed by the handle for the reason [`BOXES`] gives: an entry inside a
     /// `Set` is compared against every candidate a `contains` walks.
     static PAIRS: RefCell<Vec<Option<Pair>>> = const { RefCell::new(Vec::new()) };
+    /// Every live `Optional`: handle -> (its class, the value it holds).
+    ///
+    /// Separate from `HEAP` for the reason [`HostObj::Optional`] gives, and
+    /// indexed by the handle for the reason [`BOXES`] gives.
+    static OPTIONALS: RefCell<Vec<Option<OptionalSlot>>> = const { RefCell::new(Vec::new()) };
     /// For every map that has handed out entries: the entries it handed out.
     /// See [`entry_for`] for why a map must hand out the *same* entry for a key
     /// every time, and [`OwnerEntries`] for the accelerator and the scan.
@@ -2108,6 +2120,7 @@ pub fn heap_reset() {
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
     PAIRS.with(|p| p.borrow_mut().clear());
+    OPTIONALS.with(|o| o.borrow_mut().clear());
     // Keyed by heap handle like the caches above, so it goes with the heap for
     // the same reason: a surviving bucket would hand the next program's map an
     // entry belonging to this one's.
@@ -3108,6 +3121,14 @@ fn java_hash(v: &Value) -> Option<i32> {
             _ => return java_hash(&inner),
         });
     }
+    // `Optional.hashCode` is `Objects.hashCode(value)`, so an `Optional` of a
+    // value hashed here hashes as that value, and an empty one as 0.
+    if let Some((_, held)) = as_optional_full(v) {
+        return match held {
+            Some(h) => java_hash(&h),
+            None => Some(0),
+        };
+    }
     Some(match v {
         // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
         // counts UTF-16 code units; javars counts scalars, the same
@@ -3174,9 +3195,14 @@ fn element_hash(v: &Value) -> i32 {
         // exactly that quantity over the same pairs.
         None => match entry_pair(v) {
             Some(p) => element_hash(&p.key) ^ element_hash(&p.value),
-            None => match v {
-                Value::Obj(id) => *id as i32,
-                _ => 0,
+            // `Optional.hashCode` is `Objects.hashCode(value)`: the held
+            // value's hash, 0 when empty.
+            None => match as_optional_full(v) {
+                Some((_, held)) => held.map_or(0, |h| element_hash(&h)),
+                None => match v {
+                    Value::Obj(id) => *id as i32,
+                    _ => 0,
+                },
             },
         },
     }
@@ -4660,6 +4686,16 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     // comparison below and is `false`, as `Map.entry("a", 1).equals("a=1")` is.
     if let (Some(x), Some(y)) = (entry_pair(a), entry_pair(b)) {
         return value_eq(&x.key, &y.key) && value_eq(&x.value, &y.value);
+    }
+    // `Optional.equals` is a value comparison too — same class, and
+    // `Objects.equals` of the held values — which is what lets a hash
+    // container find an `Optional` key it holds.
+    if let (Some((cx, x)), Some((cy, y))) = (as_optional_full(a), as_optional_full(b)) {
+        return cx == cy
+            && match (x, y) {
+                (Some(x), Some(y)) => value_eq(&x, &y),
+                (x, y) => x.is_none() && y.is_none(),
+            };
     }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
@@ -6524,7 +6560,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Iterator { bidi: false, .. } => "Iterator$of".to_string(),
                     HostObj::PQIter { .. } => "Iterator$of".to_string(),
                     HostObj::Iterator { bidi: true, .. } => "ListIterator$of".to_string(),
-                    HostObj::Optional { class, .. } => (*class).to_string(),
+                    HostObj::Optional => as_optional_full(v)?.0.to_string(),
                     HostObj::Stream { .. } => "Stream$of".to_string(),
                     HostObj::Collector { .. } => "Collector$of".to_string(),
                     HostObj::Array(_) => "[]".to_string(),
@@ -8467,19 +8503,22 @@ fn optional(v: Option<Value>) -> Value {
 /// Allocate an `Optional` of the given class — one of `Optional`,
 /// `OptionalInt`, `OptionalLong`, `OptionalDouble`.
 fn optional_of(class: &'static str, value: Option<Value>) -> Value {
-    Value::Obj(heap_alloc(HostObj::Optional { class, value }))
+    let id = heap_alloc(HostObj::Optional);
+    OPTIONALS.with(|o| {
+        let mut o = o.borrow_mut();
+        o.resize(id as usize + 1, None);
+        o[id as usize] = Some((class, value));
+    });
+    Value::Obj(id)
 }
 
 /// The class and contents of an `Optional` handle, or `None` when the value is
 /// not an `Optional` at all.
-fn as_optional_full(v: &Value) -> Option<(&'static str, Option<Value>)> {
+fn as_optional_full(v: &Value) -> Option<OptionalSlot> {
     let Value::Obj(id) = v else {
         return None;
     };
-    HEAP.with(|h| match h.borrow().get(*id as usize) {
-        Some(HostObj::Optional { class, value }) => Some((*class, value.clone())),
-        _ => None,
-    })
+    OPTIONALS.with(|o| o.borrow().get(*id as usize)?.clone())
 }
 
 /// The source and pipeline of a `Stream` handle, or `None` for anything else.
@@ -9522,17 +9561,19 @@ fn optional_method(
             };
             Ok(Value::Undef)
         }
-        // A value, so `equals` compares contents where `==` compares handles.
+        // A value, so `equals` compares contents where `==` compares handles:
+        // `Objects.equals(value, other.value)`, which reaches a user `equals`.
         ("equals", 1) => Ok(Value::bool(match (inner, as_optional_full(&args[0])) {
-            (Some(x), Some((other, Some(y)))) => other == class && value_eq(&x, &y),
+            (Some(x), Some((other, Some(y)))) => other == class && objects_equals(vm, &x, &y),
             (None, Some((other, None))) => other == class,
             _ => false,
         })),
+        // `Objects.hashCode(value)`, which reaches a user `hashCode`.
         ("hashCode", 0) => Ok(Value::Int(match inner {
-            Some(v) => element_hash(&v).into(),
+            Some(v) => objects_hash_of(vm, &v).into(),
             None => 0,
         })),
-        ("toString", 0) => Ok(Value::str(java_str(recv))),
+        ("toString", 0) => Ok(Value::str(java_str_vm(vm, recv))),
         _ => Err(Fault::internal(format!(
             "javars: unsupported Optional method `{method}` with {} argument(s)",
             args.len()
@@ -17608,6 +17649,9 @@ enum RenderShape {
     Entries(Vec<(Value, Value)>),
     /// One `Map.Entry`.
     Pair(Value, Value),
+    /// An `Optional` (or a primitive specialization): its class name and the
+    /// value it holds, rendered through the value's own `toString()`.
+    Optional(&'static str, Option<Value>),
     /// An array, a lambda, or a dangling handle — nothing to recurse into, so
     /// the pure renderer answers.
     Opaque,
@@ -17652,6 +17696,10 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
                 Some(p) => RenderShape::Pair(p.key, p.value),
                 None => RenderShape::Opaque,
             },
+            Some(HostObj::Optional) => match as_optional_full(&Value::Obj(id)) {
+                Some((class, value)) => RenderShape::Optional(class, value),
+                None => RenderShape::Opaque,
+            },
             _ => RenderShape::Opaque,
         }
     });
@@ -17674,6 +17722,8 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
         },
         RenderShape::Sequence(items) => render_sequence_vm(vm, &items),
         RenderShape::Pair(k, v) => format!("{}={}", java_str_vm(vm, &k), java_str_vm(vm, &v)),
+        RenderShape::Optional(class, Some(v)) => format!("{class}[{}]", java_str_vm(vm, &v)),
+        RenderShape::Optional(class, None) => format!("{class}.empty"),
         RenderShape::Entries(entries) => {
             let body: Vec<String> = entries
                 .iter()
@@ -17799,9 +17849,10 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::PQIter { .. }) => format!("<iterator>@{id:x}"),
             // `Optional[x]` / `Optional.empty` — the JDK's own rendering, and
             // the same shape for the three primitive specializations.
-            Some(HostObj::Optional { class, value }) => match value {
-                Some(v) => format!("{class}[{}]", java_str(v)),
-                None => format!("{class}.empty"),
+            Some(HostObj::Optional) => match as_optional_full(&Value::Obj(id)) {
+                Some((class, Some(v))) => format!("{class}[{}]", java_str(&v)),
+                Some((class, None)) => format!("{class}.empty"),
+                None => format!("(obj:{id})"),
             },
             Some(HostObj::Stream { .. }) => format!("<stream>@{id:x}"),
             Some(HostObj::Collector { .. }) => format!("<collector>@{id:x}"),

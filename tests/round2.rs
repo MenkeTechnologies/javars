@@ -618,3 +618,72 @@ true <1>
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// An `Optional` renders its value through the value's own `toString()` on every surface (a bare `println`, a collection or map element, `toString()`, `String.valueOf`, `%s`), and `equals`/`hashCode` are `Objects.equals`/`Objects.hashCode` of the value, reaching a user or record body. Expected output from openjdk 21.0.12.1.
+#[test]
+fn optional_renders_compares_and_hashes_its_value_through_the_value_methods() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    record Emp(String name, String dept, int sal) {}
+    static class Tag { final String t; Tag(String t) { this.t = t; } public String toString() { return "<" + t + ">"; } }
+    static class K { final int v; K(int v) { this.v = v; }
+        public boolean equals(Object o) { return o instanceof K k && k.v == v; }
+        public int hashCode() { return 31 * v; } }
+    public static void main(String[] args) {
+        // An Optional renders, compares and hashes its value through the value's own methods.
+        List<Emp> emps = List.of(new Emp("ann", "eng", 120), new Emp("bob", "eng", 99), new Emp("cy", "ops", 80));
+        Map<String, Optional<Emp>> top = emps.stream().collect(Collectors.groupingBy(Emp::dept, TreeMap::new, Collectors.maxBy(Comparator.comparingInt(Emp::sal))));
+        System.out.println(top);
+        Optional<Tag> t = Optional.of(new Tag("x"));
+        System.out.println(t + " " + List.of(t, Optional.empty()));
+        System.out.println(String.valueOf(t) + " " + t.toString() + " " + String.format("%s", t));
+        System.out.println(Optional.of(List.of(new Tag("y"))) + " " + Optional.of(Optional.of(new Tag("z"))));
+        System.out.println(OptionalInt.of(3) + " " + OptionalDouble.of(2.5) + " " + Optional.of(1.5f) + " " + Optional.of('c'));
+        System.out.println(Optional.of(new K(2)).equals(Optional.of(new K(2))) + " " + Optional.of(new K(2)).hashCode());
+        System.out.println(Optional.of(new Emp("a", "b", 1)).equals(Optional.of(new Emp("a", "b", 1))) + " " + Optional.of(List.of(new K(1))).equals(Optional.of(List.of(new K(1)))) + " " + Optional.of(List.of(1, 2)).hashCode() + " " + Optional.empty().hashCode());
+    }
+}"####;
+    let expected = r####"{eng=Optional[Emp[name=ann, dept=eng, sal=120]], ops=Optional[Emp[name=cy, dept=ops, sal=80]]}
+Optional[<x>] [Optional[<x>], Optional.empty]
+Optional[<x>] Optional[<x>] Optional[<x>]
+Optional[[<y>]] Optional[Optional[<z>]]
+OptionalInt[3] OptionalDouble[2.5] Optional[1.5] Optional[c]
+true 62
+true true 994 0
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// An `Optional` hash key is found by its contents and buckets by the held value's hash, so a `HashSet`/`HashMap` of them iterates in the JDK's order; `==` stays reference identity and `Optional` never equals `OptionalInt`. Expected output from openjdk 21.0.12.1.
+#[test]
+fn optional_hash_keys_are_found_by_contents_and_iterate_in_jdk_order() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] args) {
+        // An Optional key is found by its contents and buckets by its value's hash.
+        Set<Optional<String>> s = new HashSet<>();
+        for (String w : "banana apple cherry kiwi fig date elderberry grape apple".split(" ")) s.add(Optional.of(w));
+        s.add(Optional.empty());
+        s.add(Optional.empty());
+        System.out.println(s + " " + s.size() + " " + s.contains(Optional.of("fig")) + " " + s.contains(Optional.of("lime")));
+        Map<Optional<Integer>, Integer> m = new HashMap<>();
+        for (int i = 40; i > 0; i -= 7) m.put(Optional.of(i * 1000), i);
+        System.out.println(m + " " + m.containsKey(Optional.of(5000)) + " " + m.remove(Optional.of(33000)) + " " + m.size());
+        System.out.println((Optional.of("x") == Optional.of("x")) + " " + Optional.of(1).equals(OptionalInt.of(1)) + " " + List.of(Optional.of("q")).contains(Optional.of("q")) + " " + List.of(Optional.of("q")).indexOf(Optional.empty()));
+        System.out.println(List.of(Optional.of("a"), Optional.empty()).hashCode() + " " + Set.of(Optional.of(Optional.of(7))).contains(Optional.of(Optional.of(7))));
+    }
+}"####;
+    let expected = r####"[Optional[banana], Optional[date], Optional.empty, Optional[apple], Optional[cherry], Optional[kiwi], Optional[fig], Optional[grape], Optional[elderberry]] 9 true false
+{Optional[40000]=40, Optional[26000]=26, Optional[12000]=12, Optional[33000]=33, Optional[19000]=19, Optional[5000]=5} true 33 5
+false false true -1
+3968 true
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
