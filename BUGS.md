@@ -1225,6 +1225,24 @@ storage-model differences:
   A held view does not see later changes to the map, and the view object is
   rebuilt per call where Java's map caches one and hands back the same object.
 
+  Measured again at javars 0.1.13: the first line no longer prints `2` — it
+  aborts. `size()` on an `entrySet()` taken before a later `put` panics with
+  `RefCell already mutably borrowed` at `src/host.rs:3465` (`map_value_of`, the
+  per-entry repair that reads the map's `HEAP` slot while it is already
+  borrowed mutably). The smallest reproducer, for a `HashMap` or a
+  `LinkedHashMap`:
+
+  ```java
+  Map<String, Integer> m = new HashMap<>();
+  m.put("a", 1);
+  var es = m.entrySet();
+  m.put("c", 3);
+  System.out.println(es.size());   // Java: 2   javars: thread 'main' panicked … RefCell already mutably borrowed
+  ```
+
+  Iterating the held view instead (`for (var e : es)`) does not panic and
+  prints the snapshot (`a=1`, where Java prints `a=1` and `c=3`).
+
   The *entries inside* an `entrySet()` are not copies in that sense: a map hands
   out one `Map.Entry` per key and keeps handing back that same object, its
   `getValue()` follows the map, and it detaches when its key is removed — see
@@ -1267,6 +1285,24 @@ storage-model differences:
   `generate`. What remains is a lambda passed where the receiver's type is not
   recognisable — an `Optional` held in a `var` initialized by an unmodeled call,
   say — which keeps the code point.
+- **A `Class` value prints as its bare name once its static type is lost.**
+  A class is its binary name here (see "Class literals" below), and
+  `System.out.println` prepends Java's `class ` only when the argument is
+  statically a class literal or a `getClass()` call. Stored in an `Object` or a
+  `var`, or turned into a string, it prints the name alone. Measured at javars
+  0.1.13 against `openjdk 21.0.12.1`:
+
+  ```java
+  Object o = String.class;
+  System.out.println(o);                          // Java: class java.lang.String   javars: java.lang.String
+  System.out.println("" + o);                     // Java: class java.lang.String   javars: java.lang.String
+  System.out.println(String.valueOf(Integer.class)); // Java: class java.lang.Integer javars: java.lang.Integer
+  var v = Integer.class;
+  System.out.println(v);                          // Java: class java.lang.Integer  javars: java.lang.Integer
+  Object g = "x".getClass();
+  System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
+  System.out.println(String.class);               // both: class java.lang.String
+  ```
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
