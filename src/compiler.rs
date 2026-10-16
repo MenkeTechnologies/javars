@@ -1870,6 +1870,15 @@ impl Compiler {
                 }
                 // JLS 15.25.2, the numeric conditional. Wrappers unbox first.
                 let (tp, ep) = (unwrapped_ty(t.as_deref()?), unwrapped_ty(e2.as_deref()?));
+                // A primitive against a reference that is no wrapper makes the
+                // conditional a reference one (JLS 15.25.3): the primitive boxes
+                // and the type is the lub of the two, which no call can tell
+                // from `Object`. Left untyped, an overloaded call taking it
+                // found no applicable method.
+                let primitive = |ty: &str| wrapper_of(ty).is_some();
+                if primitive(tp) != primitive(ep) && is_reference_type(if primitive(tp) { ep } else { tp }) {
+                    return Some("Object".to_string());
+                }
                 let (tr, er) = (numeric_rank(tp)?, numeric_rank(ep)?);
                 if tp == ep {
                     return Some(tp.to_string());

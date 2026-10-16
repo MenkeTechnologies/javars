@@ -866,3 +866,33 @@ public class T { public static void main(String[] a){ String s="héllo wörld, �
 {out}");
     assert_eq!(out, expected);
 }
+
+/// A conditional with a primitive branch and a non-wrapper reference branch is a reference conditional (JLS 15.25.3); as an overloaded call's argument it used to have no type and matched no overload. Expected output from openjdk 27 (Temurin).
+#[test]
+fn mixed_primitive_reference_conditional_is_an_object_argument() {
+    let src = r####"
+public class T {
+    static class V {
+        void f(long l) { System.out.print("long "); }
+        void f(Integer i) { System.out.print("Integer "); }
+        void f(Object o) { System.out.print("Object "); }
+    }
+    public static void main(String[] args) {
+        V v = new V();
+        boolean t = args.length == 0;
+        v.f(t ? (Object) 1 : 2);
+        v.f(t ? "s" : 2);
+        v.f(t ? 1 : 2);
+        v.f(t ? Integer.valueOf(1) : 2);
+        v.f(t ? 1.5 : "x");
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"Object Object long long Object 
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
