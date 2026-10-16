@@ -7558,6 +7558,24 @@ impl Compiler {
                 return Ok(());
             }
             let arg_tys: Vec<Option<String>> = self.arg_types(args);
+            // A `static` method called through an instance expression
+            // (`b.who()`) is chosen by the expression's *static* type and never
+            // dispatches on the object (JLS 15.12.4.1): the receiver is
+            // evaluated for its side effects, discarded, and the class-qualified
+            // call is made.
+            if self.resolve_instance_call(&rc, method, &arg_tys).is_none()
+                && self.resolve_static_on(&rc, method, &arg_tys).is_some()
+            {
+                self.expr(recv)?;
+                self.b.emit(Op::Pop, line);
+                let qualified = Expr::MethodCall {
+                    recv: Box::new(Expr::Var(rc.clone())),
+                    method: method.to_string(),
+                    args: args.to_vec(),
+                    line,
+                };
+                return self.expr(&qualified);
+            }
             let inherited = matches!(
                 (method, args.len()),
                 ("equals", 1) | ("toString", 0) | ("hashCode", 0)

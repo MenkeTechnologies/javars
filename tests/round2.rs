@@ -896,3 +896,40 @@ public class T {
 {out}");
     assert_eq!(out, expected);
 }
+
+/// A `static` method called through an instance expression binds to the expression's static type, evaluates the receiver once and never dereferences it (a null receiver is fine); it used to be a compile error. Expected output from openjdk 27 (Temurin).
+#[test]
+fn static_method_through_instance_uses_static_type() {
+    let src = r####"
+public class T {
+    static int made;
+    static class Base {
+        static String who() { return "Base"; }
+        static int twice(int x) { return 2 * x; }
+        String viaThis() { return this.who() + "/" + who(); }
+    }
+    static class Der extends Base {
+        static String who() { return "Der"; }
+    }
+    static Base make() { made++; return new Der(); }
+    public static void main(String[] args) {
+        Base b = new Der();
+        Der d = new Der();
+        System.out.println(b.who() + " " + d.who() + " " + ((Der) b).who() + " " + b.twice(4));
+        System.out.println(b.viaThis() + " " + d.viaThis());
+        System.out.println(make().who() + " " + make().twice(3) + " " + made);
+        Base n = null;
+        System.out.println(n.who());
+    }
+}
+"####;
+    let expected = r####"Base Der Der 8
+Base/Base Base/Base
+Base 6 2
+Base
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
