@@ -16219,6 +16219,15 @@ fn java_format(
     tags: &[&str],
     mut vm: Option<&mut VM>,
 ) -> Result<Value, Fault> {
+    // `format(String, Object...)` receives a lone array argument as the argument
+    // list itself (`String.format("%s %s", new Object[]{"a", "b"})`). Element
+    // types are erased here, so a lone primitive array spreads as well; Java would
+    // print its identity hash instead, which no program can depend on.
+    let spread = match args {
+        [only] => array_items(only),
+        _ => None,
+    };
+    let args = spread.as_deref().unwrap_or(args);
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     let mut argi = 0usize;

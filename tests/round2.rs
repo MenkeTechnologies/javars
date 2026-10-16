@@ -964,3 +964,36 @@ public class T {
 {out}");
     assert_eq!(out, expected);
 }
+
+/// `String.format`/`printf`/`formatted` given one array where the varargs `Object...` goes use its elements as the argument list; the array used to be a single argument and the specifiers ran out (MissingFormatArgumentException). Expected output from openjdk 27 (Temurin).
+#[test]
+fn format_spreads_a_lone_object_array_argument() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        Object[] two = {"a", 2};
+        String[] names = {"x", "y", "z"};
+        Integer[] nums = {7, 8};
+        System.out.println(String.format("%s %s", two));
+        System.out.println(String.format("%s-%s-%s", (Object[]) names));
+        System.out.printf("%d+%d%n", (Object[]) nums);
+        System.out.println("%s/%s".formatted(two));
+        System.out.println(String.format("%2$s %1$s", two));
+        Object[] none = {};
+        System.out.println(String.format("none", none));
+    }
+}
+"####;
+    let expected = r####"a 2
+x-y-z
+7+8
+a/2
+2 a
+none
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
