@@ -5144,7 +5144,12 @@ fn eq_plan(
         EqShape::List => (
             matches!(
                 (method, args.len()),
-                ("contains", 1) | ("indexOf", 1) | ("lastIndexOf", 1) | ("removeObject", 1)
+                ("contains", 1)
+                    | ("indexOf", 1)
+                    | ("lastIndexOf", 1)
+                    | ("removeObject", 1)
+                    | ("removeFirstOccurrence", 1)
+                    | ("removeLastOccurrence", 1)
             ),
             false,
         ),
@@ -5183,7 +5188,7 @@ fn eq_plan(
     };
     // The scan stops at the first hit, in the direction the calling method
     // scans, so a user body's side effects fire exactly as often as Java's do.
-    let at = if method == "lastIndexOf" {
+    let at = if matches!(method, "lastIndexOf" | "removeLastOccurrence") {
         (0..against.len())
             .rev()
             .find(|i| eq_call(vm, q, &against[*i]))
@@ -7009,7 +7014,7 @@ fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) ->
     }
     let through = matches!(
         method,
-        "remove" | "removeObject" | "removeIf" | "removeAll" | "retainAll" | "clear"
+        "remove" | "removeObject" | "removeFirstOccurrence" | "removeLastOccurrence" | "removeIf" | "removeAll" | "retainAll" | "clear"
     )
     .then(|| map_view_snapshot(recv))
     .flatten();
@@ -10021,9 +10026,21 @@ fn list_method(
         }
         // `List.remove(Object)` — removes the first element equal to the
         // argument and answers whether one was found.
-        ("removeObject", 1) => {
+        // `Deque.removeFirstOccurrence` is the same operation under its own name.
+        ("removeObject" | "removeFirstOccurrence", 1) => {
             structural()?;
             match eq_index(eq, items, &args[0], false) {
+                Some(i) => {
+                    items.remove(i);
+                    Value::bool(true)
+                }
+                None => Value::bool(false),
+            }
+        }
+        // `Deque.removeLastOccurrence` — the last element equal to the argument.
+        ("removeLastOccurrence", 1) => {
+            structural()?;
+            match eq_index(eq, items, &args[0], true) {
                 Some(i) => {
                     items.remove(i);
                     Value::bool(true)

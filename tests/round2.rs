@@ -828,3 +828,24 @@ public class T {
 {out}");
     assert_eq!(out, expected);
 }
+
+/// `Deque.removeFirstOccurrence`/`removeLastOccurrence` remove by equality from the head/tail side and answer whether one matched. Expected output from openjdk 27 (Temurin).
+#[test]
+fn deque_remove_first_and_last_occurrence() {
+    let src = r####"
+import java.util.*;
+public class T { record P(int a){} public static void main(String[] a){ LinkedList<String> ll=new LinkedList<>(List.of("a","x","b","x","c")); System.out.println(ll.removeFirstOccurrence("x")+" "+ll); System.out.println(ll.removeLastOccurrence("x")+" "+ll+ll.removeLastOccurrence("q")+ll.removeFirstOccurrence("q"));
+ Deque<Integer> d=new ArrayDeque<>(List.of(1,2,1,3,1)); d.removeFirstOccurrence(1); d.removeLastOccurrence(1); System.out.println(d);
+ Deque<P> dp=new ArrayDeque<>(List.of(new P(1),new P(2),new P(1))); dp.removeLastOccurrence(new P(1)); System.out.println(dp); dp.removeFirstOccurrence(new P(1)); System.out.println(dp);} }
+"####;
+    let expected = r####"true [a, b, x, c]
+true [a, b, c]falsefalse
+[2, 1, 3]
+[P[a=1], P[a=2]]
+[P[a=2]]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}

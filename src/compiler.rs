@@ -10304,7 +10304,7 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
         ("add", 1) | ("addAll", 1) | ("equals", 1) => "boolean",
         ("remove", 1) if kind == "set" || kind == "pq" => "boolean",
         // The compiler-selected `List.remove(Object)` overload.
-        ("removeObject", 1) => "boolean",
+        ("removeObject" | "removeFirstOccurrence" | "removeLastOccurrence", 1) => "boolean",
         ("toString", 0) => "String",
         ("keySet", 0) => "Set",
         ("entrySet", 0) => "Set",
