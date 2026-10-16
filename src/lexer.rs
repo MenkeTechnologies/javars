@@ -381,8 +381,9 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // numbers (int or float)
-        if c.is_ascii_digit() {
+        // numbers (int or float); a leading point (`.5`) starts one too
+        let dot_number = c == '.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit);
+        if c.is_ascii_digit() || dot_number {
             let start = i;
             let mut is_float = false;
             while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
@@ -396,6 +397,22 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
                 is_float = true;
                 i += 1;
                 while i < bytes.len() && ((bytes[i] as char).is_ascii_digit() || bytes[i] == b'_') {
+                    i += 1;
+                }
+            }
+            // A point with no fraction digits (`5.`, `5.e1`, `5.f`) is still a
+            // floating literal, unless it is a member access or a range-like `..`.
+            if !is_float && i < bytes.len() && bytes[i] == b'.' {
+                let after = bytes.get(i + 1).copied().unwrap_or(b' ');
+                let after2 = bytes.get(i + 2).copied().unwrap_or(b' ');
+                let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+                let exp = matches!(after, b'e' | b'E')
+                    && (after2.is_ascii_digit()
+                        || (matches!(after2, b'+' | b'-')
+                            && bytes.get(i + 3).is_some_and(u8::is_ascii_digit)));
+                let suffix = matches!(after, b'f' | b'F' | b'd' | b'D') && !ident(after2);
+                if exp || suffix || (!ident(after) && after != b'.') {
+                    is_float = true;
                     i += 1;
                 }
             }

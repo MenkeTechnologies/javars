@@ -803,3 +803,28 @@ false false true -1
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A floating literal may start with the point (`.5`) or end with it (`5.`, `2.e1`, `5.f`); the lexer used to reject both. Expected output from openjdk 27 (Temurin).
+#[test]
+fn float_literals_may_omit_the_integer_or_fraction_digits() {
+    let src = r####"
+public class T {
+    public static void main(String[] args) {
+        double d = .5;
+        double e = 5.;
+        int[] x = {1, 2};
+        System.out.println(d + " " + e + " " + 3d + " " + 2.e1 + " " + 5.f + " " + .25f + " " + 1.e-1 + " " + .5e1 + " " + 1_0.);
+        System.out.println(x[1] + .5);
+        System.out.println(1. + 2. + " " + (e * 2.) + " " + 10 / 4. + " " + (int) 7.);
+    }
+}
+"####;
+    let expected = r####"0.5 5.0 3.0 20.0 5.0 0.25 0.1 5.0 10.0
+2.5
+3.0 10.0 2.5 7
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
