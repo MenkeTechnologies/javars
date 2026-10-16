@@ -933,3 +933,34 @@ Base
 {out}");
     assert_eq!(out, expected);
 }
+
+/// `Collection.parallelStream()` and the stream's `parallel`/`sequential`/`unordered` switches run (javars is single-threaded, so results are those of the sequential pipeline) instead of being refused. Expected output from openjdk 27 (Temurin).
+#[test]
+fn parallel_stream_and_execution_mode_switches() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> l = List.of(3, 1, 2);
+        System.out.println(l.parallelStream().mapToInt(x -> x).sum());
+        System.out.println(new TreeSet<>(l).parallelStream().map(x -> x * 2).collect(Collectors.toList()));
+        System.out.println(Stream.of(1, 2).parallel().count() + " " + Arrays.stream(new int[]{1, 2}).parallel().sum());
+        System.out.println(IntStream.range(0, 5).parallel().sequential().unordered().sum());
+        System.out.println(l.stream().parallel().sorted().map(String::valueOf).collect(Collectors.joining(",")));
+        System.out.println(Set.of(7).parallelStream().findFirst().get());
+    }
+}
+"####;
+    let expected = r####"6
+[2, 4, 6]
+2 3
+10
+1,2,3
+7
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}

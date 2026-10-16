@@ -8223,7 +8223,7 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
     }
     // `stream()` on a collection — a *second* heap object, like the iterator
     // below, and built from the elements as they stand.
-    if method == "stream" && args.is_empty() {
+    if matches!(method, "stream" | "parallelStream") && args.is_empty() {
         if let Some(items) = sequence_items(recv) {
             return stream_of(items, StreamKind::Ref);
         }
@@ -8932,6 +8932,9 @@ fn stream_method(
         ("takeWhile", 1) => stage(Stage::TakeWhile(args[0].clone())),
         ("dropWhile", 1) => stage(Stage::DropWhile(args[0].clone())),
         ("distinct", 0) => stage(Stage::Distinct),
+        // javars runs one thread, so a stream is always sequential: the
+        // execution-mode switches answer the receiver itself, as the JDK does.
+        ("parallel" | "sequential" | "unordered", 0) => Ok(recv.clone()),
         ("sorted", 0) => stage(Stage::Sorted(None)),
         ("sorted", 1) => stage(Stage::Sorted(Some(args[0].clone()))),
         // The mapping operations that also change the stream's *shape*, which
