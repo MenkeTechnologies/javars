@@ -11165,7 +11165,16 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         }
         ("substring", 1) => substring(s, args[0].jint(), char_len()),
         ("substring", 2) | ("subSequence", 2) => substring(s, args[0].jint(), args[1].jint()),
-        ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &args[0].as_str_cow()))),
+        // `indexOf(int ch)` / `lastIndexOf(int ch)` take a code point: an `int`
+        // here (`s.chars().filter(c -> "aeiou".indexOf(c) >= 0)`) is the
+        // character itself, not the digits of its decimal rendering. A value
+        // that is no code point matches nothing.
+        ("indexOf" | "lastIndexOf", 1 | 2)
+            if matches!(&args[0], Value::Int(i) if u32::try_from(*i).ok().and_then(char::from_u32).is_none()) =>
+        {
+            Ok(Value::Int(-1))
+        }
+        ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &needle_arg(&args[0])))),
         // `indexOf(t, from)` starts the search at `from`; the result is still an
         // index into the whole string.
         ("indexOf", 2) => {
@@ -11176,17 +11185,17 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             // `from` back through the empty-needle hit.
             let from = args[1].jint().clamp(0, char_len()) as usize;
             let tail: String = s.chars().skip(from).collect();
-            let hit = char_index_of(&tail, &args[0].as_str_cow());
+            let hit = char_index_of(&tail, &needle_arg(&args[0]));
             Ok(Value::Int(if hit < 0 { -1 } else { hit + from as i64 }))
         }
         ("lastIndexOf", 1) => Ok(Value::Int(char_last_index_of(
             s,
-            &args[0].as_str_cow(),
+            &needle_arg(&args[0]),
             char_len(),
         ))),
         ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
             s,
-            &args[0].as_str_cow(),
+            &needle_arg(&args[0]),
             args[1].jint(),
         ))),
         // `codePointBefore` checks `index - 1`, the position it reads.
@@ -11434,6 +11443,19 @@ fn substring(s: &str, begin: i64, end: i64) -> Result<Value, Fault> {
 }
 
 /// `String.indexOf(sub)` returning a `char` index (not a byte offset), or `-1`.
+/// The text a `String.indexOf`/`lastIndexOf` argument searches for: a `char`
+/// travels as a one-character string already, while an `int` is a code point and
+/// is turned into that character.
+fn needle_arg(v: &Value) -> std::borrow::Cow<'_, str> {
+    match v {
+        Value::Int(i) => match u32::try_from(*i).ok().and_then(char::from_u32) {
+            Some(c) => std::borrow::Cow::Owned(c.to_string()),
+            None => v.as_str_cow(),
+        },
+        _ => v.as_str_cow(),
+    }
+}
+
 fn char_index_of(s: &str, needle: &str) -> i64 {
     match s.find(needle) {
         Some(byte_pos) => s[..byte_pos].chars().count() as i64,

@@ -849,3 +849,20 @@ true [a, b, c]falsefalse
 {out}");
     assert_eq!(out, expected);
 }
+
+/// `String.indexOf(int)`/`lastIndexOf(int)` search for the character with that code point (as in `s.chars().filter(c -> vowels.indexOf(c) >= 0)`); they used to search for the decimal digits and a non-code-point answers -1. Expected output from openjdk 27 (Temurin).
+#[test]
+fn string_index_of_takes_an_int_code_point() {
+    let src = r####"
+public class T { public static void main(String[] a){ String s="héllo wörld, 😀!"; int c='o'; char ch='l';
+ System.out.println(s.indexOf(c)+" "+s.indexOf(c,6)+" "+s.lastIndexOf(c)+" "+s.lastIndexOf(c,5)+" "+s.indexOf(ch)+" "+s.indexOf(233)+" "+s.indexOf(-1)+" "+s.indexOf(0x110000)+" "+s.lastIndexOf(-5)+" "+s.indexOf(0xD800));
+ long n=s.chars().filter(x->"aeiouö".indexOf(x)>=0).count(); System.out.println(n+" "+"abc".indexOf('c')+" "+"abc".indexOf("c")+" "+"a1".indexOf(49)); } }
+"####;
+    let expected = r####"4 -1 4 4 2 1 -1 -1 -1 -1
+2 2 2 1
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
