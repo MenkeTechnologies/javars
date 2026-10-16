@@ -1876,7 +1876,9 @@ impl Compiler {
                 // from `Object`. Left untyped, an overloaded call taking it
                 // found no applicable method.
                 let primitive = |ty: &str| wrapper_of(ty).is_some();
-                if primitive(tp) != primitive(ep) && is_reference_type(if primitive(tp) { ep } else { tp }) {
+                if primitive(tp) != primitive(ep)
+                    && is_reference_type(if primitive(tp) { ep } else { tp })
+                {
                     return Some("Object".to_string());
                 }
                 let (tr, er) = (numeric_rank(tp)?, numeric_rank(ep)?);
@@ -5582,8 +5584,10 @@ impl Compiler {
             // An interface that extends `Iterable` declares no `iterator()` of
             // its own, but its static type is just as much an `Iterable`: the
             // call dispatches to the runtime class's method.
-            let user_iterable =
-                self.classes.contains_key(class) && self.is_subclass(class, "Iterable");
+            // A bare `Iterable` (a lambda or method reference assigned to the
+            // interface) is walked through its `iterator()` the same way.
+            let user_iterable = class == "Iterable"
+                || (self.classes.contains_key(class) && self.is_subclass(class, "Iterable"));
             if self.has_instance_method(class, "iterator", 0) || user_iterable {
                 return self.foreach_iterable(ty, name, iter, body, line);
             }
@@ -6937,6 +6941,40 @@ impl Compiler {
         Ok(())
     }
 
+    /// `Iterable.forEach(action)` as the interface's `default` body:
+    /// `for (T x : recv) action.accept(x)`, with `action` evaluated once.
+    fn iterable_for_each(&mut self, recv: &Expr, args: &[Expr], line: u32) -> Result<(), String> {
+        let action = format!("#fe{}", self.temp_counter);
+        self.temp_counter += 1;
+        let each = format!("#fe{}", self.temp_counter);
+        self.temp_counter += 1;
+        let accept = Expr::MethodCall {
+            recv: Box::new(Expr::Var(action.clone())),
+            method: "accept".to_string(),
+            args: vec![Expr::Var(each.clone())],
+            line,
+        };
+        self.stmt(&Stmt::new(
+            line,
+            StmtKind::Local {
+                ty: "Consumer".to_string(),
+                name: action,
+                init: Some(args[0].clone()),
+            },
+        ))?;
+        self.stmt(&Stmt::new(
+            line,
+            StmtKind::ForEach {
+                ty: "var".to_string(),
+                name: each,
+                iter: recv.clone(),
+                body: vec![Stmt::new(line, StmtKind::Expr(accept))],
+            },
+        ))?;
+        self.b.emit(Op::LoadUndef, line);
+        Ok(())
+    }
+
     /// Lower an instance method call `recv.method(args...)`. Dispatch order:
     /// a bare stdlib class receiver (`Math.abs`) → the static-dispatch builtin;
     /// a user-class receiver (resolved by the receiver's static type) → a direct
@@ -7465,6 +7503,19 @@ impl Compiler {
         // because an identity hash for a value type would have been a silently
         // wrong number rather than the compile error it was; for a plain class
         // the identity hash IS `Object`'s specified answer.
+        // A receiver typed as the bare interface (a lambda or a collection held as
+        // an `Iterable`) gets the same default `forEach`.
+        if method == "forEach"
+            && args.len() == 1
+            && self.expr_class(recv).is_none()
+            && self
+                .expr_java_type(recv)
+                .as_deref()
+                .map(|t| t.split('<').next().unwrap_or_default())
+                == Some("Iterable")
+        {
+            return self.iterable_for_each(recv, args, line);
+        }
         if let Some(rc) = self.expr_class(recv) {
             // `Iterable.forEach(action)` is a `default` method, so a user class
             // that implements `Iterable` and declares no `forEach` inherits it:
@@ -7474,35 +7525,7 @@ impl Compiler {
                 && self.is_subclass(&rc, "Iterable")
                 && !self.has_instance_method(&rc, "forEach", 1)
             {
-                let action = format!("#fe{}", self.temp_counter);
-                self.temp_counter += 1;
-                let each = format!("#fe{}", self.temp_counter);
-                self.temp_counter += 1;
-                let accept = Expr::MethodCall {
-                    recv: Box::new(Expr::Var(action.clone())),
-                    method: "accept".to_string(),
-                    args: vec![Expr::Var(each.clone())],
-                    line,
-                };
-                self.stmt(&Stmt::new(
-                    line,
-                    StmtKind::Local {
-                        ty: "Consumer".to_string(),
-                        name: action,
-                        init: Some(args[0].clone()),
-                    },
-                ))?;
-                self.stmt(&Stmt::new(
-                    line,
-                    StmtKind::ForEach {
-                        ty: "var".to_string(),
-                        name: each,
-                        iter: recv.clone(),
-                        body: vec![Stmt::new(line, StmtKind::Expr(accept))],
-                    },
-                ))?;
-                self.b.emit(Op::LoadUndef, line);
-                return Ok(());
+                return self.iterable_for_each(recv, args, line);
             }
             // `Iterator.forEachRemaining(action)` is the interface's `default`
             // body, inherited the same way: `Objects.requireNonNull(action);

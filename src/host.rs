@@ -7014,7 +7014,14 @@ fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) ->
     }
     let through = matches!(
         method,
-        "remove" | "removeObject" | "removeFirstOccurrence" | "removeLastOccurrence" | "removeIf" | "removeAll" | "retainAll" | "clear"
+        "remove"
+            | "removeObject"
+            | "removeFirstOccurrence"
+            | "removeLastOccurrence"
+            | "removeIf"
+            | "removeAll"
+            | "retainAll"
+            | "clear"
     )
     .then(|| map_view_snapshot(recv))
     .flatten();
@@ -8231,6 +8238,11 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
     // An iterator names a *second* heap object, so both its construction and
     // its own methods run outside the exclusive borrow below.
     if method == "iterator" && args.is_empty() {
+        // A lambda assigned to `Iterable` IS its `iterator()`: calling the method
+        // runs the body, which answers the iterator.
+        if closure_meta(recv).is_some() {
+            return invoke_closure(vm, recv, &[]);
+        }
         if let Value::Obj(id) = recv {
             return Value::Obj(heap_alloc(HostObj::Iterator {
                 source: *id,
@@ -11172,9 +11184,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // here (`s.chars().filter(c -> "aeiou".indexOf(c) >= 0)`) is the
         // character itself, not the digits of its decimal rendering. A value
         // that is no code point matches nothing.
-        ("indexOf" | "lastIndexOf", 1 | 2)
-            if matches!(&args[0], Value::Int(i) if u32::try_from(*i).ok().and_then(char::from_u32).is_none()) =>
-        {
+        ("indexOf" | "lastIndexOf", 1 | 2) if matches!(&args[0], Value::Int(i) if u32::try_from(*i).ok().and_then(char::from_u32).is_none()) => {
             Ok(Value::Int(-1))
         }
         ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &needle_arg(&args[0])))),

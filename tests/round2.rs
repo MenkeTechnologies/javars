@@ -997,3 +997,47 @@ none
 {out}");
     assert_eq!(out, expected);
 }
+
+/// A lambda assigned to `Iterable` is its `iterator()`: the enhanced `for` and the default `forEach` walk the iterator the lambda returns (they used to be refused or silently iterate nothing). Expected output from openjdk 27 (Temurin).
+#[test]
+fn lambda_iterable_is_walked_by_for_each_and_foreach() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static Iterable<Integer> range(int n) {
+        return () -> new Iterator<Integer>() {
+            int i = 0;
+            public boolean hasNext() { return i < n; }
+            public Integer next() { return i++ * 10; }
+        };
+    }
+    public static void main(String[] a) {
+        Iterable<Integer> itb = () -> List.of(1, 2, 3).iterator();
+        for (int x : itb) System.out.print(x);
+        System.out.println();
+        for (int x : itb) System.out.print(x + ";");
+        System.out.println();
+        for (Integer v : range(4)) { if (v == 10) continue; System.out.print(v + " "); }
+        System.out.println();
+        Iterable<String> words = List.of("p", "q");
+        for (String w : words) System.out.print(w);
+        System.out.println();
+        itb.forEach(System.out::print);
+        System.out.println();
+        words.forEach(w -> System.out.print(w + "."));
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"123
+1;2;3;
+0 20 30 
+pq
+123
+p.q.
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:
+{out}");
+    assert_eq!(out, expected);
+}
