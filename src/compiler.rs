@@ -1608,7 +1608,9 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } if method == "values" && args.is_empty() => {
-                self.enum_type_ref(recv).map(|c| format!("{c}[]"))
+                self.enum_type_ref(recv)
+                    .map(|c| format!("{c}[]"))
+                    .or_else(|| self.is_rounding_mode_ref(recv).then(|| "RoundingMode[]".to_string()))
             }
             Expr::Call { name, args, line } => match self.implicit_enum_static(name, args, *line) {
                 Some(call) => self.expr_array_type(&call),
@@ -1911,8 +1913,8 @@ impl Compiler {
                 if name == "length" {
                     return Some("int".to_string());
                 }
-                if self.big_integer_constant(e).is_some() {
-                    return Some("BigInteger".to_string());
+                if let Some((_, ty)) = self.library_constant(e) {
+                    return Some(ty.to_string());
                 }
                 if let Some((_, ty)) = self.wrapper_constant_ref(e) {
                     return Some(ty.to_string());
@@ -2029,7 +2031,9 @@ impl Compiler {
                         // type and return the promotion of their arguments —
                         // `abs(int)` is an `int` (and so wraps), `abs(long)` is
                         // not. Unknown argument types leave the result unknown.
-                        if class == "Math" && matches!(method.as_str(), "abs" | "max" | "min") {
+                        if class == "Math" && matches!(method.as_str(),        "scale" | "precision" | "stripTrailingZeros" | "toPlainString" | "unscaledValue"
+        | "toBigInteger" | "plus" | "ulp" | "negate" | "abs" | "signum" | "not" | "bitLength"
+        | "bitCount"| "max" | "min") {
                             let ranks: Option<Vec<u32>> = args
                                 .iter()
                                 .map(|a| self.expr_java_type(a).as_deref().and_then(numeric_rank))
@@ -4594,7 +4598,7 @@ impl Compiler {
         }
         // `BigInteger::add`, `BigInteger::valueOf` — the unbound instance
         // methods and the one static a stream pipeline over big values names.
-        if name == "BigInteger" && !self.classes.contains_key(name) {
+        if matches!(name, "BigInteger" | "BigDecimal") && !self.classes.contains_key(name) {
             if method == "valueOf" {
                 let ps = mk(1);
                 return Ok(Some(lambda(
@@ -4607,7 +4611,7 @@ impl Compiler {
                     },
                 )));
             }
-            if let Some(arity) = biginteger_instance_ref_arity(method) {
+            if let Some(arity) = bignum_instance_ref_arity(method) {
                 let ps = mk(arity + 1);
                 return Ok(Some(lambda(
                     ps.clone(),
@@ -6866,13 +6870,7 @@ impl Compiler {
                     self.b.emit(Op::LoadConst(c), 0);
                 }
                 // `BigInteger.ONE` — the shared constant, built through `valueOf`.
-                else if let Some(n) = self.big_integer_constant(e) {
-                    let call = Expr::MethodCall {
-                        recv: Box::new(Expr::Var("BigInteger".to_string())),
-                        method: "valueOf".to_string(),
-                        args: vec![Expr::Int(n)],
-                        line: 0,
-                    };
+                else if let Some((call, _)) = self.library_constant(e) {
                     self.expr(&call)?;
                 }
                 // `Color.RED` names an enum constant's singleton, not a field of
@@ -9196,22 +9194,52 @@ impl Compiler {
         Ok(())
     }
 
-    /// `BigInteger.ZERO` / `ONE` / `TWO` / `TEN` — the constant's value, when
-    /// `e` names one and no user class shadows `BigInteger`.
-    fn big_integer_constant(&self, e: &Expr) -> Option<i64> {
+    /// Whether `e` names `java.math.RoundingMode` (not shadowed by a user type),
+    /// the one JDK enum javars holds as its constant names.
+    fn is_rounding_mode_ref(&self, e: &Expr) -> bool {
+        matches!(e, Expr::Var(c) if c == "RoundingMode" && !self.classes.contains_key(c) && !self.is_declared_var(c))
+    }
+
+    /// `BigInteger.ONE`, `BigDecimal.TEN`, `MathContext.DECIMAL128` — the shared
+    /// constants of the `java.math` classes, as the call that builds each (so
+    /// the object is made by the same code `valueOf`/`new` use) and its type.
+    /// `None` when `e` names none, or a user class shadows the name.
+    fn library_constant(&self, e: &Expr) -> Option<(Expr, &'static str)> {
         let Expr::Field { recv, name } = e else {
             return None;
         };
-        if !matches!(&**recv, Expr::Var(c) if c == "BigInteger") || self.classes.contains_key("BigInteger") {
+        let Expr::Var(class) = &**recv else {
+            return None;
+        };
+        if self.classes.contains_key(class) || self.is_declared_var(class) {
             return None;
         }
-        match name.as_str() {
-            "ZERO" => Some(0),
-            "ONE" => Some(1),
-            "TWO" => Some(2),
-            "TEN" => Some(10),
-            _ => None,
-        }
+        let (ty, method, arg) = match (class.as_str(), name.as_str()) {
+            ("BigInteger", "ZERO") => ("BigInteger", "valueOf", Expr::Int(0)),
+            ("BigInteger", "ONE") => ("BigInteger", "valueOf", Expr::Int(1)),
+            ("BigInteger", "TWO") => ("BigInteger", "valueOf", Expr::Int(2)),
+            ("BigInteger", "TEN") => ("BigInteger", "valueOf", Expr::Int(10)),
+            ("BigDecimal", "ZERO") => ("BigDecimal", "valueOf", Expr::Int(0)),
+            ("BigDecimal", "ONE") => ("BigDecimal", "valueOf", Expr::Int(1)),
+            ("BigDecimal", "TWO") => ("BigDecimal", "valueOf", Expr::Int(2)),
+            ("BigDecimal", "TEN") => ("BigDecimal", "valueOf", Expr::Int(10)),
+            ("MathContext", "DECIMAL32" | "DECIMAL64" | "DECIMAL128" | "UNLIMITED") => {
+                ("MathContext", "#const", Expr::Str(name.clone()))
+            }
+            (
+                "RoundingMode",
+                "UP" | "DOWN" | "CEILING" | "FLOOR" | "HALF_UP" | "HALF_DOWN" | "HALF_EVEN"
+                | "UNNECESSARY",
+            ) => ("RoundingMode", "#const", Expr::Str(name.clone())),
+            _ => return None,
+        };
+        let call = Expr::MethodCall {
+            recv: Box::new(Expr::Var(ty.to_string())),
+            method: method.to_string(),
+            args: vec![arg],
+            line: 0,
+        };
+        Some((call, ty))
     }
 
     /// `Integer.MAX_VALUE` / `Double.NaN` / `Math.PI` / … — the value and Java
@@ -9851,7 +9879,8 @@ fn qualified_static_class(e: &Expr) -> Option<String> {
 fn is_static_class(name: &str) -> bool {
     matches!(
         name,
-        "Math"
+        "RoundingMode"
+            |         "Math"
             | "StrictMath"
             | "Integer"
             | "Long"
@@ -9894,6 +9923,8 @@ fn is_static_class(name: &str) -> bool {
             | "Matcher"
             | "BitSet"
             | "BigInteger"
+            | "BigDecimal"
+            | "MathContext"
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
@@ -10029,6 +10060,9 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Random", "#new") => "Random",
         ("BitSet", "#new") => "BitSet",
         ("BigInteger", "#new" | "valueOf") => "BigInteger",
+        ("BigDecimal", "#new" | "valueOf") => "BigDecimal",
+        ("MathContext", "#new" | "#const") => "MathContext",
+        ("RoundingMode", "#const" | "valueOf") => "RoundingMode",
         ("StringJoiner", "#new") => "StringJoiner",
         ("AtomicInteger", "#new") => "AtomicInteger",
         ("AtomicLong", "#new") => "AtomicLong",
@@ -10946,11 +10980,13 @@ fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
     })
 }
 
-/// The argument count of the `BigInteger` instance method a method reference
-/// names, when that name has one arity only.
-fn biginteger_instance_ref_arity(method: &str) -> Option<usize> {
+/// The argument count of the `BigInteger`/`BigDecimal` instance method a method
+/// reference names, when that name has one arity only.
+fn bignum_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
-        "negate" | "abs" | "signum" | "sqrt" | "not" | "bitLength" | "bitCount"
+        "scale" | "precision" | "stripTrailingZeros" | "toPlainString" | "unscaledValue" | "toBigInteger"
+        | "plus" | "ulp" |
+        "negate" | "abs" | "signum" | "not" | "bitLength" | "bitCount"
         | "getLowestSetBit" | "intValue" | "longValue" | "doubleValue" | "floatValue"
         | "shortValue" | "byteValue" | "intValueExact" | "longValueExact" | "hashCode"
         | "toString" | "nextProbablePrime" | "toByteArray" => 0,
@@ -10975,6 +11011,8 @@ fn is_host_value_class(name: &str) -> bool {
             | "DoubleSummaryStatistics"
             | "BitSet"
             | "BigInteger"
+            | "BigDecimal"
+            | "MathContext"
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
@@ -11038,6 +11076,28 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("BigInteger", "testBit" | "equals" | "isProbablePrime") => "boolean",
         ("BigInteger", "toString") => "String",
         ("BigInteger", "toByteArray") => "byte[]",
+        (
+            "BigDecimal",
+            "add" | "subtract" | "multiply" | "divide" | "remainder" | "divideToIntegralValue"
+            | "pow" | "sqrt" | "round" | "setScale" | "negate" | "abs" | "plus" | "min" | "max"
+            | "stripTrailingZeros" | "movePointLeft" | "movePointRight" | "scaleByPowerOfTen"
+            | "ulp",
+        ) => "BigDecimal",
+        ("BigDecimal", "divideAndRemainder") => "BigDecimal[]",
+        ("BigDecimal", "unscaledValue" | "toBigInteger" | "toBigIntegerExact") => "BigInteger",
+        (
+            "BigDecimal",
+            "scale" | "precision" | "signum" | "compareTo" | "hashCode" | "intValue"
+            | "intValueExact",
+        ) => "int",
+        ("BigDecimal", "longValue" | "longValueExact") => "long",
+        ("BigDecimal", "doubleValue") => "double",
+        ("BigDecimal", "floatValue") => "float",
+        ("BigDecimal", "equals") => "boolean",
+        ("BigDecimal", "toString" | "toPlainString") => "String",
+        ("MathContext", "getPrecision") => "int",
+        ("RoundingMode", "name" | "toString") => "String",
+        ("RoundingMode", "ordinal" | "compareTo") => "int",
         ("StringJoiner", "add" | "merge" | "setEmptyValue") => "StringJoiner",
         ("StringJoiner", "toString") => "String",
         ("StringJoiner", "length") => "int",

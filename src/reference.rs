@@ -1065,6 +1065,27 @@ pub const REFERENCE: &[Entry] = &[
         "BigInteger f = BigInteger.ONE;\nfor (int i = 2; i <= 25; i++) f = f.multiply(BigInteger.valueOf(i));\nSystem.out.println(f);   // 15511210043330985984000000",
     ),
     (
+        "BigDecimal",
+        "Static Library",
+        "new BigDecimal(String | int | long | double | BigInteger [, MathContext])   |   BigDecimal.valueOf(long [, int scale] | double)   |   BigDecimal.ZERO/ONE/TWO/TEN",
+        "`java.math.BigDecimal`: an unscaled `BigInteger` and a scale. `add`/`subtract`/`multiply`, `divide(x)` (exact, or `Non-terminating decimal expansion`), `divide(x, scale, mode)`, `divide(x, mode)`, `divide(x, mc)` with the JDK's preferred-scale stripping, `remainder`, `divideToIntegralValue`, `pow`, `sqrt(mc)`, `setScale`, `round(mc)`, `stripTrailingZeros`, `movePointLeft`/`movePointRight`, `scaleByPowerOfTen`, `precision`/`scale`/`unscaledValue`, `compareTo` (numeric) against `equals`/`hashCode` (value and scale), `toString` (scientific past six leading zeros), `toPlainString`, the narrowing and `*Exact` conversions. `%f` and `%e` format it from its digits, rounding HALF_UP, never through a `double`.",
+        "BigDecimal p = new BigDecimal(\"19.99\").multiply(BigDecimal.valueOf(3));\nSystem.out.println(p.setScale(1, RoundingMode.HALF_UP));   // 60.0",
+    ),
+    (
+        "MathContext",
+        "Static Library",
+        "new MathContext(int precision [, RoundingMode])   |   MathContext.DECIMAL32/DECIMAL64/DECIMAL128/UNLIMITED",
+        "`java.math.MathContext`: a digit budget and a rounding mode, accepted by `BigDecimal.divide`/`round`/`sqrt`/`add`/`subtract`/`multiply`. `getPrecision`, `getRoundingMode`, and the `precision=7 roundingMode=HALF_EVEN` rendering.",
+        "MathContext mc = new MathContext(5, RoundingMode.DOWN);\nSystem.out.println(new BigDecimal(\"1.23456789\").round(mc));   // 1.2345",
+    ),
+    (
+        "RoundingMode",
+        "Static Library",
+        "RoundingMode.UP | DOWN | CEILING | FLOOR | HALF_UP | HALF_DOWN | HALF_EVEN | UNNECESSARY",
+        "`java.math.RoundingMode`: one canonical object per constant, so `==` is identity; `values()`, `valueOf(String)`, `name()`, `ordinal()`, `compareTo`. `UNNECESSARY` raises `ArithmeticException: Rounding necessary` when any digit would be dropped.",
+        "System.out.println(RoundingMode.valueOf(\"HALF_EVEN\").ordinal());   // 6",
+    ),
+    (
         "Collections.addAll",
         "Collection Statics",
         "boolean Collections.addAll(Collection<T> c, T... elements)",

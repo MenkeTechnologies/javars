@@ -14,6 +14,7 @@ pub mod dap;
 pub mod fdlibm;
 pub mod host;
 pub mod jbig;
+pub mod jbigdec;
 pub mod jbitset;
 pub mod jio;
 pub mod jrandom;

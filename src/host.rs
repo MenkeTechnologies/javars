@@ -510,6 +510,13 @@ enum HostObj {
     Bits(crate::jbitset::BitSet),
     /// A `java.math.BigInteger` (see [`crate::jbig`]); the value lives in [`BIGS`].
     Big,
+    /// A `java.math.BigDecimal` (see [`crate::jbigdec`]); the value lives in [`DECS`].
+    Dec,
+    /// A `java.math.MathContext`.
+    MathCtx(crate::jbigdec::Mc),
+    /// A `java.math.RoundingMode` constant; one object per constant ([`ROUNDING_MODES`]),
+    /// so `==` is the identity the JDK gives an enum.
+    Rounding(crate::jbigdec::Rm),
     /// A `java.util.StringJoiner`.
     Joiner(Box<Joiner>),
     /// An `AtomicInteger`, `AtomicLong` or `AtomicBoolean`.
@@ -1568,6 +1575,262 @@ fn biginteger_static(method: &str, args: &[Value]) -> Option<Result<Value, Fault
     })
 }
 
+/// The `BigDecimal` a handle names; `None` for any other value.
+fn dec_of(v: &Value) -> Option<crate::jbigdec::Dec> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    DECS.with(|d| d.borrow().get(*id as usize)?.clone())
+}
+
+fn alloc_dec(d: crate::jbigdec::Dec) -> Value {
+    let id = heap_alloc(HostObj::Dec);
+    DECS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.resize(id as usize + 1, None);
+        t[id as usize] = Some(d);
+    });
+    Value::Obj(id)
+}
+
+/// The `MathContext` a handle names.
+fn mc_of(v: &Value) -> Option<crate::jbigdec::Mc> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::MathCtx(mc)) => Some(*mc),
+        _ => None,
+    })
+}
+
+/// A `RoundingMode` argument: the constant's name (which is how javars holds
+/// the enum) or the legacy `BigDecimal.ROUND_*` ordinal.
+fn rm_of(v: &Value) -> Option<crate::jbigdec::Rm> {
+    match v {
+        Value::Int(n) => crate::jbigdec::Rm::from_code(*n),
+        Value::Obj(id) => HEAP.with(|h| match h.borrow().get(*id as usize) {
+            Some(HostObj::Rounding(rm)) => Some(*rm),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// The canonical `RoundingMode` object for `rm`.
+fn rounding_mode_value(rm: crate::jbigdec::Rm) -> Value {
+    let known = ROUNDING_MODES.with(|r| r.borrow()[rm as usize]);
+    let id = known.unwrap_or_else(|| {
+        let id = heap_alloc(HostObj::Rounding(rm));
+        ROUNDING_MODES.with(|r| r.borrow_mut()[rm as usize] = Some(id));
+        id
+    });
+    Value::Obj(id)
+}
+
+/// A method call on a `java.math.BigDecimal` receiver; `None` for any other.
+fn bigdecimal_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jbigdec as jd;
+    if let Some(rm) = rm_of(recv).filter(|_| !matches!(recv, Value::Int(_))) {
+        return Some(match (method, args.len()) {
+            ("name", 0) | ("toString", 0) => Ok(Value::str(rm.name().to_string())),
+            ("ordinal", 0) => Ok(Value::Int(rm as i64)),
+            ("equals", 1) => Ok(Value::bool(
+                matches!((recv, &args[0]), (Value::Obj(a), Value::Obj(b)) if a == b),
+            )),
+            ("compareTo", 1) => rm_of(&args[0])
+                .map(|o| Value::Int(rm as i64 - o as i64))
+                .ok_or_else(|| Fault::java("NullPointerException", String::new())),
+            _ => Err(Fault::internal(format!(
+                "javars: unsupported RoundingMode method `{method}` with {} argument(s)",
+                args.len()
+            ))),
+        });
+    }
+    if let Some(mc) = mc_of(recv) {
+        return Some(match (method, args.len()) {
+            ("getPrecision", 0) => Ok(Value::Int(i64::from(mc.precision))),
+            ("getRoundingMode", 0) => Ok(rounding_mode_value(mc.mode)),
+            ("toString", 0) => Ok(Value::str(mc.render())),
+            ("equals", 1) => Ok(Value::bool(mc_of(&args[0]) == Some(mc))),
+            _ => Err(Fault::internal(format!(
+                "javars: unsupported MathContext method `{method}` with {} argument(s)",
+                args.len()
+            ))),
+        });
+    }
+    let me = dec_of(recv)?;
+    let refuse = |(class, msg): crate::jbig::Refusal| Fault::java(class, msg);
+    let npe = || Fault::java("NullPointerException", String::new());
+    let operand = |i: usize| dec_of(&args[i]).ok_or_else(npe);
+    let mode = |i: usize| rm_of(&args[i]).ok_or_else(npe);
+    let ctx = |i: usize| mc_of(&args[i]).ok_or_else(npe);
+    let dec = |r: Result<jd::Dec, crate::jbig::Refusal>| r.map(alloc_dec).map_err(refuse);
+    // `op` then `round(mc)` — the `(BigDecimal, MathContext)` overloads.
+    let with_mc = |r: jd::Dec, i: usize| ctx(i).and_then(|mc| dec(r.round(mc)));
+    let int_arg = |i: usize| args[i].jint();
+    Some(match (method, args.len()) {
+        ("add", 1) => operand(0).map(|o| alloc_dec(me.add(&o))),
+        ("add", 2) => operand(0).and_then(|o| with_mc(me.add(&o), 1)),
+        ("subtract", 1) => operand(0).map(|o| alloc_dec(me.subtract(&o))),
+        ("subtract", 2) => operand(0).and_then(|o| with_mc(me.subtract(&o), 1)),
+        ("multiply", 1) => operand(0).map(|o| alloc_dec(me.multiply(&o))),
+        ("multiply", 2) => operand(0).and_then(|o| with_mc(me.multiply(&o), 1)),
+        ("divide", 1) => operand(0).and_then(|o| dec(me.divide_exact(&o))),
+        ("divide", 2) => operand(0).and_then(|o| match mc_of(&args[1]) {
+            Some(mc) => dec(me.divide_with(&o, mc)),
+            None => mode(1).and_then(|m| dec(me.divide_scale(&o, me.scale, m))),
+        }),
+        ("divide", 3) => operand(0).and_then(|o| {
+            mode(2).and_then(|m| dec(me.divide_scale(&o, int_arg(1), m)))
+        }),
+        ("divideToIntegralValue", 1) => operand(0).and_then(|o| dec(me.divide_to_integral(&o))),
+        ("remainder", 1) => operand(0).and_then(|o| dec(me.remainder(&o))),
+        ("divideAndRemainder", 1) => operand(0).and_then(|o| {
+            let q = me.divide_to_integral(&o).map_err(refuse)?;
+            let r = me.subtract(&q.multiply(&o));
+            Ok(Value::Obj(heap_alloc(HostObj::Array(vec![
+                alloc_dec(q),
+                alloc_dec(r),
+            ]))))
+        }),
+        ("pow", 1) => dec(me.pow(int_arg(0))),
+        ("sqrt", 1) => ctx(0).and_then(|mc| dec(me.sqrt(mc))),
+        ("round", 1) => ctx(0).and_then(|mc| dec(me.round(mc))),
+        ("setScale", 1) => dec(me.set_scale(int_arg(0), jd::Rm::Unnecessary)),
+        ("setScale", 2) => mode(1).and_then(|m| dec(me.set_scale(int_arg(0), m))),
+        ("negate", 0) => Ok(alloc_dec(me.negate())),
+        ("abs", 0) => Ok(alloc_dec(me.abs())),
+        ("plus", 0) => Ok(alloc_dec(me)),
+        ("negate", 1) => ctx(0).and_then(|mc| dec(me.negate().round(mc))),
+        ("abs", 1) => ctx(0).and_then(|mc| dec(me.abs().round(mc))),
+        ("plus", 1) => ctx(0).and_then(|mc| dec(me.round(mc))),
+        ("min", 1) => operand(0).map(|o| {
+            alloc_dec(if me.compare(&o) == std::cmp::Ordering::Greater {
+                o
+            } else {
+                me
+            })
+        }),
+        ("max", 1) => operand(0).map(|o| {
+            alloc_dec(if me.compare(&o) == std::cmp::Ordering::Less {
+                o
+            } else {
+                me
+            })
+        }),
+        ("stripTrailingZeros", 0) => Ok(alloc_dec(me.strip_trailing_zeros())),
+        ("movePointLeft", 1) => Ok(alloc_dec(me.move_point(-int_arg(0)))),
+        ("movePointRight", 1) => Ok(alloc_dec(me.move_point(int_arg(0)))),
+        ("scaleByPowerOfTen", 1) => Ok(alloc_dec(jd::Dec::new(
+            me.unscaled.clone(),
+            me.scale - int_arg(0),
+        ))),
+        ("ulp", 0) => Ok(alloc_dec(me.ulp())),
+        ("scale", 0) => Ok(Value::Int(me.scale)),
+        ("precision", 0) => Ok(Value::Int(me.precision() as i64)),
+        ("signum", 0) => Ok(Value::Int(i64::from(me.signum()))),
+        ("unscaledValue", 0) => Ok(alloc_big(me.unscaled)),
+        ("toBigInteger", 0) => me
+            .to_big_integer(jd::Rm::Down)
+            .map(alloc_big)
+            .map_err(refuse),
+        ("toBigIntegerExact", 0) => me
+            .to_big_integer(jd::Rm::Unnecessary)
+            .map(alloc_big)
+            .map_err(refuse),
+        ("compareTo", 1) => operand(0).map(|o| Value::Int(me.compare(&o) as i64)),
+        ("equals", 1) => Ok(Value::bool(dec_of(&args[0]).is_some_and(|o| o == me))),
+        ("hashCode", 0) => Ok(Value::Int(i64::from(me.hash()))),
+        ("toString", 0) => Ok(Value::str(me.render())),
+        ("toPlainString", 0) => Ok(Value::str(me.plain())),
+        ("intValue", 0) => me
+            .to_big_integer(jd::Rm::Down)
+            .map(|b| Value::Int(i64::from(crate::jbig::int_value(&b))))
+            .map_err(refuse),
+        ("longValue", 0) => me
+            .to_big_integer(jd::Rm::Down)
+            .map(|b| Value::Int(crate::jbig::long_value(&b)))
+            .map_err(refuse),
+        ("intValueExact", 0) => jd::exact_i64(&me, 32).map(Value::Int).map_err(refuse),
+        ("longValueExact", 0) => jd::exact_i64(&me, 64).map(Value::Int).map_err(refuse),
+        ("doubleValue", 0) => Ok(Value::float(me.double_value())),
+        ("floatValue", 0) => Ok(Value::float(f64::from(me.double_value() as f32))),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported BigDecimal method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
+}
+
+/// Static calls on `BigDecimal` (`valueOf`, the constructors) and
+/// `MathContext` (constructor and constants). `None` for any other class.
+fn bigdecimal_static(class: &str, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jbigdec as jd;
+    let refuse = |(class, msg): crate::jbig::Refusal| Fault::java(class, msg);
+    let npe = || Fault::java("NullPointerException", String::new());
+    let mc_alloc = |mc: jd::Mc| Value::Obj(heap_alloc(HostObj::MathCtx(mc)));
+    let rounded = |d: jd::Dec, mc: Option<jd::Mc>| match mc {
+        Some(mc) => d.round(mc),
+        None => Ok(d),
+    };
+    Some(match (class, method, args) {
+        ("RoundingMode", "values", []) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+            jd::Rm::NAMES
+                .iter()
+                .filter_map(|n| jd::Rm::from_name(n))
+                .map(rounding_mode_value)
+                .collect(),
+        )))),
+        ("RoundingMode", "#const", [Value::Str(name)]) | ("RoundingMode", "valueOf", [Value::Str(name)]) => match jd::Rm::from_name(name) {
+            Some(rm) => Ok(rounding_mode_value(rm)),
+            None => Err(Fault::java(
+                "IllegalArgumentException",
+                format!("No enum constant java.math.RoundingMode.{name}"),
+            )),
+        },
+        ("MathContext", "#const", [Value::Str(name)]) => jd::Mc::constant(name)
+            .map(mc_alloc)
+            .ok_or_else(|| Fault::internal(format!("javars: unknown MathContext.{name}"))),
+        ("MathContext", "#new", [p]) => jd::Mc::new(p.jint(), jd::Rm::HalfUp)
+            .map(mc_alloc)
+            .map_err(refuse),
+        ("MathContext", "#new", [p, m]) => rm_of(m).ok_or_else(npe).and_then(|m| {
+            jd::Mc::new(p.jint(), m).map(mc_alloc).map_err(refuse)
+        }),
+        ("BigDecimal", "valueOf", [Value::Float(d)]) => {
+            jd::Dec::parse(&format_double(*d)).map(alloc_dec).map_err(refuse)
+        }
+        ("BigDecimal", "valueOf", [n]) => Ok(alloc_dec(jd::Dec::from_int(num_bigint::BigInt::from(n.jint())))),
+        ("BigDecimal", "valueOf", [n, s]) => Ok(alloc_dec(jd::Dec::new(
+            num_bigint::BigInt::from(n.jint()),
+            s.jint(),
+        ))),
+        ("BigDecimal", "#new", [v]) | ("BigDecimal", "#new", [v, _]) => {
+            let mc = args.get(1).and_then(mc_of);
+            if args.len() == 2 && mc.is_none() {
+                // `new BigDecimal(BigInteger, scale)`.
+                return Some(match big_of(v) {
+                    Some(b) => Ok(alloc_dec(jd::Dec::new(b, args[1].jint()))),
+                    None => Err(npe()),
+                });
+            }
+            let d = match v {
+                Value::Str(s) => jd::Dec::parse(s),
+                Value::Float(f) => jd::Dec::from_f64(*f),
+                Value::Int(n) => Ok(jd::Dec::from_int(num_bigint::BigInt::from(*n))),
+                Value::Obj(_) => match big_of(v) {
+                    Some(b) => Ok(jd::Dec::from_int(b)),
+                    None => return Some(Err(npe())),
+                },
+                _ => return Some(Err(npe())),
+            };
+            d.and_then(|d| rounded(d, mc)).map(alloc_dec).map_err(refuse)
+        }
+        _ => return None,
+    })
+}
+
 /// Run `f` on the summary statistics a handle names; `None` for any other
 /// value.
 fn with_stats<R>(v: &Value, f: impl FnOnce(&mut SummaryStats) -> R) -> Option<R> {
@@ -1689,6 +1952,10 @@ fn index_key(v: &Value) -> Option<IndexKey> {
             None if as_optional_full(v).is_some() => return None,
             // A `BigInteger` buckets by its digits; `value_eq` confirms.
             None if big_of(v).is_some() => IndexKey::Str(format!("\u{0}big{}", big_of(v)?)),
+            None if dec_of(v).is_some() => {
+                let d = dec_of(v)?;
+                IndexKey::Str(format!("\u{0}dec{}e{}", d.unscaled, d.scale))
+            }
             None => IndexKey::Obj(*id),
         },
         Value::Undef => IndexKey::Null,
@@ -1986,6 +2253,10 @@ thread_local! {
     /// Every live `BigInteger`: handle -> value. A side table for the reason
     /// [`BOXES`] is one: the collection index reads it while `HEAP` is borrowed.
     static BIGS: RefCell<Vec<Option<num_bigint::BigInt>>> = const { RefCell::new(Vec::new()) };
+    /// Every live `BigDecimal`, by handle, for the reason [`BIGS`] is one.
+    static DECS: RefCell<Vec<Option<crate::jbigdec::Dec>>> = const { RefCell::new(Vec::new()) };
+    /// The one heap object of each `RoundingMode` constant, by ordinal.
+    static ROUNDING_MODES: RefCell<[Option<u32>; 8]> = const { RefCell::new([None; 8]) };
     /// Every live `Map.Entry`: handle -> the pair and the map it belongs to.
     ///
     /// Separate from `HEAP` for the reason [`HostObj::Entry`] gives, and
@@ -2262,6 +2533,8 @@ pub fn heap_reset() {
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
     BIGS.with(|b| b.borrow_mut().clear());
+    DECS.with(|b| b.borrow_mut().clear());
+    ROUNDING_MODES.with(|r| *r.borrow_mut() = [None; 8]);
     PAIRS.with(|p| p.borrow_mut().clear());
     OPTIONALS.with(|o| o.borrow_mut().clear());
     // Keyed by heap handle like the caches above, so it goes with the heap for
@@ -2453,6 +2726,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // `Long.valueOf(1) instanceof Number` has a class to walk from.
         "Integer" | "Double" | "Long" | "Short" | "Byte" | "Float" => &["Number", "Comparable"],
         "BigInteger" => &["Number", "Comparable"],
+        "BigDecimal" => &["Number", "Comparable"],
+        "MathContext" => &["Serializable"],
+        "RoundingMode" => &["Enum"],
         "Number" => &["Serializable"],
         "Boolean" | "Character" => &["Comparable", "Serializable"],
         "Enum" => &["Comparable", "Serializable"],
@@ -3162,12 +3438,14 @@ fn rank_compare(vm: &mut VM, cmp: &Value, a: &Value, b: &Value) -> Option<i64> {
     (!pending()).then_some(n)
 }
 
-/// Whether `v` is a user object that orders itself — its class declares (or
-/// inherits) a one-argument `compareTo`.
+/// Whether `v` orders itself in a way `equals` does not mirror: a user object
+/// whose class declares (or inherits) a one-argument `compareTo`, or a
+/// `BigDecimal`, whose `2.0` and `2.00` compare equal and are not `equals`.
 fn self_ordering(vm: &VM, v: &Value) -> bool {
-    instance_class(v)
-        .and_then(|c| method_entry(vm, &c, "compareTo"))
-        .is_some_and(|(_, arity)| arity == 1)
+    dec_of(v).is_some()
+        || instance_class(v)
+            .and_then(|c| method_entry(vm, &c, "compareTo"))
+            .is_some_and(|(_, arity)| arity == 1)
 }
 
 /// A value that can be called as a functional interface: a lambda, or an
@@ -3275,6 +3553,9 @@ fn java_hash(v: &Value) -> Option<i32> {
     }
     if let Some(b) = big_of(v) {
         return Some(crate::jbig::hash(&b));
+    }
+    if let Some(d) = dec_of(v) {
+        return Some(d.hash());
     }
     Some(match v {
         // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
@@ -4895,6 +5176,10 @@ fn value_eq(a: &Value, b: &Value) -> bool {
                 (x, y) => x.is_none() && y.is_none(),
             };
     }
+    // `BigDecimal.equals` compares the value and the scale.
+    if let (Some(x), Some(y)) = (dec_of(a), dec_of(b)) {
+        return x == y;
+    }
     // `BigInteger.equals` is a value comparison.
     if let (Some(x), Some(y)) = (big_of(a), big_of(b)) {
         return x == y;
@@ -5383,6 +5668,9 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     let (a, b) = (&deboxed(a), &deboxed(b));
     if let (Some(x), Some(y)) = (big_of(a), big_of(b)) {
         return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (dec_of(a), dec_of(b)) {
+        return x.compare(&y);
     }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
@@ -6753,6 +7041,9 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
                     HostObj::Bits(_) => "java.util.BitSet".to_string(),
                     HostObj::Big => "BigInteger".to_string(),
+                    HostObj::Dec => "BigDecimal".to_string(),
+                    HostObj::MathCtx(_) => "MathContext".to_string(),
+                    HostObj::Rounding(_) => "RoundingMode".to_string(),
                     HostObj::Joiner(_) => "java.util.StringJoiner".to_string(),
                     HostObj::Atomic { kind, .. } => match kind {
                         AtomicKind::Int => "java.util.concurrent.atomic.AtomicInteger",
@@ -10767,6 +11058,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = bigdecimal_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = biginteger_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -11130,6 +11427,9 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
     if let (Some(x), Some(y)) = (big_of(&a), big_of(&b)) {
         return Value::Int(x.cmp(&y) as i64);
+    }
+    if let (Some(x), Some(y)) = (dec_of(&a), dec_of(&b)) {
+        return Value::Int(x.compare(&y) as i64);
     }
     // Java's own `Integer.compareTo(null)` is an NPE, and so is a call on a
     // `null` receiver. Both report the same way every other javars NPE does.
@@ -11656,6 +11956,14 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    if matches!(class.as_ref(), "BigDecimal" | "MathContext" | "RoundingMode") {
+        if let Some(r) = bigdecimal_static(&class, &method, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(f) => raise(vm, f),
+            };
+        }
+    }
     if class == "BigInteger" {
         if let Some(r) = biginteger_static(&method, &args) {
             return match r {
@@ -16933,6 +17241,57 @@ fn format_conversion(
         body,
         numeric: true,
     };
+    // `Formatter.print(BigDecimal)` for `%f`: rounded HALF_UP at the precision
+    // from the exact decimal value, never through a `double`.
+    if let (Some(d), 'f') = (dec_of(arg), conv) {
+        if let Ok(r) = d.set_scale(prec.unwrap_or(6) as i64, crate::jbigdec::Rm::HalfUp) {
+            let mut body = r.abs().plain();
+            if flags.alt && !body.contains('.') {
+                body.push('.');
+            }
+            let prefix = if d.signum() < 0 {
+                "-".to_string()
+            } else {
+                pos_sign().to_string()
+            };
+            return Ok(num(prefix, body));
+        }
+    }
+    // `%e` of a `BigDecimal` is likewise exact: round HALF_UP to `prec + 1`
+    // significant digits, then lay out `d.ddde+XX`.
+    if let (Some(d), 'e' | 'E') = (dec_of(arg), conv) {
+        let p = prec.unwrap_or(6);
+        let mc = crate::jbigdec::Mc {
+            precision: (p + 1) as u32,
+            mode: crate::jbigdec::Rm::HalfUp,
+        };
+        if let Ok(r) = d.round(mc) {
+            let mut digits = r.unscaled.magnitude().to_string();
+            let exp = if d.signum() == 0 {
+                0
+            } else {
+                digits.len() as i64 - 1 - r.scale
+            };
+            while digits.len() < p + 1 {
+                digits.push('0');
+            }
+            let mut body = digits[..1].to_string();
+            if p > 0 || flags.alt {
+                body.push('.');
+            }
+            body.push_str(&digits[1..p + 1]);
+            body.push_str(&format!("e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs()));
+            if conv == 'E' {
+                body = body.to_uppercase();
+            }
+            let prefix = if d.signum() < 0 {
+                "-".to_string()
+            } else {
+                pos_sign().to_string()
+            };
+            return Ok(num(prefix, body));
+        }
+    }
     // A `BigInteger` is formatted from its digits (`Formatter.print(BigInteger)`):
     // `%d` and the radix conversions all write the magnitude behind a sign, so
     // `%x` of -255 is `-ff`, not a two's-complement pattern.
@@ -18150,6 +18509,9 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Bits(b)) => b.render(),
             Some(HostObj::Big) => big_of(&Value::Obj(id)).map(|b| b.to_string()).unwrap_or_default(),
+            Some(HostObj::Dec) => dec_of(&Value::Obj(id)).map(|d| d.render()).unwrap_or_default(),
+            Some(HostObj::MathCtx(mc)) => mc.render(),
+            Some(HostObj::Rounding(rm)) => rm.name().to_string(),
             Some(HostObj::Joiner(j)) => j.render(),
             Some(HostObj::Atomic { value, .. }) => java_str(value),
             // `Pattern.toString()` is its source; `Matcher.toString()` names the
@@ -18917,6 +19279,9 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
         "[]" => return None,
         qualified if qualified.starts_with("java.") => qualified.to_string(),
         "BigInteger" => "java.math.BigInteger".to_string(),
+        "BigDecimal" => "java.math.BigDecimal".to_string(),
+        "MathContext" => "java.math.MathContext".to_string(),
+        "RoundingMode" => "java.math.RoundingMode".to_string(),
         "List$fixed" => "java.util.Arrays$ArrayList".to_string(),
         "Collection$view" => "java.util.Collections$UnmodifiableCollection".to_string(),
         "List$immutable" => match len() {

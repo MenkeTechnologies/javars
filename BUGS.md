@@ -1356,12 +1356,21 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   modeled (a read or overwrite moves the entry to the end); only the flag's
   literal `true`/`false` is accepted.
 - **Whole library areas that are not modeled are refused by name**, never run
-  with a guessed meaning: `java.math.BigDecimal`, `java.time`,
+  with a guessed meaning: `java.time`,
   threads and executors (`Thread`, `Executors`, `ConcurrentHashMap`), `UUID`,
   `Locale`, `Runtime`, and `System.getProperty`. Each is
   ``javars: unknown class `X` `` or ``cannot find symbol: `X` `` at the first
   use, so a program that needs one fails at compile time rather than printing a
   wrong answer.
+- **`java.math` is modeled except for a few corners.** `BigInteger`, `BigDecimal`,
+  `MathContext` and `RoundingMode` follow the JDK's arithmetic, preferred
+  scales, rendering and exception messages. Not covered: `BigDecimal.pow(n, mc)`,
+  `toEngineeringString`, the legacy `BigDecimal.ROUND_*` constants,
+  `BigInteger.probablePrime` and the `Random`-taking constructors, `%g` of a
+  `BigDecimal`, and non-ASCII digits in a numeric string. A `RoundingMode` is
+  accepted and printed but cannot be a `switch` selector. `isProbablePrime` is a
+  deterministic Miller-Rabin test over fixed bases rather than the JDK's
+  randomized one, so the two agree except on contrived pseudoprimes.
 - **A `char` element is two things in a collection.** One built from a literal or
   `charAt` is held as a one-character string; one from `mapToObj(c -> (char) c)`
   or `Character.valueOf` is a code point. Lookups that mix the two

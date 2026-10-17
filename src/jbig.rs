@@ -175,7 +175,8 @@ pub fn long_value(a: &BigInt) -> i64 {
 }
 
 pub fn int_value_exact(a: &BigInt) -> Result<i32, Refusal> {
-    a.to_i32().ok_or_else(|| arith("BigInteger out of int range"))
+    a.to_i32()
+        .ok_or_else(|| arith("BigInteger out of int range"))
 }
 
 pub fn long_value_exact(a: &BigInt) -> Result<i64, Refusal> {
@@ -208,9 +209,7 @@ pub fn bit_count(a: &BigInt) -> u64 {
 }
 
 pub fn lowest_set_bit(a: &BigInt) -> i64 {
-    a.magnitude()
-        .trailing_zeros()
-        .map_or(-1, |z| z as i64)
+    a.magnitude().trailing_zeros().map_or(-1, |z| z as i64)
 }
 
 fn bit_index(n: i64) -> Result<u64, Refusal> {
@@ -255,7 +254,10 @@ pub fn hash(a: &BigInt) -> i32 {
 
 /// `toByteArray`: big-endian two's complement, minimal length.
 pub fn to_bytes(a: &BigInt) -> Vec<i8> {
-    a.to_signed_bytes_be().into_iter().map(|b| b as i8).collect()
+    a.to_signed_bytes_be()
+        .into_iter()
+        .map(|b| b as i8)
+        .collect()
 }
 
 /// `new BigInteger(byte[])`: big-endian two's complement.
