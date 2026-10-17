@@ -1607,11 +1607,13 @@ impl Compiler {
             // `Color.values()` hands back a `Color[]`.
             Expr::MethodCall {
                 recv, method, args, ..
-            } if method == "values" && args.is_empty() => {
-                self.enum_type_ref(recv)
-                    .map(|c| format!("{c}[]"))
-                    .or_else(|| self.is_rounding_mode_ref(recv).then(|| "RoundingMode[]".to_string()))
-            }
+            } if method == "values" && args.is_empty() => self
+                .enum_type_ref(recv)
+                .map(|c| format!("{c}[]"))
+                .or_else(|| {
+                    self.is_rounding_mode_ref(recv)
+                        .then(|| "RoundingMode[]".to_string())
+                }),
             Expr::Call { name, args, line } => match self.implicit_enum_static(name, args, *line) {
                 Some(call) => self.expr_array_type(&call),
                 None => self.expr_java_type(e).filter(|t| t.ends_with("[]")),
@@ -2031,9 +2033,27 @@ impl Compiler {
                         // type and return the promotion of their arguments —
                         // `abs(int)` is an `int` (and so wraps), `abs(long)` is
                         // not. Unknown argument types leave the result unknown.
-                        if class == "Math" && matches!(method.as_str(),        "scale" | "precision" | "stripTrailingZeros" | "toPlainString" | "unscaledValue"
-        | "toBigInteger" | "plus" | "ulp" | "negate" | "abs" | "signum" | "not" | "bitLength"
-        | "bitCount"| "max" | "min") {
+                        if class == "Math"
+                            && matches!(
+                                method.as_str(),
+                                "scale"
+                                    | "precision"
+                                    | "stripTrailingZeros"
+                                    | "toPlainString"
+                                    | "unscaledValue"
+                                    | "toBigInteger"
+                                    | "plus"
+                                    | "ulp"
+                                    | "negate"
+                                    | "abs"
+                                    | "signum"
+                                    | "not"
+                                    | "bitLength"
+                                    | "bitCount"
+                                    | "max"
+                                    | "min"
+                            )
+                        {
                             let ranks: Option<Vec<u32>> = args
                                 .iter()
                                 .map(|a| self.expr_java_type(a).as_deref().and_then(numeric_rank))
@@ -10984,12 +11004,11 @@ fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
 /// reference names, when that name has one arity only.
 fn bignum_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
-        "scale" | "precision" | "stripTrailingZeros" | "toPlainString" | "unscaledValue" | "toBigInteger"
-        | "plus" | "ulp" |
-        "negate" | "abs" | "signum" | "not" | "bitLength" | "bitCount"
-        | "getLowestSetBit" | "intValue" | "longValue" | "doubleValue" | "floatValue"
-        | "shortValue" | "byteValue" | "intValueExact" | "longValueExact" | "hashCode"
-        | "toString" | "nextProbablePrime" | "toByteArray" => 0,
+        "scale" | "precision" | "stripTrailingZeros" | "toPlainString" | "unscaledValue"
+        | "toBigInteger" | "plus" | "ulp" | "negate" | "abs" | "signum" | "not" | "bitLength"
+        | "bitCount" | "getLowestSetBit" | "intValue" | "longValue" | "doubleValue"
+        | "floatValue" | "shortValue" | "byteValue" | "intValueExact" | "longValueExact"
+        | "hashCode" | "toString" | "nextProbablePrime" | "toByteArray" => 0,
         "add" | "subtract" | "multiply" | "divide" | "remainder" | "mod" | "pow" | "gcd"
         | "min" | "max" | "compareTo" | "equals" | "and" | "or" | "xor" | "andNot"
         | "shiftLeft" | "shiftRight" | "testBit" | "setBit" | "clearBit" | "flipBit"
@@ -11078,9 +11097,25 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("BigInteger", "toByteArray") => "byte[]",
         (
             "BigDecimal",
-            "add" | "subtract" | "multiply" | "divide" | "remainder" | "divideToIntegralValue"
-            | "pow" | "sqrt" | "round" | "setScale" | "negate" | "abs" | "plus" | "min" | "max"
-            | "stripTrailingZeros" | "movePointLeft" | "movePointRight" | "scaleByPowerOfTen"
+            "add"
+            | "subtract"
+            | "multiply"
+            | "divide"
+            | "remainder"
+            | "divideToIntegralValue"
+            | "pow"
+            | "sqrt"
+            | "round"
+            | "setScale"
+            | "negate"
+            | "abs"
+            | "plus"
+            | "min"
+            | "max"
+            | "stripTrailingZeros"
+            | "movePointLeft"
+            | "movePointRight"
+            | "scaleByPowerOfTen"
             | "ulp",
         ) => "BigDecimal",
         ("BigDecimal", "divideAndRemainder") => "BigDecimal[]",

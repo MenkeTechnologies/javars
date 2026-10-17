@@ -1488,9 +1488,9 @@ fn biginteger_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
             ]))))
         }),
         ("pow", 1) => big(jb::pow(&me, int_arg(0))),
-        ("modPow", 2) => operand(0).and_then(|e| {
-            operand(1).and_then(|m| big(jb::mod_pow(&me, &e, &m)))
-        }),
+        ("modPow", 2) => {
+            operand(0).and_then(|e| operand(1).and_then(|m| big(jb::mod_pow(&me, &e, &m))))
+        }
         ("modInverse", 1) => operand(0).and_then(|m| big(jb::mod_inverse(&me, &m))),
         ("gcd", 1) => operand(0).map(|o| alloc_big(num_integer::Integer::gcd(&me, &o))),
         ("min", 1) => operand(0).map(|o| alloc_big(me.min(o))),
@@ -1510,7 +1510,9 @@ fn biginteger_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
         ("not", 0) => Ok(alloc_big(!me)),
         ("shiftLeft", 1) => Ok(alloc_big(jb::shift(&me, int_arg(0)))),
         ("shiftRight", 1) => Ok(alloc_big(jb::shift(&me, -int_arg(0)))),
-        ("testBit", 1) => jb::test_bit(&me, int_arg(0)).map(Value::bool).map_err(refuse),
+        ("testBit", 1) => jb::test_bit(&me, int_arg(0))
+            .map(Value::bool)
+            .map_err(refuse),
         ("setBit", 1) => big(jb::set_bit(&me, int_arg(0), Some(true))),
         ("clearBit", 1) => big(jb::set_bit(&me, int_arg(0), Some(false))),
         ("flipBit", 1) => big(jb::set_bit(&me, int_arg(0), None)),
@@ -1681,9 +1683,9 @@ fn bigdecimal_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
             Some(mc) => dec(me.divide_with(&o, mc)),
             None => mode(1).and_then(|m| dec(me.divide_scale(&o, me.scale, m))),
         }),
-        ("divide", 3) => operand(0).and_then(|o| {
-            mode(2).and_then(|m| dec(me.divide_scale(&o, int_arg(1), m)))
-        }),
+        ("divide", 3) => {
+            operand(0).and_then(|o| mode(2).and_then(|m| dec(me.divide_scale(&o, int_arg(1), m))))
+        }
         ("divideToIntegralValue", 1) => operand(0).and_then(|o| dec(me.divide_to_integral(&o))),
         ("remainder", 1) => operand(0).and_then(|o| dec(me.remainder(&o))),
         ("divideAndRemainder", 1) => operand(0).and_then(|o| {
@@ -1782,7 +1784,8 @@ fn bigdecimal_static(class: &str, method: &str, args: &[Value]) -> Option<Result
                 .map(rounding_mode_value)
                 .collect(),
         )))),
-        ("RoundingMode", "#const", [Value::Str(name)]) | ("RoundingMode", "valueOf", [Value::Str(name)]) => match jd::Rm::from_name(name) {
+        ("RoundingMode", "#const", [Value::Str(name)])
+        | ("RoundingMode", "valueOf", [Value::Str(name)]) => match jd::Rm::from_name(name) {
             Some(rm) => Ok(rounding_mode_value(rm)),
             None => Err(Fault::java(
                 "IllegalArgumentException",
@@ -1795,13 +1798,15 @@ fn bigdecimal_static(class: &str, method: &str, args: &[Value]) -> Option<Result
         ("MathContext", "#new", [p]) => jd::Mc::new(p.jint(), jd::Rm::HalfUp)
             .map(mc_alloc)
             .map_err(refuse),
-        ("MathContext", "#new", [p, m]) => rm_of(m).ok_or_else(npe).and_then(|m| {
-            jd::Mc::new(p.jint(), m).map(mc_alloc).map_err(refuse)
-        }),
-        ("BigDecimal", "valueOf", [Value::Float(d)]) => {
-            jd::Dec::parse(&format_double(*d)).map(alloc_dec).map_err(refuse)
-        }
-        ("BigDecimal", "valueOf", [n]) => Ok(alloc_dec(jd::Dec::from_int(num_bigint::BigInt::from(n.jint())))),
+        ("MathContext", "#new", [p, m]) => rm_of(m)
+            .ok_or_else(npe)
+            .and_then(|m| jd::Mc::new(p.jint(), m).map(mc_alloc).map_err(refuse)),
+        ("BigDecimal", "valueOf", [Value::Float(d)]) => jd::Dec::parse(&format_double(*d))
+            .map(alloc_dec)
+            .map_err(refuse),
+        ("BigDecimal", "valueOf", [n]) => Ok(alloc_dec(jd::Dec::from_int(
+            num_bigint::BigInt::from(n.jint()),
+        ))),
         ("BigDecimal", "valueOf", [n, s]) => Ok(alloc_dec(jd::Dec::new(
             num_bigint::BigInt::from(n.jint()),
             s.jint(),
@@ -1825,7 +1830,9 @@ fn bigdecimal_static(class: &str, method: &str, args: &[Value]) -> Option<Result
                 },
                 _ => return Some(Err(npe())),
             };
-            d.and_then(|d| rounded(d, mc)).map(alloc_dec).map_err(refuse)
+            d.and_then(|d| rounded(d, mc))
+                .map(alloc_dec)
+                .map_err(refuse)
         }
         _ => return None,
     })
@@ -11956,7 +11963,10 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
-    if matches!(class.as_ref(), "BigDecimal" | "MathContext" | "RoundingMode") {
+    if matches!(
+        class.as_ref(),
+        "BigDecimal" | "MathContext" | "RoundingMode"
+    ) {
         if let Some(r) = bigdecimal_static(&class, &method, &args) {
             return match r {
                 Ok(v) => v,
@@ -17280,7 +17290,11 @@ fn format_conversion(
                 body.push('.');
             }
             body.push_str(&digits[1..p + 1]);
-            body.push_str(&format!("e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs()));
+            body.push_str(&format!(
+                "e{}{:02}",
+                if exp < 0 { '-' } else { '+' },
+                exp.abs()
+            ));
             if conv == 'E' {
                 body = body.to_uppercase();
             }
@@ -18508,8 +18522,12 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Bits(b)) => b.render(),
-            Some(HostObj::Big) => big_of(&Value::Obj(id)).map(|b| b.to_string()).unwrap_or_default(),
-            Some(HostObj::Dec) => dec_of(&Value::Obj(id)).map(|d| d.render()).unwrap_or_default(),
+            Some(HostObj::Big) => big_of(&Value::Obj(id))
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            Some(HostObj::Dec) => dec_of(&Value::Obj(id))
+                .map(|d| d.render())
+                .unwrap_or_default(),
             Some(HostObj::MathCtx(mc)) => mc.render(),
             Some(HostObj::Rounding(rm)) => rm.name().to_string(),
             Some(HostObj::Joiner(j)) => j.render(),

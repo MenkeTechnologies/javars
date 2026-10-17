@@ -57,7 +57,9 @@ public class Y {
 "####;
     let (out, ok) = run(src, "Y");
     assert!(ok);
-    assert_eq!(out, r####"[] java.lang.NumberFormatException: null
+    assert_eq!(
+        out,
+        r####"[] java.lang.NumberFormatException: null
 [abc] java.lang.NumberFormatException: Character a is neither a decimal digit number, decimal point, nor "e" notation exponential mark.
 [1e] java.lang.NumberFormatException: null
 [1.2.3] java.lang.NumberFormatException: Character array contains more than one decimal point.
@@ -99,7 +101,8 @@ precision=16 roundingMode=HALF_EVEN precision=5 roundingMode=DOWN HALF_UP 0
 2.5 0.125 2.0E+2 0.50 5E+2 3 0.3333333333333333333333333333333333 0.667 10
 123.46|   123.456|123.456|1,234,567.90|7.890000|1.234560e+02|3
 123.456 7.89 11 0 2 123.45 12345 12 12 131.3 974.1
-"####);
+"####
+    );
 }
 
 /// Natural ordering, hash and tree containers, stream reduction, currency arithmetic, `RoundingMode` identity.
@@ -136,7 +139,9 @@ static void switchTest(RoundingMode r) { System.out.println(r == RoundingMode.HA
 "####;
     let (out, ok) = run(src, "B1");
     assert!(ok);
-    assert_eq!(out, r####"[-1.25, 2.50, 2.5, 10]
+    assert_eq!(
+        out,
+        r####"[-1.25, 2.50, 2.5, 10]
 13.75
 [-10, -2.50, -2.5, 1.25]
 10 13.75
@@ -154,7 +159,8 @@ hu
 2
 28 true
 2.001       -0.1 1E+3
-"####);
+"####
+    );
 }
 
 /// Several thousand operations across values, scales, rounding modes and `MathContext`s, checked against the JDK as a line count, a rolling hash and sampled lines.
@@ -222,7 +228,9 @@ public class Z3 {
 "####;
     let (out, ok) = run(src, "Z3");
     assert!(ok);
-    assert_eq!(out, r####"0 strip/plain = 0|0
+    assert_eq!(
+        out,
+        r####"0 strip/plain = 0|0
 0.00 , 100 add/sub/mul = 100.00|-100.00|0.00
 1 , 12345678901234567890.123456789 div rm UP = 1 [0]
 2.5 , 7 div rm UP = 0.4 [1]
@@ -236,5 +244,6 @@ public class Z3 {
 16 , 2.5 div 4 HALF_EVEN = 6.4000 [4]
 12345678901234567890.123456789 , 9.995 div precision=3 roundingMode=HALF_UP = 1.24E+18 [-16]
 lines=7290 hash=392876637
-"####);
+"####
+    );
 }

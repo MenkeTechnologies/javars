@@ -64,7 +64,9 @@ public class W {
 "####;
     let (out, ok) = run(src, "W");
     assert!(ok);
-    assert_eq!(out, r####"java.lang.NumberFormatException: For input string: "abc"
+    assert_eq!(
+        out,
+        r####"java.lang.NumberFormatException: For input string: "abc"
 java.lang.NumberFormatException: Zero length BigInteger
 java.lang.NumberFormatException: Zero length BigInteger
 java.lang.NumberFormatException: For input string: "1_0"
@@ -93,7 +95,8 @@ true 101 1000000000000000 -1 true false
 1180591620717411303429 5 15 true 9223372036854775808 0
 [-1, 127] -255 65281 1 3.0 Infinity 1.2345678901234568E29
 100000000000000000000    10 10,000,000 ff 1
-"####);
+"####
+    );
 }
 
 /// Natural ordering, hash-container keying, stream reduction through
@@ -123,7 +126,9 @@ public class X { public static void main(String[] a){
 "####;
     let (out, ok) = run(src, "X");
     assert!(ok);
-    assert_eq!(out, r####"-1
+    assert_eq!(
+        out,
+        r####"-1
 -1
 [-3, 2, 10]
 [-3, 2, 10] 10
@@ -140,5 +145,6 @@ n=265252859812191058636308480000000
 108
 201326592 -4
 true -469516795
-"####);
+"####
+    );
 }
