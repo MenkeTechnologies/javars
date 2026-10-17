@@ -824,8 +824,11 @@ public class T {
 3.0 10.0 2.5 7
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -845,8 +848,11 @@ true [a, b, c]falsefalse
 [P[a=2]]
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -862,8 +868,11 @@ public class T { public static void main(String[] a){ String s="héllo wörld, �
 2 2 2 1
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -892,8 +901,11 @@ public class T {
     let expected = r####"Object Object long long Object 
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -929,8 +941,11 @@ Base 6 2
 Base
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -960,8 +975,11 @@ public class T {
 7
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -993,8 +1011,11 @@ a/2
 none
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
 
@@ -1037,7 +1058,10 @@ pq
 p.q.
 "####;
     let (out, ok) = run(src);
-    assert!(ok, "program failed:
-{out}");
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
     assert_eq!(out, expected);
 }
