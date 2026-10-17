@@ -1058,6 +1058,13 @@ pub const REFERENCE: &[Entry] = &[
         "BitSet b = new BitSet();\nb.set(1, 4);\nSystem.out.println(b);   // {1, 2, 3}",
     ),
     (
+        "BigInteger",
+        "Static Library",
+        "new BigInteger(String [, int radix])   |   BigInteger.valueOf(long)   |   BigInteger.ZERO/ONE/TWO/TEN",
+        "`java.math.BigInteger`: arbitrary-precision integers. `add`/`subtract`/`multiply`, truncating `divide`/`remainder` and flooring `mod`, `divideAndRemainder`, `pow`, `modPow`, `modInverse`, `gcd`, `sqrt`, `negate`/`abs`/`signum`, `min`/`max`, two's-complement `and`/`or`/`xor`/`not`/`andNot`/`shiftLeft`/`shiftRight`/`testBit`/`setBit`/`clearBit`/`flipBit`, `bitLength`/`bitCount`/`getLowestSetBit`, `compareTo`/`equals`/`hashCode`, `toString(radix)`, the narrowing `intValue`/`longValue` and the `*Exact` forms, `toByteArray`, `isProbablePrime`/`nextProbablePrime`. Exception messages are the JDK's (`BigInteger divide by zero`, `Negative exponent`). `%d`/`%x`/`%o` format it from its digits.",
+        "BigInteger f = BigInteger.ONE;\nfor (int i = 2; i <= 25; i++) f = f.multiply(BigInteger.valueOf(i));\nSystem.out.println(f);   // 15511210043330985984000000",
+    ),
+    (
         "Collections.addAll",
         "Collection Statics",
         "boolean Collections.addAll(Collection<T> c, T... elements)",

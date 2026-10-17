@@ -64,6 +64,11 @@ path = "src/bin/gen_docs.rs"
 # by-name-call dispatch into `fusevm::ffi`).
 fusevm = { version = "0.26.9", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
+# `java.math.BigInteger` / `BigDecimal` arithmetic (src/jbig.rs).
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+
 thiserror = "2.0"
 
 # `String.split`/`replaceAll`/`replaceFirst`/`matches` take a

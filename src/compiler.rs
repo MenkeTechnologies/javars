@@ -1911,6 +1911,9 @@ impl Compiler {
                 if name == "length" {
                     return Some("int".to_string());
                 }
+                if self.big_integer_constant(e).is_some() {
+                    return Some("BigInteger".to_string());
+                }
                 if let Some((_, ty)) = self.wrapper_constant_ref(e) {
                     return Some(ty.to_string());
                 }
@@ -4589,6 +4592,34 @@ impl Compiler {
                 )));
             }
         }
+        // `BigInteger::add`, `BigInteger::valueOf` — the unbound instance
+        // methods and the one static a stream pipeline over big values names.
+        if name == "BigInteger" && !self.classes.contains_key(name) {
+            if method == "valueOf" {
+                let ps = mk(1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(name.to_string())),
+                        method: method.to_string(),
+                        args: vars(&ps),
+                        line,
+                    },
+                )));
+            }
+            if let Some(arity) = biginteger_instance_ref_arity(method) {
+                let ps = mk(arity + 1);
+                return Ok(Some(lambda(
+                    ps.clone(),
+                    Expr::MethodCall {
+                        recv: Box::new(Expr::Var(ps[0].clone())),
+                        method: method.to_string(),
+                        args: vars(&ps[1..]),
+                        line,
+                    },
+                )));
+            }
+        }
         if !is_static_class(name) {
             return Ok(None);
         }
@@ -6833,6 +6864,16 @@ impl Compiler {
                 else if let Some((v, _)) = self.wrapper_constant_ref(e) {
                     let c = self.b.add_constant(v);
                     self.b.emit(Op::LoadConst(c), 0);
+                }
+                // `BigInteger.ONE` — the shared constant, built through `valueOf`.
+                else if let Some(n) = self.big_integer_constant(e) {
+                    let call = Expr::MethodCall {
+                        recv: Box::new(Expr::Var("BigInteger".to_string())),
+                        method: "valueOf".to_string(),
+                        args: vec![Expr::Int(n)],
+                        line: 0,
+                    };
+                    self.expr(&call)?;
                 }
                 // `Color.RED` names an enum constant's singleton, not a field of
                 // a value — there is no receiver to evaluate.
@@ -9155,6 +9196,24 @@ impl Compiler {
         Ok(())
     }
 
+    /// `BigInteger.ZERO` / `ONE` / `TWO` / `TEN` — the constant's value, when
+    /// `e` names one and no user class shadows `BigInteger`.
+    fn big_integer_constant(&self, e: &Expr) -> Option<i64> {
+        let Expr::Field { recv, name } = e else {
+            return None;
+        };
+        if !matches!(&**recv, Expr::Var(c) if c == "BigInteger") || self.classes.contains_key("BigInteger") {
+            return None;
+        }
+        match name.as_str() {
+            "ZERO" => Some(0),
+            "ONE" => Some(1),
+            "TWO" => Some(2),
+            "TEN" => Some(10),
+            _ => None,
+        }
+    }
+
     /// `Integer.MAX_VALUE` / `Double.NaN` / `Math.PI` / … — the value and Java
     /// type of a `static final` constant on a `java.lang` type, when `e` names
     /// one. A user class of the same name shadows it.
@@ -9834,6 +9893,7 @@ fn is_static_class(name: &str) -> bool {
             | "Pattern"
             | "Matcher"
             | "BitSet"
+            | "BigInteger"
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
@@ -9968,6 +10028,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("SimpleImmutableEntry", "#new") => "SimpleImmutableEntry",
         ("Random", "#new") => "Random",
         ("BitSet", "#new") => "BitSet",
+        ("BigInteger", "#new" | "valueOf") => "BigInteger",
         ("StringJoiner", "#new") => "StringJoiner",
         ("AtomicInteger", "#new") => "AtomicInteger",
         ("AtomicLong", "#new") => "AtomicLong",
@@ -10885,6 +10946,23 @@ fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
     })
 }
 
+/// The argument count of the `BigInteger` instance method a method reference
+/// names, when that name has one arity only.
+fn biginteger_instance_ref_arity(method: &str) -> Option<usize> {
+    Some(match method {
+        "negate" | "abs" | "signum" | "sqrt" | "not" | "bitLength" | "bitCount"
+        | "getLowestSetBit" | "intValue" | "longValue" | "doubleValue" | "floatValue"
+        | "shortValue" | "byteValue" | "intValueExact" | "longValueExact" | "hashCode"
+        | "toString" | "nextProbablePrime" | "toByteArray" => 0,
+        "add" | "subtract" | "multiply" | "divide" | "remainder" | "mod" | "pow" | "gcd"
+        | "min" | "max" | "compareTo" | "equals" | "and" | "or" | "xor" | "andNot"
+        | "shiftLeft" | "shiftRight" | "testBit" | "setBit" | "clearBit" | "flipBit"
+        | "modInverse" | "divideAndRemainder" | "isProbablePrime" => 1,
+        "modPow" => 2,
+        _ => return None,
+    })
+}
+
 /// The non-input classes the host models as shapes of its own, built by the
 /// `#new` static their class answers to: `java.util.Random` and the three
 /// summary-statistics classes.
@@ -10896,6 +10974,7 @@ fn is_host_value_class(name: &str) -> bool {
             | "LongSummaryStatistics"
             | "DoubleSummaryStatistics"
             | "BitSet"
+            | "BigInteger"
             | "AtomicInteger"
             | "AtomicLong"
             | "AtomicBoolean"
@@ -10938,6 +11017,27 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("BitSet", "cardinality" | "length" | "size" | "nextSetBit" | "nextClearBit") => "int",
         ("BitSet", "previousSetBit" | "previousClearBit" | "hashCode") => "int",
         ("BitSet", "isEmpty" | "intersects") => "boolean",
+        (
+            "BigInteger",
+            "add" | "subtract" | "multiply" | "divide" | "remainder" | "mod" | "pow" | "modPow"
+            | "modInverse" | "gcd" | "min" | "max" | "negate" | "abs" | "sqrt" | "and" | "or"
+            | "xor" | "andNot" | "not" | "shiftLeft" | "shiftRight" | "setBit" | "clearBit"
+            | "flipBit" | "nextProbablePrime",
+        ) => "BigInteger",
+        ("BigInteger", "divideAndRemainder") => "BigInteger[]",
+        (
+            "BigInteger",
+            "signum" | "bitLength" | "bitCount" | "getLowestSetBit" | "compareTo" | "hashCode"
+            | "intValue" | "intValueExact",
+        ) => "int",
+        ("BigInteger", "shortValue") => "short",
+        ("BigInteger", "byteValue") => "byte",
+        ("BigInteger", "longValue" | "longValueExact") => "long",
+        ("BigInteger", "doubleValue") => "double",
+        ("BigInteger", "floatValue") => "float",
+        ("BigInteger", "testBit" | "equals" | "isProbablePrime") => "boolean",
+        ("BigInteger", "toString") => "String",
+        ("BigInteger", "toByteArray") => "byte[]",
         ("StringJoiner", "add" | "merge" | "setEmptyValue") => "StringJoiner",
         ("StringJoiner", "toString") => "String",
         ("StringJoiner", "length") => "int",

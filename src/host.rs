@@ -508,6 +508,8 @@ enum HostObj {
     Stats(SummaryStats),
     /// A `java.util.BitSet` (see [`crate::jbitset`]).
     Bits(crate::jbitset::BitSet),
+    /// A `java.math.BigInteger` (see [`crate::jbig`]); the value lives in [`BIGS`].
+    Big,
     /// A `java.util.StringJoiner`.
     Joiner(Box<Joiner>),
     /// An `AtomicInteger`, `AtomicLong` or `AtomicBoolean`.
@@ -1431,6 +1433,141 @@ fn bitset_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
     })
 }
 
+/// The `BigInteger` a handle names, cloned out of the heap; `None` for any
+/// other value (including `null`).
+fn big_of(v: &Value) -> Option<num_bigint::BigInt> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    BIGS.with(|b| b.borrow().get(*id as usize)?.clone())
+}
+
+fn alloc_big(b: num_bigint::BigInt) -> Value {
+    let id = heap_alloc(HostObj::Big);
+    BIGS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.resize(id as usize + 1, None);
+        t[id as usize] = Some(b);
+    });
+    Value::Obj(id)
+}
+
+/// A method call on a `java.math.BigInteger` receiver; `None` for any other.
+///
+/// `BigInteger` is immutable, so every operation answers a new object and the
+/// receiver is copied out of the heap first.
+fn biginteger_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jbig as jb;
+    let me = big_of(recv)?;
+    let refuse = |(class, msg): jb::Refusal| Fault::java(class, msg);
+    let npe = || Fault::java("NullPointerException", String::new());
+    // The one-`BigInteger`-operand methods share the null check and the copy.
+    let operand = |i: usize| big_of(&args[i]).ok_or_else(npe);
+    let int_arg = |i: usize| args[i].jint();
+    let big = |r: Result<num_bigint::BigInt, jb::Refusal>| r.map(alloc_big).map_err(refuse);
+    Some(match (method, args.len()) {
+        ("add", 1) => operand(0).map(|o| alloc_big(me + o)),
+        ("subtract", 1) => operand(0).map(|o| alloc_big(me - o)),
+        ("multiply", 1) => operand(0).map(|o| alloc_big(me * o)),
+        ("divide", 1) => operand(0).and_then(|o| big(jb::divide(&me, &o))),
+        ("remainder", 1) => operand(0).and_then(|o| big(jb::remainder(&me, &o))),
+        ("mod", 1) => operand(0).and_then(|o| big(jb::modulo(&me, &o))),
+        ("divideAndRemainder", 1) => operand(0).and_then(|o| {
+            let q = jb::divide(&me, &o).map_err(refuse)?;
+            let r = jb::remainder(&me, &o).map_err(refuse)?;
+            Ok(Value::Obj(heap_alloc(HostObj::Array(vec![
+                alloc_big(q),
+                alloc_big(r),
+            ]))))
+        }),
+        ("pow", 1) => big(jb::pow(&me, int_arg(0))),
+        ("modPow", 2) => operand(0).and_then(|e| {
+            operand(1).and_then(|m| big(jb::mod_pow(&me, &e, &m)))
+        }),
+        ("modInverse", 1) => operand(0).and_then(|m| big(jb::mod_inverse(&me, &m))),
+        ("gcd", 1) => operand(0).map(|o| alloc_big(num_integer::Integer::gcd(&me, &o))),
+        ("min", 1) => operand(0).map(|o| alloc_big(me.min(o))),
+        ("max", 1) => operand(0).map(|o| alloc_big(me.max(o))),
+        ("negate", 0) => Ok(alloc_big(-me)),
+        ("abs", 0) => Ok(alloc_big(num_traits::Signed::abs(&me))),
+        ("signum", 0) => Ok(Value::Int(match me.sign() {
+            num_bigint::Sign::Minus => -1,
+            num_bigint::Sign::NoSign => 0,
+            num_bigint::Sign::Plus => 1,
+        })),
+        ("sqrt", 0) => big(jb::sqrt(&me)),
+        ("and", 1) => operand(0).map(|o| alloc_big(me & o)),
+        ("or", 1) => operand(0).map(|o| alloc_big(me | o)),
+        ("xor", 1) => operand(0).map(|o| alloc_big(me ^ o)),
+        ("andNot", 1) => operand(0).map(|o| alloc_big(me & !o)),
+        ("not", 0) => Ok(alloc_big(!me)),
+        ("shiftLeft", 1) => Ok(alloc_big(jb::shift(&me, int_arg(0)))),
+        ("shiftRight", 1) => Ok(alloc_big(jb::shift(&me, -int_arg(0)))),
+        ("testBit", 1) => jb::test_bit(&me, int_arg(0)).map(Value::bool).map_err(refuse),
+        ("setBit", 1) => big(jb::set_bit(&me, int_arg(0), Some(true))),
+        ("clearBit", 1) => big(jb::set_bit(&me, int_arg(0), Some(false))),
+        ("flipBit", 1) => big(jb::set_bit(&me, int_arg(0), None)),
+        ("bitLength", 0) => Ok(Value::Int(jb::bit_length(&me) as i64)),
+        ("bitCount", 0) => Ok(Value::Int(jb::bit_count(&me) as i64)),
+        ("getLowestSetBit", 0) => Ok(Value::Int(jb::lowest_set_bit(&me))),
+        ("compareTo", 1) => operand(0).map(|o| Value::Int(me.cmp(&o) as i64)),
+        ("equals", 1) => Ok(Value::bool(big_of(&args[0]).is_some_and(|o| o == me))),
+        ("hashCode", 0) => Ok(Value::Int(i64::from(jb::hash(&me)))),
+        ("toString", 0) => Ok(Value::str(me.to_string())),
+        ("toString", 1) => Ok(Value::str(jb::to_string_radix(&me, int_arg(0)))),
+        ("intValue", 0) => Ok(Value::Int(i64::from(jb::int_value(&me)))),
+        ("longValue", 0) => Ok(Value::Int(jb::long_value(&me))),
+        ("shortValue", 0) => Ok(Value::Int(i64::from(jb::int_value(&me) as i16))),
+        ("byteValue", 0) => Ok(Value::Int(i64::from(jb::int_value(&me) as i8))),
+        ("intValueExact", 0) => jb::int_value_exact(&me)
+            .map(|n| Value::Int(i64::from(n)))
+            .map_err(refuse),
+        ("longValueExact", 0) => jb::long_value_exact(&me).map(Value::Int).map_err(refuse),
+        ("doubleValue", 0) => Ok(Value::float(jb::double_value(&me))),
+        ("floatValue", 0) => Ok(Value::float(f64::from(jb::double_value(&me) as f32))),
+        ("isProbablePrime", 1) => Ok(Value::bool(jb::is_probable_prime(&me))),
+        ("nextProbablePrime", 0) => big(jb::next_probable_prime(&me)),
+        ("toByteArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+            jb::to_bytes(&me)
+                .into_iter()
+                .map(|b| Value::Int(i64::from(b)))
+                .collect(),
+        )))),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported BigInteger method `{method}` with {} argument(s)",
+            args.len()
+        ))),
+    })
+}
+
+/// A static call on `java.math.BigInteger`: `valueOf` and the constructors
+/// (`#new`). `None` for any other class or member.
+fn biginteger_static(method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jbig as jb;
+    let refuse = |(class, msg): jb::Refusal| Fault::java(class, msg);
+    let bytes_of = |v: &Value| -> Option<Vec<i8>> {
+        sequence_items(v).map(|s| s.iter().map(|b| b.jint() as i8).collect())
+    };
+    let npe = || Fault::java("NullPointerException", String::new());
+    Some(match (method, args) {
+        ("valueOf", [n]) => Ok(alloc_big(num_bigint::BigInt::from(n.jint()))),
+        ("#new", [Value::Str(s)]) => jb::parse(s, 10).map(alloc_big).map_err(refuse),
+        ("#new", [Value::Str(s), radix]) => {
+            jb::parse(s, radix.jint()).map(alloc_big).map_err(refuse)
+        }
+        ("#new", [Value::Undef]) | ("#new", [Value::Undef, _]) => Err(npe()),
+        ("#new", [bytes]) => bytes_of(bytes)
+            .ok_or_else(npe)
+            .and_then(|b| jb::from_bytes(&b).map(alloc_big).map_err(refuse)),
+        ("#new", [signum, bytes]) => bytes_of(bytes).ok_or_else(npe).and_then(|b| {
+            jb::from_sign_magnitude(signum.jint(), &b)
+                .map(alloc_big)
+                .map_err(refuse)
+        }),
+        _ => return None,
+    })
+}
+
 /// Run `f` on the summary statistics a handle names; `None` for any other
 /// value.
 fn with_stats<R>(v: &Value, f: impl FnOnce(&mut SummaryStats) -> R) -> Option<R> {
@@ -1550,6 +1687,8 @@ fn index_key(v: &Value) -> Option<IndexKey> {
             None if entry_pair(v).is_some() => return None,
             // An `Optional` is compared by its contents, for the same reason.
             None if as_optional_full(v).is_some() => return None,
+            // A `BigInteger` buckets by its digits; `value_eq` confirms.
+            None if big_of(v).is_some() => IndexKey::Str(format!("\u{0}big{}", big_of(v)?)),
             None => IndexKey::Obj(*id),
         },
         Value::Undef => IndexKey::Null,
@@ -1844,6 +1983,9 @@ thread_local! {
     /// handle rather than hashed on it, because unboxing is on the path of every
     /// arithmetic operation a wrapper takes part in and every erased read.
     static BOXES: RefCell<Vec<Option<(&'static str, Value)>>> = const { RefCell::new(Vec::new()) };
+    /// Every live `BigInteger`: handle -> value. A side table for the reason
+    /// [`BOXES`] is one: the collection index reads it while `HEAP` is borrowed.
+    static BIGS: RefCell<Vec<Option<num_bigint::BigInt>>> = const { RefCell::new(Vec::new()) };
     /// Every live `Map.Entry`: handle -> the pair and the map it belongs to.
     ///
     /// Separate from `HEAP` for the reason [`HostObj::Entry`] gives, and
@@ -2119,6 +2261,7 @@ pub fn heap_reset() {
     // objects occupy, and `Integer.valueOf(1)` would answer someone else's list.
     BOX_CACHE.with(|c| c.borrow_mut().clear());
     BOXES.with(|b| b.borrow_mut().clear());
+    BIGS.with(|b| b.borrow_mut().clear());
     PAIRS.with(|p| p.borrow_mut().clear());
     OPTIONALS.with(|o| o.borrow_mut().clear());
     // Keyed by heap handle like the caches above, so it goes with the heap for
@@ -2309,6 +2452,7 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // could answer as; a boxed value now names its own class, so
         // `Long.valueOf(1) instanceof Number` has a class to walk from.
         "Integer" | "Double" | "Long" | "Short" | "Byte" | "Float" => &["Number", "Comparable"],
+        "BigInteger" => &["Number", "Comparable"],
         "Number" => &["Serializable"],
         "Boolean" | "Character" => &["Comparable", "Serializable"],
         "Enum" => &["Comparable", "Serializable"],
@@ -3128,6 +3272,9 @@ fn java_hash(v: &Value) -> Option<i32> {
             Some(h) => java_hash(&h),
             None => Some(0),
         };
+    }
+    if let Some(b) = big_of(v) {
+        return Some(crate::jbig::hash(&b));
     }
     Some(match v {
         // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
@@ -4748,6 +4895,10 @@ fn value_eq(a: &Value, b: &Value) -> bool {
                 (x, y) => x.is_none() && y.is_none(),
             };
     }
+    // `BigInteger.equals` is a value comparison.
+    if let (Some(x), Some(y)) = (big_of(a), big_of(b)) {
+        return x == y;
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => x == y,
@@ -5230,6 +5381,9 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Through any box: a `new String(…)` handle orders by its text, and a boxed
     // wrapper by its number, exactly as the values they hold do.
     let (a, b) = (&deboxed(a), &deboxed(b));
+    if let (Some(x), Some(y)) = (big_of(a), big_of(b)) {
+        return x.cmp(&y);
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Undef, Value::Undef) => Ordering::Equal,
@@ -6598,6 +6752,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
                     HostObj::Bits(_) => "java.util.BitSet".to_string(),
+                    HostObj::Big => "BigInteger".to_string(),
                     HostObj::Joiner(_) => "java.util.StringJoiner".to_string(),
                     HostObj::Atomic { kind, .. } => match kind {
                         AtomicKind::Int => "java.util.concurrent.atomic.AtomicInteger",
@@ -10612,6 +10767,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             Err(f) => raise(vm, f),
         };
     }
+    if let Some(r) = biginteger_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = bitset_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -10967,6 +11128,9 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     // the value, not the handle.
     let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
     let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    if let (Some(x), Some(y)) = (big_of(&a), big_of(&b)) {
+        return Value::Int(x.cmp(&y) as i64);
+    }
     // Java's own `Integer.compareTo(null)` is an NPE, and so is a call on a
     // `null` receiver. Both report the same way every other javars NPE does.
     if matches!(a, Value::Undef) {
@@ -11492,6 +11656,14 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    if class == "BigInteger" {
+        if let Some(r) = biginteger_static(&method, &args) {
+            return match r {
+                Ok(v) => v,
+                Err(f) => raise(vm, f),
+            };
+        }
+    }
     if let Some(r) = regex_static(&class, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -16761,6 +16933,32 @@ fn format_conversion(
         body,
         numeric: true,
     };
+    // A `BigInteger` is formatted from its digits (`Formatter.print(BigInteger)`):
+    // `%d` and the radix conversions all write the magnitude behind a sign, so
+    // `%x` of -255 is `-ff`, not a two's-complement pattern.
+    if let (Some(b), 'd' | 'x' | 'X' | 'o') = (big_of(arg), conv) {
+        let radix = match conv {
+            'd' => 10,
+            'o' => 8,
+            _ => 16,
+        };
+        let mut body = num_traits::Signed::abs(&b).to_str_radix(radix);
+        if conv == 'X' {
+            body = body.to_uppercase();
+        }
+        let prefix = if b.sign() == num_bigint::Sign::Minus {
+            "-".to_string()
+        } else {
+            pos_sign().to_string()
+        };
+        let alt = match (flags.alt, conv) {
+            (true, 'x') => "0x",
+            (true, 'X') => "0X",
+            (true, 'o') => "0",
+            _ => "",
+        };
+        return Ok(num(format!("{prefix}{alt}"), body));
+    }
     match conv {
         // A non-finite floating argument never reaches the digit formatter
         // (`Formatter.print(double)`): NaN is `NaN` with no sign at all, an
@@ -17951,6 +18149,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),
             Some(HostObj::Bits(b)) => b.render(),
+            Some(HostObj::Big) => big_of(&Value::Obj(id)).map(|b| b.to_string()).unwrap_or_default(),
             Some(HostObj::Joiner(j)) => j.render(),
             Some(HostObj::Atomic { value, .. }) => java_str(value),
             // `Pattern.toString()` is its source; `Matcher.toString()` names the
@@ -18717,6 +18916,7 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
     Some(match class {
         "[]" => return None,
         qualified if qualified.starts_with("java.") => qualified.to_string(),
+        "BigInteger" => "java.math.BigInteger".to_string(),
         "List$fixed" => "java.util.Arrays$ArrayList".to_string(),
         "Collection$view" => "java.util.Collections$UnmodifiableCollection".to_string(),
         "List$immutable" => match len() {

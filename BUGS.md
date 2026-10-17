@@ -1356,7 +1356,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   modeled (a read or overwrite moves the entry to the end); only the flag's
   literal `true`/`false` is accepted.
 - **Whole library areas that are not modeled are refused by name**, never run
-  with a guessed meaning: `java.math` (`BigInteger`, `BigDecimal`), `java.time`,
+  with a guessed meaning: `java.math.BigDecimal`, `java.time`,
   threads and executors (`Thread`, `Executors`, `ConcurrentHashMap`), `UUID`,
   `Locale`, `Runtime`, and `System.getProperty`. Each is
   ``javars: unknown class `X` `` or ``cannot find symbol: `X` `` at the first

@@ -398,7 +398,9 @@ Implemented and checked against the reference `java`:
   first writable through `setValue`),
   `java.util.StringJoiner`,
   `removeAll`/`retainAll`/`containsAll`, `Collections.addAll`, `java.util.BitSet`
-  (a port of the JDK's word vector, its growth rule, `hashCode` and messages), and
+  (a port of the JDK's word vector, its growth rule, `hashCode` and messages), `java.math.BigInteger`
+  (arbitrary-precision arithmetic with the JDK's division, bitwise, `hashCode`,
+  narrowing and exception semantics), and
   `Collections.sort`/`reverse`/`max`/`min`. A removal through a map's
   `keySet()`/`values()`/`entrySet()` reaches the map. A `TreeMap` navigates by key
   (`firstKey`, `floorKey`, `ceilingEntry`, `pollFirstEntry`, …) and a `TreeSet`
