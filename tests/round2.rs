@@ -1248,3 +1248,105 @@ true false [1018847, 1024, 94420522, 120]
     );
     assert_eq!(out, expected);
 }
+
+/// `System.out` as a value and the `java.io` writers (`PrintWriter`, `BufferedWriter`, `OutputStreamWriter`, `StringWriter`, `PrintStream`, `BufferedOutputStream`), each refused before: a buffered writer holds its text until a flush (an unflushed `PrintWriter(System.out)` prints nothing), autoflush follows `println`/`printf`, `print` converts its argument by static type, closing a writer closes `System.out` beneath it, and the classes answer `instanceof` along the `java.io` hierarchy. Expected output from openjdk 21.0.12.1.
+#[test]
+fn output_writers_buffer_flush_and_close_like_the_jdk() {
+    let src = r####"
+import java.io.*;
+import java.util.*;
+public class T {
+    static PrintWriter out = new PrintWriter(new BufferedWriter(new OutputStreamWriter(System.out)));
+    record P(int x) { public String toString() { return "P" + x; } }
+    public static void main(String[] a) throws IOException {
+        PrintWriter lazy = new PrintWriter(System.out);
+        lazy.print("never flushed");
+        PrintWriter auto = new PrintWriter(System.out, true);
+        auto.print("p");
+        System.out.print("s");
+        auto.println("l");
+        auto.printf("f%n");
+        auto.print("q");
+        System.out.println("e");
+        PrintStream ps = new PrintStream(new BufferedOutputStream(System.out));
+        ps.print("a");
+        System.out.println("b");
+        ps.println("c");
+        ps.flush();
+        out.println(new P(3)); out.println('c'); out.println(2.5f); out.println(1e20); out.println(7L); out.println((Object) null);
+        out.println(new char[]{'o', 'k'}); out.printf("%5.2f|%s|%c%n", Math.PI, List.of(1, 2), 'z'); out.format("%d%n", 42);
+        char c = 'q'; out.write(c); out.write("\n"); out.write(new char[]{'a', 'b', '\n'}); out.write("hello\n", 1, 3); out.append("x").append('y').append(null); out.println();
+        System.out.println("before the flush");
+        out.flush();
+        BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(System.out));
+        bw.write("x"); bw.write(65); bw.newLine(); bw.append('c').append("d"); bw.newLine(); bw.flush();
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        pw.print(1); pw.println('c'); pw.printf("%.2f", 1.0); pw.print(0.1f);
+        System.out.println("[" + sw + "] " + pw.checkError());
+        PrintStream o = System.out; o.printf("direct %d%n", 1); o.append("ap").append('\n'); o.write(66); o.println();
+        Object w = pw, s = System.out;
+        System.out.println((w instanceof Writer) + " " + (w instanceof Flushable) + " " + (s instanceof PrintStream) + " " + (s instanceof OutputStream) + " " + (w instanceof AutoCloseable) + " " + w.getClass().getName());
+        try (PrintWriter t = new PrintWriter(new OutputStreamWriter(System.out))) { t.println("closed at the end of the try"); }
+        System.out.println("dropped: System.out is closed");
+        bw.write("dropped too");
+    }
+}
+"####;
+    let expected = r####"spl
+f
+e
+b
+ac
+before the flush
+P3
+c
+2.5
+1.0E20
+7
+null
+ok
+ 3.14|[1, 2]|z
+42
+q
+ab
+ellxynull
+xA
+cd
+[1c
+1.000.1] false
+direct 1
+ap
+B
+true true true true true java.io.PrintWriter
+closed at the end of the try
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// An unflushed `PrintWriter(System.out)` loses exactly what its buffers still
+/// hold at exit: the `BufferedWriter` hands on each 8192 characters the moment
+/// it fills, and the `OutputStreamWriter` writes its 8192 bytes only when the
+/// next character no longer fits — so 20000 characters print 8192. Measured on
+/// openjdk 21.0.12.1.
+#[test]
+fn unflushed_print_writer_prints_only_what_overflowed() {
+    let src = r####"
+import java.io.*;
+public class T {
+    public static void main(String[] a) {
+        PrintWriter pw = new PrintWriter(System.out);
+        for (int i = 0; i < 2000; i++) pw.print("abcdefghi\n");
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, "abcdefghi\n".repeat(819) + "ab");
+}

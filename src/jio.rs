@@ -1,6 +1,9 @@
-//! Console and text input: `System.in`, `java.util.Scanner`,
-//! `java.io.BufferedReader`/`InputStreamReader`/`StringReader`, and
-//! `java.util.StringTokenizer`.
+//! Console and text input and output: `System.in`, `java.util.Scanner`,
+//! `java.io.BufferedReader`/`InputStreamReader`/`StringReader`,
+//! `java.util.StringTokenizer`, and on the output side `System.out`/`err`, the
+//! `java.io` writers (`PrintWriter`, `BufferedWriter`, `OutputStreamWriter`,
+//! `StringWriter`) and print streams (`PrintStream`, `BufferedOutputStream`).
+//! The output half is at the end of the file.
 //!
 //! Every reader is a cursor over characters. A reader over a `String` owns its
 //! text; every reader over `System.in` shares one process-wide cursor, filled a
@@ -505,5 +508,181 @@ impl Tokenizer {
             },
             _ => return None,
         })
+    }
+}
+
+// ── Console and text output: java.io writers and print streams ──────────────
+//
+// `System.out`/`System.err` are `PrintStream`s that write straight through.
+// The buffered classes keep their text until a flush, a close, or an overflow,
+// exactly where the JDK's do — measured on openjdk 21.0.12.1:
+//
+//   * `new PrintWriter(System.out)` is `PrintWriter(BufferedWriter(
+//     OutputStreamWriter(System.out)))`, so nothing it prints appears until
+//     `flush()`/`close()`/`checkError()`, and a program that never flushes
+//     loses the text. Output written to `System.out` meanwhile goes first.
+//   * A `BufferedWriter` hands its 8192 characters on the moment it fills; an
+//     `OutputStreamWriter` writes its 8192 bytes only when a further character
+//     no longer fits. So 20000 unflushed ASCII characters through a
+//     `PrintWriter(System.out)` print exactly 8192.
+//   * A `BufferedOutputStream` flushes its 8192 bytes *before* a write that
+//     would overflow them, and passes a write of 8192 or more straight through.
+//   * Closing a writer closes everything under it, `System.out` included:
+//     every later write to that stream is dropped.
+//   * A closed `PrintWriter`/`PrintStream` drops writes and reports it through
+//     `checkError()`; a closed `BufferedWriter`/`OutputStreamWriter` throws
+//     `IOException: Stream closed`. Closing twice is harmless.
+
+/// Which output class a [`Writer`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WKind {
+    PrintStream,
+    PrintWriter,
+    BufferedWriter,
+    OutputStreamWriter,
+    BufferedOutputStream,
+    StringWriter,
+}
+
+impl WKind {
+    /// The fully-qualified class name `getClass().getName()` reports.
+    pub fn class_name(self) -> &'static str {
+        match self {
+            WKind::PrintStream => "java.io.PrintStream",
+            WKind::PrintWriter => "java.io.PrintWriter",
+            WKind::BufferedWriter => "java.io.BufferedWriter",
+            WKind::OutputStreamWriter => "java.io.OutputStreamWriter",
+            WKind::BufferedOutputStream => "java.io.BufferedOutputStream",
+            WKind::StringWriter => "java.io.StringWriter",
+        }
+    }
+
+    /// True for the two classes whose methods never throw and whose failures
+    /// are reported by `checkError()` instead.
+    pub fn is_print(self) -> bool {
+        matches!(self, WKind::PrintStream | WKind::PrintWriter)
+    }
+
+    /// True for the byte streams, as opposed to the character writers.
+    pub fn is_stream(self) -> bool {
+        matches!(self, WKind::PrintStream | WKind::BufferedOutputStream)
+    }
+}
+
+/// Where a writer's text goes once it leaves the writer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sink {
+    Stdout,
+    Stderr,
+    /// Another writer on the host heap, by handle.
+    Handle(u32),
+    /// Nowhere: a `StringWriter` keeps its text.
+    Own,
+}
+
+/// The JDK's buffer size for `BufferedWriter`, `OutputStreamWriter`'s encoder
+/// and `BufferedOutputStream`.
+const OUT_BUF: usize = 8192;
+
+/// One output object.
+pub struct Writer {
+    pub kind: WKind,
+    pub sink: Sink,
+    /// The text held and not yet handed to the sink — all of it, for a
+    /// `StringWriter`.
+    pub buf: String,
+    /// `buf.chars().count()`, kept for `BufferedWriter`'s capacity test.
+    held: usize,
+    /// `println`/`printf`/`format` flush (and, on a `PrintStream`, any write
+    /// holding a newline).
+    pub autoflush: bool,
+    pub closed: bool,
+    /// The `checkError()` flag of a `PrintWriter`/`PrintStream`.
+    pub error: bool,
+}
+
+impl Writer {
+    pub fn new(kind: WKind, sink: Sink, autoflush: bool) -> Writer {
+        Writer {
+            kind,
+            sink,
+            buf: String::new(),
+            held: 0,
+            autoflush,
+            closed: false,
+            error: false,
+        }
+    }
+
+    /// Take `text`, answering the chunks that leave for the sink now, in
+    /// order. A closed print class drops the text and records the error; a
+    /// closed writer is `IOException: Stream closed`.
+    pub fn accept(&mut self, text: &str) -> Result<Vec<String>, Fail> {
+        if self.closed && self.kind != WKind::StringWriter {
+            if self.kind.is_print() {
+                self.error = true;
+                return Ok(Vec::new());
+            }
+            return Err(("IOException", Some("Stream closed".to_string())));
+        }
+        let mut out = Vec::new();
+        match self.kind {
+            WKind::PrintStream | WKind::PrintWriter => out.push(text.to_string()),
+            WKind::StringWriter => self.buf.push_str(text),
+            WKind::BufferedWriter => {
+                // `BufferedWriter.write` copies into its array and flushes it
+                // the moment it is full.
+                for c in text.chars() {
+                    self.buf.push(c);
+                    self.held += 1;
+                    if self.held >= OUT_BUF {
+                        out.push(std::mem::take(&mut self.buf));
+                        self.held = 0;
+                    }
+                }
+            }
+            WKind::OutputStreamWriter => {
+                // The encoder writes its byte buffer out only when the next
+                // character does not fit, so a buffer filled exactly stays.
+                for c in text.chars() {
+                    if self.buf.len() + c.len_utf8() > OUT_BUF {
+                        out.push(std::mem::take(&mut self.buf));
+                    }
+                    self.buf.push(c);
+                }
+            }
+            WKind::BufferedOutputStream => {
+                if text.len() >= OUT_BUF {
+                    if !self.buf.is_empty() {
+                        out.push(std::mem::take(&mut self.buf));
+                    }
+                    out.push(text.to_string());
+                } else {
+                    if text.len() > OUT_BUF - self.buf.len() {
+                        out.push(std::mem::take(&mut self.buf));
+                    }
+                    self.buf.push_str(text);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Everything held, for a flush; empty for a `StringWriter`, whose text
+    /// never leaves it. A closed writer's flush is `IOException: Stream
+    /// closed`, except a print class's, which only records the error.
+    pub fn drain(&mut self) -> Result<String, Fail> {
+        if self.closed && self.kind != WKind::StringWriter {
+            if self.kind.is_print() {
+                self.error = true;
+                return Ok(String::new());
+            }
+            return Err(("IOException", Some("Stream closed".to_string())));
+        }
+        if self.kind == WKind::StringWriter {
+            return Ok(String::new());
+        }
+        self.held = 0;
+        Ok(std::mem::take(&mut self.buf))
     }
 }

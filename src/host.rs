@@ -500,6 +500,9 @@ type ArgEntries<'a> = &'a [Option<Vec<(Value, Value)>>];
 enum HostObj {
     /// `System.in`, a `Scanner`, or a `java.io` reader (see [`crate::jio`]).
     Reader(crate::jio::Reader),
+    /// `System.out`/`err`, or a `java.io` writer or print stream (see
+    /// [`crate::jio`]).
+    Writer(crate::jio::Writer),
     /// A `java.util.StringTokenizer`.
     Tokenizer(crate::jio::Tokenizer),
     /// A `java.util.Random` (see [`crate::jrandom`]).
@@ -2557,6 +2560,8 @@ pub fn heap_reset() {
     SORT_CMP.with(|s| s.borrow_mut().clear());
     EXIT_CODE.with(|c| c.set(None));
     STDIN_HANDLE.with(|s| s.set(None));
+    STD_WRITERS.with(|s| s.set([None, None]));
+    STD_CLOSED.with(|s| s.set([false, false]));
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
@@ -2750,6 +2755,35 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // which reach `Throwable` and stop; `Throwable implements Serializable`
         // is the one edge above it.
         "Throwable" => &["Serializable"],
+        // java.io and the input/output classes [`crate::jio`] models. A reader
+        // or writer reports its qualified name, which steps to the simple one
+        // the type test is written with.
+        "java.io.BufferedReader" => &["BufferedReader"],
+        "java.io.InputStreamReader" => &["InputStreamReader"],
+        "java.io.StringReader" => &["StringReader"],
+        "java.io.BufferedInputStream" => &["BufferedInputStream"],
+        "java.util.Scanner" => &["Scanner"],
+        "java.util.StringTokenizer" => &["StringTokenizer"],
+        "java.io.PrintWriter" => &["PrintWriter"],
+        "java.io.BufferedWriter" => &["BufferedWriter"],
+        "java.io.OutputStreamWriter" => &["OutputStreamWriter"],
+        "java.io.StringWriter" => &["StringWriter"],
+        "java.io.PrintStream" => &["PrintStream"],
+        "java.io.BufferedOutputStream" => &["BufferedOutputStream"],
+        "BufferedReader" | "InputStreamReader" | "StringReader" => &["Reader"],
+        "Reader" => &["Readable", "Closeable"],
+        "BufferedInputStream" => &["FilterInputStream"],
+        "FilterInputStream" => &["InputStream"],
+        "InputStream" => &["Closeable"],
+        "Scanner" => &["Iterator", "Closeable"],
+        "StringTokenizer" => &["Enumeration"],
+        "PrintWriter" | "BufferedWriter" | "OutputStreamWriter" | "StringWriter" => &["Writer"],
+        "Writer" => &["Appendable", "Closeable", "Flushable"],
+        "PrintStream" => &["FilterOutputStream", "Appendable", "Closeable"],
+        "BufferedOutputStream" => &["FilterOutputStream"],
+        "FilterOutputStream" => &["OutputStream"],
+        "OutputStream" => &["Closeable", "Flushable"],
+        "Closeable" => &["AutoCloseable"],
         // java.util — the collection interfaces. `List` gained
         // `SequencedCollection` in Java 21 and `Set` did not, which is why they
         // are not one arm.
@@ -7043,6 +7077,7 @@ fn value_class(v: &Value) -> Option<String> {
                     // Named by its qualified class, which [`binary_name`] passes
                     // through: none of these is a name a program declares.
                     HostObj::Reader(r) => r.kind.class_name().to_string(),
+                    HostObj::Writer(w) => w.kind.class_name().to_string(),
                     HostObj::Tokenizer(_) => "java.util.StringTokenizer".to_string(),
                     HostObj::Random(_) => "java.util.Random".to_string(),
                     HostObj::Stats(s) => format!("java.util.{}", s.class_name()),
@@ -11058,6 +11093,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         }
         return b_closure_call(vm, n as u8 + 1);
     }
+    if let Some(r) = writer_method(vm, &recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if let Some(r) = io_method(&recv, &method, &args) {
         return match r {
             Ok(v) => v,
@@ -12107,6 +12148,13 @@ thread_local! {
     /// The heap handle of `System.in`, so the stream is one object however
     /// often it is named (`System.in == System.in`). Cleared with the heap.
     static STDIN_HANDLE: Cell<Option<u32>> = const { Cell::new(None) };
+    /// The heap handles of `System.out` and `System.err`, made on first use
+    /// as values (`PrintStream o = System.out`). Cleared with the heap.
+    static STD_WRITERS: Cell<[Option<u32>; 2]> = const { Cell::new([None, None]) };
+    /// Whether `System.out` / `System.err` has been closed — by its own
+    /// `close()` or by closing a writer built over it. A closed stream drops
+    /// every later write, `System.out.println` included. Cleared with the heap.
+    static STD_CLOSED: Cell<[bool; 2]> = const { Cell::new([false, false]) };
     /// The generator behind `Math.random()`, created on first use.
     static MATH_RANDOM: RefCell<Option<crate::jrandom::Random>> = const { RefCell::new(None) };
     /// The generator behind the one-argument `Collections.shuffle`.
@@ -12174,6 +12222,26 @@ fn system_static(
             Ok(Value::Int(ORIGIN.with(|o| o.elapsed().as_nanos() as i64)))
         }
         ("System", "lineSeparator", []) => Ok(Value::str("\n".to_string())),
+        // `System.out` and `System.err` named as values rather than as the
+        // receiver of a `print` call.
+        ("System", "#out", []) => Ok(Value::Obj(std_writer(false))),
+        ("System", "#err", []) => Ok(Value::Obj(std_writer(true))),
+        (
+            "PrintWriter"
+            | "BufferedWriter"
+            | "OutputStreamWriter"
+            | "StringWriter"
+            | "PrintStream"
+            | "BufferedOutputStream",
+            "#new",
+            _,
+        ) => match writer_new(class, args) {
+            Some(r) => r,
+            None => Err(Fault::internal(format!(
+                "javars: `new {class}(…)` with these {} argument(s) is not modeled",
+                args.len()
+            ))),
+        },
         ("System", "#flushOut", []) => {
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -12453,6 +12521,345 @@ fn random_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
             args.len()
         ))),
     })
+}
+
+// ── java.io output: System.out/err as values, writers and print streams ──────
+
+/// The handle of `System.out` (`err == false`) or `System.err`, made on first
+/// use so the stream is one object however often it is named.
+fn std_writer(err: bool) -> u32 {
+    use crate::jio::{Sink, WKind, Writer};
+    let slot = usize::from(err);
+    let mut handles = STD_WRITERS.with(Cell::get);
+    if let Some(id) = handles[slot] {
+        return id;
+    }
+    let sink = if err { Sink::Stderr } else { Sink::Stdout };
+    let id = heap_alloc(HostObj::Writer(Writer::new(WKind::PrintStream, sink, true)));
+    handles[slot] = Some(id);
+    STD_WRITERS.with(|s| s.set(handles));
+    id
+}
+
+/// The writer a value names, as its handle; `None` for anything else.
+fn writer_of(v: &Value) -> Option<u32> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| matches!(h.borrow().get(*id as usize), Some(HostObj::Writer(_))).then_some(*id))
+}
+
+/// Run `f` on the writer `id` names.
+fn with_writer<R>(id: u32, f: impl FnOnce(&mut crate::jio::Writer) -> R) -> Option<R> {
+    HEAP.with(|h| match h.borrow_mut().get_mut(id as usize) {
+        Some(HostObj::Writer(w)) => Some(f(w)),
+        _ => None,
+    })
+}
+
+/// Write `text` to one of the process streams, unless it has been closed.
+fn std_emit(err: bool, text: &str) {
+    use std::io::Write;
+    if STD_CLOSED.with(Cell::get)[usize::from(err)] {
+        return;
+    }
+    if err {
+        let _ = std::io::stderr().lock().write_all(text.as_bytes());
+    } else {
+        let _ = std::io::stdout().lock().write_all(text.as_bytes());
+    }
+}
+
+/// Hand `text` to `sink`.
+fn sink_write(sink: crate::jio::Sink, text: &str) -> Result<(), Fault> {
+    use crate::jio::Sink;
+    match sink {
+        Sink::Stdout => std_emit(false, text),
+        Sink::Stderr => std_emit(true, text),
+        Sink::Handle(h) => writer_write(h, text)?,
+        Sink::Own => {}
+    }
+    Ok(())
+}
+
+/// Give `text` to the writer `id`; whatever its buffering lets go travels on
+/// down the chain. The heap borrow is released before the next writer is
+/// reached, since that writer lives in the same heap.
+fn writer_write(id: u32, text: &str) -> Result<(), Fault> {
+    let Some(r) = with_writer(id, |w| w.accept(text).map(|chunks| (chunks, w.sink))) else {
+        return Ok(());
+    };
+    let (chunks, sink) = r.map_err(|(c, m)| Fault::java(c, m.unwrap_or_default()))?;
+    for c in chunks {
+        sink_write(sink, &c)?;
+    }
+    Ok(())
+}
+
+/// `flush()`: everything the writer holds goes down the chain, and every
+/// writer below it flushes in turn, down to the process stream.
+fn writer_flush(id: u32) -> Result<(), Fault> {
+    use crate::jio::Sink;
+    let Some(r) = with_writer(id, |w| w.drain().map(|text| (text, w.sink))) else {
+        return Ok(());
+    };
+    let (text, sink) = r.map_err(|(c, m)| Fault::java(c, m.unwrap_or_default()))?;
+    if !text.is_empty() {
+        sink_write(sink, &text)?;
+    }
+    match sink {
+        Sink::Handle(h) => writer_flush(h),
+        Sink::Stdout | Sink::Stderr => {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            Ok(())
+        }
+        Sink::Own => Ok(()),
+    }
+}
+
+/// `close()`: flush, then close this writer and everything under it. Closing
+/// a closed writer does nothing, as in the JDK; a `StringWriter` stays usable.
+fn writer_close(id: u32) -> Result<(), Fault> {
+    use crate::jio::{Sink, WKind};
+    let Some((closed, kind, sink)) = with_writer(id, |w| (w.closed, w.kind, w.sink)) else {
+        return Ok(());
+    };
+    if closed || kind == WKind::StringWriter {
+        return Ok(());
+    }
+    let flushed = writer_flush(id);
+    with_writer(id, |w| w.closed = true);
+    match sink {
+        Sink::Handle(h) => writer_close(h)?,
+        Sink::Stdout | Sink::Stderr => {
+            let slot = usize::from(sink == Sink::Stderr);
+            let mut closed = STD_CLOSED.with(Cell::get);
+            closed[slot] = true;
+            STD_CLOSED.with(|s| s.set(closed));
+        }
+        Sink::Own => {}
+    }
+    flushed
+}
+
+/// A writer's constructor. `inner` is what it wraps; the result is `None` when
+/// the arguments are not a shape the JDK class has.
+fn writer_new(class: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    use crate::jio::{Sink, WKind, Writer};
+    let alloc = |w: Writer| Value::Obj(heap_alloc(HostObj::Writer(w)));
+    let kind_of = |v: &Value| writer_of(v).and_then(|id| with_writer(id, |w| (id, w.kind)));
+    let flag = |v: Option<&Value>| matches!(v, Some(Value::Bool(true)));
+    if matches!(args.first(), Some(Value::Undef)) {
+        return Some(Err(Fault::java("NullPointerException", String::new())));
+    }
+    Some(Ok(match (class, args) {
+        ("StringWriter", [] | [_]) => alloc(Writer::new(WKind::StringWriter, Sink::Own, false)),
+        // `PrintWriter(OutputStream[, autoFlush])` buffers through a
+        // `BufferedWriter` over an `OutputStreamWriter`, exactly as the JDK
+        // constructor builds it; `PrintWriter(Writer[, autoFlush])` writes
+        // straight into the writer it is given.
+        ("PrintWriter", [inner] | [inner, _]) => {
+            let (id, kind) = kind_of(inner)?;
+            let target = if kind.is_stream() {
+                let osw = heap_alloc(HostObj::Writer(Writer::new(
+                    WKind::OutputStreamWriter,
+                    Sink::Handle(id),
+                    false,
+                )));
+                heap_alloc(HostObj::Writer(Writer::new(
+                    WKind::BufferedWriter,
+                    Sink::Handle(osw),
+                    false,
+                )))
+            } else {
+                id
+            };
+            alloc(Writer::new(
+                WKind::PrintWriter,
+                Sink::Handle(target),
+                flag(args.get(1)),
+            ))
+        }
+        ("BufferedWriter", [inner] | [inner, _]) => {
+            let (id, kind) = kind_of(inner)?;
+            if kind.is_stream() {
+                return None;
+            }
+            alloc(Writer::new(WKind::BufferedWriter, Sink::Handle(id), false))
+        }
+        ("OutputStreamWriter", [inner] | [inner, _]) => {
+            let (id, kind) = kind_of(inner)?;
+            if !kind.is_stream() {
+                return None;
+            }
+            alloc(Writer::new(
+                WKind::OutputStreamWriter,
+                Sink::Handle(id),
+                false,
+            ))
+        }
+        ("BufferedOutputStream", [inner] | [inner, _]) => {
+            let (id, kind) = kind_of(inner)?;
+            if !kind.is_stream() {
+                return None;
+            }
+            alloc(Writer::new(
+                WKind::BufferedOutputStream,
+                Sink::Handle(id),
+                false,
+            ))
+        }
+        ("PrintStream", [inner] | [inner, Value::Bool(_)]) => {
+            let (id, kind) = kind_of(inner)?;
+            if !kind.is_stream() {
+                return None;
+            }
+            alloc(Writer::new(
+                WKind::PrintStream,
+                Sink::Handle(id),
+                flag(args.get(1)),
+            ))
+        }
+        _ => return None,
+    }))
+}
+
+/// The text a `write`/`append` argument stands for: a code point for an `int`
+/// (`write(int)` writes one character), the characters of a `char[]`, the
+/// string conversion of anything else (`append(null)` appends `null`).
+fn writer_text(vm: &mut VM, v: &Value) -> String {
+    match v {
+        Value::Int(n) => char::from_u32(*n as u32 & 0xFFFF)
+            .map(String::from)
+            .unwrap_or_default(),
+        Value::Obj(_) if array_items(v).is_some() => array_items(v)
+            .unwrap_or_default()
+            .iter()
+            .map(|c| match c {
+                Value::Int(n) => char::from_u32(*n as u32)
+                    .map(String::from)
+                    .unwrap_or_default(),
+                other => java_str(other),
+            })
+            .collect(),
+        other => java_str_vm(vm, other),
+    }
+}
+
+/// A method call on `System.out`/`err` used as a value or on a writer;
+/// `None` when the receiver is neither.
+///
+/// `print`/`println` arrive with their argument already converted to its
+/// string form where only the static type knew it (a `char`, a `float`);
+/// `#printf` carries the text `String.format` produced, which a `PrintWriter`
+/// writes and then autoflushes like `println`.
+fn writer_method(
+    vm: &mut VM,
+    recv: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<Result<Value, Fault>> {
+    use crate::jio::WKind;
+    let id = writer_of(recv)?;
+    let kind = with_writer(id, |w| w.kind)?;
+    let autoflush = with_writer(id, |w| w.autoflush)?;
+    let write_then = |text: &str, flush: bool| -> Result<(), Fault> {
+        writer_write(id, text)?;
+        if flush {
+            writer_flush(id)?;
+        }
+        Ok(())
+    };
+    Some(match (method, args) {
+        ("print" | "println", [] | [_]) if kind.is_print() => {
+            let mut text = args
+                .first()
+                .map(|a| writer_text_print(vm, a))
+                .unwrap_or_default();
+            let newline = method == "println";
+            if newline {
+                text.push('\n');
+            }
+            // A `PrintStream` autoflushes on any newline it writes; a
+            // `PrintWriter` only on `println`/`printf`/`format`.
+            let flush =
+                autoflush && (newline || (kind == WKind::PrintStream && text.contains('\n')));
+            write_then(&text, flush).map(|()| Value::Undef)
+        }
+        ("#printf", [text]) if kind.is_print() => {
+            write_then(&text.as_str_cow(), autoflush).map(|()| recv.clone())
+        }
+        ("write", [v]) => {
+            let text = if kind.is_stream() {
+                match v {
+                    // `PrintStream.write(int)` writes the low byte.
+                    Value::Int(n) => char::from(*n as u8).to_string(),
+                    other => writer_text(vm, other),
+                }
+            } else {
+                writer_text(vm, v)
+            };
+            let flush = kind == WKind::PrintStream && autoflush && text.contains('\n');
+            write_then(&text, flush).map(|()| Value::Undef)
+        }
+        ("write", [v, off, len]) => {
+            let all: Vec<char> = writer_text(vm, v).chars().collect();
+            let (off, len) = (off.jint(), len.jint());
+            if off < 0 || len < 0 || off + len > all.len() as i64 {
+                return Some(Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    format!(
+                        "Range [{off}, {off} + {len}) out of bounds for length {}",
+                        all.len()
+                    ),
+                )));
+            }
+            let text: String = all[off as usize..(off + len) as usize].iter().collect();
+            write_then(&text, false).map(|()| Value::Undef)
+        }
+        ("append", [v]) => {
+            let text = match v {
+                Value::Undef => "null".to_string(),
+                other => writer_text(vm, other),
+            };
+            write_then(&text, false).map(|()| recv.clone())
+        }
+        ("newLine", []) if kind == WKind::BufferedWriter => {
+            write_then("\n", false).map(|()| Value::Undef)
+        }
+        ("flush", []) => writer_flush(id).map(|()| Value::Undef),
+        ("close", []) => writer_close(id).map(|()| Value::Undef),
+        ("checkError", []) if kind.is_print() => {
+            let _ = writer_flush(id);
+            Ok(Value::bool(with_writer(id, |w| w.error).unwrap_or(false)))
+        }
+        ("toString", []) if kind == WKind::StringWriter => Ok(Value::str(
+            with_writer(id, |w| w.buf.clone()).unwrap_or_default(),
+        )),
+        _ => Err(Fault::internal(format!(
+            "javars: unsupported method `{method}` with {} argument(s) on {}",
+            args.len(),
+            kind.class_name()
+        ))),
+    })
+}
+
+/// The string conversion `print`'s overloads apply: a `char[]` prints its
+/// characters, everything else its `String.valueOf`.
+fn writer_text_print(vm: &mut VM, v: &Value) -> String {
+    match v {
+        Value::Obj(_)
+            if array_items(v).is_some_and(|a| {
+                a.iter()
+                    .all(|c| matches!(c, Value::Str(s) if s.chars().count() == 1))
+            }) =>
+        {
+            writer_text(vm, v)
+        }
+        other => java_str_vm(vm, other),
+    }
 }
 
 fn io_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
@@ -18328,6 +18735,10 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
     } else {
         vals.iter().map(java_str).collect()
     };
+    // A stream closed through a writer built over it drops the write.
+    if STD_CLOSED.with(Cell::get)[usize::from(err)] {
+        return Value::Undef;
+    }
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let mut lock: Box<dyn Write> = if err {
@@ -18672,6 +19083,10 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Closure { .. }) => format!("<lambda>@{id:x}"),
             // A reader renders as `Object.toString()` does: class, `@`, hash.
             Some(HostObj::Reader(r)) => format!("{}@{id:x}", r.kind.class_name()),
+            // A `StringWriter` renders its text; every other writer is an
+            // `Object.toString()`.
+            Some(HostObj::Writer(w)) if w.kind == crate::jio::WKind::StringWriter => w.buf.clone(),
+            Some(HostObj::Writer(w)) => format!("{}@{id:x}", w.kind.class_name()),
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
             Some(HostObj::Stats(s)) => s.render(),

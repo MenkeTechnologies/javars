@@ -1596,7 +1596,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   the `Objects` members, the `String` instance methods, and the `java.util`
   collections are the whole
   library surface, with console and text input (`Scanner`, `BufferedReader`
-  over `InputStreamReader`/`StringReader`, `StringTokenizer`), `java.util.Random`
+  over `InputStreamReader`/`StringReader`, `StringTokenizer`), console output
+  through the `java.io` writers and print streams (`PrintWriter`,
+  `BufferedWriter`, `OutputStreamWriter`, `StringWriter`, `PrintStream`,
+  `BufferedOutputStream`; `StringWriter.getBuffer()` is refused), `java.util.Random`
   (a port of the JDK's generator, so a seeded sequence is the JDK's),
   `java.util.BitSet`, `java.util.regex.Pattern`/`Matcher`, the
   `Int`/`Long`/`DoubleSummaryStatistics` classes, and `AtomicInteger`/`AtomicLong`/

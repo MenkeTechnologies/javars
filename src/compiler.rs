@@ -7100,6 +7100,25 @@ impl Compiler {
         // accepted element downstream in order). The mapper adapter is the
         // prelude's `BiConsumer.mapMulti$`, so the user's lambda is lowered
         // against `BiConsumer` and its consumer argument is a real `Consumer`.
+        // `out.printf(fmt, args…)` on a `PrintWriter`/`PrintStream` is
+        // `String.format(fmt, args…)` written through the receiver — the one
+        // formatter, which only the static call site can give each argument's
+        // type to — then the autoflush a `println` would do.
+        if matches!(method, "printf" | "format")
+            && !args.is_empty()
+            && matches!(
+                self.expr_java_type(recv).as_deref(),
+                Some("PrintWriter" | "PrintStream")
+            )
+        {
+            let text = Expr::MethodCall {
+                recv: Box::new(Expr::Var("String".to_string())),
+                method: "format".to_string(),
+                args: args.to_vec(),
+                line,
+            };
+            return self.method_call(recv, "#printf", &[text], line);
+        }
         if method == "mapMulti" && args.len() == 1 && self.expr_class(recv).is_none() {
             let adapter = Expr::MethodCall {
                 recv: Box::new(Expr::Var("BiConsumer".to_string())),
@@ -10010,6 +10029,12 @@ fn is_static_class(name: &str) -> bool {
             | "InputStreamReader"
             | "StringReader"
             | "StringTokenizer"
+            | "PrintWriter"
+            | "BufferedWriter"
+            | "OutputStreamWriter"
+            | "StringWriter"
+            | "PrintStream"
+            | "BufferedOutputStream"
             | "Random"
             | "IntSummaryStatistics"
             | "LongSummaryStatistics"
@@ -10146,6 +10171,13 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("System", "currentTimeMillis" | "nanoTime") => "long",
         ("System", "lineSeparator") => "String",
         ("System", "#in") => "InputStream",
+        ("System", "#out" | "#err") => "PrintStream",
+        ("PrintWriter", "#new") => "PrintWriter",
+        ("BufferedWriter", "#new") => "BufferedWriter",
+        ("OutputStreamWriter", "#new") => "OutputStreamWriter",
+        ("StringWriter", "#new") => "StringWriter",
+        ("PrintStream", "#new") => "PrintStream",
+        ("BufferedOutputStream", "#new") => "BufferedOutputStream",
         ("Scanner", "#new") => "Scanner",
         ("BufferedReader", "#new") => "BufferedReader",
         ("InputStreamReader", "#new") => "InputStreamReader",
@@ -11125,11 +11157,21 @@ fn is_host_value_class(name: &str) -> bool {
     )
 }
 
-/// The input classes `crate::jio` models as host shapes.
+/// The input and output classes `crate::jio` models as host shapes.
 fn is_input_class(name: &str) -> bool {
     matches!(
         name,
-        "Scanner" | "BufferedReader" | "InputStreamReader" | "StringReader" | "StringTokenizer"
+        "Scanner"
+            | "BufferedReader"
+            | "InputStreamReader"
+            | "StringReader"
+            | "StringTokenizer"
+            | "PrintWriter"
+            | "BufferedWriter"
+            | "OutputStreamWriter"
+            | "StringWriter"
+            | "PrintStream"
+            | "BufferedOutputStream"
     )
 }
 
@@ -11153,6 +11195,12 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "nextToken") => "String",
         ("StringTokenizer", "hasMoreTokens" | "hasMoreElements") => "boolean",
         ("StringTokenizer", "countTokens") => "int",
+        ("PrintWriter" | "PrintStream", "checkError") => "boolean",
+        ("StringWriter", "toString") => "String",
+        ("PrintWriter", "append" | "#printf") => "PrintWriter",
+        ("PrintStream", "append" | "#printf") => "PrintStream",
+        ("BufferedWriter", "append") => "BufferedWriter",
+        ("StringWriter", "append") => "StringWriter",
         ("BitSet", "cardinality" | "length" | "size" | "nextSetBit" | "nextClearBit") => "int",
         ("BitSet", "previousSetBit" | "previousClearBit" | "hashCode") => "int",
         ("BitSet", "isEmpty" | "intersects") => "boolean",

@@ -795,38 +795,63 @@ while ((line = br.readLine()) != null) System.out.println(line.trim());</code></
 int a = Integer.parseInt(st.nextToken());</code></pre>
         </article>
         <article class="doc-entry" id="doc-console-io-5">
-          <h3><a class="doc-anchor" href="#doc-console-io-5">#</a> <code>System.out</code></h3>
-          <pre><code class="lang-java">System.out</code></pre>
-          <p>The standard output stream. It is not an object javars can pass around: <code>System.out</code> is recognized only as the receiver of <code>print</code>/<code>println</code>/<code>printf</code>/<code>flush</code> or as the left side of a <code>System.out::println</code> method reference.</p>
-          <pre><code class="lang-java">System.out.print("x");</code></pre>
+          <h3><a class="doc-anchor" href="#doc-console-io-5">#</a> <code>PrintWriter</code></h3>
+          <pre><code class="lang-java">new PrintWriter(System.out [, boolean autoFlush])   |   new PrintWriter(Writer w [, boolean autoFlush])</code></pre>
+          <p><code>java.io.PrintWriter</code>: <code>print</code>/<code>println</code> of every type (by its static type, so a <code>char</code> prints as a character and a <code>float</code> at 32 bits), <code>printf</code>/<code>format</code>, <code>write</code>, <code>append</code>, <code>flush</code>, <code>close</code> and <code>checkError</code>. Over an <code>OutputStream</code> it buffers through a <code>BufferedWriter</code> and an <code>OutputStreamWriter</code>, as the JDK constructor does: text reaches the console at <code>flush()</code>, <code>close()</code>, an autoflush (<code>println</code>/<code>printf</code>/<code>format</code> when <code>autoFlush</code> is set), or a buffer overflow, and what is still buffered when the program ends is lost. A closed <code>PrintWriter</code> drops writes and reports it through <code>checkError()</code>.</p>
+          <pre><code class="lang-java">PrintWriter out = new PrintWriter(System.out);
+out.println(42);
+out.flush();</code></pre>
         </article>
         <article class="doc-entry" id="doc-console-io-6">
-          <h3><a class="doc-anchor" href="#doc-console-io-6">#</a> <code>System.err</code></h3>
-          <pre><code class="lang-java">System.err</code></pre>
-          <p>The standard error stream, recognized in exactly the same positions as <code>System.out</code> and lowered to the stderr pair of print builtins.</p>
-          <pre><code class="lang-java">System.err.println("oops");</code></pre>
+          <h3><a class="doc-anchor" href="#doc-console-io-6">#</a> <code>BufferedWriter</code></h3>
+          <pre><code class="lang-java">new BufferedWriter(Writer w)   |   new OutputStreamWriter(System.out)   |   new StringWriter()</code></pre>
+          <p>The character writers. A <code>BufferedWriter</code> passes its 8192 characters on when it fills and adds <code>newLine()</code>; an <code>OutputStreamWriter</code> writes its 8192 bytes when the next character no longer fits; a <code>StringWriter</code> keeps everything and its <code>toString()</code> is the text. <code>write(int)</code> writes one character, <code>write(s, off, len)</code> a range, and <code>append</code> returns the writer. After <code>close</code>, a write or flush is <code>IOException: Stream closed</code>.</p>
+          <pre><code class="lang-java">BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(System.out));
+bw.write("hi");
+bw.newLine();
+bw.flush();</code></pre>
         </article>
         <article class="doc-entry" id="doc-console-io-7">
-          <h3><a class="doc-anchor" href="#doc-console-io-7">#</a> <code>System.out.println</code></h3>
+          <h3><a class="doc-anchor" href="#doc-console-io-7">#</a> <code>PrintStream</code></h3>
+          <pre><code class="lang-java">new PrintStream(OutputStream out [, boolean autoFlush])   |   new BufferedOutputStream(OutputStream out)</code></pre>
+          <p>The byte streams. A <code>PrintStream</code> writes through to the stream it wraps (<code>System.out</code> is one) and, with <code>autoFlush</code>, flushes on every newline; a <code>BufferedOutputStream</code> holds 8192 bytes, flushing them before a write that would overflow. <code>write(int)</code> writes the low byte.</p>
+          <pre><code class="lang-java">PrintStream ps = new PrintStream(new BufferedOutputStream(System.out));
+ps.println("x");
+ps.flush();</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-8">
+          <h3><a class="doc-anchor" href="#doc-console-io-8">#</a> <code>System.out</code></h3>
+          <pre><code class="lang-java">System.out</code></pre>
+          <p>The standard output stream, a <code>java.io.PrintStream</code>. As the receiver of <code>print</code>/<code>println</code>/<code>printf</code>/<code>flush</code> it lowers straight to the print builtins; named as a value (<code>PrintStream o = System.out</code>, <code>new PrintWriter(System.out)</code>) it is one shared object with <code>write</code>, <code>append</code>, <code>checkError</code> and <code>close</code>. Closing it — directly, or by closing a writer built over it — drops every later write, as in the JDK.</p>
+          <pre><code class="lang-java">System.out.print("x");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-9">
+          <h3><a class="doc-anchor" href="#doc-console-io-9">#</a> <code>System.err</code></h3>
+          <pre><code class="lang-java">System.err</code></pre>
+          <p>The standard error stream, in every position <code>System.out</code> takes and lowered to the stderr pair of print builtins.</p>
+          <pre><code class="lang-java">System.err.println("oops");</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-console-io-10">
+          <h3><a class="doc-anchor" href="#doc-console-io-10">#</a> <code>System.out.println</code></h3>
           <pre><code class="lang-java">void System.out.println([Object x])</code></pre>
           <p>Prints one argument in Java's <code>String.valueOf</code> form followed by a newline, then returns nothing. The Java formatting is the point of the builtin: <code>true</code> prints as <code>true</code> (not <code>1</code>), a whole double as <code>3.0</code> (not <code>3</code>), and a null reference as <code>null</code>. Called with no argument it prints just the newline.</p>
           <pre><code class="lang-java">System.out.println("hello");
 System.out.println();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-8">
-          <h3><a class="doc-anchor" href="#doc-console-io-8">#</a> <code>System.out.print</code></h3>
+        <article class="doc-entry" id="doc-console-io-11">
+          <h3><a class="doc-anchor" href="#doc-console-io-11">#</a> <code>System.out.print</code></h3>
           <pre><code class="lang-java">void System.out.print([Object x])</code></pre>
           <p>As <code>println</code>, but with no trailing newline.</p>
           <pre><code class="lang-java">System.out.print("no newline");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-9">
-          <h3><a class="doc-anchor" href="#doc-console-io-9">#</a> <code>System.err.println</code></h3>
+        <article class="doc-entry" id="doc-console-io-12">
+          <h3><a class="doc-anchor" href="#doc-console-io-12">#</a> <code>System.err.println</code></h3>
           <pre><code class="lang-java">void System.err.println([Object x])</code></pre>
           <p>As <code>System.out.println</code>, writing to stderr. stdout and stderr are locked and written independently, so redirecting one does not reorder the other.</p>
           <pre><code class="lang-java">System.err.println("to stderr");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-console-io-10">
-          <h3><a class="doc-anchor" href="#doc-console-io-10">#</a> <code>System.err.print</code></h3>
+        <article class="doc-entry" id="doc-console-io-13">
+          <h3><a class="doc-anchor" href="#doc-console-io-13">#</a> <code>System.err.print</code></h3>
           <pre><code class="lang-java">void System.err.print([Object x])</code></pre>
           <p>As <code>System.err.println</code>, with no trailing newline.</p>
           <pre><code class="lang-java">System.err.print("partial");</code></pre>

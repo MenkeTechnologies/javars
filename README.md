@@ -487,8 +487,13 @@ Implemented and checked against the reference `java`:
   `Collectors` factories (`toMap`, `groupingBy`, `partitioningBy`, `mapping`,
   `teeing`, `summarizingInt`/`Long`/`Double`, …), `summaryStatistics()`; a
   `double` stream sums with the JDK's compensated summation.
-- **Output** — `System.out.println(x)` / `System.out.print(x)` with Java value
-  formatting.
+- **Output** — `System.out.println(x)` / `System.out.print(x)` / `printf` with Java
+  value formatting; `System.out`/`System.err` as `PrintStream` values; and the
+  `java.io` writers — `PrintWriter`, `BufferedWriter`, `OutputStreamWriter`,
+  `StringWriter`, `PrintStream`, `BufferedOutputStream` — with the JDK's
+  buffering: text reaches the console at `flush()`/`close()`/autoflush or when
+  a buffer overflows, an unflushed `PrintWriter(System.out)` loses what it
+  holds, and closing a writer closes the stream under it.
 - **Input** — `new Scanner(System.in)` (`nextInt`/`nextLong`/`nextDouble`/
   `nextBoolean`/`next`/`nextLine` and their `hasNext*` tests, with Java's
   `InputMismatchException`/`NoSuchElementException` behavior),

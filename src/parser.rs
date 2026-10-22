@@ -4135,9 +4135,29 @@ impl Parser {
                 ))
             }
         };
+        // `System.out` as a value — `PrintStream o = System.out;`,
+        // `new PrintWriter(System.out)` — rather than as a `print` receiver.
+        let stream_value = system_call(if err { "#err" } else { "#out" }, Vec::new());
+        if !self.is(&Tok::Dot) {
+            return Ok(stream_value);
+        }
         self.eat(&Tok::Dot)?;
         let line = self.line();
         let method = self.ident()?;
+        // Every other `PrintStream` member (`write`, `append`, `checkError`,
+        // `close`) is an ordinary call on the stream value.
+        if !matches!(
+            method.as_str(),
+            "flush" | "printf" | "format" | "println" | "print"
+        ) {
+            let args = self.call_args()?;
+            return Ok(Expr::MethodCall {
+                recv: Box::new(stream_value),
+                method,
+                args,
+                line,
+            });
+        }
         // `flush()` writes out whatever the stream holds; the host's streams
         // hold nothing a later write would not also flush, but a prompt read
         // back by another process must not wait for the program to end.

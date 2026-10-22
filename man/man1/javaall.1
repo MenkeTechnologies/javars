@@ -83,9 +83,21 @@ classic and arrow
 .BR return ,
 .BR throw ,
 .BR try / catch / finally
-(including try\-with\-resources), and
+(including try\-with\-resources),
+.B assert
+(parsed and disabled, as the JDK launcher runs it without
+.BR \-ea ),
 .BR System.out.print [ln]
-calls.
+and
+.B printf
+calls, and the
+.B java.io
+writers
+.RB ( PrintWriter ,
+.BR BufferedWriter ,
+.BR StringWriter ,
+.BR PrintStream )
+with the JDK's buffering.
 .SS Expressions
 Integer, floating, boolean, string, and char literals; arithmetic, comparison,
 bitwise, shift, and short\-circuit logical operators; casts; lambdas and
