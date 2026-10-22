@@ -2369,18 +2369,102 @@ fn regex_errors_are_the_throwables_java_raises() {
 #[test]
 fn an_untranslatable_regex_construct_is_refused_by_name() {
     // javars's standing rule applied to regular expressions: a construct with no
-    // faithful translation (a possessive quantifier never gives back what it
-    // consumed; the engine's greedy one does) is reported rather than compiled
+    // faithful translation (`\G` anchors at the end of the previous match, a
+    // notion the engine has no anchor for) is reported rather than compiled
     // into a different language. OpenJDK *accepts* these — this is the
     // deliberate difference, and the message has to name which construct.
     let (out, ok) = run(&wrap(
-        "try { System.out.println(\"aab\".matches(\"a*+b\")); }\
+        "try { System.out.println(\"aab\".matches(\"\\\\Ga*b\")); }\
          catch (RuntimeException e) { System.out.println(e.getMessage().split(\"\\n\")[0]); }",
     ));
     assert!(ok);
     assert_eq!(
         out,
-        "javars supports no equivalent of *+ (possessive quantifier) near index 0\n"
+        "javars supports no equivalent of \\G (end of previous match) near index 0\n"
+    );
+}
+
+#[test]
+fn regex_possessive_quantifiers_never_give_back() {
+    // `X*+`, `X++`, `X?+` and `X{n,m}+` keep everything they consumed, so
+    // `"aaa".matches("a*+a")` is false where the greedy `a*a` is true, and
+    // `"[^"]*+"` is the idiomatic no-backtracking quoted-string. The engine
+    // spells the quantifier the same way and compiles it to an atomic group.
+    // Verified byte-for-byte against OpenJDK 27.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"aab\".matches(\"a*+b\") + \",\" + \"aaa\".matches(\"a*+a\") + \",\"\
+             + \"aaa\".matches(\"a*a\") + \",\" + \"aaa\".matches(\"a++a\") + \",\"\
+             + \"a\".matches(\"a?+a\") + \",\" + \"aaaa\".matches(\"a{2,3}+a\") + \",\"\
+             + \"aaa\".matches(\"(?i)A*+a\"));\
+         System.out.println(\"\\\"ab\\\" x \\\"cd\\\"\".replaceAll(\"\\\"[^\\\"]*+\\\"\", \"S\") + \",\"\
+             + \"abab\".replaceAll(\"(ab)*+\", \"X\") + \",\" + \"xaay\".replaceAll(\"a*+\", \"-\"));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,false,true,false,false,true,false\nS x S,XX,-x--y-\n"
+    );
+}
+
+#[test]
+fn regex_atomic_groups_commit_to_their_first_alternative() {
+    // `(?>a|ab)c` on `abc` is false — once `a` matched the group is done and
+    // `ab` is never tried — where `(?:a|ab)c` is true; an inline flag set
+    // inside the group ends with it, as in any group.
+    // Verified byte-for-byte against OpenJDK 27.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"abc\".matches(\"(?>a|ab)c\") + \",\" + \"abc\".matches(\"(?>ab|a)c\") + \",\"\
+             + \"abc\".matches(\"(?:a|ab)c\") + \",\" + \"aaa\".matches(\"(?>a*)a\") + \",\"\
+             + \"foobar\".replaceAll(\"(?>foo|foob)ar\", \"X\") + \",\"\
+             + \"aXb\".matches(\"(?>(?i)a)Xb\") + \",\" + \"aXb\".matches(\"(?>(?i)A)xb\"));",
+    ));
+    assert!(ok);
+    assert_eq!(out, "false,true,true,false,foobar,true,false\n");
+}
+
+#[test]
+fn regex_control_and_octal_escapes_name_their_character() {
+    // `\cX` is `X ^ 64` whatever `X` is (`\cA` U+0001, `\ca` `!`, `\c?` DEL);
+    // `\0n` reads one to three octal digits after the `0`, the third only when
+    // the first is `0`-`3` (`\0401` is a space then `1`). Both fold under
+    // `(?i)` and both work inside a class, including as a range end.
+    // Verified byte-for-byte against OpenJDK 27.
+    let (out, ok) = run(&wrap(
+        "System.out.println(\"\\u0001\".matches(\"\\\\cA\") + \",\" + \"!\".matches(\"\\\\ca\") + \",\"\
+             + \"a\\tb\".replaceAll(\"\\\\cI\", \"T\") + \",\" + \"\\u007f\".matches(\"\\\\c?\") + \",\"\
+             + \"\\u0001\\u0002\".matches(\"[\\\\cA\\\\cB]+\") + \",\" + \"a\".matches(\"(?i)\\\\c\\u0001\"));\
+         System.out.println(\"\\t\".matches(\"\\\\011\") + \",\" + \"A\".matches(\"\\\\0101\") + \",\"\
+             + \"\\u00ff\".matches(\"\\\\0377\") + \",\" + \" 1\".matches(\"\\\\0401\") + \",\"\
+             + \"7\".matches(\"\\\\07\") + \",\" + \"\\u0000\".matches(\"\\\\00\") + \",\"\
+             + \"A\".matches(\"(?i)\\\\0141\") + \",\" + \"a-c\".replaceAll(\"[\\\\0141-\\\\0143]\", \".\"));",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "true,true,aTb,true,true,true\ntrue,true,true,true,false,true,true,.-.\n"
+    );
+}
+
+#[test]
+fn regex_malformed_control_and_octal_escapes_raise_javas_message() {
+    // A `\c` with nothing after it and a `\0` with no octal digit are the
+    // JDK's own `PatternSyntaxException`s, index and caret line included; the
+    // caret is omitted when the index is the end of the pattern, as the JDK
+    // omits it.
+    // Verified byte-for-byte against OpenJDK 27.
+    let (out, ok) = run(&wrap(
+        "for (String p : new String[] { \"\\\\c\", \"\\\\08\", \"\\\\0\", \"\\\\0x\" }) {\
+             try { \"x\".matches(p); System.out.println(\"compiled\"); }\
+             catch (RuntimeException e) { System.out.println(e.getClass().getName() + \": \" + e.getMessage().replace(\"\\n\", \"|\")); }\
+         }",
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "java.util.regex.PatternSyntaxException: Illegal control escape sequence near index 1|\\c| ^\n\
+         java.util.regex.PatternSyntaxException: Illegal octal escape sequence near index 2|\\08|  ^\n\
+         java.util.regex.PatternSyntaxException: Illegal octal escape sequence near index 2|\\0\n\
+         java.util.regex.PatternSyntaxException: Illegal octal escape sequence near index 2|\\0x|  ^\n"
     );
 }
 

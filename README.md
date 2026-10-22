@@ -344,9 +344,11 @@ Implemented and checked against the reference `java`:
   because the two flavours' *defaults* differ where it changes answers: Java's
   `\d`/`\w`/`\s`/`\b` are ASCII-only, its `(?i)` folds ASCII only, its `.`
   excludes five line terminators, and its default-mode `$` matches before a
-  final one. A construct with no faithful translation (a possessive quantifier,
-  an atomic group, a Unicode block) raises `PatternSyntaxException` naming it
-  rather than compiling into a different language.
+  final one. Possessive quantifiers (`a*+`), atomic groups (`(?>…)`), `\cX`
+  control and `\0n` octal escapes translate exactly; a construct with no
+  faithful translation (`\G`, a Unicode block, `(?m)`) raises
+  `PatternSyntaxException` naming it rather than compiling into a different
+  language.
   `Pattern.compile` (with `CASE_INSENSITIVE`, `DOTALL` and `LITERAL`) and
   `Matcher` run on the same engine: `find`/`find(int)`/`matches`/`lookingAt`,
   `group` by number or name, `start`/`end` in UTF-16 indices, `groupCount`,

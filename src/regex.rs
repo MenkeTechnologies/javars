@@ -11,12 +11,15 @@
 //! a large common core that maps one-for-one (literals, groups, classes,
 //! quantifiers, `\d`/`\w`/`\s`, the anchors, lookaround, backreferences, inline
 //! flags), a smaller set that maps mechanically once rewritten (`\Q…\E`,
-//! `\h`/`\v`/`\R`, `\Z`, the POSIX `\p{Alpha}` names), and a tail that does not
-//! map at all (possessive quantifiers, atomic groups, `\G`, Unicode *blocks*).
-//! Handing the tail to the engine anyway would compile — and quietly answer a
-//! different question. So [`translate`] rewrites the middle set and **rejects**
-//! the tail by name, which keeps javars's standing rule: an unsupported
-//! construct is an error, never a wrong answer.
+//! `\h`/`\v`/`\R`, `\Z`, `\cX`, `\0n`, the POSIX `\p{Alpha}` names), and a
+//! tail that does not map at all (`\G`, `\X`, `\N{…}`, Unicode *blocks*, the
+//! `(?m)`/`(?x)` flags). Handing the tail to the engine anyway would compile —
+//! and quietly answer a different question. So [`translate`] rewrites the middle
+//! set and **rejects** the tail by name, which keeps javars's standing rule: an
+//! unsupported construct is an error, never a wrong answer. Possessive
+//! quantifiers (`a*+`) and atomic groups (`(?>…)`) are in the common core: the
+//! engine spells both exactly as Java does and gives them Java's never-give-back
+//! semantics.
 //!
 //! On top of the engine this module implements the three `String` methods'
 //! *specified* behaviour, which is not what a naive call to the engine gives:
@@ -497,12 +500,31 @@ pub fn translate(pattern: &str) -> Result<String, String> {
                         i = next;
                         out.push_str(&translate_property(e, &name, pattern)?);
                     }
+                    // `\cX` is the control character `X ^ 64` (`\cA` is U+0001,
+                    // `\c?` is DEL); Java takes *any* following character.
+                    'c' => {
+                        let Some(&x) = cs.get(i) else {
+                            return Err(syntax_error(
+                                "Illegal control escape sequence",
+                                pattern,
+                                i - 1,
+                            ));
+                        };
+                        i += 1;
+                        let ch = char::from_u32(u32::from(x) ^ 64).unwrap_or(x);
+                        push_literal(&mut out, ch, in_class, flags.ci, true);
+                    }
+                    // `\0n`, `\0nn`, `\0mnn` — an octal code point, spelled by
+                    // its digits once decoded.
+                    '0' => {
+                        let (ch, next) = read_octal(&cs, i, pattern)?;
+                        i = next;
+                        push_literal(&mut out, ch, in_class, flags.ci, true);
+                    }
                     // Constructs with no equivalent at all.
                     'G' => return Err(unsupported("\\G (end of previous match)", pattern)),
                     'X' => return Err(unsupported("\\X (grapheme cluster)", pattern)),
-                    'c' => return Err(unsupported("\\cX (control character)", pattern)),
                     'N' => return Err(unsupported("\\N{...} (named character)", pattern)),
-                    '0' => return Err(unsupported("\\0n (octal escape)", pattern)),
                     // A backreference, `\A`/`\z`, or an escaped metacharacter —
                     // all spelled identically by both flavours.
                     other => {
@@ -549,8 +571,10 @@ pub fn translate(pattern: &str) -> Result<String, String> {
             }
             '(' if !in_class => {
                 if cs.get(i + 1) == Some(&'?') {
+                    // `(?>...)` (atomic group) is spelled the same by the
+                    // engine and falls through to the plain-group path below,
+                    // which also scopes any inline flags set inside it.
                     match cs.get(i + 2) {
-                        Some('>') => return Err(unsupported("(?> (atomic group)", pattern)),
                         Some('(') => return Err(unsupported("(?(...) (conditional)", pattern)),
                         Some('#') => return Err(unsupported("(?# (comment group)", pattern)),
                         _ => {}
@@ -597,14 +621,9 @@ pub fn translate(pattern: &str) -> Result<String, String> {
                 out.push(')');
                 i += 1;
             }
-            // A possessive quantifier never gives back what it consumed; the
-            // engine's greedy one does, which is a different language.
-            '*' | '+' | '?' | '}' if !in_class && cs.get(i + 1) == Some(&'+') => {
-                return Err(unsupported(
-                    &format!("{c}+ (possessive quantifier)"),
-                    pattern,
-                ));
-            }
+            // A possessive quantifier (`*+`, `++`, `?+`, `{n,m}+`) never gives
+            // back what it consumed. The engine spells it the same way and
+            // compiles it to an atomic group, which is Java's definition of it.
             // An ASCII letter under `(?i)` becomes both cases explicitly, which
             // is Java's ASCII-only folding; the engine's own `i` folds Unicode.
             other if flags.ci && other.is_ascii_alphabetic() => {
@@ -721,6 +740,47 @@ fn read_code_point(
             pattern,
         )),
     }
+}
+
+/// Read the digits of Java's `\0n` octal escape, with `i` just past the `0`.
+/// Port of `Pattern.o()`: one digit, two if the second is octal, three if the
+/// third is octal *and* the first is `0`–`3` (so the value fits a byte). No
+/// digit at all is `PatternSyntaxException: Illegal octal escape sequence`.
+/// Returns the character and the index past the last digit consumed.
+fn read_octal(cs: &[char], i: usize, pattern: &str) -> Result<(char, usize), String> {
+    let digit = |at: usize| cs.get(at).and_then(|c| c.to_digit(8));
+    let Some(n) = digit(i) else {
+        return Err(syntax_error("Illegal octal escape sequence", pattern, i));
+    };
+    let Some(m) = digit(i + 1) else {
+        return Ok((octal_char(n), i + 1));
+    };
+    match digit(i + 2) {
+        Some(o) if n <= 3 => Ok((octal_char(n * 64 + m * 8 + o), i + 3)),
+        _ => Ok((octal_char(n * 8 + m), i + 2)),
+    }
+}
+
+/// The character an octal escape names; the value is at most `0o377`, so it is
+/// always a character.
+fn octal_char(value: u32) -> char {
+    char::from_u32(value).unwrap_or('\0')
+}
+
+/// A `PatternSyntaxException` message in the JDK's exact shape: the description,
+/// ` near index N`, the pattern on its own line, and a caret under index `N`
+/// when it lies inside the pattern (a tab stays a tab so the caret lines up).
+fn syntax_error(desc: &str, pattern: &str, index: usize) -> String {
+    let mut msg = format!("{desc} near index {index}\n{pattern}");
+    let cs: Vec<char> = pattern.chars().collect();
+    if index < cs.len() {
+        msg.push('\n');
+        for &c in &cs[..index] {
+            msg.push(if c == '\t' { '\t' } else { ' ' });
+        }
+        msg.push('^');
+    }
+    msg
 }
 
 /// Negate a bracketed class produced above (`[...]` becomes `[^...]`).

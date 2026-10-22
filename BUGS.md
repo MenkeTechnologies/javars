@@ -1639,8 +1639,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **The regular-expression constructs with no faithful translation.** Regular
   expressions themselves are implemented (see the entry under "Implemented");
   what is refused — as a `PatternSyntaxException` naming the construct — is the
-  tail that `fancy-regex` cannot reproduce: possessive quantifiers (`a*+`),
-  atomic groups (`(?>…)`), `\G`, `\X`, `\cX`, `\N{…}`, `\0n` octal escapes,
+  tail that `fancy-regex` cannot reproduce: `\G`, `\X`, `\N{…}`,
   conditionals `(?(1)…)`, Unicode *blocks* (`\p{InGreek}`) and the
   `\p{javaLowerCase}` predicates, and the `(?m)`/`(?x)`/`(?d)`/`(?u)`/`(?U)`
   flags. OpenJDK *accepts* every one of these, so this is a deliberate
@@ -1652,7 +1651,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   translation (see README); their `MULTILINE`, `COMMENTS`, `UNICODE_CASE`,
   `UNIX_LINES`, `CANON_EQ` and `UNICODE_CHARACTER_CLASS` flags are refused by
   name for the reason `(?m)`/`(?x)` are, and a `MatchResult` is a frozen
-  `Matcher`, so its `getClass()` names `java.util.regex.Matcher`.
+  `Matcher`, so its `getClass()` names `java.util.regex.Matcher`. Possessive
+  quantifiers (`a*+`), atomic groups (`(?>…)`), `\cX` control escapes and
+  `\0n` octal escapes were once on this list and are now translated: the engine
+  spells the first two as Java does with the same never-give-back semantics,
+  and the escapes decode to the character they name.
 - ~~**`List.listIterator`**~~ — implemented, on `ArrayList.ListItr`'s cursor
   model: `previous`/`hasPrevious`, `nextIndex`/`previousIndex`, and `set`/`add`
   at the cursor, with `IllegalStateException` after an `add` and a
