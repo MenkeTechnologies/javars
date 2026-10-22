@@ -1303,6 +1303,30 @@ storage-model differences:
   System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
   System.out.println(String.class);               // both: class java.lang.String
   ```
+- **A `Float` or `Character` read back out of a generic container computes as
+  the wrong type.** Type arguments are erased at parse time, so `l.get(0)` on a
+  `List<Float>` has no static type: the `Float` box it returns is right (it
+  prints `0.1` and `equals` compares it as a `Float`), but arithmetic on it is
+  the `double` operation, and a `Character` element — javars's one-character
+  String — concatenates where Java adds. Measured on `openjdk 21.0.12.1`:
+
+  ```java
+  List<Float> l = new ArrayList<>(List.of(0.1f));
+  System.out.println(l.get(0) + 1);            // Java: 1.1   javars: 1.1000000014901161
+  List<Character> c = new ArrayList<>(List.of('d'));
+  System.out.println((char) (c.get(0) + 1));   // Java: e     javars: U+0000
+  ```
+
+  Assigning the element to a typed local first (`float g = l.get(0);`) gives
+  Java's answer, because the local's declared type drives the arithmetic. The
+  `int` analogue is the 64-bit result in the first bullet above.
+- **`Arrays.asList(array)` copies the array instead of viewing it.** Java's
+  list writes through: `Integer[] a = {5, 2}; Arrays.asList(a).set(0, 99);`
+  leaves `a[0] == 99`, and a later write to `a` shows in the list. javars's
+  list is a fixed-size copy, so `a[0]` stays `5`. Measured on
+  `openjdk 21.0.12.1`. An array and a list are different host objects with
+  separate storage; sharing it needs a list variant that reads and writes the
+  array's slab.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1346,6 +1370,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
+- **An array type in `instanceof`.** `o instanceof int[]` and the pattern form
+  `o instanceof int[] ia` are parse errors (`expected RParen but found
+  LBracket`). A reference array carries no element type at run time (see the
+  `ArrayStoreException` entry below), so the test could not distinguish
+  `int[]` from `String[]` even once it parsed.
+- **`Enum.valueOf(Cls.class, name)`, `Character.getType` and
+  `Character.isIdeographic`** are refused (`cannot find symbol: Enum`,
+  ``unsupported static method``). `Cls.valueOf(name)` is the modeled spelling
+  of the first.
 - **A user class cannot extend a JDK collection.** `class Lru<K, V> extends
   LinkedHashMap<K, V> { protected boolean removeEldestEntry(…) { … } }` — the
   usual LRU cache — and `class Stack2 extends ArrayList<Integer>` are refused

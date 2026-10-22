@@ -1934,6 +1934,20 @@ impl Parser {
                     self.eat(&Tok::Semi)?;
                     return Ok(StmtKind::Yield(e));
                 }
+                // `assert cond;` / `assert cond : detail;` (JLS 14.10). The
+                // reference launcher runs with assertions disabled unless `-ea`
+                // is given, and a disabled assertion evaluates *neither*
+                // expression, so the statement is parsed and compiles to nothing.
+                "assert" => {
+                    self.advance();
+                    self.expression()?;
+                    if self.is(&Tok::Colon) {
+                        self.advance();
+                        self.expression()?;
+                    }
+                    self.eat(&Tok::Semi)?;
+                    return Ok(StmtKind::Locals(Vec::new()));
+                }
                 "throw" => {
                     self.uses_exceptions = true;
                     self.advance();

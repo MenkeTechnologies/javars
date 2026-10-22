@@ -2000,6 +2000,17 @@ impl Compiler {
                                 "long".to_string()
                             });
                         }
+                        // The `float` overloads of the bit-pattern statics answer a
+                        // `float` (`getExponent(float)` its `int`), so the result
+                        // prints through `Float.toString`.
+                        if self.math_float_overload(class, method, args) {
+                            let t = if method == "getExponent" {
+                                "int"
+                            } else {
+                                "float"
+                            };
+                            return Some(t.to_string());
+                        }
                         // The width-overloaded family answers at the width its
                         // arguments selected, so `Math.addExact(1L, 2L)` is a
                         // `long` where `Math.addExact(1, 2)` is an `int` — and
@@ -3570,6 +3581,34 @@ impl Compiler {
             "float" => crate::host::width::FLOAT,
             "long" => crate::host::width::LONG,
             _ => crate::host::width::INT,
+        })
+    }
+
+    /// True when `Math.<method>(args)` selects the `float` overload of one of
+    /// the bit-pattern statics, which step or measure in 32-bit units:
+    /// `Math.ulp(1.0f)` is `1.1920929E-7`, not the `double` overload's
+    /// `2.220446049250313E-16`. The overload is a static-type choice, so the
+    /// call carries [`crate::host::width::FLOAT`] as one more operand, the way
+    /// [`Compiler::overload_width`] passes the `Exact` family's width.
+    ///
+    /// `nextAfter(float, double)` and `scalb(float, int)` are chosen by their
+    /// first argument alone; `copySign` has only the all-`float` and
+    /// all-`double` overloads, so a `double` second argument selects the latter.
+    fn math_float_overload(&self, class: &str, method: &str, args: &[Expr]) -> bool {
+        if class != "Math" {
+            return false;
+        }
+        let deciding = match (method, args.len()) {
+            ("ulp" | "nextUp" | "nextDown" | "signum" | "getExponent", 1)
+            | ("nextAfter" | "scalb", 2) => &args[..1],
+            ("copySign", 2) => args,
+            _ => return false,
+        };
+        deciding.iter().all(|a| {
+            matches!(
+                self.expr_java_type(a).as_deref().map(unwrapped_ty),
+                Some("float")
+            )
         })
     }
 
@@ -7056,6 +7095,20 @@ impl Compiler {
         // (`getName`, `getSimpleName`) are String methods over it. A user class
         // that declares its own `getClass` is not shadowed, because Java forbids
         // overriding it.
+        // `s.mapMulti(m)` is `s.flatMap(e -> { buf = []; m.accept(e, buf::add);
+        // return buf; })` (the JDK's own default body, which pushes each
+        // accepted element downstream in order). The mapper adapter is the
+        // prelude's `BiConsumer.mapMulti$`, so the user's lambda is lowered
+        // against `BiConsumer` and its consumer argument is a real `Consumer`.
+        if method == "mapMulti" && args.len() == 1 && self.expr_class(recv).is_none() {
+            let adapter = Expr::MethodCall {
+                recv: Box::new(Expr::Var("BiConsumer".to_string())),
+                method: "mapMulti$".to_string(),
+                args: args.to_vec(),
+                line,
+            };
+            return self.method_call(recv, "flatMap", &[adapter], line);
+        }
         if method == "getClass" && args.is_empty() {
             self.expr(recv)?;
             // An array's element type is erased at runtime, so `[I` versus
@@ -7339,7 +7392,10 @@ impl Compiler {
                 for (i, a) in args.iter().enumerate() {
                     let floats = match &text_slots {
                         Some(slots) => i > 0 && slots.contains(&(i - 1)),
-                        None => stringify,
+                        // A factory that boxes its arguments makes a `float` a
+                        // `Float` element, which renders through `Float.toString`
+                        // by itself; its text would not be a number any more.
+                        None => stringify && !box_args,
                     };
                     // Every lambda a `Collectors` factory takes answers a
                     // reference (a key, a value, a mapped element, a merged
@@ -7457,7 +7513,11 @@ impl Compiler {
                 // call selected, so the width goes to the host as one more
                 // operand — which is also what makes the arity it dispatches on
                 // (`("Math", "addExact", 3)`) distinct from any real overload's.
-                let widened = self.overload_width(class, method, args)?;
+                let widened = if self.math_float_overload(class, method, args) {
+                    Some(crate::host::width::FLOAT)
+                } else {
+                    self.overload_width(class, method, args)?
+                };
                 if let Some(code) = widened {
                     self.b.emit(Op::LoadInt(code), line);
                 }
@@ -7728,7 +7788,15 @@ impl Compiler {
                 if ref_result {
                     self.lambda_ret_hint = Some("Object".to_string());
                 }
-                let r = self.emit_char_string(a);
+                let r = if self.is_float32_expr(a) {
+                    // A `float` element boxes to the `Float` it is, not to its
+                    // `Float.toString` text: the box renders through the same
+                    // rule, and the text would make `l.get(0) * 2` a type error
+                    // and `l.get(0) + 1` a concatenation.
+                    self.expr(a)
+                } else {
+                    self.emit_char_string(a)
+                };
                 self.lambda_ret_hint = None;
                 r?;
                 if let Some(code) = self.autobox_code(a) {
@@ -8069,7 +8137,14 @@ impl Compiler {
             self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), 0);
             return Ok(());
         }
-        self.emit_char_string(a)?;
+        // A `float` that is about to box keeps its number: `Float.equals`
+        // compares the boxed values, and its `Float.toString` text would
+        // never equal the receiver's.
+        if boxed && self.is_float32_expr(a) {
+            self.expr(a)?;
+        } else {
+            self.emit_char_string(a)?;
+        }
         if boxed {
             if let Some(code) = self.autobox_code(a) {
                 self.b.emit(Op::LoadInt(code), 0);
@@ -10055,6 +10130,7 @@ fn boxed_call_java_type(method: &str, argc: usize) -> Option<&'static str> {
         "doubleValue" => "double",
         "floatValue" => "float",
         "booleanValue" => "boolean",
+        "isNaN" | "isInfinite" => "boolean",
         "charValue" => "char",
         _ => return None,
     })
@@ -10123,6 +10199,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
             | "log" | "log10" | "log1p" | "expm1" | "cbrt" | "hypot" | "sinh" | "cosh" | "tanh"
             | "asinh" | "acosh" | "atanh" | "IEEEremainder",
         ) => "double",
+        ("Math", "getExponent") => "int",
         // `StrictMath`'s own two; every other `StrictMath` member is aliased
         // to `Math` by the parser (see `strict_math_alias`).
         ("StrictMath", "sin" | "cos") => "double",
@@ -10192,6 +10269,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Integer", "toUnsignedLong") => "long",
         ("Long", "divideUnsigned" | "remainderUnsigned") => "long",
         ("Long", "compareUnsigned") => "int",
+        ("Long", "decode") => "long",
         ("Integer" | "Long", "toUnsignedString") => "String",
         ("Short", "parseShort") => "short",
         ("Byte", "parseByte") => "byte",
@@ -10619,7 +10697,7 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         // The radix renderings, static-only on both widths.
         ("Integer" | "Long", "toBinaryString" | "toHexString" | "toOctalString") => 1,
         // The remaining static-only wrapper members with a single public arity.
-        ("Float", "parseFloat") | ("Double" | "Float", "isFinite") | ("Integer", "decode") => 1,
+        ("Float", "parseFloat") | ("Double" | "Float", "isFinite") | ("Integer" | "Long", "decode") => 1,
         ("Boolean", "logicalAnd" | "logicalOr" | "logicalXor") => 2,
         // The `Collections` factories and wrappers with one public arity — the
         // finisher a `collectingAndThen` is written with
@@ -10685,8 +10763,12 @@ fn builder_instance_ref_arity(method: &str) -> Option<usize> {
 
 fn string_instance_ref_arity(method: &str) -> Option<usize> {
     Some(match method {
-        "length" | "isEmpty" | "toUpperCase" | "toLowerCase" | "trim" => 0,
+        "length" | "isEmpty" | "toUpperCase" | "toLowerCase" | "trim" | "strip"
+        | "stripLeading" | "stripTrailing" | "isBlank" | "chars" | "codePoints" | "lines"
+        | "intern" | "hashCode" => 0,
         "charAt"
+        | "matches"
+        | "contentEquals"
         | "contains"
         | "startsWith"
         | "endsWith"

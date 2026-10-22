@@ -206,7 +206,8 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
     (
         "BiConsumer",
         "void accept(Object t, Object u)",
-        "default BiConsumer andThen(BiConsumer after) { return (t, u) -> { this.accept(t, u); after.accept(t, u); }; }",
+        "default BiConsumer andThen(BiConsumer after) { return (t, u) -> { this.accept(t, u); after.accept(t, u); }; } \
+         static Function mapMulti$(BiConsumer mapper) { return t -> { ArrayList buf = new ArrayList(); mapper.accept(t, buf::add); return buf; }; }",
     ),
     (
         "Function",
@@ -243,7 +244,8 @@ pub const FUNCTIONAL: &[(&str, &str, &str)] = &[
         "default Predicate and(Predicate other) { return t -> this.test(t) && other.test(t); } \
          default Predicate negate() { return t -> !this.test(t); } \
          default Predicate or(Predicate other) { return t -> this.test(t) || other.test(t); } \
-         static Predicate not(Predicate target) { return target.negate(); }",
+         static Predicate not(Predicate target) { return target.negate(); } \
+         static Predicate isEqual(Object targetRef) { return t -> targetRef == null ? t == null : targetRef.equals(t); }",
     ),
     (
         "BiPredicate",

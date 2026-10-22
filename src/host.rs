@@ -9391,6 +9391,26 @@ fn stream_method(
         }
         ("map", 1) => stage(Stage::Map(args[0].clone())),
         ("flatMap", 1) => stage(Stage::FlatMap(args[0].clone())),
+        // The shape-changing flat maps: each mapped stream's elements go on in
+        // place of the element, into a pipeline of the named primitive shape.
+        ("flatMapToInt", 1) => {
+            Ok(
+                stream_with(recv, StreamKind::Int, Some(Stage::FlatMap(args[0].clone())))
+                    .expect("receiver is a stream"),
+            )
+        }
+        ("flatMapToLong", 1) => Ok(stream_with(
+            recv,
+            StreamKind::Long,
+            Some(Stage::FlatMap(args[0].clone())),
+        )
+        .expect("receiver is a stream")),
+        ("flatMapToDouble", 1) => Ok(stream_with(
+            recv,
+            StreamKind::Double,
+            [Stage::FlatMap(args[0].clone()), Stage::Widen],
+        )
+        .expect("receiver is a stream")),
         ("peek", 1) => stage(Stage::Peek(args[0].clone())),
         ("limit", 1) => stage(Stage::Limit(args[0].jint())),
         ("skip", 1) => stage(Stage::Skip(args[0].jint())),
@@ -11234,6 +11254,9 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
             ("hashCode", 0) => {
                 return java_hash(&recv).map_or(Value::Undef, |h| Value::Int(h.into()))
             }
+            // A `Float` renders through `Float.toString`, which the bare
+            // `double` inside it would not.
+            ("toString", 0) => return Value::str(java_str(&recv)),
             _ => {}
         }
         let inner = deboxed(&recv);
@@ -11380,6 +11403,9 @@ fn boxed_method(recv: &Value, method: &str, argc: usize) -> Option<Value> {
         "doubleValue" => Value::float(recv.jfloat()),
         "floatValue" => Value::float(recv.jfloat() as f32 as f64),
         "booleanValue" if matches!(recv, Value::Bool(_)) => recv.clone(),
+        // `Double`/`Float`'s instance tests, the boxed forms of the statics.
+        "isNaN" if matches!(recv, Value::Float(_)) => Value::bool(recv.jfloat().is_nan()),
+        "isInfinite" if matches!(recv, Value::Float(_)) => Value::bool(recv.jfloat().is_infinite()),
         // A `char` is carried as its code point (or as the one-character
         // `String` a rendered one becomes), so unboxing it is identity — the
         // compiler types the call `char`, which is what makes it print as a
@@ -11556,6 +11582,62 @@ fn next_after(start: f64, direction: f64) -> f64 {
     // negative one, which is exactly whether the step matches the sign.
     let step = if (start > 0.0) == up { 1 } else { -1 };
     f64::from_bits((bits + step) as u64)
+}
+
+/// A `float` result as the `double` holding it exactly.
+fn f32_value(f: f32) -> Value {
+    Value::float(f64::from(f))
+}
+
+/// `Math.getExponent(double)`: the unbiased exponent, `1024` for NaN and the
+/// infinities and `-1023` for zero and the subnormals.
+fn double_exponent(d: f64) -> i32 {
+    ((d.to_bits() >> 52) & 0x7ff) as i32 - 1023
+}
+
+/// `Math.getExponent(float)`: `128` for NaN and the infinities, `-127` for
+/// zero and the subnormals.
+fn float_exponent(f: f32) -> i32 {
+    ((f.to_bits() >> 23) & 0xff) as i32 - 127
+}
+
+/// `Math.nextAfter(float start, double direction)`, and through it
+/// `nextUp(float)`/`nextDown(float)`: the adjacent `float` toward `direction`.
+/// Equal arguments answer `direction` narrowed to `float`, as the JDK does.
+fn next_after_f32(start: f32, direction: f64) -> f32 {
+    if start.is_nan() || direction.is_nan() {
+        return f32::NAN;
+    }
+    let s = f64::from(start);
+    if s == direction {
+        return direction as f32;
+    }
+    let up = direction > s;
+    if start == 0.0 {
+        return if up {
+            f32::from_bits(1)
+        } else {
+            -f32::from_bits(1)
+        };
+    }
+    let bits = start.to_bits() as i32;
+    let step = if (start > 0.0) == up { 1 } else { -1 };
+    f32::from_bits((bits + step) as u32)
+}
+
+/// `Math.ulp(float)`: the distance from `f` to the next `float` away from zero.
+fn float_ulp(f: f32) -> f32 {
+    if f.is_nan() {
+        return f32::NAN;
+    }
+    if f.is_infinite() {
+        return f32::INFINITY;
+    }
+    let f = f.abs();
+    if f == f32::MAX {
+        return f - next_after_f32(f, f64::NEG_INFINITY);
+    }
+    next_after_f32(f, f64::INFINITY) - f
 }
 
 /// `Math.ulp(d)`: the distance from `d` to the next `double` away from zero.
@@ -13133,6 +13215,38 @@ fn collection_static(
             }
             Ok(Value::Undef)
         }
+        // `Arrays.parallelPrefix(a, op)` / `(a, from, to, op)`: each element
+        // becomes `op(previous, element)`, left to right, so `a[i]` ends as the
+        // fold of `a[from..=i]`. The JDK computes it in parallel only for an
+        // associative `op`, which is the contract, so the sequential fold is the
+        // same answer.
+        ("Arrays", "parallelPrefix") if args.len() == 2 || args.len() == 4 => {
+            let Some(items) = array_items(&args[0]) else {
+                return Some(Err(Fault::java("NullPointerException", String::new())));
+            };
+            let len = items.len();
+            let (from, to, op) = if args.len() == 4 {
+                let (from, to) = (args[1].jint(), args[2].jint());
+                if let Err(f) = arrays_range_check(len, from, to) {
+                    return Some(Err(f));
+                }
+                (from as usize, to as usize, &args[3])
+            } else {
+                (0, len, &args[1])
+            };
+            let mut acc = items.get(from).cloned().unwrap_or(Value::Undef);
+            for (i, item) in items.iter().enumerate().take(to).skip(from + 1) {
+                acc = invoke_closure(vm, op, &[acc, item.clone()]);
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+                let v = acc.clone();
+                if let Err(f) = array_mutate(&args[0], |a| a[i] = v) {
+                    return Some(Err(f));
+                }
+            }
+            Ok(Value::Undef)
+        }
         ("Objects", "equals") if args.len() == 2 => {
             Ok(Value::bool(objects_equals(vm, &args[0], &args[1])))
         }
@@ -13963,6 +14077,44 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ("Math", "nextAfter", 2) => {
             Ok(Value::float(next_after(args[0].jfloat(), args[1].jfloat())))
         }
+        ("Math", "getExponent", 1) => Ok(Value::Int(double_exponent(args[0].jfloat()).into())),
+        // The `float` overloads, selected by the compiler from the static type
+        // and marked by a trailing [`width::FLOAT`] operand. Each steps or
+        // measures in 32-bit units, so it is computed on the `f32` itself.
+        ("Math", "ulp", 2) => Ok(f32_value(float_ulp(args[0].jfloat() as f32))),
+        ("Math", "nextUp", 2) => Ok(f32_value(next_after_f32(
+            args[0].jfloat() as f32,
+            f64::INFINITY,
+        ))),
+        ("Math", "nextDown", 2) => Ok(f32_value(next_after_f32(
+            args[0].jfloat() as f32,
+            f64::NEG_INFINITY,
+        ))),
+        ("Math", "nextAfter", 3) => Ok(f32_value(next_after_f32(
+            args[0].jfloat() as f32,
+            args[1].jfloat(),
+        ))),
+        ("Math", "signum", 2) => Ok(f32_value(match args[0].jfloat() as f32 {
+            f if f > 0.0 => 1.0,
+            f if f < 0.0 => -1.0,
+            f => f,
+        })),
+        ("Math", "copySign", 3) => Ok(f32_value(
+            (args[0].jfloat() as f32).copysign(args[1].jfloat() as f32),
+        )),
+        // `Math.scalb(float, int)` is `(float) (f * 2^n)` computed in `double`
+        // with the factor clamped to the range past which every result
+        // saturates (the JDK's own `MAX_EXPONENT - MIN_EXPONENT +
+        // SIGNIFICAND_WIDTH + 1`): the `double` product is exact there, so
+        // the one rounding is the narrowing.
+        ("Math", "scalb", 3) => {
+            let n = args[1].jint().clamp(-278, 278) as i32;
+            let f = args[0].jfloat() as f32 as f64;
+            Ok(f32_value((f * 2f64.powi(n)) as f32))
+        }
+        ("Math", "getExponent", 2) => {
+            Ok(Value::Int(float_exponent(args[0].jfloat() as f32).into()))
+        }
 
         // ── java.lang.Integer / Long ──
         // A null argument is rejected before the text is looked at; without the
@@ -14222,7 +14374,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             parse_int_radix(&args[0].as_str_cow(), args[1].jint(), false)
         }
         ("Integer", "decode", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
-        ("Integer", "decode", 1) => java_decode(&args[0].as_str_cow()),
+        ("Integer", "decode", 1) => java_decode(&args[0].as_str_cow(), true),
+        ("Long", "decode", 1) if matches!(args[0], Value::Undef) => Err(null_number_fault()),
+        ("Long", "decode", 1) => java_decode(&args[0].as_str_cow(), false),
         ("Integer", "parseUnsignedInt", 1 | 2) if matches!(args[0], Value::Undef) => {
             Err(null_number_fault())
         }
@@ -18015,10 +18169,10 @@ fn parse_unsigned_long(s: &str, radix: i64) -> Result<Value, Fault> {
     }
 }
 
-/// `Integer.decode`: an optional sign, then a `0x`/`0X`/`#` hexadecimal or a
+/// `Integer.decode` and `Long.decode` (`int` picks the width): an optional sign, then a `0x`/`0X`/`#` hexadecimal or a
 /// leading-`0` octal prefix, then digits — ported from `java.lang.Integer`,
 /// including where each of its messages comes from.
-fn java_decode(s: &str) -> Result<Value, Fault> {
+fn java_decode(s: &str, int: bool) -> Result<Value, Fault> {
     let nfe = |m: &str| Fault::java("NumberFormatException", m.to_string());
     if s.is_empty() {
         return Err(nfe("Zero length string"));
@@ -18048,7 +18202,7 @@ fn java_decode(s: &str) -> Result<Value, Fault> {
     } else {
         digits.to_string()
     };
-    parse_int_radix(&signed, radix, true)
+    parse_int_radix(&signed, radix, int)
 }
 
 /// Render `n` in the given radix (2..=36), matching `Integer.toString(i, radix)`.

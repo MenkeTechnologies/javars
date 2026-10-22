@@ -1065,3 +1065,186 @@ p.q.
     );
     assert_eq!(out, expected);
 }
+
+/// The `float` overloads of `Math.ulp`/`nextUp`/`nextDown`/`nextAfter`/`signum`/`copySign`/`scalb`/`getExponent` step and measure in 32-bit units and answer a `float` (they ran the `double` overload: `Math.ulp(1.0f)` was `2.220446049250313E-16`); `Math.getExponent` was unsupported. Expected output from openjdk 21.0.12.1.
+#[test]
+fn float_overloads_of_the_math_bit_pattern_statics() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        float[] fs = {0f, -0f, 1f, -1.5f, 0.1f, Float.MIN_VALUE, Float.MIN_NORMAL, Float.MAX_VALUE, Float.NaN, Float.NEGATIVE_INFINITY, 3.4e-39f};
+        for (float f : fs) {
+            System.out.println(f + " " + Math.ulp(f) + " " + Math.nextUp(f) + " " + Math.nextDown(f) + " " + Math.getExponent(f)
+                + " " + Math.signum(f) + " " + Math.copySign(0.3f, f) + " " + Math.scalb(f, 3) + " " + Math.scalb(f, -150)
+                + " " + Math.nextAfter(f, 0.0) + " " + Math.scalb(f, 300));
+        }
+        double[] ds = {0.0, 1.0, 0.1, Double.MIN_VALUE, Double.MAX_VALUE, Double.NaN, 1e-310};
+        for (double d : ds) System.out.println(Math.getExponent(d) + " " + Math.ulp(d));
+        float x = 2.5f;
+        double y = -1;
+        Float boxed = 0.1f;
+        System.out.println(Math.copySign(x, y) + " " + Math.nextAfter(x, 3) + " " + (Math.getExponent(x) + 1) + " " + Math.ulp(boxed) + " " + Math.nextUp(boxed));
+    }
+}
+"####;
+    let expected = r####"0.0 1.4E-45 1.4E-45 -1.4E-45 -127 0.0 0.3 0.0 0.0 0.0 0.0
+-0.0 1.4E-45 1.4E-45 -1.4E-45 -127 -0.0 -0.3 -0.0 -0.0 0.0 -0.0
+1.0 1.1920929E-7 1.0000001 0.99999994 0 1.0 0.3 8.0 0.0 0.99999994 Infinity
+-1.5 1.1920929E-7 -1.4999999 -1.5000001 0 -1.0 -0.3 -12.0 -1.4E-45 -1.4999999 -Infinity
+0.1 7.450581E-9 0.10000001 0.099999994 -4 1.0 0.3 0.8 0.0 0.099999994 Infinity
+1.4E-45 1.4E-45 2.8E-45 0.0 -127 1.0 0.3 1.1E-44 0.0 0.0 Infinity
+1.1754944E-38 1.4E-45 1.1754945E-38 1.1754942E-38 -126 1.0 0.3 9.403955E-38 0.0 1.1754942E-38 Infinity
+3.4028235E38 2.028241E31 Infinity 3.4028233E38 127 1.0 0.3 Infinity 2.3841856E-7 3.4028233E38 Infinity
+NaN NaN NaN NaN 128 NaN 0.3 NaN NaN NaN NaN
+-Infinity Infinity -3.4028235E38 -Infinity 128 -1.0 -0.3 -Infinity -Infinity -3.4028235E38 -Infinity
+3.4E-39 1.4E-45 3.400001E-39 3.399998E-39 -127 1.0 0.3 2.72E-38 0.0 3.399998E-39 Infinity
+-1023 4.9E-324
+0 2.220446049250313E-16
+-4 1.3877787807814457E-17
+-1023 4.9E-324
+1023 1.99584030953472E292
+1024 NaN
+-1023 4.9E-324
+-2.5 2.5000002 2 7.450581E-9 0.10000001
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// A `float` entering a collection element, a factory argument, or the argument of `equals` boxes to a `Float` holding the number (it boxed its `Float.toString` text, so `Float.equals` answered `false`, element arithmetic was a type error, and `+ 1` concatenated); a boxed `Float` renders through `toString()` at 32 bits and answers `isNaN`/`isInfinite`. Expected output from openjdk 21.0.12.1.
+#[test]
+fn float_elements_box_as_float_not_as_text() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        List<Float> l = new ArrayList<>(Arrays.asList(0.5f, 0.1f, 0.3f));
+        l.add(0.7f);
+        Collections.sort(l);
+        float g0 = l.get(0), g1 = l.get(1);
+        System.out.println(l + " " + (g0 + 1) + " " + g1 * 2 + " " + l.get(0) + l.get(1) + " " + l.indexOf(0.3f) + " " + l.remove(Float.valueOf(0.1f)) + l);
+        System.out.println(List.of(1.5f, 2.5f).get(1) + " " + Set.of(0.25f).contains(0.25f));
+        Map<String, Float> m = new TreeMap<>();
+        m.put("b", 0.1f);
+        m.put("a", 2.7f);
+        m.merge("a", 0.1f, Float::sum);
+        float mb = m.get("b");
+        System.out.println(m + " " + (mb + 1) + " " + m.get("b") + " " + m.containsValue(0.1f));
+        Float bf = 3.3f;
+        float p = 3.3f;
+        System.out.println(bf.equals(3.3f) + " " + bf.equals(p) + " " + bf.equals(3.3) + " " + Objects.equals(bf, p));
+        Object o = 0.1f;
+        System.out.println(o.equals(0.1f) + " " + o.getClass().getSimpleName() + " " + Float.valueOf(0.1f).toString() + " " + bf.toString());
+        Double nan = 0.0 / 0;
+        Float inf = 1f / 0;
+        System.out.println(nan.isNaN() + " " + nan.isInfinite() + " " + inf.isInfinite() + " " + inf.isNaN() + " " + bf.isNaN());
+    }
+}
+"####;
+    let expected = r####"[0.1, 0.3, 0.5, 0.7] 1.1 0.6 0.10.3 1 true[0.3, 0.5, 0.7]
+2.5 true
+{a=2.8, b=0.1} 1.1 0.1 true
+true true false true
+true Float 0.1 3.3
+true false true false false
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// An `assert` statement parses (it was "expected Semi") and runs as the reference launcher runs it without `-ea`: disabled, evaluating neither the condition nor the detail. Expected output from openjdk 21.0.12.1.
+#[test]
+fn assert_statement_runs_disabled() {
+    let src = r####"
+public class T {
+    static int calls = 0;
+    static boolean touch() { calls++; return false; }
+    public static void main(String[] a) {
+        int x = 0;
+        assert (x = 5) > 0;
+        assert touch() : "detail " + touch();
+        if (x == 0) assert false;
+        for (int i = 0; i < 3; i++) assert i < 0 : i;
+        System.out.println(x + " " + calls);
+    }
+}
+"####;
+    let expected = r####"0 0
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// `Long.decode`, `Predicate.isEqual`, `Arrays.parallelPrefix` (both arities, with the JDK range checks), `Stream.mapMulti`, `flatMapToInt`/`Long`/`Double`, and the unbound `String::chars`/`codePoints`/`strip`/`isBlank`/`lines`/`matches`/`hashCode` references, each refused before. Expected output from openjdk 21.0.12.1.
+#[test]
+fn long_decode_parallel_prefix_map_multi_and_string_refs() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        System.out.println(Long.decode("0x1F") + " " + Long.decode("-010") + " " + Long.decode("#ff") + " " + Long.decode("9223372036854775807") + " " + Long.decode("-0x8000000000000000"));
+        for (String s : new String[]{"", "0x", "--1", "0x-1", "9223372036854775808"}) {
+            try { Long.decode(s); } catch (NumberFormatException e) { System.out.println(e.getMessage()); }
+        }
+        Predicate<Object> isNull = Predicate.isEqual(null);
+        System.out.println(Predicate.isEqual("a").test("a") + " " + Predicate.isEqual(1).test(1L) + " " + isNull.test(null) + " " + isNull.test("x"));
+        int[] pz = {1, 2, 3, 4, 5};
+        Arrays.parallelPrefix(pz, Integer::sum);
+        long[] lz = {3, 1, 4, 1, 5};
+        Arrays.parallelPrefix(lz, 1, 4, Math::max);
+        String[] sz = {"a", "b", "c"};
+        Arrays.parallelPrefix(sz, String::concat);
+        System.out.println(Arrays.toString(pz) + Arrays.toString(lz) + Arrays.toString(sz));
+        try { Arrays.parallelPrefix(pz, 3, 1, Integer::sum); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { Arrays.parallelPrefix(pz, 0, 9, Integer::sum); } catch (ArrayIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }
+        System.out.println(Stream.of(1, 2, 3).<Object>mapMulti((v, sink) -> { if (v != 2) { sink.accept(v); sink.accept(-v); } }).toList());
+        List<String> ws = List.of(" Ab ", "  ", "cd\nef", "x");
+        System.out.println(ws.stream().flatMapToInt(String::chars).sum() + " " + ws.stream().flatMapToInt(String::codePoints).max().getAsInt()
+            + " " + ws.stream().flatMapToLong(w -> LongStream.of(w.length())).sum() + " " + ws.stream().flatMapToDouble(w -> DoubleStream.of(w.length() / 2.0)).boxed().toList());
+        System.out.println(ws.stream().map(String::strip).toList() + " " + ws.stream().filter(String::isBlank).count() + " " + ws.stream().flatMap(String::lines).toList());
+        BiPredicate<String, String> m = String::matches;
+        System.out.println(m.test("aaa", "a+") + " " + m.test("b", "a+") + " " + ws.stream().map(String::hashCode).toList());
+    }
+}
+"####;
+    let expected = r####"31 -8 255 9223372036854775807 -9223372036854775808
+Zero length string
+For input string: "" under radix 16
+Sign character in wrong position
+Sign character in wrong position
+For input string: "9223372036854775808"
+true false true false
+[1, 3, 6, 10, 15][3, 1, 4, 4, 5][a, ab, abc]
+fromIndex(3) > toIndex(1)
+Array index out of range: 9
+[1, -1, 3, -3]
+823 120 12 [2.0, 1.0, 2.5, 0.5]
+[Ab, , cd
+ef, x] 1 [ Ab ,   , cd, ef, x]
+true false [1018847, 1024, 94420522, 120]
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}

@@ -668,12 +668,12 @@ value-copied.
 
 Next waves, in priority order:
 
-1. **The remaining stream surface** — `mapMulti` and the unmodifiable-map
-   collectors, whose
+1. **The remaining stream surface** — the unmodifiable-map collectors, whose
    iteration order the JDK randomizes per run. See [`BUGS.md`](BUGS.md) for the
    stages and collectors that do run.
-2. **Lazy class initialization** — javars runs every class's `static`
-   initializers before `main`; Java runs each class's on first use.
+2. **Generic type arguments** — javars erases them at parse time, so an element
+   read back out of a `List<Float>` or `List<Character>` is untyped and
+   computes at the wrong width (see [`BUGS.md`](BUGS.md)).
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 
