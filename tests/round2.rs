@@ -2993,3 +2993,37 @@ CME
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A `LinkedList` and an `ArrayDeque` are their own runtime classes — `getClass()`, `instanceof ArrayList`/`RandomAccess`/`Deque`, the reference cast, `unmodifiableList`'s wrapper and `reversed()`'s view class all answer as Java's — and `clone()` on a modifiable collection is a shallow copy of the same class (a sorted one keeping its comparator).
+#[test]
+fn linked_list_and_array_deque_are_their_own_classes() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> ll = new LinkedList<>(List.of(1, 2));
+        Object o = ll, al = new ArrayList<>(), dq = new ArrayDeque<>(List.of(1));
+        System.out.println(ll.getClass().getName() + " " + (o instanceof ArrayList) + " " + (o instanceof LinkedList) + " " + (o instanceof Deque) + " " + (o instanceof RandomAccess) + " " + (o instanceof AbstractSequentialList) + " " + (o instanceof Queue));
+        System.out.println(dq.getClass().getSimpleName() + " " + (dq instanceof List) + " " + (dq instanceof Deque) + " " + (dq instanceof AbstractCollection) + " " + (dq instanceof ArrayList) + " " + (al instanceof Deque));
+        try { ArrayList<Integer> x = (ArrayList<Integer>) o; } catch (ClassCastException e) { System.out.println(e.getMessage()); }
+        LinkedList<Integer> back = (LinkedList<Integer>) o;
+        System.out.println(back.getFirst() + " " + Collections.unmodifiableList(ll).getClass().getSimpleName() + " " + ll.reversed().getClass().getName());
+        ArrayList<Integer> al2 = new ArrayList<>(List.of(1)); Object c = al2.clone(); al2.add(2);
+        HashMap<String, Integer> hm = new HashMap<>(Map.of("a", 1)); Object mc = hm.clone(); hm.put("b", 2);
+        TreeSet<Integer> ts = new TreeSet<>(Comparator.reverseOrder()); ts.addAll(List.of(1, 3, 2));
+        System.out.println(c + " " + mc + " " + ts.clone() + " " + c.getClass().getSimpleName());
+        System.out.println(new LinkedList<>(ll).getClass().getSimpleName() + " " + ((LinkedList<Integer>) ll).clone().getClass().getSimpleName());
+    }
+}
+"####;
+    let expected = r####"java.util.LinkedList false true true false true true
+ArrayDeque false true true false false
+class java.util.LinkedList cannot be cast to class java.util.ArrayList (java.util.LinkedList and java.util.ArrayList are in module java.base of loader 'bootstrap')
+1 UnmodifiableList java.util.LinkedList$ReverseOrderLinkedListView
+[1] {a=1} [3, 2, 1] ArrayList
+LinkedList LinkedList
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

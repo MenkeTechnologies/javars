@@ -84,9 +84,8 @@ at the bottom, and are summarized in the section right after this one.
   a cast does not erase what the operand is (`println((Object) dog)` still finds
   `Dog`'s `toString`). The wrapper types javars's value model tells apart
   (`String`, `Integer`, `Double`, `Boolean`, `Number`, `CharSequence`) are checked
-  too; the ones it cannot (`int` and `long` are one integer here, and a
-  `LinkedList` is the mutable list an `ArrayList` is) are allowed rather than
-  guessed at. **An array is the one value the cast still declines**: its element
+  too; the ones it cannot (`int` and `long` are one integer here) are allowed
+  rather than guessed at. **An array is the one value the cast still declines**: its element
   type is erased, so javars can produce neither `[I` nor `[Ljava.lang.String;`,
   and it does not throw an exception whose message would have to invent the class
   it names — `(String) anIntArray` passes where Java throws.
@@ -1973,19 +1972,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
     same erasure the reference cast documents just below, decided the other way
     — a cast cannot prove itself wrong and allows the sibling, while a type test
     has to answer a boolean and answers for the member programs actually write.
-  * **`new LinkedList<>()` is modeled as the mutable list an `ArrayList` is**, so
-    it answers `instanceof ArrayList` `true` where Java says `false`. Every
-    interface above it — `List`, `Collection`, `Iterable`, `SequencedCollection`
-    — is exact.
-  * **`new ArrayDeque<>()` is the same mutable list**, on the same terms. Its
-    `Deque`/`Queue` methods (`push`/`pop`/`peek*`/`poll*`/`add*`/`offer*`/
-    `get*`/`remove*`/`element`) produce the reference's element order and the
-    reference's empty-receiver behaviour — the throwing family and the
-    null-answering family are distinguished — and, like the real one, it
-    refuses a `null` element from every method of its add family (`addAll`
-    adds the elements before the first `null`, then throws). What the list
-    shape cannot carry is the class: `getClass().getSimpleName()` is
-    `ArrayList`.
+  * **`new LinkedList<>()` and `new ArrayDeque<>()` share the mutable-list
+    shape an `ArrayList` has**, with the runtime class recorded beside it, so
+    `getClass()`, `instanceof` and the reference cast answer `LinkedList` and
+    `ArrayDeque` as Java does. An `ArrayDeque`'s `Deque`/`Queue` methods
+    produce the reference's element order and empty-receiver behaviour, and it
+    refuses a `null` element from every method of its add family. What the
+    shared shape does not carry is the iterator: see the iterator entry above.
 
   The *reference cast* reads the same answer. It used to keep its own, narrower
   copy of "what class is this value" — one that named a `String`, a boxed

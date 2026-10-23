@@ -2624,6 +2624,7 @@ pub fn heap_reset() {
     LIST_ARRAY.with(|m| m.borrow_mut().clear());
     ARRAY_DEQUES.with(|d| d.borrow_mut().clear());
     VECTORS.with(|v| v.borrow_mut().clear());
+    LINKED_LISTS.with(|l| l.borrow_mut().clear());
     FILED_HASH.with(|f| f.borrow_mut().clear());
     COMPUTING.with(|c| c.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
@@ -2876,6 +2877,15 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // `LinkedHashSet` extend their hash counterparts; the tree kinds do not,
         // which is the pair a name-matching answer gets wrong.
         "ArrayList" => &["AbstractList", "RandomAccess", "Cloneable", "Serializable"],
+        "LinkedList" => &[
+            "AbstractSequentialList",
+            "Deque",
+            "Cloneable",
+            "Serializable",
+        ],
+        "AbstractSequentialList" => &["AbstractList"],
+        "ArrayDeque" => &["AbstractCollection", "Deque", "Cloneable", "Serializable"],
+        "Deque" => &["Queue", "SequencedCollection"],
         "Vector" => &["AbstractList", "RandomAccess", "Cloneable", "Serializable"],
         "Stack" => &["Vector"],
         "HashMap" => &["AbstractMap", "Cloneable", "Serializable"],
@@ -5970,6 +5980,9 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
     if kind == "ArrayDeque" {
         ARRAY_DEQUES.with(|d| d.borrow_mut().insert(id));
     }
+    if kind == "LinkedList" {
+        LINKED_LISTS.with(|l| l.borrow_mut().insert(id));
+    }
     if let Some(class) = match kind {
         "Vector" => Some(VectorClass::Vector),
         "Stack" => Some(VectorClass::Stack),
@@ -6082,6 +6095,10 @@ thread_local! {
     /// class and its capacity — which `capacity()` reports and the JDK's
     /// message for a negative index names.
     static VECTORS: RefCell<HashMap<u32, (VectorClass, usize)>> = RefCell::new(HashMap::new());
+    /// The lists made by `new LinkedList<>(…)`: the same mutable-list shape an
+    /// `ArrayList` has, told apart here so the runtime class is `LinkedList`.
+    static LINKED_LISTS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 /// Refresh the `unmodifiableX` view at `id` from the collection it shows. A
@@ -7357,9 +7374,13 @@ fn value_class(v: &Value) -> Option<String> {
                     // `ArrayList`s, and a `subList` view is a third answer
                     // again — see the note in [`jdk_supers`].
                     HostObj::List { fixed, .. } => match fixed {
-                        Fixity::Mutable => vector_class(*id)
-                            .map_or("ArrayList", VectorClass::name)
-                            .to_string(),
+                        Fixity::Mutable => match vector_class(*id) {
+                            Some(c) => c.name(),
+                            None if ARRAY_DEQUES.with(|d| d.borrow().contains(id)) => "ArrayDeque",
+                            None if LINKED_LISTS.with(|l| l.borrow().contains(id)) => "LinkedList",
+                            None => "ArrayList",
+                        }
+                        .to_string(),
                         Fixity::FixedSize => "List$fixed".to_string(),
                         Fixity::Immutable => "List$immutable".to_string(),
                     },
@@ -7832,6 +7853,52 @@ fn coll_method_unlinked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
     if let Value::Obj(id) = recv {
         sync_view(*id);
     }
+    // `clone()` on a modifiable JDK collection: a shallow copy of the same
+    // class, which is what its copy constructor builds.
+    if method == "clone" && args.is_empty() {
+        let kind = value_class(recv).filter(|k| {
+            matches!(
+                k.as_str(),
+                "ArrayList"
+                    | "LinkedList"
+                    | "ArrayDeque"
+                    | "Vector"
+                    | "Stack"
+                    | "HashMap"
+                    | "LinkedHashMap"
+                    | "TreeMap"
+                    | "HashSet"
+                    | "LinkedHashSet"
+                    | "TreeSet"
+            )
+        });
+        if let Some(kind) = kind {
+            // A sorted collection keeps its comparator: an empty one ordered by
+            // it, then filled.
+            let cmp = match recv {
+                Value::Obj(id) => SORT_CMP.with(|s| s.borrow().get(id).cloned()),
+                _ => None,
+            };
+            let made = match &cmp {
+                Some(c) => new_collection(vm, &kind, c),
+                None => new_collection(vm, &kind, recv),
+            };
+            return match made {
+                Ok(v) => {
+                    if cmp.is_some() {
+                        let fill = if kind == "TreeMap" {
+                            "putAll"
+                        } else {
+                            "addAll"
+                        };
+                        coll_method(vm, &v, fill, std::slice::from_ref(recv));
+                    }
+                    v
+                }
+                Err(f) => raise(vm, f),
+            };
+        }
+    }
     if map_order(recv) == Order::Access {
         let out = coll_method_inner(vm, recv, method, args);
         touch_access_order(recv, method, args);
@@ -7936,6 +8003,8 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
                 // `RandomAccess` list view.
                 let class = if ARRAY_DEQUES.with(|d| d.borrow().contains(id)) {
                     "java.util.ReverseOrderDequeView"
+                } else if LINKED_LISTS.with(|l| l.borrow().contains(id)) {
+                    "java.util.LinkedList$ReverseOrderLinkedListView"
                 } else {
                     "java.util.ReverseOrderListView$Rand"
                 };
@@ -14515,9 +14584,11 @@ fn collection_static(
             | "unmodifiableSequencedCollection",
         ) if args.len() == 1 => {
             // `unmodifiableList` wraps a random-access list in its `RandomAccess`
-            // subclass, and every list javars models is one (a `LinkedList` is
-            // the mutable list an `ArrayList` is; see BUGS.md).
+            // subclass; a `LinkedList` is not one.
             let class = match method {
+                "unmodifiableList" if value_class(&args[0]).as_deref() == Some("LinkedList") => {
+                    "java.util.Collections$UnmodifiableList"
+                }
                 "unmodifiableList" => "java.util.Collections$UnmodifiableRandomAccessList",
                 "unmodifiableSet" => "java.util.Collections$UnmodifiableSet",
                 "unmodifiableMap" => "java.util.Collections$UnmodifiableMap",
@@ -21455,12 +21526,6 @@ fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
         "Integer" => matches!(target, "Long" | "Short" | "Byte" | "Character"),
         "Double" => target == "Float",
         "String" => target == "Character" && value.as_str_cow().chars().count() == 1,
-        // `new LinkedList<>()` is modeled as the mutable list an `ArrayList` is,
-        // so a `LinkedList` value arrives here calling itself an `ArrayList`.
-        // Refusing `(LinkedList) aLinkedList` would be inventing a failure out
-        // of javars's own modelling choice, which is exactly what the wrapper
-        // arms above avoid.
-        "ArrayList" => target == "LinkedList",
         _ => false,
     }
 }
@@ -21530,6 +21595,9 @@ const CHECKABLE_CAST_TARGETS: &[&str] = &[
     "List",
     "ArrayList",
     "LinkedList",
+    "AbstractSequentialList",
+    "ArrayDeque",
+    "Deque",
     "Collection",
     "SequencedCollection",
     "AbstractCollection",
