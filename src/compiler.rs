@@ -577,6 +577,14 @@ struct Compiler {
     /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
     /// See [`Compiler::lambda_param_generics`].
     lambda_param_hint: Option<Vec<String>>,
+    /// See [`Compiler::expr_generic`]: node address → (node, answer), alive
+    /// only while an outermost query is in progress.
+    generic_memo: TypeMemo,
+    /// The same for [`Compiler::expr_java_type`].
+    java_type_memo: TypeMemo,
+    /// How many typing queries are in progress; the memos are dropped when it
+    /// returns to zero.
+    query_depth: std::cell::Cell<u32>,
     /// Each user method's and constructor's parameter types with their type
     /// arguments, keyed by its mangled name — only the ones declaring any.
     param_generics: HashMap<String, Vec<Option<String>>>,
@@ -753,6 +761,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_ret_hint: None,
         lambda_generic: None,
         lambda_param_hint: None,
+        generic_memo: Default::default(),
+        java_type_memo: Default::default(),
+        query_depth: Default::default(),
         param_generics,
         ret_generics,
         current_ret_generic: None,
@@ -1743,7 +1754,48 @@ impl Compiler {
     /// `Entry<String,Integer>` for an element of a map's `entrySet()`. This is
     /// the part of `javac`'s typing that erasure-at-parse-time used to lose, and
     /// [`Compiler::expr_java_type`] reads its erasure.
+    ///
+    /// Memoized per node for the duration of one outermost query: typing a
+    /// generic call types each argument both for overload resolution and for
+    /// inference, which without the memo doubles per level of nesting
+    /// (`id(id(…id(5)…))`). The memo is dropped when the outermost query
+    /// returns, so it never outlives the scope it was computed in, and a hit
+    /// must match the [`memo_fingerprint`] of the node it was computed for,
+    /// so a temporary the compiler builds at a reused address cannot read
+    /// another node's answer.
     fn expr_generic(&self, e: &Expr) -> Option<String> {
+        self.memoized(&self.generic_memo, e, |c| c.expr_generic_uncached(e))
+    }
+
+    /// Answer `compute` for `e` through `memo`, which (with every other typing
+    /// memo) lives only while an outermost typing query is in progress.
+    fn memoized(
+        &self,
+        memo: &TypeMemo,
+        e: &Expr,
+        compute: impl FnOnce(&Self) -> Option<String>,
+    ) -> Option<String> {
+        let key = e as *const Expr as usize;
+        let print = memo_fingerprint(e);
+        if let Some((p, t)) = memo.borrow().get(&key) {
+            if *p == print {
+                return t.clone();
+            }
+        }
+        self.query_depth.set(self.query_depth.get() + 1);
+        let t = compute(self);
+        let depth = self.query_depth.get() - 1;
+        self.query_depth.set(depth);
+        if depth == 0 {
+            self.generic_memo.borrow_mut().clear();
+            self.java_type_memo.borrow_mut().clear();
+        } else {
+            memo.borrow_mut().insert(key, (print, t.clone()));
+        }
+        t
+    }
+
+    fn expr_generic_uncached(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Var(name) => self.var_generic(name),
             // `(List<Float>) o` states the type outright.
@@ -2501,7 +2553,14 @@ impl Compiler {
             .collect()
     }
 
+    /// Memoized like [`Compiler::expr_generic`], within the same outermost
+    /// query: the two call each other on every subexpression of a call nest,
+    /// and an unmemoized one would type the whole nest again at every level.
     fn expr_java_type(&self, e: &Expr) -> Option<String> {
+        self.memoized(&self.java_type_memo, e, |c| c.expr_java_type_uncached(e))
+    }
+
+    fn expr_java_type_uncached(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Int(_) => Some("int".to_string()),
             Expr::Long(_) => Some("long".to_string()),
@@ -11192,6 +11251,28 @@ fn with_targs(ty: &str, targs: &[String]) -> Option<String> {
         }
     }
     (!targs.is_empty() && !ty.ends_with("[]")).then(|| format!("{ty}<{}>", targs.join(",")))
+}
+
+/// A typing memo: node address → (its [`memo_fingerprint`], the answer).
+type TypeMemo = std::cell::RefCell<HashMap<usize, (String, Option<String>)>>;
+
+/// A constant-size summary of an expression node — its kind, its name or
+/// member, its argument count and line — that tells a memoized node from a
+/// different one later built at the same address.
+fn memo_fingerprint(e: &Expr) -> String {
+    match e {
+        Expr::Var(n) => format!("v{n}"),
+        Expr::Call { name, args, line } => format!("c{name}/{}@{line}", args.len()),
+        Expr::MethodCall {
+            method, args, line, ..
+        } => format!("m{method}/{}@{line}", args.len()),
+        Expr::Field { name, .. } => format!("f{name}"),
+        Expr::NewObject {
+            class, args, line, ..
+        } => format!("n{class}/{}@{line}", args.len()),
+        Expr::Cast { ty, line, .. } => format!("k{ty}@{line}"),
+        other => format!("{:?}", std::mem::discriminant(other)),
+    }
 }
 
 /// Replace each type variable `#P` in the generic type text `sig` by the

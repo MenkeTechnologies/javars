@@ -2418,3 +2418,20 @@ fn nested_plain_static_calls_compile_in_linear_time() {
     );
     assert_eq!(run_within_60s(&src), "35\n");
 }
+
+/// A nest of generic calls is typed once per node: overload resolution and
+/// inference both type each argument, which unmemoized doubled the work per
+/// level, so `id(id(…))` thirty deep — and `id(wrap(…).get(0))`, which also
+/// goes through a generic receiver — never finished compiling.
+#[test]
+fn nested_generic_calls_infer_in_linear_time() {
+    let depth = 30;
+    let src = format!(
+        "import java.util.*;\npublic class T {{\n    static <A> A id(A a) {{ return a; }}\n    static <A> List<A> wrap(A a) {{ return List.of(a); }}\n    public static void main(String[] a) {{\n        System.out.println({}2_000_000_000{} * 2);\n        System.out.println({}5{});\n    }}\n}}\n",
+        "id(".repeat(depth),
+        ")".repeat(depth),
+        "id(wrap(".repeat(depth),
+        ").get(0))".repeat(depth)
+    );
+    assert_eq!(run_within_60s(&src), "-294967296\n5\n");
+}
