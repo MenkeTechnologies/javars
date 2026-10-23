@@ -1627,7 +1627,7 @@ xs.set(0, 9);   // fine
         <article class="doc-entry" id="doc-collection-statics-12">
           <h3><a class="doc-anchor" href="#doc-collection-statics-12">#</a> <code>EnumSet</code></h3>
           <pre><code class="lang-java">EnumSet.of(E e, E... rest)   |   EnumSet.noneOf(Class&lt;E&gt;)   |   EnumSet.allOf(Class&lt;E&gt;)   |   EnumSet.copyOf(Collection&lt;E&gt;)</code></pre>
-          <p>An enum set, iterating in ordinal order. javars models it as the <code>TreeSet</code> it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; <code>getClass()</code> names <code>java.util.TreeSet</code>. <code>range</code> and <code>complementOf</code> are not modeled.</p>
+          <p>An enum set, iterating in ordinal order. javars models it as the <code>TreeSet</code> it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; <code>getClass()</code> names <code>java.util.TreeSet</code>. <code>range</code> and <code>complementOf</code> read the constants off the static enum type, so their argument has to have one.</p>
           <pre><code class="lang-java">System.out.println(EnumSet.of(Day.SUN, Day.MON));   // [MON, SUN]</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-statics-13">

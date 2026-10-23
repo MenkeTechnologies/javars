@@ -426,7 +426,9 @@ Implemented and checked against the reference `java`:
   `replaceAll` run a predicate or operator per element and report through the
   receiver's shape — a `List.of` refuses before it looks at the argument, an
   `Arrays.asList` runs the predicate and refuses only when something must
-  actually go. `Arrays.asList` is fixed-size and
+  actually go. `Arrays.asList` is fixed-size (and, over an array, a view of
+  it: writes through either show in the other, as a list's `reversed()` view
+  does with its list) and
   `List.of`/`Set.of` immutable, so a structural write to one throws
   `UnsupportedOperationException` as Java's does, and neither factory answers
   `instanceof` as the mutable kind it is not. The `of` factories also refuse a
