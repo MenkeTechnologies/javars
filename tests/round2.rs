@@ -3205,3 +3205,110 @@ hi1[1]
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A block lambda's result binds its interface's result variable from its `return` values typed with the block's own locals in scope — declared, `var`, loop variables — so `ap(1, x -> { float f = 0.1f; return f; })` is a `Float` and a summing loop's `int` wraps.
+#[test]
+fn block_lambda_results_type_through_their_locals() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static <S, R> R ap(S s, Function<S, R> f) { return f.apply(s); }
+    public static void main(String[] a) {
+        System.out.println(ap(1, x -> { float f = 0.1f; return f; }) + 1);
+        double d = ap(1, x -> { int k = 9; return k; }) + 0;
+        System.out.println(d);
+        System.out.println(ap(2_000_000_000, x -> { var y = x; if (y > 0) return y; else return -y; }) * 2);
+        System.out.println(ap(List.of(2_000_000_000), l -> { int s = 0; for (int v : l) s += v; return s; }) * 1);
+        System.out.println(ap(List.of(0.1f), l -> { for (Float v : l) return v; return 0f; }) + 1);
+        System.out.println(List.of(1, 2).stream().map(x -> { long z = x; return z * 3_000_000_000L; }).toList().get(1) / 7);
+        System.out.println(ap("s", x -> { String t = x + "!"; return t; }).length());
+    }
+}
+"####;
+    let expected = r####"1.1
+9.0
+-294967296
+2000000000
+1.1
+857142857
+2
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A generic call whose inferred return variable conflicts with its target is
+/// `javac`'s incompatible-bounds error in every shape javars can decide: an
+/// argument-bound variable a primitive target cannot widen from (`int x =
+/// id(1.5)`, `char c = id(65)`), one a final JDK or user class target is not
+/// (`String s = id(5)`, `B y = id(new A())`), and a lambda- or method-ref-bound
+/// one (`String s = ap(1, x -> 9)`, `double d = ap("9", Integer::parseInt)`);
+/// the assignable shapes run.
+#[test]
+fn conflicting_inferred_bounds_are_rejected_in_every_decidable_shape() {
+    let program = |decl: &str| {
+        format!(
+            "import java.util.function.*;\npublic class T {{\n    static class A {{}} static class B extends A {{}} static class C {{}}\n    static <S, R> R ap(S s, Function<S, R> f) {{ return f.apply(s); }}\n    static <Q> Q id(Q q) {{ return q; }}\n    public static void main(String[] a) {{\n        {decl}\n        System.out.println(\"ok\");\n    }}\n}}\n"
+        )
+    };
+    for decl in [
+        "String s = id(5);",
+        "int x = id(1.5);",
+        "Integer x = id(5L);",
+        "char c = id(65);",
+        "B y = id(new A());",
+        "A z = id(new C());",
+        "String s = ap(1, x -> 9);",
+        "Integer i = ap(1, x -> 9L);",
+        "double d = ap(\"9\", Integer::parseInt);",
+    ] {
+        let (out, ok) = run(&program(decl));
+        assert!(
+            !ok && out.is_empty(),
+            "javac rejects `{decl}`, javars ran it: {out:?}"
+        );
+    }
+    for decl in [
+        "long x = id(1);",
+        "Number n = id(5);",
+        "Comparable<Integer> c = id(5);",
+        "int k = id('a');",
+        "A x = id(new B());",
+        "double e = id(1.5f);",
+        "Number n = ap(1, x -> 9);",
+        "int i = ap(\"9\", Integer::parseInt);",
+        "String t = id(null);",
+    ] {
+        let (out, ok) = run(&program(decl));
+        assert!(ok, "`{decl}` failed:\n{out}");
+        assert_eq!(out, "ok\n");
+    }
+}
+
+/// A method reference binds its interface's result variable as the lambda it abbreviates would: `ap("2000000000", Integer::parseInt)` is an `Integer` that wraps, `ap(0.1f, Float::valueOf)` a `Float`, `stream().map(Integer::valueOf)` a `Stream<Integer>`; `Float.valueOf`/`Double.valueOf` of a number box it rather than parse it.
+#[test]
+fn method_reference_results_bind_type_variables() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+ static <S, R> R ap(S s, Function<S, R> f) { return f.apply(s); }
+ public static void main(String[] a) {
+ System.out.println(ap(0.1f, Float::valueOf) + 1);
+ System.out.println(ap("2000000000", Integer::parseInt) * 2);
+ System.out.println(ap("2000000000", Integer::valueOf) * 2);
+ System.out.println(List.of("2000000000").stream().map(Integer::valueOf).toList().get(0) * 2);
+ }
+}
+"####;
+    let expected = r####"1.1
+-294967296
+-294967296
+-294967296
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

@@ -2371,6 +2371,12 @@ impl Compiler {
     /// top-level `return` values when they all agree. `None` when the body is
     /// not statically typed.
     fn lambda_result_type(&self, lambda: &Expr, param_types: &[String]) -> Option<String> {
+        // A method reference answers as the lambda it abbreviates, when its
+        // arity is its own.
+        if let Expr::MethodRef { recv, method, line } = lambda {
+            let l = self.desugar_method_ref(recv, method, *line).ok()?;
+            return self.lambda_result_type(&l, param_types);
+        }
         let Expr::Lambda { params, body, .. } = lambda else {
             return None;
         };
@@ -2392,27 +2398,13 @@ impl Compiler {
             .zip(param_types.iter().cloned())
             .filter(|(_, t)| is_known_type(&crate::ast::generic_parts(t).0))
             .collect();
-        let pushed = typed.len();
+        let mut pushed = typed.len();
         self.lambda_param_types.borrow_mut().extend(typed);
-        let ty = |e: &Expr| -> Option<String> {
-            self.expr_generic(e)
-                .filter(|g| is_known_type(&crate::ast::generic_parts(g).0))
-                .or_else(|| {
-                    let t = self.expr_java_type(e)?;
-                    Some(wrapper_of(&t).map_or(t.clone(), str::to_string))
-                })
-                .filter(|t| t != NULL_LITERAL && t != "void")
-        };
         let result = match body {
-            LambdaBody::Expr(e) => ty(e),
+            LambdaBody::Expr(e) => self.lambda_value_type(e),
             LambdaBody::Block(stmts) => {
-                let rets: Vec<Option<String>> = stmts
-                    .iter()
-                    .filter_map(|s| match &s.kind {
-                        StmtKind::Return(Some(e)) => Some(ty(e)),
-                        _ => None,
-                    })
-                    .collect();
+                let mut rets = Vec::new();
+                pushed += self.block_return_types(stmts, &mut rets);
                 match rets.split_first() {
                     Some((first, rest)) if rest.iter().all(|r| r == first) => first.clone(),
                     _ => None,
@@ -2426,6 +2418,94 @@ impl Compiler {
         }
         clear();
         result
+    }
+
+    /// The type a lambda body's value has, boxed — what binds its interface's
+    /// result variable.
+    fn lambda_value_type(&self, e: &Expr) -> Option<String> {
+        self.expr_generic(e)
+            .filter(|g| is_known_type(&crate::ast::generic_parts(g).0))
+            .or_else(|| {
+                let t = self.expr_java_type(e)?;
+                Some(wrapper_of(&t).map_or(t.clone(), str::to_string))
+            })
+            .filter(|t| t != NULL_LITERAL && t != "void")
+    }
+
+    /// The types of the `return` values in a block lambda body, in order,
+    /// each typed with the locals declared before it in scope — the block's
+    /// own declarations, which are typed ahead of lowering by pushing them
+    /// as [`Compiler::lambda_param_types`] overrides. Answers how many it
+    /// pushed, for the caller to pop.
+    fn block_return_types(&self, stmts: &[Stmt], out: &mut Vec<Option<String>>) -> usize {
+        let mut pushed = 0;
+        let declare = |name: &str, ty: Option<String>, pushed: &mut usize| {
+            if let Some(t) = ty.filter(|t| t != "var") {
+                self.lambda_param_types
+                    .borrow_mut()
+                    .push((name.to_string(), t));
+                self.generic_memo.borrow_mut().clear();
+                self.java_type_memo.borrow_mut().clear();
+                *pushed += 1;
+            }
+        };
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Local {
+                    ty,
+                    targs,
+                    name,
+                    init,
+                } => {
+                    let t = if ty == "var" {
+                        init.as_ref()
+                            .and_then(|e| self.expr_generic(e).or_else(|| self.expr_java_type(e)))
+                    } else {
+                        Some(with_targs(ty, targs).unwrap_or_else(|| ty.clone()))
+                    };
+                    declare(name, t, &mut pushed);
+                }
+                StmtKind::Locals(decls) => pushed += self.block_return_types(decls, out),
+                StmtKind::Return(Some(e)) => out.push(self.lambda_value_type(e)),
+                StmtKind::If { then, els, .. } => {
+                    pushed += self.block_return_types(then, out);
+                    pushed += self.block_return_types(els, out);
+                }
+                StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+                    pushed += self.block_return_types(body, out);
+                }
+                StmtKind::For { init, body, .. } => {
+                    pushed += self.block_return_types(init, out);
+                    pushed += self.block_return_types(body, out);
+                }
+                StmtKind::ForEach {
+                    ty,
+                    targs,
+                    name,
+                    iter,
+                    body,
+                } => {
+                    let t = if ty == "var" {
+                        self.foreach_elem_generic(iter)
+                    } else {
+                        Some(with_targs(ty, targs).unwrap_or_else(|| ty.clone()))
+                    };
+                    declare(name, t, &mut pushed);
+                    pushed += self.block_return_types(body, out);
+                }
+                StmtKind::Labeled { body, .. } => {
+                    pushed += self.block_return_types(std::slice::from_ref(body), out);
+                }
+                StmtKind::Try {
+                    body, finally_body, ..
+                } => {
+                    pushed += self.block_return_types(body, out);
+                    pushed += self.block_return_types(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+        pushed
     }
 
     /// The `EnumSet<E>` an `EnumSet` factory answers: `E` from a class
@@ -5525,7 +5605,10 @@ impl Compiler {
         // have already bound (JLS 18.2.1) — `ap(1, x -> 0.1f)` makes `R` a
         // `Float` once `S` is an `Integer`.
         for (p, a) in params.iter().zip(args).filter(|_| lambdas) {
-            let (Some(p), Expr::Lambda { .. }) = (p, a) else {
+            let Some(p) = p
+                .as_ref()
+                .filter(|_| matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. }))
+            else {
                 continue;
             };
             let (names, types): (Vec<String>, Vec<String>) = bound.iter().cloned().unzip();
@@ -5550,7 +5633,6 @@ impl Compiler {
     /// leaves `R` with incompatible bounds — `double d = ap(1, x -> 9)` binds
     /// `R` to both `Double` and `Integer`. `Some(message)` for such a call.
     fn incompatible_inferred_return(&self, target: &str, init: &Expr) -> Option<String> {
-        let want = wrapper_of(target)?;
         let (name, args, line) = match init {
             Expr::Call { name, args, line } => (name.as_str(), args, *line),
             _ => return None,
@@ -5563,17 +5645,74 @@ impl Compiler {
             .ret_generics
             .get(&resolved.mangled)?
             .strip_prefix('#')?;
-        let (before, _) = self.infer_bindings_with(&resolved.mangled, args, false);
-        if before.iter().any(|n| n == var) {
-            return None;
-        }
+        let (before, before_types) = self.infer_bindings_with(&resolved.mangled, args, false);
+        let from_args = before
+            .iter()
+            .position(|n| n == var)
+            .map(|k| before_types[k].clone());
         let (names, types) = self.infer_bindings(&resolved.mangled, args);
-        let got = names.iter().position(|n| n == var).map(|k| &types[k])?;
-        (got != want).then(|| {
-            format!(
-                "javars: incompatible types: inference variable {var} has incompatible bounds (equality constraints: {want}, lower bounds: {got}) on line {line}"
-            )
-        })
+        let got = names
+            .iter()
+            .position(|n| n == var)
+            .map(|k| types[k].clone())?;
+        let reject = || {
+            Some(format!(
+                "javars: incompatible types: inference variable {var} has incompatible bounds (target {target}, lower bounds: {got}) on line {line}"
+            ))
+        };
+        match (wrapper_of(target), from_args) {
+            // A primitive target, the variable bound by an argument: the bound
+            // must unbox to a primitive that widens to the target (`long x =
+            // id(1)` is fine, `int x = id(1.5)` is not).
+            (Some(_), Some(_)) => {
+                let prim = unwrapped_ty(&got);
+                let widens = prim == target
+                    || matches!(
+                        (prim, target),
+                        ("byte", "short" | "int" | "long" | "float" | "double")
+                            | ("short" | "char", "int" | "long" | "float" | "double")
+                            | ("int", "long" | "float" | "double")
+                            | ("long", "float" | "double")
+                            | ("float", "double")
+                    );
+                let fits = prim != got.as_str() && widens;
+                if fits {
+                    None
+                } else {
+                    reject()
+                }
+            }
+            // Bound only by a lambda's result: the primitive target fixes the
+            // variable as its wrapper first, and the result must be exactly it.
+            (Some(want), None) => (got != want).then(reject).flatten(),
+            // A reference target: the bound must be assignable to it. Only
+            // what javars can decide is refused — a final JDK class the bound
+            // is not, or two user classes that are unrelated.
+            (None, _) => {
+                if got == target || target == "Object" || !is_reference_type(target) {
+                    return None;
+                }
+                let final_jdk = |t: &str| {
+                    matches!(
+                        t,
+                        "String"
+                            | "Integer"
+                            | "Long"
+                            | "Short"
+                            | "Byte"
+                            | "Character"
+                            | "Boolean"
+                            | "Double"
+                            | "Float"
+                    )
+                };
+                let user = |t: &str| self.classes.contains_key(t);
+                let unrelated = (final_jdk(target) && (final_jdk(&got) || user(&got)))
+                    || (user(target)
+                        && (final_jdk(&got) || (user(&got) && !self.is_subclass(&got, target))));
+                unrelated.then(reject).flatten()
+            }
+        }
     }
 
     /// The parameter and result types of the functional interface `base`
@@ -12460,6 +12599,7 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Integer", "valueOf")
         | ("Long", "valueOf")
         | ("Double", "valueOf")
+        | ("Float", "valueOf")
         | ("Double", "parseDouble")
         // The `java.lang.Math` statics javars models at arity 1, the fdlibm
         // transcendentals among them. `sin` and `cos` are unmodelled (see the

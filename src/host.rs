@@ -16184,6 +16184,19 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         {
             Err(null_float_parse_fault())
         }
+        // `valueOf(double)`/`valueOf(float)` box the number they are given — a
+        // method reference reaches here with one — where the `String`
+        // overloads parse.
+        ("Double" | "Float", "valueOf", 1)
+            if matches!(deboxed(&args[0]), Value::Float(_) | Value::Int(_)) =>
+        {
+            let x = deboxed(&args[0]).jfloat();
+            Ok(Value::float(if class == "Float" {
+                f64::from(x as f32)
+            } else {
+                x
+            }))
+        }
         ("Double", "parseDouble", 1) | ("Double", "valueOf", 1) => {
             let s = args[0].as_str_cow();
             parse_java_double(&s, false)

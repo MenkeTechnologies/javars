@@ -1324,32 +1324,15 @@ storage-model differences:
   System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
   System.out.println(String.class);               // both: class java.lang.String
   ```
-- **A `Float` from a generic position the compiler cannot type computes at
-  `double` width.** A declared type's arguments now type the JDK collection,
-  `Optional`, `Iterator`, `Stream` and `java.util.function` members (see
-  "Generics" under "Implemented"), so `l.get(0) + 1` on a `List<Float>` is
-  `1.1`; a user generic class's type variables are substituted, a generic
-  method's and a JDK factory's inferred from their arguments, and a diamond, an
-  explicit `new ArrayList<Float>(…)` and a generic cast carry theirs the same
-  way, and a member inherited from a parameterized supertype is typed through
-  the `extends`/`implements` clauses, and a variable a lambda's result binds is
-  inferred from its body (`ap(1, x -> 0.1f)`, `stream().map(x -> 0.1f)`). What
-  still carries no type is a lambda result whose body reads a local the block
-  declares, which javars does not type ahead of lowering the block: with
-  `static <S, R> R ap(S s, Function<S, R> f)`, `ap(1, x -> { float f = 0.1f;
-  return f; }) + 1` is `1.1` in Java and `1.1000000014901161` here (measured on
-  `openjdk 21.0.12.1`).
 
-  Assigning the element to a typed local first (`float g = ap(…);`) gives
-  Java's answer, because the local's declared type drives the arithmetic. The
-  `int` analogue is the 64-bit result in the first bullet above.
-
-- **A generic call's inferred bounds are checked against one shape of target
-  only.** `javac` rejects a call whose inference variables get incompatible
-  bounds; javars rejects the case where a bare return variable only a
-  lambda's result binds meets a primitive target (`double d = ap(1, x -> 9)`,
-  as a declaration, an assignment, a `return` or an argument), and accepts
-  every other conflicting shape `javac` would refuse.
+- **A generic call's inferred bounds are checked where javars can decide
+  them.** A return variable bound by an argument, a lambda or a method
+  reference that conflicts with its target is refused as `javac` refuses it
+  when the target is a primitive (`int x = id(1.5)`), a final JDK class
+  (`String s = id(5)`) or a user class (`B y = id(new A())`). A conflict with
+  any other JDK type (an interface, or a class javars does not know the
+  subtypes of) is accepted: `List<String> l = id(5);` runs where `javac`
+  reports incompatible bounds. Measured on `openjdk 21.0.12.1`.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1831,18 +1814,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   kept, corrected, because "unbound" was the documented behaviour long enough
   to be worth contradicting explicitly. An *uninitialized local* is still
   unbound — see below — so the two are no longer the same case.)
-- **A widening conversion needs a statically known *source* type.** The
-  conversion itself is performed (see "Widening primitive conversion" under
-  "Implemented"), but it is emitted only when the value's own type is
-  statically integral, so a value arriving from an erased generic position is
-  left alone: `double d = ap(1, x -> { int k = 9; return k; }) + 0;` prints
-  `9`, where Java infers `Integer` from the lambda, unboxes and widens to
-  `9.0` (a declared
-  or inferred type argument does type its position: `double e = l.get(0);` on
-  a `List<Integer>`, `List.of(9).get(0)`, and `double d = id(7);` through
-  `static <T> T id(T x)` are all widened). This is the same erasure limit as the `s.get() / 2` entry
-  above. Every source javars can type — a literal, a local,
-  a field, an array element, a declared-return method — converts.
 - **`==` on objects and on strings is reference identity.** Object and array
   handles (`Value::Obj`) are identity-comparable, so `x == y`, `x == z` after
   `z = x`, and `obj.field == null` all behave like Java's reference `==`.
