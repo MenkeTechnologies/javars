@@ -2134,3 +2134,39 @@ fn a_local_type_rejects_access_static_and_sealed_modifiers() {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, "ok\n");
 }
+
+/// A comparator's `Stream.min`/`max` is `reduce(BinaryOperator.minBy/maxBy(c))` and `Collections.min`/`max` replace their candidate only on a strict win, so the first of several equal extremes is the answer, with the JDK's comparator call order; a `DoubleStream`'s `min()`/`max()` is `reduce(Math::min/max)`, so a NaN anywhere is the answer.
+#[test]
+fn min_and_max_keep_the_first_of_equal_extremes() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        Comparator<Integer> c = (x, y) -> { System.out.print(x + "?" + y + " "); return Integer.compare(x % 3, y % 3); };
+        System.out.println(Stream.of(4, 2, 5, 8).max(c).get());
+        System.out.println(Stream.of(4, 2, 5, 8).min(c).get());
+        System.out.println(Collections.max(List.of(4, 2, 5, 8), c));
+        System.out.println(Collections.min(List.of(4, 2, 5, 8), c));
+        List<String> l = List.of("bb", "aa", "c");
+        Comparator<String> len = Comparator.comparingInt(String::length);
+        System.out.println(l.stream().max(len).get() + l.stream().min(len.reversed()).get() + Collections.max(l, len) + Stream.of("b", "a", "c").max((x, y) -> 0).get() + Stream.of("b", "a", "c").min((x, y) -> 0).get());
+        Map<String, Integer> m = new LinkedHashMap<>(); m.put("x", 4); m.put("y", 4);
+        System.out.println(m.entrySet().stream().max(Map.Entry.comparingByValue()).get().getKey() + m.entrySet().stream().min(Map.Entry.comparingByValue()).get().getKey());
+        System.out.println(DoubleStream.of(1, Double.NaN, 2).max() + " " + DoubleStream.of(3, Double.NaN).min() + " " + DoubleStream.of(-0.0, 0.0).max() + " " + DoubleStream.of(0.0, -0.0).min());
+    }
+}
+"####;
+    let expected = r####"4?2 2?5 2?8 2
+4?2 4?5 4?8 4
+2?4 5?2 8?2 2
+2?4 5?4 8?4 4
+bbbbbbbb
+xx
+OptionalDouble[NaN] OptionalDouble[NaN] OptionalDouble[0.0] OptionalDouble[-0.0]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

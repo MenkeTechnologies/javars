@@ -10086,10 +10086,47 @@ fn stream_method(
                 (!items.is_empty()).then(|| Value::float(stream_average(&items, kind))),
             ))
         }
-        ("min" | "max", 0 | 1) => {
+        // A comparator's `min`/`max` is `reduce(BinaryOperator.minBy(c))`:
+        // the accumulated element is kept on a tie (`compare(a, b) >= 0 ? a :
+        // b` for `maxBy`), so the *first* of several equal extremes wins.
+        ("min" | "max", 1) => {
             let items = all(vm);
-            let cmp = args.first().cloned();
-            let sorted = sort_values(vm, items, cmp.as_ref());
+            let mut best: Option<Value> = None;
+            for v in items {
+                best = Some(match best {
+                    None => v,
+                    Some(acc) => {
+                        let c = invoke_closure(vm, &args[0], &[acc.clone(), v.clone()]).jint();
+                        let keep = if method == "max" { c >= 0 } else { c <= 0 };
+                        if keep {
+                            acc
+                        } else {
+                            v
+                        }
+                    }
+                });
+            }
+            Ok(optional_of(kind.optional_class(), best))
+        }
+        // A primitive stream's `min()`/`max()` is `reduce(Math::min)` /
+        // `reduce(Math::max)`: for a `DoubleStream` a NaN anywhere is the
+        // answer and `-0.0` is below `0.0`, which no ordering of the values
+        // expresses. The integral ones have no such case.
+        ("min" | "max", 0) => {
+            let items = all(vm);
+            if kind == StreamKind::Double {
+                let pick = if method == "min" {
+                    min_double
+                } else {
+                    max_double
+                };
+                let folded = items.iter().map(|v| v.jfloat()).reduce(pick);
+                return Some(Ok(optional_of(
+                    kind.optional_class(),
+                    folded.map(Value::float),
+                )));
+            }
+            let sorted = sort_values(vm, items, None);
             let pick = if method == "min" {
                 sorted.first()
             } else {
@@ -14494,20 +14531,27 @@ fn collection_static(
             set_all(&args[0], items).map(|()| Value::Undef)
         }
         // `max`/`min` take an optional comparator, which may be a user closure
-        // — so the pick goes through the same stable sort the stream terminals
-        // use rather than through `Iterator::max_by`, which cannot call back
-        // into the VM.
+        // — so the walk calls it through the VM rather than through
+        // `Iterator::max_by`, which cannot call back into it.
         ("Collections", "max") | ("Collections", "min") if matches!(args.len(), 1 | 2) => {
             let items = sequence_items(&args[0]).unwrap_or_default();
             if items.is_empty() {
                 return Some(Err(Fault::java("NoSuchElementException", String::new())));
             }
-            let sorted = sort_values(vm, items, args.get(1));
-            Ok(if method == "max" {
-                sorted.last().cloned().unwrap_or(Value::Undef)
-            } else {
-                sorted.first().cloned().unwrap_or(Value::Undef)
-            })
+            // The JDK's walk: a later element replaces the candidate only when
+            // it compares strictly beyond it, so the first extreme wins a tie.
+            let mut items = items.into_iter();
+            let mut candidate = items.next().unwrap_or(Value::Undef);
+            for next in items {
+                let c = match args.get(1) {
+                    Some(cmp) => invoke_closure(vm, cmp, &[next.clone(), candidate.clone()]).jint(),
+                    None => natural_cmp(&next, &candidate) as i64,
+                };
+                if (method == "max" && c > 0) || (method == "min" && c < 0) {
+                    candidate = next;
+                }
+            }
+            Ok(candidate)
         }
         // `shuffle(l [, rnd])`: the JDK's Fisher–Yates walk from the top,
         // `swap(l, i - 1, rnd.nextInt(i))` for `i` from the size down to 2, so
