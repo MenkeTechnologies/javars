@@ -1376,11 +1376,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
-- **An escaped quote run inside a text block.** The lexer ends a text block
-  at the first `"""` without skipping escapes, so `\"""` (JLS 3.10.6's way to
-  put three quotes in a block) closes it early and the rest of the line is a
-  lex error (``unexpected character `\` ``). Measured on `openjdk 25.0.2`.
-
 - **The JVM-describing `System.getProperty` keys** are refused: they
   describe a JVM.
 - **`Enum.valueOf` on a `Class` value** is refused (`cannot find symbol:

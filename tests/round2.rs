@@ -3404,3 +3404,72 @@ two 5
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// Text blocks with `\"""`, `\s` and line-joining `\` escapes, `formatted`; `var` and `final var` lambda parameters; the boxed-value caches `==` exposes (`Integer`/`Long` -128..127, `Character`, `Boolean`); labeled `break`/`continue` across nested loops and out of a labeled block.
+#[test]
+fn text_blocks_var_lambdas_integer_cache_and_labels() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    public static void main(String[] a) {
+        String tb = """
+            Hello,
+              World!\tTab "quoted" \"""
+            line with trailing space\s
+            joined \
+            continued
+            end""";
+        System.out.println(tb);
+        System.out.println(tb.lines().count() + " " + tb.length());
+        String empty = """
+            """;
+        System.out.println("[" + empty + "]");
+        String json = """
+                {"k": %d}
+                """.formatted(5);
+        System.out.print(json);
+        BiFunction<Integer, Integer, Integer> add = (var x, var y) -> x + y;
+        Function<String, Integer> len = (final var s) -> s.length();
+        System.out.println(add.apply(2_000_000_000, 2_000_000_000) + " " + len.apply("abc"));
+        Integer i1 = 127, i2 = 127, i3 = 128, i4 = 128;
+        Long l1 = 127L, l2 = 127L, l3 = 128L, l4 = 128L;
+        System.out.println((i1 == i2) + " " + (i3 == i4) + " " + (l1 == l2) + " " + (l3 == l4) + " " + (Integer.valueOf(-128) == Integer.valueOf(-128)) + " " + (Integer.valueOf(-129) == Integer.valueOf(-129)) + " " + ((Character) 'a' == (Character) 'a') + " " + (Boolean.valueOf(true) == Boolean.TRUE) + " " + (new String("x") == "x") + " " + ("x" + "" == "x"));
+        outer:
+        for (int i = 0; i < 4; i++) {
+            inner:
+            for (int j = 0; j < 4; j++) {
+                if (j == i) continue outer;
+                if (i == 3) break outer;
+                if (j > 2) break inner;
+                System.out.print(i + "" + j + " ");
+            }
+        }
+        System.out.println();
+        int n = 0;
+        loop:
+        while (true) { do { n++; if (n > 5) break loop; } while (n % 2 != 0); }
+        System.out.println(n);
+        block: { if (n > 0) break block; System.out.println("unreached"); }
+        System.out.println("after");
+    }
+}
+"####;
+    let expected = r####"Hello,
+  World!	Tab "quoted" """
+line with trailing space 
+joined continued
+end
+5 79
+[]
+{"k": 5}
+-294967296 3
+true false true false true false true true false true
+10 20 21 
+6
+after
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

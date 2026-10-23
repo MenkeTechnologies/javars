@@ -871,10 +871,18 @@ fn text_block(src: &str, start: usize, line: u32) -> Result<(String, usize, u32)
         ));
     }
     let body_start = after_open + header + 1;
-    let body_end = src[body_start..]
-        .find("\"\"\"")
-        .map(|k| body_start + k)
-        .ok_or_else(|| format!("javars: unterminated text block on line {line}"))?;
+    // The first `"""` that is not escaped closes it: `\"""` puts three quotes
+    // in the content, so a backslash skips the character after it.
+    let bytes = src.as_bytes();
+    let mut k = body_start;
+    let body_end = loop {
+        match bytes.get(k) {
+            None => return Err(format!("javars: unterminated text block on line {line}")),
+            Some(b'\\') => k += 2,
+            Some(b'"') if src[k..].starts_with("\"\"\"") => break k,
+            Some(_) => k += 1,
+        }
+    };
     let body = &src[body_start..body_end];
     let newlines = body.matches('\n').count() as u32 + 1;
 
