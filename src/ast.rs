@@ -82,6 +82,9 @@ pub struct Class {
     /// binds `T`), in order — what a use's type arguments substitute into the
     /// members' `#T`-marked types.
     pub type_params: Vec<String>,
+    /// The type arguments of the `extends` clause (`extends Box<Float>`), in
+    /// the declaration's own type variables — what binds the superclass's.
+    pub super_targs: Vec<String>,
     pub name: String,
     /// Java's *binary* name for this type: `Outer$Nested` for a nested
     /// declaration, the simple name for a top-level one. javars flattens nesting

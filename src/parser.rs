@@ -336,6 +336,7 @@ impl Parser {
         // several interfaces (collected as `interfaces`).
         let mut superclass = None;
         let mut interfaces = Vec::new();
+        let mut super_targs = Vec::new();
         if matches!(self.peek(), Tok::Ident(w) if w == "extends") {
             self.advance();
             loop {
@@ -354,6 +355,7 @@ impl Parser {
                 if is_interface {
                     interfaces.push(sup);
                 } else {
+                    super_targs = self.last_targs.clone();
                     superclass = Some(sup);
                 }
                 if self.is(&Tok::Comma) {
@@ -476,6 +478,7 @@ impl Parser {
         self.undeclare_generics(class_generics);
         classes.push(Class {
             type_params,
+            super_targs,
             name,
             binary,
             superclass,
@@ -611,6 +614,7 @@ impl Parser {
         self.eat(&Tok::RBrace)?;
         Ok(Class {
             type_params: Vec::new(),
+            super_targs: Vec::new(),
             // An enum constant body is a synthetic subclass javars mints; Java
             // names its own `Outer$Enum$1`, which is a counter this frontend does
             // not model, so the synthetic name stands in.
@@ -4164,6 +4168,7 @@ impl Parser {
         };
         let mut cl = Class {
             type_params: Vec::new(),
+            super_targs: Vec::new(),
             name: binary.clone(),
             binary: binary.clone(),
             superclass,

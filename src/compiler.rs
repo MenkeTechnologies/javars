@@ -223,6 +223,8 @@ struct ClassInfo {
     field_generic: HashMap<String, (String, String)>,
     /// The type variables the declaration binds, see [`crate::ast::Class::type_params`].
     type_params: Vec<String>,
+    /// See [`crate::ast::Class::super_targs`].
+    super_targs: Vec<String>,
     /// Declared type of every `static` field visible on this class — its own
     /// plus every ancestor's, because Java inherits statics by name. Maps the
     /// field name to `(declaring class, declared type)`; the declaring class is
@@ -1013,6 +1015,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 field_types,
                 field_generic,
                 type_params: cl.type_params.clone(),
+                super_targs: cl.super_targs.clone(),
                 static_fields,
                 methods,
                 ctors,
@@ -1811,9 +1814,10 @@ impl Compiler {
     /// variables are replaced by the receiver's type arguments, so `V get()`
     /// on a `Box<Integer>` answers `Integer`.
     ///
-    /// Only a member `owner` declares itself is substituted: an inherited one
-    /// is written in its superclass's type variables, which the receiver's
-    /// arguments do not bind, so it keeps them and reads as their erasure.
+    /// A member `owner` declares in a superclass is written in that class's
+    /// type variables, which the `extends` clauses between `rc` and `owner`
+    /// bind: with `class FBox extends Box<Float>`, an `FBox`'s `V get()` is a
+    /// `Float`. A variable nothing binds keeps its `#T` and reads as `Object`.
     fn through_receiver(
         &self,
         owner: &str,
@@ -1821,14 +1825,34 @@ impl Compiler {
         recv_generic: Option<String>,
         sig: &str,
     ) -> String {
-        let (Some(info), Some(g)) = (self.classes.get(rc), recv_generic) else {
+        let Some(info) = self.classes.get(rc) else {
             return sig.to_string();
         };
-        let (base, targs) = crate::ast::generic_parts(&g);
-        if base != rc || owner != rc {
-            return sig.to_string();
+        // The receiver's own variables, bound by its type arguments when it
+        // has them and otherwise left as themselves.
+        let mut args: Vec<String> = match recv_generic.map(|g| crate::ast::generic_parts(&g)) {
+            Some((base, targs)) if base == rc => targs,
+            _ => info.type_params.iter().map(|p| format!("#{p}")).collect(),
+        };
+        let mut cur = rc.to_string();
+        while cur != owner {
+            let Some(ci) = self.classes.get(&cur) else {
+                return sig.to_string();
+            };
+            let Some(sup) = ci.superclass.clone() else {
+                return sig.to_string();
+            };
+            args = ci
+                .super_targs
+                .iter()
+                .map(|t| subst_tvars(t, &ci.type_params, &args))
+                .collect();
+            cur = sup;
         }
-        subst_tvars(sig, &info.type_params, &targs)
+        match self.classes.get(owner) {
+            Some(oi) => subst_tvars(sig, &oi.type_params, &args),
+            None => sig.to_string(),
+        }
     }
 
     /// The user class a receiver is statically an instance of, with its generic

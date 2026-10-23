@@ -2171,7 +2171,7 @@ OptionalDouble[NaN] OptionalDouble[NaN] OptionalDouble[0.0] OptionalDouble[-0.0]
     assert_eq!(out, expected);
 }
 
-/// A user generic class's members are typed through the receiver's type arguments: `Box<Float>`'s `V get()` and `V v` are `Float`, `Pair<String, Integer>.second()` an `Integer` that wraps at 32 bits — through nested receivers (`lb.get(0).get()`), a lambda passed to `map(Function<V, R>)`, and a user generic functional interface (`Gen<Integer>`, `Fn2<Float, Float>`); a member inherited from a superclass written in its own type variable (`Sub<T> extends Base<String>`) is not substituted.
+/// A user generic class's members are typed through the receiver's type arguments: `Box<Float>`'s `V get()` and `V v` are `Float`, `Pair<String, Integer>.second()` an `Integer` that wraps at 32 bits — through nested receivers (`lb.get(0).get()`), a lambda passed to `map(Function<V, R>)`, and a user generic functional interface (`Gen<Integer>`, `Fn2<Float, Float>`); a member inherited from `Base<T>` through `Sub<T> extends Base<String>` takes the `extends` clause's `String`, not the receiver's argument.
 #[test]
 fn user_generic_classes_substitute_their_type_variables() {
     let src = r####"
@@ -2282,6 +2282,48 @@ public class T {
 -294967296
 1.1 -294967296 1.1 1.1 -294967296 -294967296
 1.1 -294967296 -294967296
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A member a parameterized superclass declares is typed through the `extends` clauses between the receiver's class and it: `class FBox extends Box<Float>` makes `V get()` a `Float`, `Leaf extends Mid<Integer>` with `Mid<W> extends Box<W>` an `Integer`, and `Swap<A, B> extends Box<B>` binds `V` to the receiver's second argument.
+#[test]
+fn inherited_members_take_the_extends_clauses_type_arguments() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static class Box<V> { V v; Box(V v) { this.v = v; } V get() { return v; } }
+    static class FBox extends Box<Float> { FBox(float f) { super(f); } }
+    static class Mid<W> extends Box<W> { Mid(W w) { super(w); } W again() { return get(); } }
+    static class Leaf extends Mid<Integer> { Leaf(int i) { super(i); } }
+    static class Swap<A, B> extends Box<B> { A a; Swap(A a, B b) { super(b); this.a = a; } }
+    static class Base<T> { T t; Base(T t) { this.t = t; } T getT() { return t; } }
+    static class Sub<T> extends Base<String> { T u; Sub(T u) { super("s"); this.u = u; } }
+    public static void main(String[] args) {
+        FBox f = new FBox(0.1f);
+        System.out.println(f.get() + 1 + " " + (f.v * 3));
+        Leaf l = new Leaf(2_000_000_000);
+        System.out.println(l.get() + l.again() + " " + (l.v + l.v));
+        Mid<Float> m = new Mid<>(0.1f);
+        System.out.println(m.get() + 1 + " " + (m.again() + 1));
+        Swap<String, Integer> s = new Swap<>("x", 2_000_000_000);
+        System.out.println(s.get() * 2 + s.a);
+        Sub<Integer> sb = new Sub<>(5);
+        System.out.println(sb.getT() + 1 + sb.t + (sb.u + 1));
+        Box<Integer> up = l;
+        System.out.println(up.get() * 2);
+    }
+}
+"####;
+    let expected = r####"1.1 0.3
+-294967296 -294967296
+1.1 1.1
+-294967296x
+s1s6
+-294967296
 "####;
     let (out, ok) = run(src);
     assert!(ok, "program failed:\n{out}");

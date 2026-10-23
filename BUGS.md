@@ -1333,13 +1333,15 @@ storage-model differences:
   `1.1`; a user generic class's type variables are substituted, a generic
   method's and a JDK factory's inferred from their arguments, and a diamond, an
   explicit `new ArrayList<Float>(…)` and a generic cast carry theirs the same
-  way. What still carries no type argument is a member a class *inherits* from
-  a parameterized superclass, whose type variable the subclass's `extends`
-  clause binds: with `class FBox extends Box<Float>`, `new FBox(0.1f).get() + 1`
-  is `1.1` in Java and `1.1000000014901161` here (measured on
-  `openjdk 21.0.12.1`).
+  way, and a member inherited from a parameterized superclass is typed through
+  the `extends` clauses. What still carries no type argument is a `default`
+  method inherited from a parameterized *interface*, whose type variable the
+  `implements` clause binds: with `interface Holder<H> { H val(); default H
+  same() { return val(); } }` and `class IH implements Holder<Float>`,
+  `new IH().same() + 1` is `1.1` in Java and `1.1000000014901161` here
+  (measured on `openjdk 21.0.12.1`).
 
-  Assigning the element to a typed local first (`float g = f.get();`) gives
+  Assigning the element to a typed local first (`float g = h.same();`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
 - **`Character.getNumericValue` knows only the digits and the Latin letters.**
@@ -1851,8 +1853,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   conversion itself is performed (see "Widening primitive conversion" under
   "Implemented"), but it is emitted only when the value's own type is
   statically integral, so a value arriving from an erased generic position is
-  left alone: with `class IBox extends Box<Integer>`, `double e = new
-  IBox(9).get();` prints `9`, where Java unboxes and widens to `9.0` (a declared
+  left alone: with `class IH implements Holder<Integer>` (`Holder<H>`
+  declaring `default H same()`), `double e = new IH().same();` prints `9`,
+  where Java unboxes and widens to `9.0` (a declared
   or inferred type argument does type its position: `double e = l.get(0);` on
   a `List<Integer>`, `List.of(9).get(0)`, and `double d = id(7);` through
   `static <T> T id(T x)` are all widened). This is the same erasure limit as the `s.get() / 2` entry
