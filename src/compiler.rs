@@ -577,6 +577,10 @@ struct Compiler {
     /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
     /// See [`Compiler::lambda_param_generics`].
     lambda_param_hint: Option<Vec<String>>,
+    /// The parameters of a lambda whose body is being *typed* (not lowered)
+    /// to infer its result, innermost last — see
+    /// [`Compiler::lambda_result_type`].
+    lambda_param_types: std::cell::RefCell<Vec<(String, String)>>,
     /// See [`Compiler::expr_generic`]: node address → (node, answer), alive
     /// only while an outermost query is in progress.
     generic_memo: TypeMemo,
@@ -761,6 +765,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_ret_hint: None,
         lambda_generic: None,
         lambda_param_hint: None,
+        lambda_param_types: Default::default(),
         generic_memo: Default::default(),
         java_type_memo: Default::default(),
         query_depth: Default::default(),
@@ -1736,6 +1741,9 @@ impl Compiler {
     /// a local without type arguments hides a generic field), then a field of
     /// `this`, then an unqualified `static`.
     fn var_generic(&self, name: &str) -> Option<String> {
+        if let Some(g) = self.lambda_param_override(name) {
+            return g.contains('<').then_some(g);
+        }
         if self.var_decl_type(name).is_some() {
             return self.local_generic(name);
         }
@@ -1853,6 +1861,19 @@ impl Compiler {
                 let recv_generic = self.expr_generic(recv);
                 if let Some(g) = self.call_ret_generic(recv, recv_generic.clone(), method, args) {
                     return Some(g);
+                }
+                // A primitive stream's `boxed()` and `mapToObj(f)` answer a
+                // `Stream` of the wrapper or of what `f` returns.
+                if recv_generic.is_none() {
+                    let prim = self.primitive_stream_elem(recv)?;
+                    return match (method.as_str(), args.as_slice()) {
+                        ("boxed", []) => Some(format!("Stream<{}>", wrapper_of(prim)?)),
+                        ("mapToObj", [f]) => {
+                            let r = self.lambda_result_type(f, &[prim.to_string()])?;
+                            Some(format!("Stream<{r}>"))
+                        }
+                        _ => None,
+                    };
                 }
                 let (base, targs) = crate::ast::generic_parts(&recv_generic?);
                 if self.classes.contains_key(&base) && functional_type_arg_slots(&base).is_none() {
@@ -2087,6 +2108,17 @@ impl Compiler {
             | ("Stream", "reduce", 1) => return of("Optional", elem()),
             ("Stream", "reduce", 2) => return arg(0),
             ("Stream", "toList", 0) => return of("List", elem()),
+            // `map(f)` is a `Stream<R>` (an `Optional<U>`) for the `R` the
+            // lambda's body returns given the element type, and `flatMap(f)`
+            // what the body returns itself.
+            ("Stream" | "Optional", "map", 1) => {
+                let r = self.lambda_result_type(&args[0], elem())?;
+                return Some(format!("{base}<{r}>"));
+            }
+            ("Stream" | "Optional", "flatMap", 1) => {
+                let r = self.lambda_result_type(&args[0], elem())?;
+                return (crate::ast::generic_parts(&r).0 == base).then_some(r);
+            }
             ("Stream", _, _) => return None,
             ("Function", "apply", 1) | ("BiFunction", "apply", 2) => return arg(n),
             ("UnaryOperator", "apply", 1)
@@ -2245,6 +2277,125 @@ impl Compiler {
             )),
             _ => None,
         }
+    }
+
+    /// The element type of an expression that is a primitive stream —
+    /// `int` for `IntStream.range(…)`, `s.chars()`, `mapToInt(…)` — read off
+    /// the call that made it, the way [`Compiler::stream_is_ref`] reads shape.
+    fn primitive_stream_elem(&self, e: &Expr) -> Option<&'static str> {
+        let by_name = |t: &str| match t {
+            "IntStream" => Some("int"),
+            "LongStream" => Some("long"),
+            "DoubleStream" => Some("double"),
+            _ => None,
+        };
+        let Expr::MethodCall {
+            recv, method, args, ..
+        } = e
+        else {
+            return by_name(&self.expr_java_type(e)?);
+        };
+        if let Expr::Var(c) = recv.as_ref() {
+            if !self.is_declared_var(c) {
+                if let Some(t) = by_name(c) {
+                    return Some(t);
+                }
+                if c == "Arrays" && method == "stream" {
+                    let ty = self.expr_java_type(args.first()?)?;
+                    return match ty.as_str() {
+                        "int[]" => Some("int"),
+                        "long[]" => Some("long"),
+                        "double[]" => Some("double"),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        match method.as_str() {
+            "chars" | "codePoints" | "mapToInt" | "flatMapToInt" => Some("int"),
+            "mapToLong" | "asLongStream" | "flatMapToLong" => Some("long"),
+            "mapToDouble" | "asDoubleStream" | "flatMapToDouble" => Some("double"),
+            "filter" | "map" | "sorted" | "distinct" | "limit" | "skip" | "peek" | "parallel"
+            | "sequential" | "unordered" | "takeWhile" | "dropWhile" => {
+                self.primitive_stream_elem(recv)
+            }
+            _ => None,
+        }
+    }
+
+    /// The type a lambda parameter has while [`Compiler::lambda_result_type`]
+    /// types its body.
+    fn lambda_param_override(&self, name: &str) -> Option<String> {
+        let ps = self.lambda_param_types.borrow();
+        ps.iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+    }
+
+    /// The static type of what `lambda` returns when its parameters have the
+    /// types `param_types` — what `javac` infers a functional interface's
+    /// result variable from (JLS 18.2.1: `ap(1, x -> 0.1f)` binds `R` to
+    /// `Float`). A primitive result is boxed, as the inference variable is a
+    /// reference. An expression body is its expression; a block body is its
+    /// top-level `return` values when they all agree. `None` when the body is
+    /// not statically typed.
+    fn lambda_result_type(&self, lambda: &Expr, param_types: &[String]) -> Option<String> {
+        let Expr::Lambda { params, body, .. } = lambda else {
+            return None;
+        };
+        if params.len() != param_types.len() {
+            return None;
+        }
+        // Typing under these parameters changes what the body's nodes mean,
+        // so the per-query memos are dropped on the way in and out.
+        let clear = || {
+            self.generic_memo.borrow_mut().clear();
+            self.java_type_memo.borrow_mut().clear();
+        };
+        clear();
+        // A parameter whose type is not known is left untyped, as it is when
+        // the body is lowered without one.
+        let typed: Vec<(String, String)> = params
+            .iter()
+            .cloned()
+            .zip(param_types.iter().cloned())
+            .filter(|(_, t)| is_known_type(&crate::ast::generic_parts(t).0))
+            .collect();
+        let pushed = typed.len();
+        self.lambda_param_types.borrow_mut().extend(typed);
+        let ty = |e: &Expr| -> Option<String> {
+            self.expr_generic(e)
+                .filter(|g| is_known_type(&crate::ast::generic_parts(g).0))
+                .or_else(|| {
+                    let t = self.expr_java_type(e)?;
+                    Some(wrapper_of(&t).map_or(t.clone(), str::to_string))
+                })
+                .filter(|t| t != NULL_LITERAL && t != "void")
+        };
+        let result = match body {
+            LambdaBody::Expr(e) => ty(e),
+            LambdaBody::Block(stmts) => {
+                let rets: Vec<Option<String>> = stmts
+                    .iter()
+                    .filter_map(|s| match &s.kind {
+                        StmtKind::Return(Some(e)) => Some(ty(e)),
+                        _ => None,
+                    })
+                    .collect();
+                match rets.split_first() {
+                    Some((first, rest)) if rest.iter().all(|r| r == first) => first.clone(),
+                    _ => None,
+                }
+            }
+        };
+        {
+            let mut ps = self.lambda_param_types.borrow_mut();
+            let keep = ps.len() - pushed;
+            ps.truncate(keep);
+        }
+        clear();
+        result
     }
 
     /// The erasure of [`Compiler::expr_generic`] when it says more than
@@ -2472,6 +2623,9 @@ impl Compiler {
         // `super` cannot be shadowed, because it is a Java reserved word.
         if name == SUPER {
             return self.super_class();
+        }
+        if let Some(g) = self.lambda_param_override(name) {
+            return Some(crate::ast::generic_parts(&g).0);
         }
         if let Some(t) = self.var_decl_type(name) {
             return Some(t.to_string());
@@ -2942,6 +3096,9 @@ impl Compiler {
     /// an instance field of `this` or a `static` field — so a bare `int` field
     /// truncates its division the same way an `int` local does.
     fn lookup_type(&self, name: &str) -> NumType {
+        if let Some(g) = self.lambda_param_override(name) {
+            return numtype_of_ty(&crate::ast::generic_parts(&g).0).unwrap_or(NumType::Other);
+        }
         let map = match &self.scope {
             Some(scope) => &scope.types,
             None => &self.global_types,
@@ -5132,6 +5289,9 @@ impl Compiler {
     /// entering a reference slot is boxed; and a bare `{…}` array literal takes
     /// its element type from the declaration it initializes.
     fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
+        if let Some(msg) = target.and_then(|t| self.incompatible_inferred_return(t, e)) {
+            return Err(msg);
+        }
         // A targeted `switch` expression is a poly expression: the target
         // reaches each result expression, which converts on its own.
         if let (Expr::SwitchExpr { disc, arms, line }, Some(_)) = (e, target) {
@@ -5256,6 +5416,18 @@ impl Compiler {
     /// argument's static type (boxed, as a primitive argument is), and a
     /// `List<E>` parameter binds it to the argument's own type argument.
     fn infer_bindings(&self, mangled: &str, args: &[Expr]) -> (Vec<String>, Vec<String>) {
+        self.infer_bindings_with(mangled, args, true)
+    }
+
+    /// [`Compiler::infer_bindings`], optionally without the lambda pass —
+    /// what `javac`'s applicability inference sees before a lambda's body is
+    /// pertinent (JLS 18.5.1).
+    fn infer_bindings_with(
+        &self,
+        mangled: &str,
+        args: &[Expr],
+        lambdas: bool,
+    ) -> (Vec<String>, Vec<String>) {
         let Some(params) = self.param_generics.get(mangled) else {
             return (Vec::new(), Vec::new());
         };
@@ -5270,7 +5442,78 @@ impl Compiler {
                 unify_tvars(p, &actual, &mut bound);
             }
         }
+        // A lambda argument binds its functional interface's result variable
+        // from its body, typed under the parameter types the other arguments
+        // have already bound (JLS 18.2.1) — `ap(1, x -> 0.1f)` makes `R` a
+        // `Float` once `S` is an `Integer`.
+        for (p, a) in params.iter().zip(args).filter(|_| lambdas) {
+            let (Some(p), Expr::Lambda { .. }) = (p, a) else {
+                continue;
+            };
+            let (names, types): (Vec<String>, Vec<String>) = bound.iter().cloned().unzip();
+            let (base, targs) = crate::ast::generic_parts(&subst_tvars(p, &names, &types));
+            let Some((ps, Some(ret))) = self.functional_shape(&base, &targs) else {
+                continue;
+            };
+            let ps: Vec<String> = ps.into_iter().map(Option::unwrap_or_default).collect();
+            // `ret` came through the bindings, so a variable still free in it is
+            // one the body binds.
+            if let Some(actual) = self.lambda_result_type(a, &ps) {
+                unify_tvars(&ret, &actual, &mut bound);
+            }
+        }
         bound.into_iter().unzip()
+    }
+
+    /// `javac`'s rejection of a generic call assigned to a primitive whose
+    /// return type is a bare type variable that only a lambda's result binds
+    /// (JLS 18.5.2.1): with no argument binding `R` beforehand, the primitive
+    /// target makes `R` its wrapper, and a lambda returning anything else
+    /// leaves `R` with incompatible bounds — `double d = ap(1, x -> 9)` binds
+    /// `R` to both `Double` and `Integer`. `Some(message)` for such a call.
+    fn incompatible_inferred_return(&self, target: &str, init: &Expr) -> Option<String> {
+        let want = wrapper_of(target)?;
+        let (name, args, line) = match init {
+            Expr::Call { name, args, line } => (name.as_str(), args, *line),
+            _ => return None,
+        };
+        if !self.has_generic_return(name) {
+            return None;
+        }
+        let resolved = self.resolve_static_call(name, &self.arg_types(args))?;
+        let var = self
+            .ret_generics
+            .get(&resolved.mangled)?
+            .strip_prefix('#')?;
+        let (before, _) = self.infer_bindings_with(&resolved.mangled, args, false);
+        if before.iter().any(|n| n == var) {
+            return None;
+        }
+        let (names, types) = self.infer_bindings(&resolved.mangled, args);
+        let got = names.iter().position(|n| n == var).map(|k| &types[k])?;
+        (got != want).then(|| {
+            format!(
+                "javars: incompatible types: inference variable {var} has incompatible bounds (equality constraints: {want}, lower bounds: {got}) on line {line}"
+            )
+        })
+    }
+
+    /// The parameter and result types of the functional interface `base`
+    /// with type arguments `targs`: the JDK's by their table, a user generic
+    /// interface by its single abstract method's declared signature.
+    #[allow(clippy::type_complexity)]
+    fn functional_shape(
+        &self,
+        base: &str,
+        targs: &[String],
+    ) -> Option<(Vec<Option<String>>, Option<String>)> {
+        match functional_type_arg_slots(base) {
+            Some((slots, ret)) => Some((
+                slots.iter().map(|&i| targs.get(i).cloned()).collect(),
+                ret.and_then(|i| targs.get(i).cloned()),
+            )),
+            None => self.user_sam_generics(base, targs),
+        }
     }
 
     /// Lower a call's arguments, each targeted at its parameter's type and

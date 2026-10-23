@@ -2435,3 +2435,86 @@ fn nested_generic_calls_infer_in_linear_time() {
     );
     assert_eq!(run_within_60s(&src), "-294967296\n5\n");
 }
+
+/// A type variable a lambda's result binds is inferred from the lambda's body typed under the parameter types the other arguments bound (JLS 18.2.1): `ap(1, x -> 0.1f)` is a `Float`, `make(() -> { return 2_000_000_000; })` an `Integer`; `Stream.map`/`Optional.map`/`flatMap` and a primitive stream's `mapToObj`/`boxed` take their element type the same way.
+#[test]
+fn type_variables_bind_from_a_lambdas_result() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static <S, R> R ap(S s, Function<S, R> f) { return f.apply(s); }
+    static <S, R> List<R> mapAll(List<S> in, Function<S, R> f) { List<R> out = new ArrayList<>(); for (S x : in) out.add(f.apply(x)); return out; }
+    static <R> R make(Supplier<R> s) { return s.get(); }
+    public static void main(String[] a) {
+        System.out.println(ap(1, x -> 0.1f) + 1);
+        System.out.println(ap(2_000_000_000, x -> x) * 2);
+        System.out.println(ap("abc", s -> s.length()) * 1_000_000_000);
+        System.out.println(mapAll(List.of(1, 2), x -> x * 0.1f).get(1) + 1);
+        System.out.println(make(() -> 0.1f) + 1);
+        System.out.println(make(() -> { return 2_000_000_000; }) * 2);
+        List<Integer> li = List.of(2_000_000_000);
+        System.out.println(ap(li, l -> l.get(0)) * 2);
+        System.out.println(ap(1, x -> "s" + x).length());
+        System.out.println(List.of(1).stream().map(x -> 0.1f).toList().get(0) + 1);
+        System.out.println(Optional.of("abc").map(s -> s.length()).get() * 1_000_000_000 + " " + (Optional.of(2).flatMap(x -> Optional.of(0.1f)).get() + 1));
+        System.out.println(java.util.stream.IntStream.range(0, 2).mapToObj(i -> 0.1f * i).toList().get(1) + 1 + " " + java.util.stream.IntStream.of(2_000_000_000).boxed().toList().get(0) * 2);
+        double e = List.of(1).stream().map(x -> 9).toList().get(0);
+        System.out.println(e);
+    }
+}
+"####;
+    let expected = r####"1.1
+-294967296
+-1294967296
+1.2
+1.1
+-294967296
+-294967296
+2
+1.1
+-1294967296 1.1
+1.1 -294967296
+9.0
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A generic call assigned to a primitive, whose bare return variable only a
+/// lambda's result binds, is `javac`'s "inference variable R has incompatible
+/// bounds" error when the lambda returns anything but the target's wrapper
+/// (JLS 18.5.2.1); a variable an argument binds first converts as usual.
+#[test]
+fn a_lambda_result_conflicting_with_a_primitive_target_is_rejected() {
+    let program = |decl: &str| {
+        format!(
+            "import java.util.function.*;\npublic class T {{\n    static <S, R> R ap(S s, Function<S, R> f) {{ return f.apply(s); }}\n    static <A> A id(A a) {{ return a; }}\n    static void take(double x) {{ }}\n    static double back() {{ return id(2); }}\n    public static void main(String[] a) {{\n        {decl}\n        System.out.println(\"ok\");\n    }}\n}}\n"
+        )
+    };
+    for decl in [
+        "double d = ap(1, x -> 9);",
+        "long d = ap(1, x -> 9);",
+        "int d = ap(1, x -> (short) 9);",
+        "double d; d = ap(1, x -> 9);",
+        "take(ap(1, x -> 9));",
+    ] {
+        let (out, ok) = run(&program(decl));
+        assert!(
+            !ok && out.is_empty(),
+            "javac rejects `{decl}`, javars ran it: {out:?}"
+        );
+    }
+    for decl in [
+        "double d = ap(1, x -> 9.0);",
+        "int d = ap(1, x -> 9);",
+        "double d = id(7);",
+        "double d = ap(1.5, x -> x);",
+        "take(ap(1, x -> 2.0)); back();",
+    ] {
+        let (out, ok) = run(&program(decl));
+        assert!(ok, "`{decl}` failed:\n{out}");
+        assert_eq!(out, "ok\n");
+    }
+}
