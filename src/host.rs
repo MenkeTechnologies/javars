@@ -417,6 +417,12 @@ pub const JCLASS_STR: u16 = 759;
 /// arrays it holds with the inner types too.
 pub const JARRAY_TAG: u16 = 760;
 
+/// Record the class `getClass()` names for a value whose shape cannot say —
+/// an anonymous class javars lowered to a closure or to the collection it
+/// fills (`T$3`). Stack `[value, binaryName]`; `argc == 2`; answers the
+/// value.
+pub const JCLASS_NAME: u16 = 761;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -3076,6 +3082,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JCOLL_DISPATCH, b_coll_dispatch);
     vm.register_builtin(JITER_ARRAY, b_iter_array);
     vm.register_builtin(JARRAY_TAG, b_array_tag);
+    vm.register_builtin(JCLASS_NAME, b_class_name);
 }
 
 /// `main`'s `String[] args` — a fresh array of the program arguments.
@@ -3362,6 +3369,13 @@ fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
                 .and_then(array_descriptor)
                 .unwrap_or_default(),
         );
+    }
+    // A value whose class was recorded by name (an anonymous class javars
+    // lowered to a closure) answers it.
+    if let Value::Obj(id) = v {
+        if let Some(c) = VIEW_CLASSES.with(|m| m.borrow().get(id).cloned()) {
+            return intern_class(c);
+        }
     }
     // A lambda keeps the dispatch sentinel: Java names one
     // `Class$$Lambda/0x…`, which is not reproducible (BUGS.md).
@@ -6088,7 +6102,7 @@ thread_local! {
     /// `System.getenv()` map) is an instance of — what `getClass()` names,
     /// which the view's own shape cannot tell (`Collections$UnmodifiableMap`
     /// rather than the immutable factory's `ImmutableCollections$MapN`).
-    static VIEW_CLASSES: RefCell<HashMap<u32, &'static str>> = RefCell::new(HashMap::default());
+    static VIEW_CLASSES: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::default());
     /// The lists made by `new ArrayDeque<>(…)`. They share the mutable-list
     /// shape, but an `ArrayDeque` refuses a `null` element, which this set is
     /// what lets the add family check.
@@ -7090,6 +7104,16 @@ fn is_reference_type_name(t: &str) -> bool {
         t,
         "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
     )
+}
+
+/// [`JCLASS_NAME`].
+fn b_class_name(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let v = args.first().cloned().unwrap_or(Value::Undef);
+    if let (Value::Obj(id), Some(name)) = (&v, args.get(1)) {
+        VIEW_CLASSES.with(|m| m.borrow_mut().insert(*id, name.as_str_cow().into_owned()));
+    }
+    v
 }
 
 /// [`JARRAY_TAG`].
@@ -8117,7 +8141,7 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
                 } else {
                     "java.util.ReverseOrderListView$Rand"
                 };
-                VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class));
+                VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class.to_string()));
             }
             Some(view)
         }
@@ -8256,7 +8280,7 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
             let v = heap_alloc(obj);
             VIEWS.with(|m| m.borrow_mut().insert(v, *id));
             REVERSED_VIEWS.with(|r| r.borrow_mut().insert(v));
-            VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class));
+            VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class.to_string()));
             Value::Obj(v)
         })),
         (
@@ -12981,6 +13005,14 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // and enclosing-class qualifiers off it.
         ("getSimpleName", 0) => Ok(Value::str(simple_class_name(s).to_string())),
         ("getName", 0) => Ok(Value::str(s.to_string())),
+        // An anonymous class is `Encloser$N`, a binary name ending in a number;
+        // an array's binary name is its descriptor.
+        ("isAnonymousClass", 0) => {
+            Ok(Value::bool(s.rsplit_once('$').is_some_and(|(_, n)| {
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+            })))
+        }
+        ("isArray", 0) => Ok(Value::bool(s.starts_with('['))),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
@@ -13515,7 +13547,7 @@ fn system_static(
             if let Value::Obj(id) = view {
                 VIEW_CLASSES.with(|m| {
                     m.borrow_mut()
-                        .insert(id, "java.util.Collections$UnmodifiableMap")
+                        .insert(id, "java.util.Collections$UnmodifiableMap".to_string())
                 });
             }
             Ok(view)
@@ -14729,7 +14761,7 @@ fn collection_static(
             match unmodifiable_view(&args[0], method == "unmodifiableCollection") {
                 Some(v) => {
                     if let Value::Obj(id) = v {
-                        VIEW_CLASSES.with(|m| m.borrow_mut().insert(id, class));
+                        VIEW_CLASSES.with(|m| m.borrow_mut().insert(id, class.to_string()));
                     }
                     Ok(v)
                 }
@@ -21522,8 +21554,8 @@ fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
 /// and `[I` and `[Ljava.lang.String;` differ only by it.
 fn binary_name(class: &str, v: &Value) -> Option<String> {
     if let Value::Obj(id) = v {
-        if let Some(c) = VIEW_CLASSES.with(|m| m.borrow().get(id).copied()) {
-            return Some(c.to_string());
+        if let Some(c) = VIEW_CLASSES.with(|m| m.borrow().get(id).cloned()) {
+            return Some(c);
         }
     }
     let len = || sequence_len(v).unwrap_or(0);

@@ -3169,3 +3169,39 @@ ASE [Ljava.lang.Integer;
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// Every anonymous class reports the binary name `javac` gives it — `Encloser$N`, numbered in source order per enclosing class (`T$1` for a static field's, `T$Inner$1` inside a nested class) — including the ones javars lowers to a closure (a single-method interface body) or to the collection a double-brace initializer fills; `Class.isAnonymousClass()` and `isArray()` answer from the name.
+#[test]
+fn anonymous_classes_are_named_as_javac_numbers_them() {
+    let src = r####"
+import java.util.*;
+public class T {
+    interface Greet { String hi(); }
+    static abstract class Base { abstract int v(); }
+    static class Inner {
+        Object make() { return new Object() { public String toString() { return "inner-anon"; } }; }
+    }
+    static Object field = new Object() {};
+    public static void main(String[] a) {
+        Object o1 = new Object() { };
+        Greet g = new Greet() { public String hi() { return "hi"; } };
+        Base b = new Base() { int v() { return 1; } };
+        Runnable r = new Runnable() { public void run() {} };
+        List<Integer> l = new ArrayList<>() {{ add(1); }};
+        Comparator<String> c = new Comparator<>() { public int compare(String x, String y) { return 0; } };
+        System.out.println(o1.getClass().getName() + " " + g.getClass().getName() + " " + b.getClass().getName() + " " + r.getClass().getName() + " " + l.getClass().getName() + " " + c.getClass().getName());
+        System.out.println(field.getClass().getName() + " " + new Inner().make().getClass().getName() + " " + o1.getClass().getSimpleName().isEmpty());
+        System.out.println(o1.getClass().isAnonymousClass() + " " + l.getClass().isAnonymousClass() + " " + String.class.isAnonymousClass() + " " + new int[0].getClass().isArray() + " " + o1.getClass().isArray());
+        System.out.println(g.hi() + b.v() + l);
+    }
+}
+"####;
+    let expected = r####"T$2 T$3 T$4 T$5 T$6 T$7
+T$1 T$Inner$1 true
+true true false true false
+hi1[1]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

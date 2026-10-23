@@ -1334,6 +1334,16 @@ impl Compiler {
         self.emit_set(&name, 0);
     }
 
+    /// Record the binary name `name` (an `Expr::Str`) as the `getClass()` of
+    /// the value on top of the stack, leaving it there.
+    fn emit_anon_class_name(&mut self, name: &Expr) {
+        if let Expr::Str(n) = name {
+            let c = self.b.add_constant(Value::str(n.clone()));
+            self.b.emit(Op::LoadConst(c), 0);
+            self.b.emit(Op::CallBuiltin(crate::host::JCLASS_NAME, 2), 0);
+        }
+    }
+
     /// Record the array on top of the stack as having type `ty` (see
     /// [`crate::host::JARRAY_TAG`]), leaving it there.
     fn emit_array_tag(&mut self, ty: &str, line: u32) {
@@ -5348,6 +5358,15 @@ impl Compiler {
     /// entering a reference slot is boxed; and a bare `{…}` array literal takes
     /// its element type from the declaration it initializes.
     fn expr_targeted(&mut self, e: &Expr, target: Option<&str>) -> Result<(), String> {
+        // An anonymous class javars lowered (see `parser::anonymous_named`)
+        // takes the target itself — its lambda is the one the target types.
+        if let Expr::Call { name, args, .. } = e {
+            if name == crate::parser::ANON_CLASS_CALL {
+                self.expr_targeted(&args[0], target)?;
+                self.emit_anon_class_name(&args[1]);
+                return Ok(());
+            }
+        }
         if let Some(msg) = target.and_then(|t| self.incompatible_inferred_return(t, e)) {
             return Err(msg);
         }
@@ -8352,6 +8371,10 @@ impl Compiler {
                 value,
                 line,
             } => self.assign_value(target, *op, value, *line)?,
+            Expr::Call { name, args, .. } if name == crate::parser::ANON_CLASS_CALL => {
+                self.expr(&args[0])?;
+                self.emit_anon_class_name(&args[1]);
+            }
             Expr::Call { name, args, line } => match self.implicit_enum_static(name, args, *line) {
                 Some(call) => self.expr(&call)?,
                 None => self.call(name, args, *line)?,

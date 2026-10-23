@@ -688,6 +688,22 @@ fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
 
 /// The index one past the last token of the block enclosing `from`: the
 /// first `}` that closes a brace opened before `from`, or the end of input.
+/// `e`, an anonymous class javars lowered to something else (a closure, or
+/// the collection a double-brace initializer fills), marked with the binary
+/// name `javac` gives the class: the compiler lowers `e` and records the name
+/// for `getClass()` ([`crate::host::JCLASS_NAME`]).
+fn anonymous_named(e: Expr, binary: String, line: u32) -> Expr {
+    Expr::Call {
+        name: ANON_CLASS_CALL.to_string(),
+        args: vec![e, Expr::Str(binary)],
+        line,
+    }
+}
+
+/// The internal call [`anonymous_named`] builds; `#` keeps it out of reach of
+/// a Java identifier.
+pub const ANON_CLASS_CALL: &str = "#anon_class";
+
 fn block_end(toks: &[Token], from: usize) -> usize {
     let mut depth = 0usize;
     for (k, t) in toks.iter().enumerate().skip(from) {
@@ -4012,10 +4028,9 @@ impl Parser {
             let (counts, captures) = (self.local_counts.clone(), self.local_captures.clone());
             if let Some(lambda) = self.anonymous_lambda(ty, line)? {
                 // javac still compiles it to a class, which takes the next
-                // `Encloser$N`; a lifted anonymous class after it is `$N+1`.
-                let outer = self.enclosing.last().cloned().unwrap_or_default();
-                *self.local_counts.entry((outer, String::new())).or_insert(0) += 1;
-                return Ok(lambda);
+                // `Encloser$N`, and that is what its `getClass()` names.
+                let binary = self.next_anonymous_name();
+                return Ok(anonymous_named(lambda, binary, line));
             }
             self.toks = toks;
             self.local_classes.truncate(n_classes);
@@ -4146,7 +4161,25 @@ impl Parser {
         }
         const SELF: &str = "#dbl";
         self.double_brace_rewrite(open, members, SELF);
-        self.double_brace_parse(ty, args, line, SELF)
+        // javac compiles the initializer to an anonymous class `Encloser$N`,
+        // which is what the result's `getClass()` names.
+        let binary = self.next_anonymous_name();
+        Ok(self
+            .double_brace_parse(ty, args, line, SELF)?
+            .map(|e| anonymous_named(e, binary, line)))
+    }
+
+    /// The binary name the next anonymous class in the innermost enclosing
+    /// declaration takes — `Encloser$N`, numbered in source order as `javac`
+    /// numbers them.
+    fn next_anonymous_name(&mut self) -> String {
+        let outer = self.enclosing.last().cloned().unwrap_or_default();
+        let n = self
+            .local_counts
+            .entry((outer.clone(), String::new()))
+            .or_insert(0);
+        *n += 1;
+        format!("{outer}${n}")
     }
 
     /// Retarget the initializer block's bare calls to the collection's own
@@ -4316,13 +4349,7 @@ impl Parser {
         class_super: bool,
         line: u32,
     ) -> Result<Expr, String> {
-        let outer = self.enclosing.last().cloned().unwrap_or_default();
-        let n = self
-            .local_counts
-            .entry((outer.clone(), String::new()))
-            .or_insert(0);
-        *n += 1;
-        let binary = format!("{outer}${n}");
+        let binary = self.next_anonymous_name();
         let start = self.pos;
         self.eat(&Tok::LBrace)?;
         self.enclosing.push(binary.clone());
