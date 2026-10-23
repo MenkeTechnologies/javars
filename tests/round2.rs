@@ -2042,3 +2042,63 @@ true
     assert_eq!(out, expected);
 }
 
+/// `Enum.valueOf(Color.class, s)` is `Color.valueOf(s)` (JLS 8.9.3), nested enum class literals included, and a `null` name is `NullPointerException: Name is null` rather than a miss.
+#[test]
+fn enum_value_of_by_class_literal_and_a_null_name() {
+    let src = r####"
+public class T {
+    enum Color { RED, GREEN; String low() { return name().toLowerCase(); } }
+    static class Box { enum In { A, B } }
+    public static void main(String[] a) {
+        System.out.println(Enum.valueOf(Color.class, "GREEN"));
+        System.out.println(Enum.valueOf(Color.class, "RED").low() + Enum.valueOf(Color.class, "GREEN").ordinal());
+        try { Enum.valueOf(Color.class, "BLUE"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { Enum.valueOf(Box.In.class, "C"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        System.out.println(Enum.valueOf(Box.In.class, "B") == Box.In.B);
+        System.out.println(Box.In.valueOf("A").compareTo(Box.In.B) + " " + Box.In.values().length);
+        Color c = Enum.valueOf(Color.class, "RED");
+        switch (c) { case RED -> System.out.println("r"); default -> System.out.println("d"); }
+        try { Enum.valueOf(Color.class, null); } catch (NullPointerException e) { System.out.println(e.getMessage()); }
+    }
+}
+"####;
+    let expected = r####"GREEN
+red1
+No enum constant T.Color.BLUE
+No enum constant T.Box.In.C
+true
+-1 2
+r
+Name is null
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A nested type named through its enclosers resolves like its simple name: `Box.In.B` is the enum constant, `T.Box.n` the static field, and `Box.In.class` the binary-named `T$Box$In` (an `interface` for `Box.I.class`).
+#[test]
+fn nested_types_named_through_their_enclosers() {
+    let src = r####"
+public class T {
+    static class Box { enum In { A, B } static int n = 5; interface I {} static class Deep { static class D2 {} } }
+    public static void main(String[] a) {
+        System.out.println(Box.In.B + " " + Box.In.class + " " + Box.In.class.getName() + " " + Box.Deep.D2.class.getName() + " " + Box.I.class);
+        Box.In x = Box.In.A;
+        System.out.println(x == Box.In.A);
+        switch (x) { case A -> System.out.println("a"); case B -> System.out.println("b"); }
+        System.out.println(Box.n + T.Box.n);
+        System.out.println(T.Box.In.B.ordinal());
+    }
+}
+"####;
+    let expected = r####"B class T$Box$In T$Box$In T$Box$Deep$D2 interface T$Box$I
+true
+a
+10
+1
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

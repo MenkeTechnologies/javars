@@ -1310,13 +1310,13 @@ impl Compiler {
         let Expr::Field { recv, name } = e else {
             return None;
         };
-        let Expr::Var(class) = recv.as_ref() else {
-            return None;
+        // `Outer.Nested.f` names the nested class through its enclosers.
+        let class = match recv.as_ref() {
+            Expr::Var(class) if !self.is_declared_var(class) => class.clone(),
+            Expr::Field { .. } => self.user_class_ref(recv)?,
+            _ => return None,
         };
-        if self.is_declared_var(class) {
-            return None;
-        }
-        self.classes.get(class)?.static_fields.get(name).cloned()
+        self.classes.get(&class)?.static_fields.get(name).cloned()
     }
 
     /// The declaring class + declared type of whichever `static` field an
@@ -1404,17 +1404,13 @@ impl Compiler {
         let Expr::Field { recv, name } = e else {
             return None;
         };
-        let Expr::Var(class) = recv.as_ref() else {
-            return None;
-        };
-        if self.is_declared_var(class) {
-            return None;
-        }
-        let info = self.classes.get(class)?;
+        // `Outer.Inner.RED` names the constant through the enclosers too.
+        let class = self.enum_type_ref(recv)?;
+        let info = self.classes.get(&class)?;
         info.enum_constants
             .iter()
             .any(|c| c == name)
-            .then(|| class.clone())
+            .then_some(class)
     }
 
     /// A bare `MUL` written inside `enum Op`'s own body names its constant —
@@ -1499,15 +1495,11 @@ impl Compiler {
 
     /// The enum type named by a bare receiver (`Color.values()`), or `None` when
     /// the receiver is a value rather than an enum type name.
+    /// A nested enum named through its enclosers (`Outer.Inner.values()`) is
+    /// the same type, resolved the way [`Compiler::user_class_ref`] resolves it.
     fn enum_type_ref(&self, recv: &Expr) -> Option<String> {
-        let Expr::Var(class) = recv else {
-            return None;
-        };
-        if self.is_declared_var(class) {
-            return None;
-        }
-        let info = self.classes.get(class)?;
-        info.is_enum.then(|| class.clone())
+        let class = self.user_class_ref(recv)?;
+        self.classes.get(&class)?.is_enum.then_some(class)
     }
 
     /// Lower `EnumName.values()` — a fresh array of the constants, in
@@ -1522,6 +1514,31 @@ impl Compiler {
             }
             self.b.emit(array_build_op(i, len), line);
         }
+    }
+
+    /// `Enum.valueOf(Color.class, s)` rewritten to the `Color.valueOf(s)` it is
+    /// (JLS 8.9.3 defines the implicit one as calling it), when the class
+    /// literal names a user enum.
+    fn enum_class_value_of(
+        &self,
+        recv: &Expr,
+        method: &str,
+        args: &[Expr],
+        line: u32,
+    ) -> Option<Expr> {
+        let (Expr::Var(c), "valueOf", [Expr::ClassLit(lit), name]) = (recv, method, args) else {
+            return None;
+        };
+        if c != "Enum" || self.is_declared_var(c) {
+            return None;
+        }
+        let simple = self.class_lit_class(lit);
+        self.classes.get(simple)?.is_enum.then(|| Expr::MethodCall {
+            recv: Box::new(Expr::Var(simple.to_string())),
+            method: method.to_string(),
+            args: vec![name.clone()],
+            line,
+        })
     }
 
     /// Lower `EnumName.valueOf(s)` — a name-to-constant lookup, raising Java's
@@ -1549,6 +1566,21 @@ impl Compiler {
         // `.` — so a nested enum reports `T.E.Z` and not the simple `E.Z` the
         // declaration site spells. The message needs the runtime argument, so
         // it is built with a concatenation rather than a constant.
+        // A `null` name misses the constant directory too, and `Enum.valueOf`
+        // then answers `NullPointerException: Name is null` instead.
+        self.emit_get(&key, line);
+        self.expr(&Expr::Var(NULL_LITERAL.to_string()))?;
+        self.b.emit(Op::NumEq, line);
+        let not_null = self.b.emit(Op::JumpIfFalse(0), line);
+        let cls = self.b.add_constant(Value::str("NullPointerException"));
+        self.b.emit(Op::LoadConst(cls), line);
+        let m = self.b.add_constant(Value::str("Name is null"));
+        self.b.emit(Op::LoadConst(m), line);
+        self.b.emit(Op::CallBuiltin(crate::host::JFAULT, 2), line);
+        self.b.emit(Op::Pop, line);
+        self.emit_unwind(line);
+        let past = self.b.current_pos();
+        self.b.patch_jump(not_null, past);
         let msg = self.temp();
         let canonical = self.classes[class].binary.replace('$', ".");
         let prefix = self
@@ -2035,6 +2067,9 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                if let Some(call) = self.enum_class_value_of(recv, method, args, 0) {
+                    return self.expr_class(&call);
+                }
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return self.classes.contains_key(&t).then_some(t);
                 }
@@ -2107,7 +2142,19 @@ impl Compiler {
     /// (`T$A` for a nested one), and everything else is left as written for the
     /// host to qualify the way it qualifies a runtime class name. A primitive
     /// (`int.class`) is its own keyword and stays as it is.
+    /// The class a class literal's spelling names: `Outer.Inner.class` names
+    /// the nested type through its enclosers, which javars keys by the simple
+    /// name — so a chain of user classes is the class its last segment names.
+    /// Any other spelling is itself.
+    fn class_lit_class<'a>(&self, name: &'a str) -> &'a str {
+        match name.rsplit_once('.') {
+            Some((_, last)) if name.split('.').all(|s| self.classes.contains_key(s)) => last,
+            _ => name,
+        }
+    }
+
     fn class_literal_name(&self, name: &str) -> String {
+        let name = self.class_lit_class(name);
         // A qualified spelling (`java.util.List.class`) is already the name.
         if let Some(c) = self.classes.get(name) {
             // A type the prelude declares (a functional interface, a throwable)
@@ -2311,6 +2358,9 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                if let Some(call) = self.enum_class_value_of(recv, method, args, 0) {
+                    return self.expr_java_type(&call);
+                }
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
                     return Some(t);
                 }
@@ -7133,6 +7183,7 @@ impl Compiler {
     fn class_value_kind(&self, e: &Expr) -> Option<bool> {
         match e {
             Expr::ClassLit(name) => {
+                let name = self.class_lit_class(name);
                 let user = self.classes.get(name).map(|c| c.is_interface);
                 Some(user.unwrap_or_else(|| crate::host::is_jdk_interface(name)))
             }
@@ -7826,6 +7877,9 @@ impl Compiler {
         // through the ordinary static path.
         if let Some(simple) = qualified_static_class(recv) {
             return self.method_call(&Expr::Var(simple), method, args, line);
+        }
+        if let Some(call) = self.enum_class_value_of(recv, method, args, line) {
+            return self.expr(&call);
         }
         // `Color.values()` / `Color.valueOf(s)` — the two statics every enum has.
         // They are compiler-generated because javars keeps no per-class static
