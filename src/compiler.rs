@@ -1762,7 +1762,7 @@ impl Compiler {
                     let (_, g) = self.classes.get(&owner)?.field_generic.get(name)?;
                     return Some(g.clone());
                 }
-                let (rc, g) = self.recv_class_generic(recv)?;
+                let (rc, g) = self.recv_class_generic(recv, self.expr_generic(recv))?;
                 let (owner, sig) = self.classes.get(&rc)?.field_generic.get(name)?;
                 Some(self.through_receiver(owner, &rc, g, sig))
             }
@@ -1789,11 +1789,13 @@ impl Compiler {
                 }
                 // A user type has its own signatures, read through the
                 // receiver's arguments; the prelude's functional interfaces are
-                // the JDK's, typed by the table.
-                if let Some(g) = self.call_ret_generic(recv, method, args) {
+                // the JDK's, typed by the table. The receiver's generic type is
+                // read once, which keeps a long chain linear.
+                let recv_generic = self.expr_generic(recv);
+                if let Some(g) = self.call_ret_generic(recv, recv_generic.clone(), method, args) {
                     return Some(g);
                 }
-                let (base, targs) = crate::ast::generic_parts(&self.expr_generic(recv)?);
+                let (base, targs) = crate::ast::generic_parts(&recv_generic?);
                 if self.classes.contains_key(&base) && functional_type_arg_slots(&base).is_none() {
                     return None;
                 }
@@ -1903,8 +1905,11 @@ impl Compiler {
     /// The user class a receiver is statically an instance of, with its generic
     /// type when it has one — read off the generic type when only that knows
     /// the class (`boxes.get(0)` on a `List<Box<Integer>>`).
-    fn recv_class_generic(&self, recv: &Expr) -> Option<(String, Option<String>)> {
-        let g = self.expr_generic(recv);
+    fn recv_class_generic(
+        &self,
+        recv: &Expr,
+        g: Option<String>,
+    ) -> Option<(String, Option<String>)> {
         let rc = self.expr_class(recv).or_else(|| {
             let base = crate::ast::generic_parts(g.as_deref()?).0;
             self.classes.contains_key(&base).then_some(base)
@@ -1965,8 +1970,14 @@ impl Compiler {
 
     /// [`Compiler::instance_ret_generic`] seen through `recv`'s own type
     /// arguments.
-    fn call_ret_generic(&self, recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
-        let (rc, g) = self.recv_class_generic(recv)?;
+    fn call_ret_generic(
+        &self,
+        recv: &Expr,
+        recv_generic: Option<String>,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<String> {
+        let (rc, g) = self.recv_class_generic(recv, recv_generic)?;
         let (owner, sig) = self.instance_ret_generic(&rc, method, args)?;
         Some(self.through_receiver(&owner, &rc, g, &sig))
     }
@@ -2795,31 +2806,29 @@ impl Compiler {
                         return Some(r.ret_name);
                     }
                 }
+                // The receiver is typed once: every table below reads it, and
+                // a chained call (`s.filter(…).map(…)…`) would otherwise type
+                // each receiver once per table, exponentially in the chain.
+                let recv_ty = self.expr_java_type(recv);
                 // A `StringBuilder` receiver's known return types. `append` and
                 // friends answer the receiver, which is what makes the chained
                 // `sb.append(1).append('a')` keep its type — and `charAt` must
                 // report `char`, or the code point it answers would print as a
                 // number.
-                if let Some(t) = self
-                    .expr_java_type(recv)
+                if let Some(t) = recv_ty
                     .as_deref()
                     .and_then(|t| builder_call_java_type(t, method, args.len()))
                 {
                     return Some(t.to_string());
                 }
-                if let Some(t) = self
-                    .expr_java_type(recv)
+                if let Some(t) = recv_ty
                     .as_deref()
                     .and_then(|t| input_call_java_type(t, method))
                 {
                     return Some(t.to_string());
                 }
                 // A collection receiver's known return types.
-                if let Some(kind) = self
-                    .expr_java_type(recv)
-                    .as_deref()
-                    .and_then(collection_kind)
-                {
+                if let Some(kind) = recv_ty.as_deref().and_then(collection_kind) {
                     if let Some(t) = collection_call_java_type(kind, method, args.len()) {
                         return Some(t.to_string());
                     }

@@ -2363,3 +2363,38 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// Typing a chained call types each receiver once: a pipeline of many stages
+/// on a typed `Stream<Integer>` used to re-type its receiver per lookup table,
+/// so compile time grew tenfold per stage and twelve stages never finished.
+/// The program runs under a deadline, so a regression fails instead of hanging.
+#[test]
+fn a_long_typed_call_chain_compiles_in_linear_time() {
+    let stages = ".filter(x -> x > 0).map(x -> x + 1)".repeat(12);
+    let src = format!(
+        "import java.util.*;\nimport java.util.stream.*;\npublic class T {{\n    public static void main(String[] a) {{\n        List<Integer> l = new ArrayList<>(List.of(3, 1, 2));\n        System.out.println(l.stream(){stages}.collect(Collectors.toList()));\n    }}\n}}\n"
+    );
+    let dir = std::env::temp_dir().join(format!("javars_round2_{}", fnv1a(&src)));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("T.java");
+    std::fs::write(&path, &src).expect("write program");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn java");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("poll java").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("a 24-stage pipeline did not compile and run within 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().expect("collect java");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[15, 13, 14]\n");
+}
