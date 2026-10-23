@@ -3027,3 +3027,46 @@ LinkedList LinkedList
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A `LinkedHashSet`'s and `LinkedHashMap`'s `reversed()` is a view: it shows the source's later changes, and a write through it is the JDK's delegation to the source (`add`/`put` append to the source, `removeFirst` is the source's `removeLast`); reversing it again answers the source, and its class is the JDK's view class.
+#[test]
+fn linked_set_and_map_reversed_are_views() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        LinkedHashSet<Integer> s = new LinkedHashSet<>(List.of(1, 2));
+        var r = s.reversed();
+        s.add(3);
+        System.out.println(r + " " + r.getFirst() + " " + r.size());
+        r.add(0);
+        r.remove(2);
+        System.out.println(s + " " + r + " " + (r.reversed() == s));
+        r.removeFirst();
+        System.out.println(s + " " + r);
+        LinkedHashMap<String, Integer> m = new LinkedHashMap<>();
+        m.put("a", 1); m.put("b", 2);
+        var rm = m.reversed();
+        m.put("c", 3);
+        System.out.println(rm + " " + rm.firstEntry() + " " + rm.keySet());
+        rm.put("z", 9);
+        rm.remove("a");
+        System.out.println(m + " " + rm);
+        for (var e : rm.entrySet()) System.out.print(e.getKey());
+        System.out.println();
+        System.out.println(r.getClass().getName() + " " + rm.getClass().getName());
+    }
+}
+"####;
+    let expected = r####"[3, 2, 1] 3 3
+[1, 3, 0] [0, 3, 1] true
+[1, 3] [3, 1]
+{c=3, b=2, a=1} c=3 [c, b, a]
+{b=2, c=3, z=9} {z=9, c=3, b=2}
+zcb
+java.util.LinkedHashSet$1ReverseLinkedHashSetView java.util.LinkedHashMap$ReversedLinkedHashMapView
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

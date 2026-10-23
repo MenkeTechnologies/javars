@@ -6122,12 +6122,22 @@ fn sync_view(id: u32) {
         Set(Vec<Value>, Order),
         Map(Vec<(Value, Value)>, Order),
     }
+    let reversed = REVERSED_VIEWS.with(|r| r.borrow().contains(&id));
+    // A `reversed()` view of an insertion-ordered set or map holds the
+    // elements backwards, presented in that stored order.
     let snap = HEAP.with(|h| match h.borrow().get(target as usize) {
+        Some(HostObj::Set { items, order, .. }) if reversed => Some(Snap::Set(
+            items.iter().rev().cloned().collect(),
+            Order::Insertion,
+        )),
+        Some(HostObj::Map { entries, order, .. }) if reversed => Some(Snap::Map(
+            entries.iter().rev().cloned().collect(),
+            Order::Insertion,
+        )),
         Some(HostObj::Set { items, order, .. }) => Some(Snap::Set(items.clone(), *order)),
         Some(HostObj::Map { entries, order, .. }) => Some(Snap::Map(entries.clone(), *order)),
         _ => None,
     });
-    let reversed = REVERSED_VIEWS.with(|r| r.borrow().contains(&id));
     let snap = snap.or_else(|| {
         sequence_items(&Value::Obj(target)).map(|mut items| {
             if reversed {
@@ -7712,10 +7722,69 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
 /// `keySet()`/`entrySet()`/`values()` is carried back to the map — see
 /// [`write_through`].
 fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    if let Some((base, mapped)) = reversed_set_or_map_write(recv, method) {
+        return coll_method(vm, &Value::Obj(base), mapped, args);
+    }
     let out = coll_method_unlinked(vm, recv, method, args);
     sync_linked_list(recv, method, args);
     sync_reversed_back(recv, method);
     out
+}
+
+/// A write through the `reversed()` view of an insertion-ordered set or map
+/// is the JDK's delegation to its source: `add`/`put` and the order-blind
+/// writes are the source's own, and the end-specific ones swap ends
+/// (`removeFirst` is the source's `removeLast`). `Some((source, method))`
+/// for such a call; the view re-reads the source when next used.
+fn reversed_set_or_map_write(recv: &Value, method: &str) -> Option<(u32, &'static str)> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    if REVERSED_VIEWS.with(|r| r.borrow().is_empty() || !r.borrow().contains(id)) {
+        return None;
+    }
+    let base = VIEWS.with(|v| v.borrow().get(id).copied())?;
+    let keyed = HEAP.with(|h| {
+        matches!(
+            h.borrow().get(base as usize),
+            Some(HostObj::Set { .. } | HostObj::Map { .. })
+        )
+    });
+    if !keyed {
+        return None;
+    }
+    Some((
+        base,
+        match method {
+            "addFirst" => "addLast",
+            "addLast" => "addFirst",
+            "removeFirst" => "removeLast",
+            "removeLast" => "removeFirst",
+            "pollFirst" => "pollLast",
+            "pollLast" => "pollFirst",
+            "putFirst" => "putLast",
+            "putLast" => "putFirst",
+            "pollFirstEntry" => "pollLastEntry",
+            "pollLastEntry" => "pollFirstEntry",
+            "add" => "add",
+            "addAll" => "addAll",
+            "remove" => "remove",
+            "removeAll" => "removeAll",
+            "retainAll" => "retainAll",
+            "removeIf" => "removeIf",
+            "clear" => "clear",
+            "put" => "put",
+            "putAll" => "putAll",
+            "putIfAbsent" => "putIfAbsent",
+            "merge" => "merge",
+            "compute" => "compute",
+            "computeIfAbsent" => "computeIfAbsent",
+            "computeIfPresent" => "computeIfPresent",
+            "replace" => "replace",
+            "replaceAll" => "replaceAll",
+            _ => return None,
+        },
+    ))
 }
 
 /// After `method` ran on a `reversed()` view, write the view's elements back
@@ -8115,7 +8184,15 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
             }
             Some(old)
         }
+        // A view (`LinkedHashSet$1ReverseLinkedHashSetView`,
+        // `LinkedHashMap$ReversedLinkedHashMapView`): re-read backwards from
+        // its source on every use, and a write through it carried back.
         (Shape::LinkedSet | Shape::LinkedMap, "reversed", []) => Some(HEAP.with(|h| {
+            if REVERSED_VIEWS.with(|r| r.borrow().contains(id)) {
+                if let Some(base) = VIEWS.with(|v| v.borrow().get(id).copied()) {
+                    return Value::Obj(base);
+                }
+            }
             let obj = match h.borrow().get(*id as usize) {
                 Some(HostObj::Set { items, fixed, .. }) => HostObj::Set {
                     items: items.iter().rev().cloned().collect(),
@@ -8132,7 +8209,15 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
                 },
                 _ => return Value::Undef,
             };
-            Value::Obj(heap_alloc(obj))
+            let class = match obj {
+                HostObj::Set { .. } => "java.util.LinkedHashSet$1ReverseLinkedHashSetView",
+                _ => "java.util.LinkedHashMap$ReversedLinkedHashMapView",
+            };
+            let v = heap_alloc(obj);
+            VIEWS.with(|m| m.borrow_mut().insert(v, *id));
+            REVERSED_VIEWS.with(|r| r.borrow_mut().insert(v));
+            VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class));
+            Value::Obj(v)
         })),
         (
             Shape::LinkedMap | Shape::SortedMap,
