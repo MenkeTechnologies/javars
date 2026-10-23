@@ -85,10 +85,8 @@ at the bottom, and are summarized in the section right after this one.
   `Dog`'s `toString`). The wrapper types javars's value model tells apart
   (`String`, `Integer`, `Double`, `Boolean`, `Number`, `CharSequence`) are checked
   too; the ones it cannot (`int` and `long` are one integer here) are allowed
-  rather than guessed at. **An array is the one value the cast still declines**: its element
-  type is erased, so javars can produce neither `[I` nor `[Ljava.lang.String;`,
-  and it does not throw an exception whose message would have to invent the class
-  it names — `(String) anIntArray` passes where Java throws.
+  rather than guessed at. An array is checked by the type its creation
+  recorded, so `(String) anIntArray` throws as Java does, naming `[I`.
 - **`char` arithmetic.** A `char` is Java's 16-bit integral type, not a string:
   `"abc".charAt(2) + 1` is 100, `'z' - 'a'` is 25, and `c - '0'` reads a digit.
   It runs as its code point and takes Java's *string conversion* (JLS 5.1.11)
@@ -1400,14 +1398,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   put three quotes in a block) closes it early and the rest of the line is a
   lex error (``unexpected character `\` ``). Measured on `openjdk 25.0.2`.
 
-- **`instanceof` an array type needs the array's recorded type.** `o
-  instanceof int[]` (and the `int[] ia` pattern) reads the type the array's
-  creation recorded: `new`, a typed literal, varargs, `values()`, `split`,
-  `toCharArray`, `getBytes`, `toArray`, `clone`, `copyOf`. An array made
-  anywhere else (a bare `{…}` with no declared type to read, or a host method
-  not in that list) has no recorded type, and the test stops with
-  ``javars: `instanceof int[]` on an array whose element type javars did not
-  record`` rather than guess.
 - **The JVM-describing `System.getProperty` keys** are refused: they
   describe a JVM.
 - **`Enum.valueOf` on a `Class` value** is refused (`cannot find symbol:
@@ -1550,12 +1540,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   and `ArrayDeque` keeps walking its own array.
 - **`Integer.parseInt` reads ASCII digits only.** The JDK reads any Unicode
   decimal digit (`Integer.parseInt("١٢")` is 12, as `Character.digit` does).
-- **`ArrayStoreException` is never raised.** A reference array carries no
-  element type at runtime, so storing the wrong type through a widened reference
-  succeeds silently: `Object[] o = new String[2]; o[0] = Integer.valueOf(3);`
-  stores and continues, where the JDK throws `ArrayStoreException:
-  java.lang.Integer`. Measured on `openjdk 21.0.12`. The array's element type
-  would have to be recorded on the host object and checked on every store.
+- **`ArrayStoreException` is raised by an element store only.** A store
+  through a widened reference is checked against the array's recorded type
+  (`Object[] o = new String[2]; o[0] = 3;` throws `ArrayStoreException:
+  java.lang.Integer`), but `System.arraycopy` and `Arrays.fill` into such an
+  array store without the check.
 - **`Throwable.getStackTrace()` and the frames of `printStackTrace()`.** javars
   keeps no call-site table (see the uncaught-report entry above), so a stack
   trace has no frames to print: `printStackTrace()` writes the throwable's

@@ -3070,3 +3070,102 @@ java.util.LinkedHashSet$1ReverseLinkedHashSetView java.util.LinkedHashMap$Revers
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// Every array a JDK method hands out records its type, so `instanceof` answers for each: `BigInteger.toByteArray` (`byte[]`), `Character.toChars` (`char[]`), `Pattern.split` (`String[]`), `divideAndRemainder` (`BigInteger[]`/`BigDecimal[]`), `RoundingMode.values()`, `main`'s arguments, and the `toArray`/`copyOf` forms.
+#[test]
+fn every_host_array_records_its_type() {
+    let src = r####"
+import java.math.*;
+import java.util.*;
+import java.util.regex.*;
+public class T {
+    static String k(Object o) {
+        return o instanceof byte[] ? "byte[]" : o instanceof char[] ? "char[]" : o instanceof String[] ? "String[]" : o instanceof BigInteger[] ? "BigInteger[]" : o instanceof BigDecimal[] ? "BigDecimal[]" : o instanceof RoundingMode[] ? "RoundingMode[]" : o instanceof Object[] ? "Object[]" : "?";
+    }
+    static void v(int... xs) { System.out.print(k(xs) + (xs instanceof int[]) + " "); }
+    public static void main(String[] args) {
+        Object[] all = { BigInteger.TEN.toByteArray(), Character.toChars(0x1F600), Pattern.compile(",").split("a,b"), BigInteger.TEN.divideAndRemainder(BigInteger.TWO), new BigDecimal("7").divideAndRemainder(BigDecimal.TEN), RoundingMode.values(), args, "x y".split(" "), new HashSet<>(List.of(1)).toArray(), new ArrayList<>(List.of("s")).toArray(new String[0]), Arrays.copyOf(new char[]{'q'}, 2), new Object[][]{{1}}, Map.of(1, 2).keySet().toArray(new Integer[5]) };
+        StringBuilder sb = new StringBuilder();
+        for (Object o : all) sb.append(k(o)).append(' ');
+        System.out.println(sb);
+        v(); v(1, 2);
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"byte[] char[] String[] BigInteger[] BigDecimal[] RoundingMode[] String[] String[] Object[] String[] char[] Object[] Object[] 
+?true ?true 
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A cast to or from an array, and an array's `getClass()`, read the type its creation recorded: `(int[]) o`, `(A[]) aBArray` and `(Cloneable) anArray` pass, `(String) anIntArray`, `(String[]) anObjectArray` and `(long[]) anIntArray` are `ClassCastException` with the JDK's descriptors and module clause, and `Object[] o = new String[1]` reports `String[]`.
+#[test]
+fn array_casts_and_classes_read_the_recorded_type() {
+    let src = r####"
+public class T {
+    static class A {} static class B extends A {}
+    public static void main(String[] args) {
+        Object o = new int[]{1};
+        Object s = new String[]{"x"};
+        Object b = new B[1];
+        Object[] arr = new Object[]{1};
+        System.out.println(o.getClass().getName() + " " + s.getClass().getSimpleName() + " " + b.getClass().getName() + " " + ((Object) arr).getClass().getName());
+        int[] back = (int[]) o; A[] as = (A[]) b; Object[] os = (Object[]) s; Cloneable c = (Cloneable) o;
+        System.out.println(back.length + as.length + os.length);
+        try { String x = (String) o; } catch (ClassCastException e) { System.out.println(e.getMessage()); }
+        try { String[] x = (String[]) arr; } catch (ClassCastException e) { System.out.println(e.getMessage()); }
+        try { long[] x = (long[]) o; } catch (ClassCastException e) { System.out.println(e.getMessage()); }
+        Object[] stored = new String[1];
+        System.out.println(stored.getClass().getSimpleName());
+    }
+}
+"####;
+    let expected = r####"[I String[] [LT$B; [Ljava.lang.Object;
+3
+class [I cannot be cast to class java.lang.String ([I and java.lang.String are in module java.base of loader 'bootstrap')
+class [Ljava.lang.Object; cannot be cast to class [Ljava.lang.String; ([Ljava.lang.Object; and [Ljava.lang.String; are in module java.base of loader 'bootstrap')
+class [I cannot be cast to class [J ([I and [J are in module java.base of loader 'bootstrap')
+String[]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A store through a widened array reference that the array's recorded element type refuses is `ArrayStoreException` naming the value's class (JLS 10.5) — `Object[] o = new String[2]; o[0] = 3`, a sibling implementation into an `Sq[]`, an `Integer[]` row into a `String[][]` — while the stores Java allows (boxed widening into `Number[]`, a `String` into `Comparable[]`, anything into `Object[]`) go through.
+#[test]
+fn array_store_exception_from_the_recorded_type() {
+    let src = r####"
+import java.util.*;
+public class T {
+    interface Shape {} static class Sq implements Shape {} static class Ci implements Shape {}
+    public static void main(String[] a) {
+        Object[] o = new String[2];
+        o[1] = "ok";
+        try { o[0] = Integer.valueOf(3); } catch (ArrayStoreException e) { System.out.println("ASE " + e.getMessage()); }
+        Shape[] sh = new Sq[1];
+        try { sh[0] = new Ci(); } catch (ArrayStoreException e) { System.out.println("ASE " + e.getMessage()); }
+        sh[0] = new Sq();
+        Long[] ls = new Long[1]; ls[0] = 5L; Number[] ns = new Integer[1]; ns[0] = 7;
+        Character[] cs = new Character[1]; cs[0] = 'x';
+        Comparable[] cmp = new String[1]; cmp[0] = "s";
+        Object[][] grid = new String[1][1];
+        try { grid[0] = new Integer[1]; } catch (ArrayStoreException e) { System.out.println("ASE " + e.getMessage()); }
+        List<Integer>[] la = new List[1]; la[0] = new ArrayList<>();
+        Object[] list = new ArrayList<>(List.of(1)).toArray(); list[0] = "any";
+        System.out.println(Arrays.toString(o) + ls[0] + ns[0] + cs[0] + cmp[0] + la[0] + list[0]);
+    }
+}
+"####;
+    let expected = r####"ASE java.lang.Integer
+ASE T$Ci
+ASE [Ljava.lang.Integer;
+[null, ok]57xs[]any
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

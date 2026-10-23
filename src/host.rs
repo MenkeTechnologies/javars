@@ -1545,10 +1545,10 @@ fn biginteger_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
         ("divideAndRemainder", 1) => operand(0).and_then(|o| {
             let q = jb::divide(&me, &o).map_err(refuse)?;
             let r = jb::remainder(&me, &o).map_err(refuse)?;
-            Ok(Value::Obj(heap_alloc(HostObj::Array(vec![
-                alloc_big(q),
-                alloc_big(r),
-            ]))))
+            Ok(typed_array(
+                vec![alloc_big(q), alloc_big(r)],
+                "BigInteger[]",
+            ))
         }),
         ("pow", 1) => big(jb::pow(&me, int_arg(0))),
         ("modPow", 2) => {
@@ -1599,12 +1599,13 @@ fn biginteger_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
         ("floatValue", 0) => Ok(Value::float(f64::from(jb::double_value(&me) as f32))),
         ("isProbablePrime", 1) => Ok(Value::bool(jb::is_probable_prime(&me))),
         ("nextProbablePrime", 0) => big(jb::next_probable_prime(&me)),
-        ("toByteArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+        ("toByteArray", 0) => Ok(typed_array(
             jb::to_bytes(&me)
                 .into_iter()
                 .map(|b| Value::Int(i64::from(b)))
                 .collect(),
-        )))),
+            "byte[]",
+        )),
         _ => Err(Fault::internal(format!(
             "javars: unsupported BigInteger method `{method}` with {} argument(s)",
             args.len()
@@ -1754,10 +1755,10 @@ fn bigdecimal_method(recv: &Value, method: &str, args: &[Value]) -> Option<Resul
         ("divideAndRemainder", 1) => operand(0).and_then(|o| {
             let q = me.divide_to_integral(&o).map_err(refuse)?;
             let r = me.subtract(&q.multiply(&o));
-            Ok(Value::Obj(heap_alloc(HostObj::Array(vec![
-                alloc_dec(q),
-                alloc_dec(r),
-            ]))))
+            Ok(typed_array(
+                vec![alloc_dec(q), alloc_dec(r)],
+                "BigDecimal[]",
+            ))
         }),
         ("pow", 1) => dec(me.pow(int_arg(0))),
         ("sqrt", 1) => ctx(0).and_then(|mc| dec(me.sqrt(mc))),
@@ -1840,13 +1841,14 @@ fn bigdecimal_static(class: &str, method: &str, args: &[Value]) -> Option<Result
         None => Ok(d),
     };
     Some(match (class, method, args) {
-        ("RoundingMode", "values", []) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+        ("RoundingMode", "values", []) => Ok(typed_array(
             jd::Rm::NAMES
                 .iter()
                 .filter_map(|n| jd::Rm::from_name(n))
                 .map(rounding_mode_value)
                 .collect(),
-        )))),
+            "RoundingMode[]",
+        )),
         ("RoundingMode", "#const", [Value::Str(name)])
         | ("RoundingMode", "valueOf", [Value::Str(name)]) => match jd::Rm::from_name(name) {
             Some(rm) => Ok(rounding_mode_value(rm)),
@@ -3346,15 +3348,16 @@ fn ref_eq(a: &Value, b: &Value) -> bool {
 
 fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let array_type = args.get(1).map(|h| h.as_str_cow().into_owned());
+    let static_type = args.get(1).map(|h| h.as_str_cow().into_owned());
     let Some(v) = args.first() else {
         return Value::str("");
     };
-    // An array's element type is erased, so the compiler's static spelling is
-    // the only source for `[I` / `[Ljava.lang.String;`.
+    // An array names the type its creation recorded (`[I`,
+    // `[Ljava.lang.String;`), else the compiler's static spelling of it.
     if matches!(value_class(v).as_deref(), Some("[]")) {
         return Value::str(
-            array_type
+            array_type(v)
+                .or(static_type)
                 .as_deref()
                 .and_then(array_descriptor)
                 .unwrap_or_default(),
@@ -7055,6 +7058,40 @@ fn typed_array(items: Vec<Value>, ty: &str) -> Value {
     v
 }
 
+/// `ArrayStoreException` for a store the array's recorded type refuses (JLS
+/// 10.5): `Object[] o = new String[1]; o[0] = 1;` names the stored value's
+/// class. Only an element type javars can decide is checked — a user class or
+/// one [`cast_allowed`] answers for, with its leniency for the types the value
+/// model cannot tell apart — so an unrecorded or undecidable array stores as
+/// before.
+fn array_store_fault(arr: &Value, val: &Value) -> Option<Fault> {
+    if matches!(val, Value::Undef) || ARRAY_TYPES.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
+    let ty = array_type(arr)?;
+    let elem = ty.strip_suffix("[]")?;
+    if !is_reference_type_name(elem) || elem == "Object" {
+        return None;
+    }
+    let decidable = elem.ends_with("[]")
+        || is_checkable_cast_target(elem)
+        || SUPERS.with(|s| s.borrow().contains_key(elem));
+    let runtime = value_class(val)?;
+    if !decidable || cast_allowed(&runtime, elem, val) {
+        return None;
+    }
+    let name = binary_name(&runtime, val).unwrap_or(runtime);
+    Some(Fault::java("ArrayStoreException", name))
+}
+
+/// Whether `t` names a reference type rather than one of the primitives.
+fn is_reference_type_name(t: &str) -> bool {
+    !matches!(
+        t,
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
+    )
+}
+
 /// [`JARRAY_TAG`].
 fn b_array_tag(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -7170,6 +7207,9 @@ fn b_array_set(vm: &mut VM, argc: u8) -> Value {
         Value::Obj(id) => id,
         _ => return raise(vm, Fault::java("NullPointerException", NULL_ARRAY_STORE)),
     };
+    if let Some(f) = array_store_fault(&arr, &val) {
+        return raise(vm, f);
+    }
     let stored = HEAP.with(|h| {
         let mut h = h.borrow_mut();
         match h.get_mut(id as usize) {
@@ -16354,7 +16394,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                     Value::Int(i64::from(0xDC00 + (v & 0x3FF))),
                 ]
             };
-            Ok(Value::Obj(heap_alloc(HostObj::Array(units))))
+            Ok(typed_array(units, "char[]"))
         }
         // A letter or a DECIMAL digit: `is_alphanumeric` also takes the
         // OTHER_NUMBER characters (`'²'`, `'½'`), which Java's does not.
@@ -17130,9 +17170,10 @@ fn pattern_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<V
                 let pat = c.as_ref().as_ref().expect("checked by regex_compiled");
                 let limit = rest.first().map_or(0, JavaNumeric::jint);
                 let parts = pat.split(&t.as_str_cow(), limit).map_err(engine_fault)?;
-                Ok(Value::Obj(heap_alloc(HostObj::Array(
+                Ok(typed_array(
                     parts.into_iter().map(Value::str).collect(),
-                ))))
+                    "String[]",
+                ))
             }),
         _ => Err(Fault::internal(format!(
             "javars: unsupported Pattern method `{method}` with {} argument(s)",
@@ -21487,7 +21528,7 @@ fn binary_name(class: &str, v: &Value) -> Option<String> {
     }
     let len = || sequence_len(v).unwrap_or(0);
     Some(match class {
-        "[]" => return None,
+        "[]" => return array_type(v).and_then(|t| array_descriptor(&t)),
         qualified if qualified.starts_with("java.") => qualified.to_string(),
         "BigInteger" => "java.math.BigInteger".to_string(),
         "BigDecimal" => "java.math.BigDecimal".to_string(),
@@ -21594,6 +21635,16 @@ fn cast_allowed(runtime: &str, target: &str, value: &Value) -> bool {
     if target == "Object" || runtime == target {
         return true;
     }
+    // An array, by the type its creation recorded (JLS 5.5.1): to another
+    // array type by the covariance `instanceof` uses, to `Cloneable` and
+    // `Serializable`, and to nothing else.
+    if runtime == "[]" {
+        return match array_type(value) {
+            Some(have) if target.ends_with("[]") => array_type_is(&have, target),
+            Some(_) => matches!(target, "Cloneable" | "Serializable"),
+            None => true,
+        };
+    }
     // The exact supertype graph — the same one `instanceof` walks, so the two
     // cannot drift into disagreeing about what a type extends.
     if is_subclass_of(runtime, target) {
@@ -21627,9 +21678,23 @@ fn cast_message(from: &str, target: &str) -> String {
     let qual = |n: &str| crate::prelude::qualified_throwable(n).unwrap_or_else(|| jdk_name(n));
     // `from` arrives already resolved by [`binary_name`], which is the only
     // side that can depend on the *value* rather than on the class name.
-    let (r, t) = (from.to_string(), qual(target));
+    // An array target is named by its descriptor (`[Ljava.lang.String;`).
+    let t = match target.strip_suffix("[]") {
+        Some(_) => array_descriptor(target).unwrap_or_else(|| qual(target)),
+        None => qual(target),
+    };
+    let r = from.to_string();
+    // A JDK class, or an array of primitives or of one, is in `java.base`.
+    let jdk = |n: &str| {
+        let el = n.trim_start_matches('[');
+        match el.strip_prefix('L') {
+            Some(c) if n.starts_with('[') => c.starts_with("java."),
+            _ if n.starts_with('[') => true,
+            _ => n.starts_with("java."),
+        }
+    };
     let head = format!("class {r} cannot be cast to class {t}");
-    if r.starts_with("java.") && t.starts_with("java.") {
+    if jdk(&r) && jdk(&t) {
         format!("{head} ({r} and {t} are in module java.base of loader 'bootstrap')")
     } else {
         head

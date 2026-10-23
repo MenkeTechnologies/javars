@@ -11072,7 +11072,10 @@ impl Compiler {
     /// checked, because a check javars cannot decide must not invent a failure.
     fn reference_cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
         self.expr(e)?;
-        let checkable = self.classes.contains_key(ty) || crate::host::is_checkable_cast_target(ty);
+        // An array target is checked against the type the array recorded.
+        let checkable = self.classes.contains_key(ty)
+            || crate::host::is_checkable_cast_target(ty)
+            || ty.ends_with("[]");
         if !checkable {
             return Ok(());
         }
