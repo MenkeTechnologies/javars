@@ -550,11 +550,6 @@ struct Compiler {
     /// parameters stay untyped; what the hint buys is the boxing conversion on
     /// the result, which is what turns a `char` body into a `Character`.
     lambda_ret_hint: Option<String>,
-    /// Set while lowering an arithmetic `Binary` whose result a numeric cast or
-    /// a numeric target consumes, so an operand of unknown type that turns out
-    /// to be a `char` that crossed an erased call as its one-character String
-    /// adds as its code point rather than concatenating. Taken by the `Binary` it is set for.
-    numeric_operands: bool,
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
@@ -712,7 +707,6 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_counter: 0,
         lambda_target: None,
         lambda_ret_hint: None,
-        numeric_operands: false,
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
@@ -4310,13 +4304,12 @@ impl Compiler {
                     return self.array_lit(elems, Some(&el));
                 }
             }
+            if let Some(t) = target.filter(|t| !is_reference_type(t) && *t != "void") {
+                if self.expr_java_type(e).as_deref() == Some("String") {
+                    return Err(string_to_primitive(t));
+                }
+            }
             let widen = self.widen_target(target, e);
-            self.numeric_operands = target.is_some_and(|t| {
-                matches!(
-                    t,
-                    "int" | "long" | "short" | "byte" | "char" | "double" | "float"
-                )
-            }) && is_arithmetic_binary(e);
             self.expr(e)?;
             // Unboxing runs *before* any widening and boxing *after* it, which
             // is the order Java converts in: `double d = anInteger` unboxes to
@@ -6978,6 +6971,17 @@ impl Compiler {
                 self.emit_pattern_test(&subject, class, binding, components, 0)?;
             }
             Expr::Unary { op, rhs } => {
+                if self.expr_java_type(rhs).as_deref() == Some("String") {
+                    let sym = match op {
+                        UnOp::Neg => "-",
+                        UnOp::Not => "!",
+                        UnOp::BitNot => "~",
+                        UnOp::Plus => "+",
+                    };
+                    return Err(format!(
+                        "javars: bad operand type String for unary operator '{sym}'"
+                    ));
+                }
                 // Unary numeric promotion and `!` both unbox a wrapper operand
                 // (JLS 5.6.1, 15.15.6), so a `null` one throws. `~` needs the
                 // number besides: it is answered natively for every operand
@@ -8866,6 +8870,30 @@ impl Compiler {
         wrap32: bool,
         line: u32,
     ) -> Result<(), String> {
+        // `javac`'s refusals of a `String` in a compound assignment: only `+=`
+        // takes one, and then only into a `String` (or reference) target.
+        let value_string = self.expr_java_type(value).as_deref() == Some("String");
+        if target_ty == Some("String") || value_string {
+            let primitive_target = target_ty.is_some_and(|t| !is_reference_type(t));
+            let sym = match op {
+                AssignOp::Add if value_string && primitive_target => {
+                    return Err(string_to_primitive(target_ty.unwrap_or_default()));
+                }
+                AssignOp::Sub => "-",
+                AssignOp::Mul => "*",
+                AssignOp::Div => "/",
+                AssignOp::Mod => "%",
+                AssignOp::Shl => "<<",
+                AssignOp::Shr => ">>",
+                AssignOp::Ushr => ">>>",
+                _ => "",
+            };
+            if !sym.is_empty() {
+                return Err(format!(
+                    "javars: bad operand types for binary operator '{sym}'"
+                ));
+            }
+        }
         // `float f; f *= x;` is one 32-bit operation, not a 64-bit one narrowed
         // afterwards — the same reason the binary path routes through the host.
         // A `double` operand makes the operation a `double` one (JLS 5.6.2), which
@@ -9248,8 +9276,37 @@ impl Compiler {
         Ok(())
     }
 
+    /// `javac`'s operand check for a statically-`String` operand: `+` is the
+    /// one operator a `String` takes, besides `==`/`!=` against another
+    /// reference. Without it `"b" - 1` ran (it once answered 97, the host
+    /// reading a one-character String as a `char`) where `javac` refuses the
+    /// program.
+    fn check_string_operands(&self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        if op == BinOp::Add {
+            return Ok(());
+        }
+        let ty = |e: &Expr| self.expr_java_type(e);
+        let (l, r) = (ty(lhs), ty(rhs));
+        let is_string = |t: &Option<String>| t.as_deref() == Some("String");
+        if !is_string(&l) && !is_string(&r) {
+            return Ok(());
+        }
+        let primitive = |t: &Option<String>| t.as_deref().is_some_and(|t| !is_reference_type(t));
+        let bad = match op {
+            BinOp::Eq | BinOp::Ne => primitive(&l) || primitive(&r),
+            _ => true,
+        };
+        if bad {
+            return Err(format!(
+                "javars: bad operand types for binary operator '{}'",
+                binop_symbol(op)
+            ));
+        }
+        Ok(())
+    }
+
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
-        let numeric_operands = std::mem::take(&mut self.numeric_operands);
+        self.check_string_operands(op, lhs, rhs)?;
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
             BinOp::And => {
@@ -9338,7 +9395,7 @@ impl Compiler {
                     self.expr(e)?;
                 }
             }
-        } else if op == BinOp::Add && self.has_user_tostring && !numeric_operands {
+        } else if op == BinOp::Add && self.has_user_tostring {
             // Neither operand is statically a String or a user class, yet one may
             // be an object at run time (an erased `get()`): a heap object that is
             // not a box is stringified, so `+` concatenates it through its
@@ -9353,15 +9410,8 @@ impl Compiler {
         } else {
             // Every other operator here is numeric, and numeric promotion
             // unboxes a wrapper operand first — a `null` one throws (JLS 5.6).
-            // In a numeric context an operand of unknown type that holds a
-            // `Character` element converts to its code point (see
-            // `numeric_operands`).
-            for e in [lhs, rhs] {
-                self.expr_unboxed(e)?;
-                if numeric_operands && self.expr_java_type(e).is_none() {
-                    self.emit_checked_unbox("Character");
-                }
-            }
+            self.expr_unboxed(lhs)?;
+            self.expr_unboxed(rhs)?;
         }
         // Integral `%` by zero throws `ArithmeticException` in Java, exactly as
         // `/` does; the floating `%` yields NaN and needs no check.
@@ -9534,6 +9584,9 @@ impl Compiler {
     /// is Java's explicit boxing conversion, and is emitted as one.
     fn cast(&mut self, ty: &str, e: &Expr, line: u32) -> Result<(), String> {
         let src = self.expr_java_type(e);
+        if src.as_deref() == Some("String") && !is_reference_type(ty) && ty != "void" {
+            return Err(string_to_primitive(ty));
+        }
         let identity = matches!(
             (ty, src.as_deref()),
             ("int", Some("int" | "short" | "byte"))
@@ -9567,7 +9620,6 @@ impl Compiler {
             }
             return self.reference_cast(ty, e, line);
         }
-        self.numeric_operands = ty != "boolean" && is_arithmetic_binary(e);
         if identity {
             return self.expr(e);
         }
@@ -11419,14 +11471,33 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
     })
 }
 
-/// True when `e` is an arithmetic `Binary` — the shape a numeric cast or a
-/// numeric target can put into a numeric context (see `numeric_operands`).
-fn is_arithmetic_binary(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Binary {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
-            ..
-        }
-    )
+/// Java's spelling of a binary operator, for `javac`'s operand-type message.
+fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Le => "<=",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        BinOp::Ushr => ">>>",
+    }
+}
+
+/// `javac`'s refusal of a statically-`String` value where a primitive `ty` is
+/// required — a cast `(int) s`, or an assignment `int x = s`.
+fn string_to_primitive(ty: &str) -> String {
+    format!("javars: incompatible types: String cannot be converted to {ty}")
 }

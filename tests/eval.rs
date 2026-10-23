@@ -6618,3 +6618,74 @@ fn system_exit_stops_without_finally_and_reports_its_status() {
     assert_eq!(out, "0\n1\n2\nexiting\n");
     assert_eq!(code, Some(7));
 }
+
+#[test]
+fn a_string_operand_of_a_numeric_operator_is_rejected_as_javac_rejects_it() {
+    // `"b" - 1` ran and printed 97: the host read a one-character String as
+    // the `char` it might have stood for. `javac` refuses every one of these
+    // (messages from openjdk 21.0.12.1), whatever spells the `String` — a
+    // literal, a local, a field, a method result.
+    let main = |body: &str| {
+        format!(
+            "public class Main {{ static String g() {{ return \"c\"; }} String f = \"d\";\
+             public static void main(String[] a) {{ String s = \"b\"; char c = 'q'; int n = 0; {body} }} }}"
+        )
+    };
+    for (body, want) in [
+        (
+            "System.out.println(s - 1);",
+            "bad operand types for binary operator '-'",
+        ),
+        (
+            "System.out.println(\"b\" - 1);",
+            "bad operand types for binary operator '-'",
+        ),
+        (
+            "System.out.println(\"b\" * 2.0);",
+            "bad operand types for binary operator '*'",
+        ),
+        (
+            "System.out.println(c - s);",
+            "bad operand types for binary operator '-'",
+        ),
+        (
+            "System.out.println(s < 'c');",
+            "bad operand types for binary operator '<'",
+        ),
+        (
+            "System.out.println(s == 1);",
+            "bad operand types for binary operator '=='",
+        ),
+        (
+            "System.out.println(g() % 2);",
+            "bad operand types for binary operator '%'",
+        ),
+        (
+            "System.out.println(new Main().f - 'a');",
+            "bad operand types for binary operator '-'",
+        ),
+        (
+            "System.out.println(s & 1);",
+            "bad operand types for binary operator '&'",
+        ),
+        (
+            "System.out.println(-s);",
+            "bad operand type String for unary operator '-'",
+        ),
+        (
+            "System.out.println((int) s);",
+            "incompatible types: String cannot be converted to int",
+        ),
+        (
+            "int x = s;",
+            "incompatible types: String cannot be converted to int",
+        ),
+        (
+            "n += s;",
+            "incompatible types: String cannot be converted to int",
+        ),
+        ("s -= 1;", "bad operand types for binary operator '-'"),
+    ] {
+        rejected(&main(body), want);
+    }
+}

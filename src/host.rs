@@ -3226,20 +3226,6 @@ fn b_unbox_nonnull(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let v = args.first().cloned().unwrap_or(Value::Undef);
     let code = args.get(1).map(|c| c.jint()).unwrap_or(0);
-    // A `char` that crossed an erased call (one whose receiver javars cannot
-    // type) arrives as its one-character String. Unboxing that to a primitive
-    // can only mean the `Character`, since a `String` never unboxes, so the
-    // text becomes its code point.
-    if let Value::Str(s) = &v {
-        let mut cs = s.chars();
-        if let (Some(c), None, true) = (
-            cs.next(),
-            cs.next(),
-            usize::try_from(code).is_ok_and(|i| i < BOX_CLASSES.len()),
-        ) {
-            return Value::Int(i64::from(u32::from(c)));
-        }
-    }
     if !matches!(v, Value::Undef) {
         return deboxed(&v);
     }
@@ -3268,15 +3254,6 @@ fn unboxed_primitive(class: &str) -> &'static str {
         "Character" => "char",
         "Float" => "float",
         _ => "double",
-    }
-}
-
-/// The single character of a one-character string, or `None`.
-fn one_char(s: &str) -> Option<char> {
-    let mut cs = s.chars();
-    match (cs.next(), cs.next()) {
-        (Some(c), None) => Some(c),
-        _ => None,
     }
 }
 
@@ -12039,17 +12016,6 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     // the value, not the handle.
     let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
     let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
-    // A `Character` compared with the one-character String a `char` argument
-    // became on an erased call: both are code points (`Integer.compareTo` of a
-    // `String` does not compile, so the pair can only be two `Character`s).
-    let as_code_point = |v: Value, other: &Value| match (&v, other) {
-        (Value::Str(s), Value::Int(_)) => {
-            one_char(s).map_or(v.clone(), |c| Value::Int(i64::from(u32::from(c))))
-        }
-        _ => v,
-    };
-    let (a0, b0) = (a.clone(), b.clone());
-    let (a, b) = (as_code_point(a, &b0), as_code_point(b, &a0));
     if let (Some(x), Some(y)) = (big_of(&a), big_of(&b)) {
         return Value::Int(x.cmp(&y) as i64);
     }
@@ -20375,28 +20341,6 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     if is_java_number(a) && is_java_number(b) {
         return java_numeric(op, &deboxed(a), &deboxed(b));
     }
-    // A `char` that crossed an erased call (one whose receiver javars cannot
-    // type) arrives as its one-character String. Every operator but `+` that
-    // pairs it with a number (`c == '('`, `c - 'a'`, `c < 'z'`) is one Java
-    // accepts only for a `Character`, never for a `String`, so the text is the
-    // code point it stands for. `+` stays ambiguous: `String + char` concatenates.
-    if op != NumOp::Add {
-        let code_point = |v: &Value| match v {
-            Value::Str(s) => {
-                let mut cs = s.chars();
-                match (cs.next(), cs.next()) {
-                    (Some(c), None) => Some(Value::Int(i64::from(u32::from(c)))),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        match (code_point(a), code_point(b)) {
-            (Some(x), None) if is_java_number(b) => return java_numeric(op, &x, &deboxed(b)),
-            (None, Some(y)) if is_java_number(a) => return java_numeric(op, &deboxed(a), &y),
-            _ => {}
-        }
-    }
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
         // Java's value-to-string rules.
@@ -20489,23 +20433,6 @@ fn b_cast(vm: &mut VM, _argc: u8) -> Value {
     let ty = vm.stack.pop().unwrap_or(Value::Undef);
     let ty = ty.as_str_cow().into_owned();
     let v = vm.stack.pop().unwrap_or(Value::Undef);
-    // A primitive cast of a one-character String can only be of a `char` that
-    // crossed an erased call as its text (a `String` does not cast to a
-    // primitive), so it converts from the code point.
-    let v = match &v {
-        Value::Str(s) if ty != "boolean" => match one_char(s) {
-            Some(c)
-                if matches!(
-                    ty.as_str(),
-                    "int" | "long" | "short" | "byte" | "char" | "double" | "float"
-                ) =>
-            {
-                Value::Int(i64::from(u32::from(c)))
-            }
-            _ => v,
-        },
-        _ => v,
-    };
     match ty.as_str() {
         "int" => Value::Int(match &v {
             Value::Float(f) => *f as i32 as i64,
