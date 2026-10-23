@@ -1346,19 +1346,13 @@ storage-model differences:
   Assigning the element to a typed local first (`float g = ap(…);`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
-- **`reversed()` on a list, deque or insertion-ordered set or map is a copy.**
-  Java 21's `reversed()` is a view: `List<Integer> r = l.reversed(); r.set(0, 9);`
-  writes `l`'s last element, and a later change to `l` shows in `r`. javars
-  answers a reversed copy with the source's fixity, so neither direction
-  follows. Measured on `openjdk 21.0.12.1`. A sorted collection's `reversed()`
+- **`reversed()` on an insertion-ordered set or map is a copy.** A list's and
+  a deque's `reversed()` is a live view; a `LinkedHashSet`'s or
+  `LinkedHashMap`'s is a reversed copy with the source's fixity, so neither
+  direction follows: after `var r = s.reversed(); s.add(3);` on a
+  `LinkedHashSet` of `1, 2`, Java prints `[3, 2, 1]` for `r` and javars
+  `[2, 1]`. Measured on `openjdk 21.0.12.1`. A sorted collection's `reversed()`
   is its descending view, on the terms recorded for those views above.
-- **`Arrays.asList(array)` copies the array instead of viewing it.** Java's
-  list writes through: `Integer[] a = {5, 2}; Arrays.asList(a).set(0, 99);`
-  leaves `a[0] == 99`, and a later write to `a` shows in the list. javars's
-  list is a fixed-size copy, so `a[0]` stays `5`. Measured on
-  `openjdk 21.0.12.1`. An array and a list are different host objects with
-  separate storage; sharing it needs a list variant that reads and writes the
-  array's slab.
 
 - **A generic call's inferred bounds are checked against one shape of target
   only.** `javac` rejects a call whose inference variables get incompatible
