@@ -2589,3 +2589,39 @@ lower
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `EnumSet.range(from, to)` holds the constants from `from` through `to` in ordinal order (`IllegalArgumentException: THU > TUE` when reversed, an NPE for a `null` end) and `EnumSet.complementOf(s)` every constant `s` lacks — empty and full sets included — each a mutable set of its own.
+#[test]
+fn enum_set_range_and_complement_of() {
+    let src = r####"
+import java.util.*;
+public class T {
+    enum Day { MON, TUE, WED, THU, FRI }
+    public static void main(String[] a) {
+        EnumSet<Day> r = EnumSet.range(Day.TUE, Day.THU);
+        System.out.println(r + " " + EnumSet.range(Day.MON, Day.MON) + " " + r.contains(Day.WED));
+        System.out.println(EnumSet.complementOf(EnumSet.of(Day.TUE, Day.FRI)));
+        System.out.println(EnumSet.complementOf(EnumSet.noneOf(Day.class)) + " " + EnumSet.complementOf(EnumSet.allOf(Day.class)));
+        Set<Day> c = EnumSet.complementOf(r); c.add(Day.WED); System.out.println(c);
+        EnumSet<Day> held = EnumSet.of(Day.MON);
+        System.out.println(EnumSet.complementOf(held).size());
+        try { EnumSet.range(Day.THU, Day.TUE); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { EnumSet.range(null, Day.TUE); } catch (NullPointerException e) { System.out.println("NPE"); }
+        for (Day d : EnumSet.range(Day.WED, Day.FRI)) System.out.print(d.ordinal());
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"[TUE, WED, THU] [MON] true
+[MON, WED, THU]
+[MON, TUE, WED, THU, FRI] []
+[MON, WED, FRI]
+4
+THU > TUE
+NPE
+234
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

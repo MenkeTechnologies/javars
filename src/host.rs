@@ -12707,6 +12707,52 @@ fn char_index_of(s: &str, needle: &str) -> i64 {
 /// arguments, then evaluates the corresponding static method. A faulting call
 /// (bad arity, `NumberFormatException`, unknown method) surfaces as a `javars:`
 /// error rather than a wrong value.
+/// `EnumSet.range(from, to)` and `EnumSet.complementOf(s)`, which the
+/// compiler hands the enum's `values()` array first because only the static
+/// type knows the element type: the constants from `from` through `to` in
+/// ordinal order (`IllegalArgumentException: TUE > MON` when `from` comes
+/// later), and every constant `s` does not hold. The result is the
+/// ordinal-ordered `TreeSet` every `EnumSet` is modeled as.
+fn enum_set_static(vm: &mut VM, method: &str, args: &[Value]) -> Result<Value, Fault> {
+    let npe = || Fault::java("NullPointerException", String::new());
+    let values = args.first().and_then(array_items).unwrap_or_default();
+    let pos = |v: &Value| {
+        values
+            .iter()
+            .position(|c| matches!((c, v), (Value::Obj(a), Value::Obj(b)) if a == b))
+    };
+    let items: Vec<Value> = match (method, args) {
+        ("range", [_, from, to]) => {
+            let (Some(i), Some(j)) = (pos(from), pos(to)) else {
+                return Err(npe());
+            };
+            if i > j {
+                let msg = format!("{} > {}", java_str_vm(vm, from), java_str_vm(vm, to));
+                return Err(Fault::java("IllegalArgumentException", msg));
+            }
+            values[i..=j].to_vec()
+        }
+        ("complementOf", [_, s]) => {
+            let held = sequence_items(s).ok_or_else(npe)?;
+            let has = |c: &Value| {
+                held.iter()
+                    .any(|h| matches!((h, c), (Value::Obj(a), Value::Obj(b)) if a == b))
+            };
+            values.iter().filter(|c| !has(c)).cloned().collect()
+        }
+        _ => {
+            return Err(Fault::internal(format!(
+                "javars: unsupported EnumSet method `{method}`"
+            )))
+        }
+    };
+    new_collection(
+        vm,
+        "TreeSet",
+        &Value::Obj(heap_alloc(HostObj::Array(items))),
+    )
+}
+
 fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
     let method_name = pop_name(vm);
     let class_name = pop_name(vm);
@@ -12718,6 +12764,12 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    if class == "EnumSet" {
+        return match enum_set_static(vm, &method, &args) {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     if matches!(
         class.as_ref(),
         "BigDecimal" | "MathContext" | "RoundingMode"

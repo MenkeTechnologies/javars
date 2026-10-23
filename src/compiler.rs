@@ -1849,6 +1849,9 @@ impl Compiler {
                     if is_static_class(class) && !self.is_declared_var(class) {
                         return self.jdk_factory_generic(class, method, args);
                     }
+                    if class == "EnumSet" && !self.is_declared_var(class) {
+                        return self.enum_set_generic(method, args);
+                    }
                 }
                 if let Some(class) = self.user_class_ref(recv) {
                     if !self.has_generic_return(method) {
@@ -2402,6 +2405,28 @@ impl Compiler {
         }
         clear();
         result
+    }
+
+    /// The `EnumSet<E>` an `EnumSet` factory answers: `E` from a class
+    /// literal (`allOf`/`noneOf`), from the constants passed (`of`, `range`),
+    /// or from the set it copies or complements.
+    fn enum_set_generic(&self, method: &str, args: &[Expr]) -> Option<String> {
+        let elem = match (method, args) {
+            ("allOf" | "noneOf", [Expr::ClassLit(c)]) => self.class_lit_class(c).to_string(),
+            ("of" | "range", _) => args
+                .iter()
+                .filter_map(|a| self.expr_java_type(a))
+                .find(|t| self.classes.get(t).is_some_and(|ci| ci.is_enum))?,
+            ("copyOf" | "complementOf", [s]) => {
+                let (_, targs) = crate::ast::generic_parts(&self.expr_generic(s)?);
+                targs.into_iter().next()?
+            }
+            _ => return None,
+        };
+        self.classes
+            .get(&elem)
+            .is_some_and(|ci| ci.is_enum)
+            .then(|| format!("EnumSet<{elem}>"))
     }
 
     /// The erasure of [`Compiler::expr_generic`] when it says more than
@@ -8690,6 +8715,37 @@ impl Compiler {
         // behaves as and each factory as the matching `TreeSet` construction.
         if let Expr::Var(c) = recv {
             if c == "EnumSet" && !self.classes.contains_key(c) && !self.is_declared_var(c) {
+                // `range` and `complementOf` need the enum's constants, which
+                // only the static type names: they reach the host with the
+                // `values()` array first.
+                if matches!((method, args.len()), ("range", 2) | ("complementOf", 1)) {
+                    let elem = self
+                        .expr_generic(&Expr::MethodCall {
+                            recv: Box::new(recv.clone()),
+                            method: method.to_string(),
+                            args: args.to_vec(),
+                            line,
+                        })
+                        .and_then(|g| crate::ast::generic_parts(&g).1.into_iter().next())
+                        .filter(|e| self.classes.get(e).is_some_and(|ci| ci.is_enum))
+                        .ok_or_else(|| {
+                            format!("javars: `EnumSet.{method}` needs a statically known enum type (line {line})")
+                        })?;
+                    self.emit_enum_values(&elem, line);
+                    for a in args {
+                        self.expr(a)?;
+                    }
+                    let cc = self.b.add_constant(Value::str("EnumSet"));
+                    self.b.emit(Op::LoadConst(cc), line);
+                    let mc = self.b.add_constant(Value::str(method.to_string()));
+                    self.b.emit(Op::LoadConst(mc), line);
+                    self.emit_raising_builtin(
+                        crate::host::JSTATIC_DISPATCH,
+                        args.len() as u8 + 3,
+                        line,
+                    );
+                    return Ok(());
+                }
                 let made = enum_set_factory(method, args, line).ok_or_else(|| {
                     format!(
                         "javars: `EnumSet.{method}` with {} argument(s) is not modeled (line {line})",
@@ -12835,8 +12891,8 @@ fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<()
 }
 
 /// The `TreeSet` construction an `EnumSet` factory call stands for, or `None`
-/// for a factory javars does not model (`range` and `complementOf` need the
-/// element type, which an erased receiver does not carry).
+/// for a factory this table does not model (`range` and `complementOf` need the
+/// element type, which [`Compiler::method_call`] reads off the static type).
 fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
     let tree_set = |args: Vec<Expr>| Expr::NewObject {
         targs: None,

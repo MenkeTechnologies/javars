@@ -1882,7 +1882,7 @@ pub const REFERENCE: &[Entry] = &[
         "EnumSet",
         "Collection Statics",
         "EnumSet.of(E e, E... rest)   |   EnumSet.noneOf(Class<E>)   |   EnumSet.allOf(Class<E>)   |   EnumSet.copyOf(Collection<E>)",
-        "An enum set, iterating in ordinal order. javars models it as the `TreeSet` it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; `getClass()` names `java.util.TreeSet`. `range` and `complementOf` are not modeled.",
+        "An enum set, iterating in ordinal order. javars models it as the `TreeSet` it behaves as (an enum's natural order is its ordinal order), so it prints, orders and answers queries as the JDK's does; `getClass()` names `java.util.TreeSet`. `range` and `complementOf` read the constants off the static enum type, so their argument has to have one.",
         "System.out.println(EnumSet.of(Day.SUN, Day.MON));   // [MON, SUN]",
     ),
     (
