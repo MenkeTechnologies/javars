@@ -1759,6 +1759,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   *Resolution* is checked, though: a name nothing declares is
   `javars: cannot find symbol: \`n\``, not a `null`. It used to read the unset
   cell, so `undefinedVar` printed `null` and `undefinedVar + 1` printed `null1`.
+  So is a statically-`String` operand where `javac` wants a number: `"b" - 1`,
+  `-s`, `(int) s`, `int x = s` and `s -= 1` are `javac`'s own errors
+  (`bad operand types for binary operator '-'`, `incompatible types: String
+  cannot be converted to int`).
 - ~~**Class initialization is eager, not lazy.**~~ — implemented (JLS 12.4.1).
   A class whose static initializer is observable — a field initializer that is
   not a literal, a `static { … }` block, an enum's constants, or a superclass or
