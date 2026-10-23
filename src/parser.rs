@@ -286,11 +286,17 @@ impl Parser {
         let inner_of = self.inner_of.take();
         // modifiers (`public`, `static`, and the ident-form ones — see
         // [`class_modifier_len`], which also spells `non-sealed`)
+        let mut is_sealed = false;
+        let mut is_abstract = false;
         loop {
             let n = class_modifier_len(&self.toks, self.pos);
             if n == 0 {
                 break;
             }
+            is_sealed |=
+                n == 1 && matches!(&self.toks[self.pos].kind, Tok::Ident(w) if w == "sealed");
+            is_abstract |=
+                n == 1 && matches!(&self.toks[self.pos].kind, Tok::Ident(w) if w == "abstract");
             self.pos += n;
         }
         let line = self.line();
@@ -380,16 +386,13 @@ impl Parser {
                 }
             }
         }
-        // `permits A, B` — a `sealed` type's list of allowed subtypes. It is a
-        // *compile-time* restriction: `javac` has already rejected every
-        // implementation outside the list, and a permitted subtype declares its
-        // own `implements`/`extends` edge, so the list adds nothing the
-        // supertype graph does not already carry. Parsed and discarded, like the
-        // generic parameters above.
+        // `permits A, B` — a `sealed` type's list of allowed subtypes, which a
+        // `switch` over the type reads to decide whether it is exhaustive.
+        let mut permits = Vec::new();
         if matches!(self.peek(), Tok::Ident(w) if w == "permits") {
             self.advance();
             loop {
-                self.type_name()?;
+                permits.push(self.type_name()?);
                 if self.is(&Tok::Comma) {
                     self.advance();
                 } else {
@@ -483,6 +486,9 @@ impl Parser {
             type_params,
             super_targs,
             interface_targs,
+            is_sealed,
+            is_abstract,
+            permits,
             name,
             binary,
             superclass,
@@ -620,6 +626,9 @@ impl Parser {
             type_params: Vec::new(),
             super_targs: Vec::new(),
             interface_targs: Vec::new(),
+            is_sealed: false,
+            is_abstract: false,
+            permits: Vec::new(),
             // An enum constant body is a synthetic subclass javars mints; Java
             // names its own `Outer$Enum$1`, which is a counter this frontend does
             // not model, so the synthetic name stands in.
@@ -4428,6 +4437,9 @@ impl Parser {
             type_params: Vec::new(),
             super_targs: Vec::new(),
             interface_targs: Vec::new(),
+            is_sealed: false,
+            is_abstract: false,
+            permits: Vec::new(),
             name: binary.clone(),
             binary: binary.clone(),
             superclass,

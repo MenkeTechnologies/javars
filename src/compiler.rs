@@ -225,6 +225,12 @@ struct ClassInfo {
     type_params: Vec<String>,
     /// See [`crate::ast::Class::super_targs`].
     super_targs: Vec<String>,
+    /// See [`crate::ast::Class::is_sealed`]; with `is_abstract` and `permits`,
+    /// what a `switch` over the type reads to decide exhaustiveness.
+    is_sealed: bool,
+    /// An `abstract` class or an interface: it has no instances of its own.
+    is_abstract: bool,
+    permits: Vec<String>,
     /// The direct interfaces with their type arguments (see
     /// [`crate::ast::Class::interface_targs`]).
     interfaces: Vec<(String, Vec<String>)>,
@@ -577,6 +583,10 @@ struct Compiler {
     /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
     /// See [`Compiler::lambda_param_generics`].
     lambda_param_hint: Option<Vec<String>>,
+    /// True while an arrow-form `switch` written as a statement is lowered,
+    /// so its labels are checked as a statement's rather than an
+    /// expression's (see [`Compiler::check_switch_labels`]).
+    switch_is_statement: bool,
     /// The parameter count a method reference argument's functional interface
     /// takes, when the JDK method it is passed to fixes one — what picks the
     /// overload of an arity-overloaded reference (`flatMapToInt(Arrays::stream)`
@@ -770,6 +780,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_ret_hint: None,
         lambda_generic: None,
         lambda_param_hint: None,
+        switch_is_statement: false,
         ref_arity_hint: None,
         lambda_param_types: Default::default(),
         generic_memo: Default::default(),
@@ -1041,6 +1052,9 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 field_generic,
                 type_params: cl.type_params.clone(),
                 super_targs: cl.super_targs.clone(),
+                is_sealed: cl.is_sealed,
+                is_abstract: cl.is_abstract || cl.is_interface,
+                permits: cl.permits.clone(),
                 interfaces: cl
                     .interfaces
                     .iter()
@@ -1563,6 +1577,146 @@ impl Compiler {
     fn enum_type_ref(&self, recv: &Expr) -> Option<String> {
         let class = self.user_class_ref(recv)?;
         self.classes.get(&class)?.is_enum.then_some(class)
+    }
+
+    /// `javac`'s two static checks on a `switch`'s labels (JLS 14.11.1):
+    /// a pattern label dominated by an earlier unguarded type pattern that
+    /// already covers its type is an error, and a `switch` expression — or a
+    /// statement that uses patterns, `case null`, or a selector type beyond the
+    /// legacy integral, `String` and enum ones — must be exhaustive: a
+    /// `default`, an unguarded pattern covering the selector type, every enum
+    /// constant, or every permitted subtype of a sealed type. `labels` is each
+    /// arm's (labels, is-default, is-guarded).
+    fn check_switch_labels(
+        &self,
+        disc: &Expr,
+        labels: &[(&[Expr], bool, bool)],
+        is_expr: bool,
+        line: u32,
+    ) -> Result<(), String> {
+        let Some(sel) = self.expr_java_type(disc) else {
+            return Ok(());
+        };
+        fn pattern(e: &Expr) -> Option<&str> {
+            match e {
+                Expr::TypePattern { class, .. } => Some(class.as_str()),
+                _ => None,
+            }
+        }
+        // Dominance: an unguarded type pattern covers every later pattern of a
+        // subtype of its type.
+        let mut covering: Vec<&str> = Vec::new();
+        for (ls, _, guarded) in labels {
+            for l in ls.iter() {
+                if let Some(t) = pattern(l) {
+                    if covering.iter().any(|c| self.type_covers(c, t)) {
+                        return Err(format!(
+                            "javars: this case label is dominated by a preceding case label (line {line})"
+                        ));
+                    }
+                }
+            }
+            if !guarded {
+                covering.extend(ls.iter().filter_map(|l| match l {
+                    Expr::TypePattern {
+                        class, components, ..
+                    } if components.is_empty() => Some(class.as_str()),
+                    _ => None,
+                }));
+            }
+        }
+        let uses_patterns = labels.iter().any(|(ls, _, _)| {
+            ls.iter()
+                .any(|l| pattern(l).is_some() || matches!(l, Expr::Var(n) if n == NULL_LITERAL))
+        });
+        let legacy = matches!(
+            sel.as_str(),
+            "char"
+                | "byte"
+                | "short"
+                | "int"
+                | "Character"
+                | "Byte"
+                | "Short"
+                | "Integer"
+                | "String"
+        ) || self.classes.get(&sel).is_some_and(|ci| ci.is_enum);
+        if !is_expr && !uses_patterns && legacy {
+            return Ok(());
+        }
+        if labels.iter().any(|(_, d, _)| *d) {
+            return Ok(());
+        }
+        // The unguarded labels: type patterns (record patterns counted as
+        // covering their record) and enum constants.
+        let mut types: Vec<&str> = Vec::new();
+        let mut constants: Vec<&str> = Vec::new();
+        for (ls, _, guarded) in labels {
+            if *guarded {
+                continue;
+            }
+            for l in ls.iter() {
+                match l {
+                    Expr::TypePattern { class, .. } => types.push(class),
+                    Expr::Var(n) => constants.push(n),
+                    Expr::Field { name, .. } => constants.push(name),
+                    _ => {}
+                }
+            }
+        }
+        if self.switch_covers(&sel, &types, &constants, 0) {
+            return Ok(());
+        }
+        let what = if is_expr { "expression" } else { "statement" };
+        Err(format!(
+            "javars: the switch {what} does not cover all possible input values (line {line})"
+        ))
+    }
+
+    /// Whether a pattern of type `t` matches every value of type `s`.
+    fn type_covers(&self, t: &str, s: &str) -> bool {
+        t == s
+            || t == "Object"
+            || (self.classes.contains_key(s) && self.is_subclass(s, t))
+            || crate::host::jdk_is_subtype(s, t)
+    }
+
+    /// Whether the unguarded `types` and enum `constants` cover every value
+    /// of type `s`: a covering pattern, every constant of an enum, or — for a
+    /// sealed type — every permitted direct subtype (and the type itself
+    /// unless it is abstract).
+    fn switch_covers(&self, s: &str, types: &[&str], constants: &[&str], depth: usize) -> bool {
+        if types.iter().any(|t| self.type_covers(t, s)) {
+            return true;
+        }
+        let Some(info) = self.classes.get(s) else {
+            return false;
+        };
+        if info.is_enum {
+            return !info.enum_constants.is_empty()
+                && info
+                    .enum_constants
+                    .iter()
+                    .all(|c| constants.contains(&c.as_str()));
+        }
+        if !info.is_sealed || !info.is_abstract || depth > 32 {
+            return false;
+        }
+        let permitted: Vec<&String> = if info.permits.is_empty() {
+            self.classes
+                .iter()
+                .filter(|(_, ci)| {
+                    ci.superclass.as_deref() == Some(s) || ci.supertypes.iter().any(|t| t == s)
+                })
+                .map(|(n, _)| n)
+                .collect()
+        } else {
+            info.permits.iter().collect()
+        };
+        !permitted.is_empty()
+            && permitted
+                .iter()
+                .all(|p| self.switch_covers(p, types, constants, depth + 1))
     }
 
     /// Lower `EnumName.values()` — a fresh array of the constants, in
@@ -6470,6 +6624,16 @@ impl Compiler {
             StmtKind::Expr(Expr::IncDec {
                 target, inc, line, ..
             }) => self.inc_dec(target, *inc, Yield::Nothing, *line),
+            // An arrow-form `switch` written as a statement is a switch
+            // *statement*: it need not be exhaustive unless it uses patterns.
+            StmtKind::Expr(e @ Expr::SwitchExpr { .. }) => {
+                self.switch_is_statement = true;
+                let r = self.expr(e);
+                self.switch_is_statement = false;
+                r?;
+                self.b.emit(Op::Pop, line);
+                Ok(())
+            }
             StmtKind::Expr(e) => {
                 self.expr(e)?;
                 self.b.emit(Op::Pop, line);
@@ -7349,6 +7513,13 @@ impl Compiler {
         line: u32,
         target: Option<&str>,
     ) -> Result<(), String> {
+        let labels: Vec<(&[Expr], bool, bool)> = arms
+            .iter()
+            .map(|a| (a.labels.as_slice(), a.is_default, a.guard.is_some()))
+            .collect();
+        // Set only for the switch itself, not for one nested in an arm.
+        let is_expr = !std::mem::replace(&mut self.switch_is_statement, false);
+        self.check_switch_labels(disc, &labels, is_expr, line)?;
         let arm_target = self.switch_arm_target(arms, target);
         // Java writes `case RED ->` unqualified when switching on an enum; the
         // label's meaning comes from the discriminant's static type.
@@ -7501,6 +7672,11 @@ impl Compiler {
     }
 
     fn switch_stmt(&mut self, disc: &Expr, groups: &[SwitchGroup]) -> Result<(), String> {
+        let labels: Vec<(&[Expr], bool, bool)> = groups
+            .iter()
+            .map(|g| (g.labels.as_slice(), g.is_default, g.guard.is_some()))
+            .collect();
+        self.check_switch_labels(disc, &labels, false, 0)?;
         let label = self.pending_label.take();
         // Evaluate the discriminant once and stash it in an internal temp. The
         // name uses `#` (not a legal Java identifier char) so it never collides

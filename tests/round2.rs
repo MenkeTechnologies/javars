@@ -3312,3 +3312,95 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `javac`'s static checks on `switch` labels (JLS 14.11.1): a switch
+/// expression, or a statement using patterns, that does not cover every value
+/// of its selector type (a missing sealed subtype or enum constant, no total
+/// pattern over `Object`, an `int` expression without `default`) is rejected,
+/// and so is a pattern label an earlier unguarded type pattern dominates; the
+/// exhaustive and legacy forms run.
+#[test]
+fn switch_exhaustiveness_and_dominance_are_checked() {
+    let program = |body: &str| format!("public class T {{\n{body}\n}}\n");
+    let main = |call: &str| {
+        format!("public static void main(String[] a) {{ System.out.println({call}); }}")
+    };
+    let rejected = [
+        format!("sealed interface S permits A, B {{}} record A() implements S {{}} record B() implements S {{}} static int f(S s) {{ return switch (s) {{ case A x -> 1; }}; }} {}", main("f(new A())")),
+        format!("enum E {{ X, Y }} static int f(E e) {{ return switch (e) {{ case X -> 1; }}; }} {}", main("f(E.X)")),
+        format!("static int f(Object o) {{ return switch (o) {{ case Integer i -> 1; }}; }} {}", main("f(1)")),
+        format!("static int f(Object o) {{ return switch (o) {{ case Object x -> 1; case Integer i -> 2; }}; }} {}", main("f(1)")),
+        format!("static int f(int k) {{ return switch (k) {{ case 1 -> 1; }}; }} {}", main("f(1)")),
+        format!("static int f(Object o) {{ return switch (o) {{ case CharSequence c -> 1; case String s -> 2; default -> 3; }}; }} {}", main("f(1)")),
+        "static void f(Object o) { switch (o) { case Integer i -> System.out.println(i); } } public static void main(String[] a) { f(1); }".to_string(),
+    ];
+    for p in &rejected {
+        let (out, ok) = run(&program(p));
+        assert!(
+            !ok && out.is_empty(),
+            "javac rejects this switch, javars ran it:\n{p}\n{out:?}"
+        );
+    }
+    let accepted = [
+        (format!("sealed interface S permits A, B {{}} record A() implements S {{}} record B() implements S {{}} static int f(S s) {{ return switch (s) {{ case A x -> 1; case B b -> 2; }}; }} {}", main("f(new B())")), "2\n"),
+        (format!("enum E {{ X, Y }} static int f(E e) {{ return switch (e) {{ case X -> 1; case Y -> 2; }}; }} {}", main("f(E.Y)")), "2\n"),
+        (format!("static int f(Number n) {{ return switch (n) {{ case Integer i -> 1; case Number m -> 2; }}; }} {}", main("f(1)")), "1\n"),
+        (format!("sealed static abstract class Sh permits C1, C2 {{}} static final class C1 extends Sh {{}} static non-sealed class C2 extends Sh {{}} static int f(Sh s) {{ return switch (s) {{ case C1 c -> 1; case C2 c -> 2; }}; }} {}", main("f(new C2())")), "2\n"),
+        (format!("static int f(Integer o) {{ return switch (o) {{ case Integer i when i > 0 -> 1; case Integer i -> 2; }}; }} {}", main("f(1)")), "1\n"),
+        ("static void f(int k) { switch (k) { case 1 -> System.out.println(k); } } public static void main(String[] a) { f(1); f(2); }".to_string(), "1\n"),
+    ];
+    for (p, want) in &accepted {
+        let (out, ok) = run(&program(p));
+        assert!(ok, "program failed:\n{p}\n{out}");
+        assert_eq!(&out, want);
+    }
+}
+
+/// Records: a compact constructor validates and reassigns its components (`List.copyOf`, `trim`), an extra constructor delegates, an accessor override is called, a generic record implements an interface, record patterns deconstruct in `instanceof` and a guarded `switch`; `Class.isRecord()` and `isEnum()` answer from the class graph.
+#[test]
+fn records_compact_constructors_and_class_queries() {
+    let src = r####"
+import java.util.*;
+public class T {
+    record Range(int lo, int hi) {
+        Range { if (lo > hi) throw new IllegalArgumentException("bad " + lo + ">" + hi); }
+        Range(int one) { this(one, one); }
+        int len() { return hi - lo; }
+        static Range unit() { return new Range(0, 1); }
+    }
+    record Named(String name, List<String> tags) {
+        Named { tags = List.copyOf(tags); name = name.trim(); }
+        @Override public String name() { return name.toUpperCase(); }
+    }
+    record Gen<A, B>(A a, B b) implements Comparable<Gen<A, B>> {
+        public int compareTo(Gen<A, B> o) { return 0; }
+    }
+    record Empty() {}
+    public static void main(String[] args) {
+        Range r = new Range(2, 5);
+        System.out.println(r + " " + r.len() + " " + new Range(3) + " " + Range.unit() + " " + r.equals(new Range(2, 5)) + " " + (r.hashCode() == new Range(2, 5).hashCode()));
+        try { new Range(5, 2); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        List<String> src = new ArrayList<>(List.of("a"));
+        Named n = new Named("  bob ", src);
+        src.add("b");
+        System.out.println(n + " " + n.name() + " " + n.tags());
+        Gen<Integer, String> g = new Gen<>(1, "x");
+        System.out.println(g + " " + g.a() + g.b() + " " + new Empty() + " " + new Empty().equals(new Empty()) + " " + (g instanceof Record) + " " + g.getClass().isRecord());
+        Object o = r;
+        if (o instanceof Range(int lo, int hi) && hi > lo) System.out.println("range " + lo + ".." + hi);
+        String s = switch (o) { case Range(var lo, var hi) when lo == 2 -> "two " + hi; case Range x -> "other"; default -> "?"; };
+        System.out.println(s);
+    }
+}
+"####;
+    let expected = r####"Range[lo=2, hi=5] 3 Range[lo=3, hi=3] Range[lo=0, hi=1] true true
+bad 5>2
+Named[name=bob, tags=[a]] BOB [a]
+Gen[a=1, b=x] 1x Empty[] true true true
+range 2..5
+two 5
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

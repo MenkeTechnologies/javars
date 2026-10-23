@@ -2975,6 +2975,12 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
 /// declarations ([`SUPERS`], set before the run) and the JDK's ([`jdk_supers`]).
 /// A user class that `implements Comparable` needs the second half to reach
 /// `Serializable`, and a modeled `TreeMap` has no entry in the first at all.
+/// [`is_subclass_of`] for the compiler, which needs the JDK half of the
+/// supertype graph to decide what a `switch` pattern covers.
+pub fn jdk_is_subtype(class: &str, target: &str) -> bool {
+    is_subclass_of(class, target)
+}
+
 fn is_subclass_of(class: &str, target: &str) -> bool {
     if class == target {
         return true;
@@ -13013,6 +13019,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             })))
         }
         ("isArray", 0) => Ok(Value::bool(s.starts_with('['))),
+        // A record or enum class, by its supertype in the class graph.
+        ("isRecord", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Record"))),
+        ("isEnum", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Enum"))),
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.

@@ -88,6 +88,13 @@ pub struct Class {
     /// The type arguments of each `implements` (or, for an interface,
     /// `extends`) entry, parallel to [`Class::interfaces`].
     pub interface_targs: Vec<Vec<String>>,
+    /// True for a `sealed` class or interface.
+    pub is_sealed: bool,
+    /// True for an `abstract` class (an interface is abstract by nature).
+    pub is_abstract: bool,
+    /// Its `permits` list, empty when it names none (the permitted subtypes
+    /// are then the ones the compilation unit declares).
+    pub permits: Vec<String>,
     pub name: String,
     /// Java's *binary* name for this type: `Outer$Nested` for a nested
     /// declaration, the simple name for a top-level one. javars flattens nesting
