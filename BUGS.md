@@ -1413,9 +1413,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   modeled (a read or overwrite moves the entry to the end); only the flag's
   literal `true`/`false` is accepted. The one anonymous subclass that is
   modeled is the "double brace" initializer (`new ArrayList<>() {{ add(1);
-  }}`), lowered to the collection it fills; its `getClass()` names the
-  anonymous class (`T$1`) as Java's does, but it answers `instanceof` as
-  the collection alone (no user supertype can be added to it).
+  }}`), lowered to the collection it fills, and its `getClass()` names the
+  anonymous class (`T$1`) as Java's does.
 - **Whole library areas that are not modeled are refused by name**, never run
   with a guessed meaning: `java.time`,
   threads and executors (`Thread`, `Executors`, `ConcurrentHashMap`), `UUID`,
