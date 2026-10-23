@@ -1962,3 +1962,29 @@ public class T {
     assert_eq!(out, expected);
 }
 
+/// A lone primitive array passed to `List.of`/`Set.of`/`Stream.of`/`Arrays.asList` is the one element of the result, since an `int[]` is no `E[]` (JLS 15.12.2.4); a reference array (`Integer[]`, `int[][]`) is the varargs array itself.
+#[test]
+fn a_lone_primitive_array_is_one_element_of_a_varargs_factory() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        int[] x = {3, 4};
+        char[] cs = {'q'};
+        System.out.println(List.of(x).size() + " " + Arrays.asList(x).size() + " " + Set.of(cs).size() + " " + Stream.of(x).count());
+        System.out.println(List.of(x).get(0)[1] + " " + Arrays.asList(x).get(0)[0] + " " + Arrays.asList(cs).get(0).length);
+        Integer[] boxed = {1, 2};
+        int[][] grid = {{1}, {2}, {3}};
+        System.out.println(List.of(boxed).size() + " " + Arrays.asList(boxed).size() + " " + List.of(grid).size() + " " + Stream.of(boxed).count() + " " + Arrays.asList(x, x).size());
+    }
+}
+"####;
+    let expected = r####"1 1 1 1
+4 3 1
+2 2 3 2 2
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

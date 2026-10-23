@@ -2269,11 +2269,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
   something a deterministic program does, so this only shows up if you ask for it.
-- **`Arrays.asList(arr)` always spreads a lone array argument.** Java's varargs
-  spreads a *reference* array (`String[]` → a 3-element list) but not a
-  primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element
-  types, so it cannot tell them apart and spreads both. The reference case —
-  the one programs actually write — is exact.
+- **`Arrays.asList(o)` spreads a lone array whose static type is not an
+  array.** Java's varargs spreads a *reference* array (`String[]` → a
+  3-element list) but not a primitive one (`int[]` → a 1-element
+  `List<int[]>`), and the choice is a static one. An argument statically a
+  primitive array is kept whole (`List.of`, `Set.of`, `Stream.of` and
+  `Arrays.asList` alike); one held in an `Object` is not, because an array's
+  element type is erased at run time: `Object arr = new int[]{1, 2};
+  Arrays.asList(arr).size()` is `1` in Java and `2` here. Measured on
+  `openjdk 21.0.12.1`.
 - **A lambda's result type is its interface's erasure when no type argument
   names it.** `Supplier<Integer> s` types `s.get()` as `Integer` (see
   "Generics" under "Implemented"), but a user generic functional interface

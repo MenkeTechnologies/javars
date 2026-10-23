@@ -7901,6 +7901,30 @@ impl Compiler {
         }
         if let Expr::Var(class) = recv {
             if is_static_class(class) && !self.is_declared_var(class) {
+                // `List.of(E...)` and its kin take a lone array argument *as*
+                // their varargs array only when it is an array of references:
+                // an `int[]` is no `E[]` (JLS 15.12.2.4), so it is the one
+                // element of the result. The host spreads a lone array, so a
+                // primitive one is handed over inside a one-element array.
+                if let [arg] = args {
+                    let prim_array = self.expr_java_type(arg).filter(|t| {
+                        t.strip_suffix("[]")
+                            .is_some_and(|el| !is_reference_type(el) && el != "void")
+                    });
+                    if let (Some(t), ("List" | "Set" | "Stream", "of") | ("Arrays", "asList")) =
+                        (prim_array, (class.as_str(), method))
+                    {
+                        return self.expr(&Expr::MethodCall {
+                            recv: Box::new(recv.clone()),
+                            method: method.to_string(),
+                            args: vec![Expr::ArrayLit {
+                                elems: vec![arg.clone()],
+                                elem_ty: Some(t),
+                            }],
+                            line,
+                        });
+                    }
+                }
                 // A static whose parameter renders the value as text takes the
                 // `char`'s one-character String; `Math.max(c, 5)` and the
                 // `Character` predicates take the code point unchanged.
