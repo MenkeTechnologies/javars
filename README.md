@@ -510,7 +510,8 @@ Implemented and checked against the reference `java`:
   `RandomSupport`, so a seeded generator draws the JDK's exact sequence
   (`nextInt`/`nextLong`/`nextDouble` and their bounded forms, `nextFloat`,
   `nextBoolean`, `nextGaussian` through a port of fdlibm's `log`, `nextBytes`,
-  `setSeed`); `Collections.shuffle(list, rnd)` permutes in the JDK's order, and
+  `setSeed`, and the `ints`/`longs`/`doubles` streams, sized or infinite,
+  which draw lazily per element as the JDK's spliterator does); `Collections.shuffle(list, rnd)` permutes in the JDK's order, and
   `Math.random()` draws from an unseeded one.
 - **`Math` transcendentals** — `tan`, `asin`/`acos`/`atan`/`atan2`, `exp`,
   `log`/`log10`/`log1p`/`expm1`, `cbrt`, `hypot`, `pow`, the hyperbolic

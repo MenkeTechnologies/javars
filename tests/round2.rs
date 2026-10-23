@@ -1988,3 +1988,57 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Random.ints`/`longs`/`doubles` streams, sized and unsized, ranged and not, draw from the generator at each pull (the JDK's `RandomIntsSpliterator` calls `nextInt()` per `tryAdvance`), so a draw made on the generator after the stream is built comes first; they are `SIZED` (`Long.MAX_VALUE` for the unsized forms), so `count()` runs no `peek`, and a bad range is rejected at the call.
+#[test]
+fn random_streams_draw_lazily_and_are_sized() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        System.out.println(new Random(1).ints(3).peek(x -> System.out.print("p")).count());
+        System.out.println(new Random(1).ints().count());
+        System.out.println(new Random(1).ints().limit(3).peek(x -> System.out.print("q")).count());
+        Random r = new Random(1);
+        IntStream s = r.ints(2);
+        int first = r.nextInt();
+        System.out.println(first + " " + s.boxed().toList());
+        Random r2 = new Random(1);
+        IntStream s2 = r2.ints();
+        int f2 = r2.nextInt();
+        System.out.println(f2 + " " + s2.limit(2).boxed().toList());
+        System.out.println(new Random(1).ints().limit(3).boxed().toList());
+        System.out.println(new Random(1).doubles().limit(2).boxed().toList());
+        System.out.println(new Random(1).ints(0, 10).limit(5).boxed().toList());
+        System.out.println(new Random(1).longs(-5, 5).limit(3).boxed().toList());
+        System.out.println(new Random(1).doubles(1.0, 2.0).limit(2).boxed().toList());
+        System.out.println(new Random(1).longs().limit(2).boxed().toList());
+        try { new Random(1).ints(5, 5); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        System.out.println(new Random(1).ints().anyMatch(x -> x > 0));
+        System.out.println(new Random(1).ints(0, 100).filter(x -> x > 90).findFirst().getAsInt());
+        System.out.println(new Random(1).ints().skip(2).limit(1).sum());
+    }
+}
+"####;
+    let expected = r####"3
+9223372036854775807
+3
+-1155869325 [431529176, 1761283695]
+-1155869325 [431529176, 1761283695]
+[-1155869325, 431529176, 1761283695]
+[0.7308781907032909, 0.41008081149220166]
+[5, 8, 7, 3, 4]
+[1, -2, 3]
+[1.7308781907032909, 1.4100808114922017]
+[-4964420948893066024, 7564655870752979346]
+bound must be greater than origin
+true
+92
+1761283695
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+

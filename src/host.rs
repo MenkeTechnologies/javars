@@ -807,6 +807,46 @@ enum Source {
     Generate(Value),
     /// `Stream.concat(a, b)`: the two stream handles, driven in order.
     Concat(Box<(Value, Value)>),
+    /// `Random.ints`/`longs`/`doubles`: `size` draws from the generator, each
+    /// made at the pull that needs it — the JDK's `RandomIntsSpliterator`
+    /// calls `nextInt()` per `tryAdvance` — so a draw the program makes on the
+    /// generator in between comes first. The unsized forms are `Long.MAX_VALUE`
+    /// draws, which is also the `SIZED` size their `count()` answers.
+    Draws(Box<Draws>),
+}
+
+/// The recipe of a [`Source::Draws`] stream.
+#[derive(Clone)]
+struct Draws {
+    rng: Value,
+    /// `ints`, `longs` or `doubles`.
+    method: &'static str,
+    /// The `(origin, bound)` of a ranged form, already checked.
+    range: Option<(Value, Value)>,
+    size: i64,
+}
+
+impl Draws {
+    /// One element, drawn as the matching `next…` call would draw it
+    /// (`RandomSupport.boundedNext…` for a ranged form).
+    fn draw(&self) -> Option<Value> {
+        with_random(&self.rng, |r| match (self.method, &self.range) {
+            ("ints", None) => Value::Int(i64::from(r.next_int())),
+            ("ints", Some((o, b))) => Value::Int(i64::from(
+                r.next_int_range(o.jint() as i32, b.jint() as i32)
+                    .unwrap_or_default(),
+            )),
+            ("longs", None) => Value::Int(r.next_long()),
+            ("longs", Some((o, b))) => {
+                Value::Int(r.next_long_range(o.jint(), b.jint()).unwrap_or_default())
+            }
+            (_, None) => Value::float(r.next_double()),
+            (_, Some((o, b))) => Value::float(
+                r.next_double_range(o.jfloat(), b.jfloat())
+                    .unwrap_or_default(),
+            ),
+        })
+    }
 }
 
 impl Source {
@@ -819,6 +859,10 @@ impl Source {
                 f,
             },
             Source::Generate(s) => SourceCursor::Generate(s),
+            Source::Draws(d) => {
+                let left = d.size;
+                SourceCursor::Draws(d, left)
+            }
             Source::Concat(_) => unreachable!("`stream_drive` expands a concatenation"),
         }
     }
@@ -835,6 +879,8 @@ enum SourceCursor {
         f: Value,
     },
     Generate(Value),
+    /// A [`Source::Draws`] and how many draws it has left.
+    Draws(Box<Draws>, i64),
 }
 
 impl SourceCursor {
@@ -843,6 +889,13 @@ impl SourceCursor {
     fn pull(&mut self, vm: &mut VM) -> Option<Value> {
         let v = match self {
             SourceCursor::Items(it) => return it.next(),
+            SourceCursor::Draws(d, left) => {
+                if *left <= 0 {
+                    return None;
+                }
+                *left -= 1;
+                return d.draw();
+            }
             SourceCursor::Iterate { prev, seed, f } => {
                 let v = match seed.take() {
                     Some(s) => s,
@@ -9639,6 +9692,7 @@ fn known_size(source: &Source, stages: &[Stage]) -> Option<i64> {
             let size = |s: &Value| as_stream(s).and_then(|(src, st, _)| known_size(&src, &st));
             size(a)?.checked_add(size(b)?)?
         }
+        Source::Draws(d) => d.size,
         Source::Unsized(_) | Source::Iterate { .. } | Source::Generate(_) => return None,
     };
     for stage in stages {
@@ -13070,16 +13124,26 @@ fn random_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
             .collect();
         return Some(array_mutate(&args[0], |a| *a = filled).map(|()| Value::Undef));
     }
-    // The sized stream factories — `ints(n)`, `ints(n, origin, bound)` and the
-    // `longs`/`doubles` pairs — draw each element as the matching `next…`
-    // call would, in order (`RandomSupport.boundedNext…` for the ranged
-    // forms). The unsized ones are infinite streams and are not modeled.
-    if matches!(method, "ints" | "longs" | "doubles") && matches!(args.len(), 1 | 3) {
-        let n = args[0].jint();
+    // The stream factories — `ints()`, `ints(n)`, `ints(origin, bound)`,
+    // `ints(n, origin, bound)` and the `longs`/`doubles` sets — are `SIZED`
+    // streams of lazy draws (see [`Source::Draws`]); the unsized ones hold
+    // `Long.MAX_VALUE` of them. The arguments are checked at the call, as
+    // `RandomSupport.checkStreamSize`/`checkRange` check them.
+    if let Some(m) = ["ints", "longs", "doubles"]
+        .into_iter()
+        .find(|m| *m == method)
+    {
+        let (n, range) = match args {
+            [] => (i64::MAX, None),
+            [n] => (n.jint(), None),
+            [o, b] => (i64::MAX, Some((o, b))),
+            [n, o, b] => (n.jint(), Some((o, b))),
+            _ => return None,
+        };
         if n < 0 {
             return Some(Err(iae("size must be non-negative")));
         }
-        if let [_, o, b] = args {
+        if let Some((o, b)) = range {
             let ok = if method == "doubles" {
                 o.jfloat() < b.jfloat() && (b.jfloat() - o.jfloat()).is_finite()
             } else {
@@ -13089,33 +13153,23 @@ fn random_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
                 return Some(Err(iae(crate::jrandom::BAD_RANGE)));
             }
         }
-        let kind = match method {
+        let kind = match m {
             "ints" => StreamKind::Int,
             "longs" => StreamKind::Long,
             _ => StreamKind::Double,
         };
-        let drawn = with_random(recv, |r| -> Result<Vec<Value>, &str> {
-            (0..n)
-                .map(|_| {
-                    Ok(match (method, &args[1..]) {
-                        ("ints", []) => Value::Int(i64::from(r.next_int())),
-                        ("ints", [o, b]) => Value::Int(i64::from(
-                            r.next_int_range(o.jint() as i32, b.jint() as i32)?,
-                        )),
-                        ("longs", []) => Value::Int(r.next_long()),
-                        ("longs", [o, b]) => Value::Int(r.next_long_range(o.jint(), b.jint())?),
-                        ("doubles", []) => Value::float(r.next_double()),
-                        (_, [o, b]) => Value::float(r.next_double_range(o.jfloat(), b.jfloat())?),
-                        _ => Value::Undef,
-                    })
-                })
-                .collect()
-        })?;
-        return Some(
-            drawn
-                .map(|items| unsized_stream_of(items, kind))
-                .map_err(iae),
-        );
+        with_random(recv, |_| ())?;
+        let draws = Draws {
+            rng: recv.clone(),
+            method: m,
+            range: range.map(|(o, b)| (o.clone(), b.clone())),
+            size: n,
+        };
+        return Some(Ok(Value::Obj(heap_alloc(HostObj::Stream {
+            source: Source::Draws(Box::new(draws)),
+            stages: Vec::new(),
+            kind,
+        }))));
     }
     with_random(recv, |r| match (method, args) {
         ("nextInt", []) => Ok(Value::Int(i64::from(r.next_int()))),

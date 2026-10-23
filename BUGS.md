@@ -1412,15 +1412,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `ArrayStoreException` entry below), so the test could not distinguish
   `int[]` from `String[]` even once it parsed.
 - **`System.getenv()` (the whole map), the JVM-describing `System.getProperty`
-  keys, the unsized `Random.ints()`/`longs()`/`doubles()` streams,
-  `Character.isEmoji` and `Character.getName`** are refused. The first is
-  ordered by the JVM's own environment class, the second describes a JVM,
-  the third are infinite streams, and the last two need Unicode tables javars
-  does not carry.
-- **`Enum.valueOf(Cls.class, name)`, `Character.getType` and
+  keys, `Character.isEmoji` and `Character.getName`** are refused. The first
+  is ordered by the JVM's own environment class, the second describes a JVM,
+  and the last two need Unicode tables javars does not carry.
+- **`Enum.valueOf` on a `Class` value, `Character.getType` and
   `Character.isIdeographic`** are refused (`cannot find symbol: Enum`,
-  ``unsupported static method``). `Cls.valueOf(name)` is the modeled spelling
-  of the first.
+  ``unsupported static method``). `Enum.valueOf(Color.class, name)` with the
+  class literal written out is modeled, as `Color.valueOf(name)` is.
 - **A user class cannot extend a JDK collection.** `class Lru<K, V> extends
   LinkedHashMap<K, V> { protected boolean removeEldestEntry(…) { … } }` — the
   usual LRU cache — and `class Stack2 extends ArrayList<Integer>` are refused
