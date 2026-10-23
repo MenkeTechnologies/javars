@@ -576,8 +576,12 @@ pub enum Sink {
     Stderr,
     /// Another writer on the host heap, by handle.
     Handle(u32),
-    /// Nowhere: a `StringWriter` keeps its text.
+    /// Nowhere: the writer keeps its text.
     Own,
+    /// A `StringWriter`'s own `StringBuffer`, by handle — where its text
+    /// lives, and what `getBuffer()` hands out, so a change through either
+    /// shows in the other.
+    Buffer(u32),
 }
 
 /// The JDK's buffer size for `BufferedWriter`, `OutputStreamWriter`'s encoder
@@ -628,7 +632,10 @@ impl Writer {
         let mut out = Vec::new();
         match self.kind {
             WKind::PrintStream | WKind::PrintWriter => out.push(text.to_string()),
-            WKind::StringWriter => self.buf.push_str(text),
+            WKind::StringWriter => match self.sink {
+                Sink::Buffer(_) => out.push(text.to_string()),
+                _ => self.buf.push_str(text),
+            },
             WKind::BufferedWriter => {
                 // `BufferedWriter.write` copies into its array and flushes it
                 // the moment it is full.

@@ -2625,3 +2625,47 @@ NPE
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A `StringWriter`'s text lives in the `StringBuffer` `getBuffer()` returns — the same object every call, starting at capacity 16 (or the constructor's size) and growing by the JDK's rule — so a change through the buffer shows in the writer and a later write in the buffer; `append(csq, start, end)` writes the window.
+#[test]
+fn string_writer_get_buffer_is_its_live_buffer() {
+    let src = r####"
+import java.io.*;
+public class T {
+    public static void main(String[] a) throws Exception {
+        StringWriter sw = new StringWriter();
+        sw.write("abc");
+        StringBuffer sb = sw.getBuffer();
+        sb.append("d");
+        System.out.println(sw + " " + sb.length() + " " + sb.capacity() + " " + (sw.getBuffer() == sb));
+        sw.write("0123456789012345");
+        System.out.println(sb + " " + sb.capacity());
+        sb.setLength(2);
+        System.out.println(sw.toString() + "|" + sw);
+        PrintWriter pw = new PrintWriter(sw);
+        pw.print(42); pw.printf("%s!", "x"); pw.flush();
+        System.out.println(sw + " " + sw.getBuffer().reverse());
+        System.out.println(sw);
+        StringWriter s2 = new StringWriter(3);
+        System.out.println(s2.getBuffer().capacity());
+        s2.append('q').append("rs", 0, 1).append(null);
+        System.out.println(s2 + " " + s2.getBuffer().length());
+        try { new StringWriter(-1); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        sw.close(); sw.write("z"); System.out.println(sw.getBuffer().indexOf("z"));
+    }
+}
+"####;
+    let expected = r####"abcd 4 16 true
+abcd0123456789012345 34
+ab|ab
+ab42x! !x24ba
+!x24ba
+3
+qrnull 6
+Negative buffer size
+6
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

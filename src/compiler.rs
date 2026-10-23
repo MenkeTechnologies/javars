@@ -13005,6 +13005,7 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         ("StringTokenizer", "countTokens") => "int",
         ("PrintWriter" | "PrintStream", "checkError") => "boolean",
         ("StringWriter", "toString") => "String",
+        ("StringWriter", "getBuffer") => "StringBuffer",
         ("PrintWriter", "append" | "#printf") => "PrintWriter",
         ("PrintStream", "append" | "#printf") => "PrintStream",
         ("BufferedWriter", "append") => "BufferedWriter",

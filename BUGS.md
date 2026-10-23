@@ -1658,7 +1658,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   over `InputStreamReader`/`StringReader`, `StringTokenizer`), console output
   through the `java.io` writers and print streams (`PrintWriter`,
   `BufferedWriter`, `OutputStreamWriter`, `StringWriter`, `PrintStream`,
-  `BufferedOutputStream`; `StringWriter.getBuffer()` is refused), `java.util.Random`
+  `BufferedOutputStream`; a `StringWriter`'s text lives in the `StringBuffer`
+  `getBuffer()` returns), `java.util.Random`
   (a port of the JDK's generator, so a seeded sequence is the JDK's),
   `java.util.BitSet`, `java.util.regex.Pattern`/`Matcher`, the
   `Int`/`Long`/`DoubleSummaryStatistics` classes, and `AtomicInteger`/`AtomicLong`/

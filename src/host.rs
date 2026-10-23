@@ -13338,9 +13338,30 @@ fn sink_write(sink: crate::jio::Sink, text: &str) -> Result<(), Fault> {
         Sink::Stdout => std_emit(false, text),
         Sink::Stderr => std_emit(true, text),
         Sink::Handle(h) => writer_write(h, text)?,
+        Sink::Buffer(b) => HEAP.with(|heap| {
+            if let Some(HostObj::Builder { s, len, cap, .. }) =
+                heap.borrow_mut().get_mut(b as usize)
+            {
+                s.push_str(text);
+                *len += text.chars().count();
+                *cap = sb_grow(*cap, *len);
+            }
+        }),
         Sink::Own => {}
     }
     Ok(())
+}
+
+/// The text a `StringWriter` holds — in its own `StringBuffer` (see
+/// [`crate::jio::Sink::Buffer`]).
+fn string_writer_text(heap: &[HostObj], w: &crate::jio::Writer) -> String {
+    match w.sink {
+        crate::jio::Sink::Buffer(b) => match heap.get(b as usize) {
+            Some(HostObj::Builder { s, .. }) => s.clone(),
+            _ => String::new(),
+        },
+        _ => w.buf.clone(),
+    }
 }
 
 /// Give `text` to the writer `id`; whatever its buffering lets go travels on
@@ -13376,7 +13397,7 @@ fn writer_flush(id: u32) -> Result<(), Fault> {
             let _ = std::io::stderr().flush();
             Ok(())
         }
-        Sink::Own => Ok(()),
+        Sink::Own | Sink::Buffer(_) => Ok(()),
     }
 }
 
@@ -13400,7 +13421,7 @@ fn writer_close(id: u32) -> Result<(), Fault> {
             closed[slot] = true;
             STD_CLOSED.with(|s| s.set(closed));
         }
-        Sink::Own => {}
+        Sink::Own | Sink::Buffer(_) => {}
     }
     flushed
 }
@@ -13416,7 +13437,27 @@ fn writer_new(class: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
         return Some(Err(Fault::java("NullPointerException", String::new())));
     }
     Some(Ok(match (class, args) {
-        ("StringWriter", [] | [_]) => alloc(Writer::new(WKind::StringWriter, Sink::Own, false)),
+        // `StringWriter()` is a `StringBuffer` of the JDK's default 16 and
+        // `StringWriter(n)` one of `n`, which `getBuffer()` hands out.
+        ("StringWriter", [] | [_]) => {
+            let cap = match args.first() {
+                Some(n) if n.jint() < 0 => {
+                    return Some(Err(Fault::java(
+                        "IllegalArgumentException",
+                        "Negative buffer size".to_string(),
+                    )))
+                }
+                Some(n) => n.jint() as usize,
+                None => 16,
+            };
+            let b = heap_alloc(HostObj::Builder {
+                s: String::new(),
+                len: 0,
+                cap,
+                buffer: true,
+            });
+            alloc(Writer::new(WKind::StringWriter, Sink::Buffer(b), false))
+        }
         // `PrintWriter(OutputStream[, autoFlush])` buffers through a
         // `BufferedWriter` over an `OutputStreamWriter`, exactly as the JDK
         // constructor builds it; `PrintWriter(Writer[, autoFlush])` writes
@@ -13587,6 +13628,25 @@ fn writer_method(
             };
             write_then(&text, false).map(|()| recv.clone())
         }
+        // `append(csq, start, end)` is `append(csq.subSequence(start, end))`,
+        // a `null` sequence reading as `"null"` — so a bad window is the
+        // `substring` fault.
+        ("append", [v, start, end]) => {
+            let text = match v {
+                Value::Undef => "null".to_string(),
+                other => writer_text(vm, other),
+            };
+            let chars: Vec<char> = text.chars().collect();
+            let (b, e) = (start.jint(), end.jint());
+            if b < 0 || e > chars.len() as i64 || b > e {
+                return Some(Err(Fault::java(
+                    "StringIndexOutOfBoundsException",
+                    format!("Range [{b}, {e}) out of bounds for length {}", chars.len()),
+                )));
+            }
+            let piece: String = chars[b as usize..e as usize].iter().collect();
+            write_then(&piece, false).map(|()| recv.clone())
+        }
         ("newLine", []) if kind == WKind::BufferedWriter => {
             write_then("\n", false).map(|()| Value::Undef)
         }
@@ -13596,9 +13656,17 @@ fn writer_method(
             let _ = writer_flush(id);
             Ok(Value::bool(with_writer(id, |w| w.error).unwrap_or(false)))
         }
-        ("toString", []) if kind == WKind::StringWriter => Ok(Value::str(
-            with_writer(id, |w| w.buf.clone()).unwrap_or_default(),
-        )),
+        ("toString", []) if kind == WKind::StringWriter => Ok(Value::str(HEAP.with(|h| {
+            let heap = h.borrow();
+            match heap.get(id as usize) {
+                Some(HostObj::Writer(w)) => string_writer_text(&heap, w),
+                _ => String::new(),
+            }
+        }))),
+        ("getBuffer", []) if kind == WKind::StringWriter => match with_writer(id, |w| w.sink) {
+            Some(crate::jio::Sink::Buffer(b)) => Ok(Value::Obj(b)),
+            _ => Ok(Value::Undef),
+        },
         _ => Err(Fault::internal(format!(
             "javars: unsupported method `{method}` with {} argument(s) on {}",
             args.len(),
@@ -20004,7 +20072,9 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::Reader(r)) => format!("{}@{id:x}", r.kind.class_name()),
             // A `StringWriter` renders its text; every other writer is an
             // `Object.toString()`.
-            Some(HostObj::Writer(w)) if w.kind == crate::jio::WKind::StringWriter => w.buf.clone(),
+            Some(HostObj::Writer(w)) if w.kind == crate::jio::WKind::StringWriter => {
+                string_writer_text(&h, w)
+            }
             Some(HostObj::Writer(w)) => format!("{}@{id:x}", w.kind.class_name()),
             Some(HostObj::Tokenizer(_)) => format!("java.util.StringTokenizer@{id:x}"),
             Some(HostObj::Random(_)) => format!("java.util.Random@{id:x}"),
