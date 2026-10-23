@@ -226,18 +226,11 @@ fn string_concatenation_is_untouched() {
     assert_eq!(cat(Value::Int(1), Value::str("x")), "1x");
     assert_eq!(cat(Value::Undef, Value::Bool(true)), "nulltrue");
     assert_eq!(cat(Value::str("v="), Value::Float(3.0)), "v=3.0");
-    // Arithmetic on a `String` operand stays a type error — `"ab" - 1` does
-    // not compile in Java, and must not start returning a number now that a
-    // numeric arm exists.
-    assert!(numeric_hook(NumOp::Sub, &Value::str("ab"), &Value::Int(1)).is_err());
-    assert!(numeric_hook(NumOp::Mul, &Value::Int(1), &Value::str("ab")).is_err());
-    // A *one*-character String is how a `Character` read back out of a
-    // collection arrives, and `c - 1` compiles only for that `Character`, so
-    // it is the code point: `stack.peek() - 'a'` is arithmetic in Java.
-    assert_eq!(
-        numeric_hook(NumOp::Sub, &Value::str("b"), &Value::Int(1)).ok(),
-        Some(Value::Int(97))
-    );
+    // Arithmetic on a `String` operand stays a type error — `"a" - 1` does not
+    // compile in Java, and must not start returning a number now that a numeric
+    // arm exists.
+    assert!(numeric_hook(NumOp::Sub, &Value::str("a"), &Value::Int(1)).is_err());
+    assert!(numeric_hook(NumOp::Mul, &Value::Int(1), &Value::str("a")).is_err());
 }
 
 /// Java has no `**`, so the compiler never emits `Pow`; if one ever arrives it
