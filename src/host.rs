@@ -2553,6 +2553,10 @@ pub fn heap_reset() {
     ENTRY_INDEX.with(|x| x.borrow_mut().clear());
     ENTRIES_LIVE.with(|e| e.set(false));
     MAP_VIEWS.with(|m| m.borrow_mut().clear());
+    // Both are keyed by heap handle, so a surviving entry would mark the next
+    // program's object in that slot.
+    PLAIN_VIEWS.with(|p| p.borrow_mut().clear());
+    ARRAY_DEQUES.with(|d| d.borrow_mut().clear());
     FILED_HASH.with(|f| f.borrow_mut().clear());
     COMPUTING.with(|c| c.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
@@ -5791,8 +5795,8 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         // and the element order every one of them produces is the reference's.
         // What this model does not carry is the *class*: like `LinkedList`
         // before it, an `ArrayDeque` answers `getClass().getSimpleName()` with
-        // `ArrayList`, and it accepts a null element where the real
-        // `ArrayDeque` throws. BUGS.md records both.
+        // `ArrayList`. Its refusal of a `null` element is [`array_deque_null`]'s.
+        // BUGS.md records the class.
         "ArrayList" | "LinkedList" | "ArrayDeque" | "Deque" | "Queue" | "List" => HostObj::List {
             mods: 0,
             items: sequence_items(seed).unwrap_or_default(),
@@ -5884,7 +5888,15 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
             }
         }
     }
+    if kind == "ArrayDeque"
+        && sequence_items(seed).is_some_and(|s| s.iter().any(|v| matches!(v, Value::Undef)))
+    {
+        return Err(Fault::java("NullPointerException", String::new()));
+    }
     let id = heap_alloc(obj);
+    if kind == "ArrayDeque" {
+        ARRAY_DEQUES.with(|d| d.borrow_mut().insert(id));
+    }
     if let Some(t) = table {
         let v = Value::Obj(id);
         store_hash_table(&v, t);
@@ -5953,6 +5965,11 @@ thread_local! {
     /// The views made by `unmodifiableCollection`, which is neither a `List` nor
     /// a `Set` whatever it wraps.
     static PLAIN_VIEWS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// The lists made by `new ArrayDeque<>(…)`. They share the mutable-list
+    /// shape, but an `ArrayDeque` refuses a `null` element, which this set is
+    /// what lets the add family check.
+    static ARRAY_DEQUES: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
@@ -7459,6 +7476,35 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     coll_method_inner(vm, recv, method, args)
 }
 
+/// `ArrayDeque` refuses `null`: each method of its add family throws
+/// `NullPointerException` for one, and `addAll` adds the elements before the
+/// first `null` and then throws, as the JDK's `forEach(this::addLast)` does.
+/// `None` for every other receiver and call, which then runs as usual.
+fn array_deque_null(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    if !ARRAY_DEQUES.with(|d| d.borrow().contains(id)) {
+        return None;
+    }
+    let npe = || Fault::java("NullPointerException", String::new());
+    match (method, args) {
+        (
+            "add" | "addFirst" | "addLast" | "offer" | "offerFirst" | "offerLast" | "push",
+            [Value::Undef],
+        ) => Some(raise(vm, npe())),
+        ("addAll", [c]) => {
+            let items = sequence_items(c)?;
+            let cut = items.iter().position(|v| matches!(v, Value::Undef))?;
+            for v in &items[..cut] {
+                coll_method_inner(vm, recv, "addLast", std::slice::from_ref(v));
+            }
+            Some(raise(vm, npe()))
+        }
+        _ => None,
+    }
+}
+
 /// An access-ordered `LinkedHashMap` moves the entry a call read or wrote to the
 /// end (`afterNodeAccess`): `get`, `getOrDefault`, `put` over an existing key,
 /// `putIfAbsent`, the compute family, `merge` and `replace`.
@@ -7494,6 +7540,9 @@ fn touch_access_order(recv: &Value, method: &str, args: &[Value]) {
 fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
     if let Some(f) = refused_view_write(recv, method) {
         return raise(vm, f);
+    }
+    if let Some(out) = array_deque_null(vm, recv, method, args) {
+        return out;
     }
     if naturally_ordered(recv) {
         if let Some(out) = natural_order_null(vm, recv, method, args) {
@@ -10679,6 +10728,9 @@ fn list_method(
             }
         },
         ("hashCode", 0) => Value::Int(list_hash(items)),
+        // `ArrayList`'s capacity hints: the backing store grows on its own,
+        // so neither changes anything a program can observe.
+        ("ensureCapacity", 1) | ("trimToSize", 0) => Value::Undef,
         _ => {
             return Err(Fault::internal(format!(
                 "javars: unsupported List method `{method}` with {} argument(s)",
@@ -11042,26 +11094,39 @@ fn set_method(
     Ok(NewColl::Value(v))
 }
 
-/// `[a, b, c]` — `AbstractCollection.toString`.
-fn render_sequence(items: &[Value]) -> String {
-    let body: Vec<String> = items.iter().map(java_str).collect();
+/// `[a, b, c]` — `AbstractCollection.toString`. An element that is the
+/// collection `me` itself renders as `(this Collection)`, as the JDK's does,
+/// rather than recursing without end.
+fn render_sequence(me: u32, items: &[Value]) -> String {
+    let body: Vec<String> = items
+        .iter()
+        .map(|e| match e {
+            Value::Obj(x) if *x == me => "(this Collection)".to_string(),
+            other => java_str(other),
+        })
+        .collect();
     format!("[{}]", body.join(", "))
 }
 
-fn render_set(items: &[Value], order: Order) -> String {
+fn render_set(me: u32, items: &[Value], order: Order) -> String {
     let ordered: Vec<Value> = present_order(items, order)
         .into_iter()
         .map(|i| items[i].clone())
         .collect();
-    render_sequence(&ordered)
+    render_sequence(me, &ordered)
 }
 
-/// `{k=v, k=v}` — `AbstractMap.toString`.
-fn render_map(entries: &[(Value, Value)], order: Order) -> String {
+/// `{k=v, k=v}` — `AbstractMap.toString`; a key or value that is the map `me`
+/// itself is `(this Map)`.
+fn render_map(me: u32, entries: &[(Value, Value)], order: Order) -> String {
+    let side = |v: &Value| match v {
+        Value::Obj(x) if *x == me => "(this Map)".to_string(),
+        other => java_str(other),
+    };
     let keys: Vec<Value> = entries.iter().map(|(k, _)| k.clone()).collect();
     let body: Vec<String> = present_order(&keys, order)
         .into_iter()
-        .map(|i| format!("{}={}", java_str(&entries[i].0), java_str(&entries[i].1)))
+        .map(|i| format!("{}={}", side(&entries[i].0), side(&entries[i].1)))
         .collect();
     format!("{{{}}}", body.join(", "))
 }
@@ -11856,6 +11921,20 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("toCharArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
             s.chars().map(|c| Value::Int(c as i64)).collect(),
         )))),
+        // `getBytes()` is UTF-8, the JDK 18+ default charset; the bytes are
+        // Java's signed ones.
+        ("getBytes", 0 | 1) => {
+            let cs = match args.first() {
+                Some(c) => charset_named(&c.as_str_cow())?,
+                None => Charset::Utf8,
+            };
+            Ok(Value::Obj(heap_alloc(HostObj::Array(
+                cs.encode(s)
+                    .into_iter()
+                    .map(|b| Value::Int(i64::from(b as i8)))
+                    .collect(),
+            ))))
+        }
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
         ("formatted", _) => java_format(s, args, &[], None),
@@ -15189,20 +15268,121 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             Ok(Value::Int(found.unwrap_or(-(low + 1))))
         }
         // `Arrays.hashCode(a)` — the JDK's documented `31 * result + e` fold,
-        // seeded at 1, wrapping at 32 bits.
-        ("Arrays", "hashCode", 1) => {
-            let items = array_items(&args[0]).unwrap_or_default();
-            let h = items.iter().fold(1i32, |acc, e| {
-                acc.wrapping_mul(31).wrapping_add(java_hash(e).unwrap_or(0))
-            });
-            Ok(Value::Int(h as i64))
+        // seeded at 1, wrapping at 32 bits; a `null` array hashes to 0.
+        // `deepHashCode` folds a nested array by its own `deepHashCode` instead
+        // of its identity.
+        ("Arrays", "hashCode", 1) => Ok(Value::Int(arrays_hash(&args[0], false).into())),
+        // `new String(bytes [, offset, length] [, charset])`, lowered here by the
+        // compiler when the first argument is statically a `byte[]`.
+        ("String", "#fromBytes", 1..=4) => {
+            let Some(bytes) = array_items(&args[0]) else {
+                return Err(Fault::java("NullPointerException", String::new()));
+            };
+            let (range, cs) = match args {
+                [_] => (0..bytes.len(), None),
+                [_, cs] => (0..bytes.len(), Some(cs)),
+                [_, off, len, rest @ ..] => {
+                    let (off, len) = (off.jint(), len.jint());
+                    if off < 0 || len < 0 || off + len > bytes.len() as i64 {
+                        return Err(Fault::java(
+                            "StringIndexOutOfBoundsException",
+                            format!(
+                                "Range [{off}, {off} + {len}) out of bounds for length {}",
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    (off as usize..(off + len) as usize, rest.first())
+                }
+                [] => unreachable!("arity is at least one"),
+            };
+            let cs = match cs {
+                Some(c) => charset_named(&c.as_str_cow())?,
+                None => Charset::Utf8,
+            };
+            let raw: Vec<u8> = bytes[range].iter().map(|b| b.jint() as u8).collect();
+            Ok(Value::str(cs.decode(&raw)))
         }
+        ("Arrays", "deepHashCode", 1) => Ok(Value::Int(arrays_hash(&args[0], true).into())),
 
         _ => Err(Fault::internal(format!(
             "javars: unsupported static method `{class}.{method}` with {} argument(s)",
             args.len()
         ))),
     }
+}
+
+/// The three charsets `java.nio.charset.StandardCharsets` names that every JDK
+/// supports and javars models.
+#[derive(Clone, Copy)]
+enum Charset {
+    Utf8,
+    Latin1,
+    Ascii,
+}
+
+impl Charset {
+    /// `String.getBytes`: a character the charset cannot represent becomes
+    /// `?`, the JDK's replacement byte.
+    fn encode(self, s: &str) -> Vec<u8> {
+        match self {
+            Charset::Utf8 => s.as_bytes().to_vec(),
+            Charset::Latin1 => s.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect(),
+            Charset::Ascii => s
+                .chars()
+                .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+                .collect(),
+        }
+    }
+
+    /// `new String(bytes, …)`: malformed input decodes to U+FFFD.
+    fn decode(self, b: &[u8]) -> String {
+        match self {
+            Charset::Utf8 => String::from_utf8_lossy(b).into_owned(),
+            Charset::Latin1 => b.iter().map(|&x| char::from(x)).collect(),
+            Charset::Ascii => b
+                .iter()
+                .map(|&x| {
+                    if x.is_ascii() {
+                        char::from(x)
+                    } else {
+                        '\u{fffd}'
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The charset a name selects, by the JDK's case-insensitive canonical names
+/// and aliases; any other name is `UnsupportedEncodingException`.
+fn charset_named(name: &str) -> Result<Charset, Fault> {
+    Ok(match name.to_ascii_uppercase().as_str() {
+        "UTF-8" | "UTF8" => Charset::Utf8,
+        "ISO-8859-1" | "ISO8859_1" | "ISO_8859_1" | "LATIN1" | "ISO-LATIN-1" => Charset::Latin1,
+        "US-ASCII" | "ASCII" => Charset::Ascii,
+        _ => {
+            return Err(Fault::java(
+                "UnsupportedEncodingException",
+                name.to_string(),
+            ))
+        }
+    })
+}
+
+/// `Arrays.hashCode` (`deep == false`) or `Arrays.deepHashCode` of `v`.
+fn arrays_hash(v: &Value, deep: bool) -> i32 {
+    let Some(items) = array_items(v) else {
+        return 0;
+    };
+    items.iter().fold(1i32, |acc, e| {
+        let h = if deep && array_items(e).is_some() {
+            arrays_hash(e, true)
+        } else {
+            java_hash(e).unwrap_or(0)
+        };
+        acc.wrapping_mul(31).wrapping_add(h)
+    })
 }
 
 /// The last index (in characters) at which `needle` starts at or before
@@ -16910,9 +17090,26 @@ fn null_float_parse_fault() -> Fault {
     )
 }
 
+/// The message of a `Double.parseDouble`/`Float.parseFloat` failure, as
+/// `FloatingDecimal.readJavaFormatString` words it: `empty String` for blank
+/// text, `multiple points` when its digit scan meets a second `.` in the
+/// significand (`1.2.3`, `..1`, `1.2.3f` — but not `1e5.5`, where the second
+/// point follows the exponent), and `For input string: "…"` otherwise.
 fn float_format_message(text: &str) -> String {
-    if text.trim_matches(|c: char| c <= ' ').is_empty() {
+    let trimmed = text.trim_matches(|c: char| c <= ' ');
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    let scans_digits = !unsigned.starts_with(['N', 'I'])
+        && !unsigned.starts_with("0x")
+        && !unsigned.starts_with("0X");
+    let points = unsigned
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .filter(|c| *c == '.')
+        .count();
+    if trimmed.is_empty() {
         "empty String".to_string()
+    } else if scans_digits && points >= 2 {
+        "multiple points".to_string()
     } else {
         format!("For input string: \"{text}\"")
     }
@@ -18966,7 +19163,7 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
             let items = sublist_items(id as usize)
                 .and_then(Result::ok)
                 .unwrap_or_default();
-            render_sequence_vm(vm, &items)
+            render_sequence_vm(vm, id, &items)
         }
         RenderShape::Opaque => obj_default_str(id),
         // `Enum.toString()` returns the constant's name unless the enum declares
@@ -18976,14 +19173,21 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
             Some(entry) => run_tostring(vm, entry, id),
             None => enum_name.unwrap_or_else(|| obj_default_str(id)),
         },
-        RenderShape::Sequence(items) => render_sequence_vm(vm, &items),
+        RenderShape::Sequence(items) => render_sequence_vm(vm, id, &items),
         RenderShape::Pair(k, v) => format!("{}={}", java_str_vm(vm, &k), java_str_vm(vm, &v)),
         RenderShape::Optional(class, Some(v)) => format!("{class}[{}]", java_str_vm(vm, &v)),
         RenderShape::Optional(class, None) => format!("{class}.empty"),
         RenderShape::Entries(entries) => {
             let body: Vec<String> = entries
                 .iter()
-                .map(|(k, v)| format!("{}={}", java_str_vm(vm, k), java_str_vm(vm, v)))
+                .map(|(k, v)| {
+                    let mut side = |x: &Value| match x {
+                        Value::Obj(o) if *o == id => "(this Map)".to_string(),
+                        other => java_str_vm(vm, other),
+                    };
+                    let k = side(k);
+                    format!("{k}={}", side(v))
+                })
                 .collect();
             format!("{{{}}}", body.join(", "))
         }
@@ -18991,8 +19195,14 @@ fn obj_str_vm(vm: &mut VM, id: u32) -> String {
 }
 
 /// `[a, b, c]` with each element rendered through its own `toString()`.
-fn render_sequence_vm(vm: &mut VM, items: &[Value]) -> String {
-    let body: Vec<String> = items.iter().map(|e| java_str_vm(vm, e)).collect();
+fn render_sequence_vm(vm: &mut VM, me: u32, items: &[Value]) -> String {
+    let body: Vec<String> = items
+        .iter()
+        .map(|e| match e {
+            Value::Obj(x) if *x == me => "(this Collection)".to_string(),
+            other => java_str_vm(vm, other),
+        })
+        .collect();
     format!("[{}]", body.join(", "))
 }
 
@@ -19057,19 +19267,20 @@ fn obj_default_str(id: u32) -> String {
             // surface — `println(sb)`, `"" + sb`, `%s`, a list element — shows
             // the text rather than a handle.
             Some(HostObj::Builder { s, .. }) => s.clone(),
-            Some(HostObj::List { items, .. }) => render_sequence(items),
-            Some(HostObj::PQueue { items, .. }) => render_sequence(items),
+            Some(HostObj::List { items, .. }) => render_sequence(id, items),
+            Some(HostObj::PQueue { items, .. }) => render_sequence(id, items),
             // A view renders its window of the backing list. Rendering cannot
             // raise, so a view whose backing list moved prints as though it
             // were empty rather than reporting the comodification the next
             // real method call does report.
             Some(HostObj::SubList { .. }) => render_sequence(
+                id,
                 &sublist_items(id as usize)
                     .and_then(Result::ok)
                     .unwrap_or_default(),
             ),
-            Some(HostObj::Set { items, order, .. }) => render_set(items, *order),
-            Some(HostObj::Map { entries, order, .. }) => render_map(entries, *order),
+            Some(HostObj::Set { items, order, .. }) => render_set(id, items, *order),
+            Some(HostObj::Map { entries, order, .. }) => render_map(id, entries, *order),
             // `Map.Entry.toString()` is `key + "=" + value` — the same shape a
             // map's own rendering gives each pair, which is why an `entrySet`
             // prints as `[a=1, b=2]`.

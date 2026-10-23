@@ -1350,3 +1350,109 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, "abcdefghi\n".repeat(819) + "ab");
 }
+
+/// A collection holding itself renders `(this Collection)` / `(this Map)` (it overflowed the native stack and aborted); `Arrays.deepHashCode` exists, `Arrays.hashCode(null)` is 0 and both are typed `int`; `ArrayList.ensureCapacity`/`trimToSize` are accepted; an `ArrayDeque` refuses `null` from its add family and its copy constructor; `Double.parseDouble`/`Float.parseFloat` say `multiple points` for a second point in the significand. Expected output from openjdk 21.0.12.1.
+#[test]
+fn collection_self_reference_deep_hash_array_deque_nulls_and_parse_messages() {
+    let src = r####"
+import java.util.*;
+public class T {
+    record R(int v) { public String toString() { return "R" + v; } }
+    public static void main(String[] a) {
+        List<Object> l = new ArrayList<>(); l.add(1); l.add(l); l.add(new R(2));
+        Map<Object, Object> m = new LinkedHashMap<>(); m.put("me", m); m.put("r", new R(3));
+        Set<Object> s = new HashSet<>(); s.add(s);
+        Deque<Object> q = new ArrayDeque<>(); q.add(q); q.add("x");
+        System.out.println(l + " " + m + " " + s + " " + q + " " + String.valueOf(l).length());
+        int[] big = new int[50]; Arrays.fill(big, 123456789);
+        System.out.println(Arrays.deepHashCode(new Object[]{new int[]{1, 2}, "s", null, new String[]{"a"}}) + " " + Arrays.deepHashCode(new int[][]{{1, 2}, {3}})
+            + " " + Arrays.deepHashCode(null) + " " + Arrays.hashCode((int[]) null) + " " + Arrays.hashCode(big) * 31 + " " + (Arrays.deepHashCode(new int[][]{big}) + Integer.MAX_VALUE));
+        ArrayList<Integer> al = new ArrayList<>(5); al.add(1); al.ensureCapacity(100); al.trimToSize(); System.out.println(al);
+        Deque<Integer> d = new ArrayDeque<>(); d.add(1);
+        try { d.add(null); } catch (NullPointerException e) { System.out.println("add"); }
+        try { d.offerFirst(null); } catch (NullPointerException e) { System.out.println("offerFirst"); }
+        try { d.push(null); } catch (NullPointerException e) { System.out.println("push"); }
+        try { d.addAll(Arrays.asList(7, 8, null, 9)); } catch (NullPointerException e) { System.out.println("addAll " + d); }
+        try { new ArrayDeque<>(Arrays.asList(1, null)); } catch (NullPointerException e) { System.out.println("ctor"); }
+        Deque<Integer> ll = new LinkedList<>(); ll.add(null); ll.push(null);
+        System.out.println(d.contains(null) + " " + d.remove(null) + " " + ll);
+        for (String t : new String[]{"1.2.3", "..1", "1.2.3f", " 1.2. ", "1e5.5", "0x1.2.3p1", "NaN.."}) {
+            try { Double.parseDouble(t); } catch (NumberFormatException e) { System.out.println("[" + t + "] " + e.getMessage()); }
+            try { Float.parseFloat(t); } catch (NumberFormatException e) { System.out.println("[" + t + "]f " + e.getMessage()); }
+        }
+    }
+}
+"####;
+    let expected = r####"[1, (this Collection), R2] {me=(this Map), r=R3} [(this Collection)] [(this Collection), x] 26
+30646418 31809 0 0 -835269441 -1620238465
+[1]
+add
+offerFirst
+push
+addAll [1, 7, 8]
+ctor
+false false [null, null]
+[1.2.3] multiple points
+[1.2.3]f multiple points
+[..1] multiple points
+[..1]f multiple points
+[1.2.3f] multiple points
+[1.2.3f]f multiple points
+[ 1.2. ] multiple points
+[ 1.2. ]f multiple points
+[1e5.5] For input string: "1e5.5"
+[1e5.5]f For input string: "1e5.5"
+[0x1.2.3p1] For input string: "0x1.2.3p1"
+[0x1.2.3p1]f For input string: "0x1.2.3p1"
+[NaN..] For input string: "NaN.."
+[NaN..]f For input string: "NaN.."
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// `String.getBytes()` (UTF-8, signed bytes) and `getBytes(charset)`, `new String(byte[] [, offset, length] [, charset])`, and the `StandardCharsets` constants, each refused or mis-decoded before (a `byte[]` went through the `char[]` path). Expected output from openjdk 21.0.12.1.
+#[test]
+fn string_get_bytes_and_new_string_from_bytes() {
+    let src = r####"
+import java.util.*;
+import java.nio.charset.StandardCharsets;
+public class T {
+    public static void main(String[] a) throws Exception {
+        String s = "h\u00e9llo\u20ac";
+        byte[] b = s.getBytes();
+        System.out.println(b.length + " " + Arrays.toString(b) + " " + b[1] + " " + (b[1] & 0xff));
+        System.out.println(new String(b) + " " + new String(b, 0, 3) + " " + new String(b, StandardCharsets.UTF_8).equals(s) + " " + new String(b, "UTF-8").length() + " " + (new String(b) == new String(b)));
+        byte[] l1 = s.getBytes(StandardCharsets.ISO_8859_1);
+        System.out.println(Arrays.toString(l1) + " " + new String(l1, StandardCharsets.ISO_8859_1));
+        byte[] as = s.getBytes("US-ASCII");
+        System.out.println(Arrays.toString(as) + " " + new String(new byte[]{72, (byte) 200, 73}, StandardCharsets.US_ASCII));
+        System.out.println(StandardCharsets.UTF_8 + " " + new String(new byte[]{(byte) 0xC3, (byte) 0xA9, 65}, "utf8") + " " + "abc".getBytes()[2] + " " + new String(new byte[0]).isEmpty());
+        try { new String(b, 5, 99); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }
+        int sum = 0;
+        for (byte x : "AB".getBytes()) sum += x;
+        System.out.println(sum);
+    }
+}
+"####;
+    let expected = r####"9 [104, -61, -87, 108, 108, 111, -30, -126, -84] -61 195
+héllo€ hé true 6 false
+[104, -23, 108, 108, 111, 63] héllo?
+[104, 63, 108, 108, 111, 63] H�I
+UTF-8 éA 99 true
+Range [5, 5 + 99) out of bounds for length 9
+131
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}

@@ -2138,6 +2138,7 @@ impl Compiler {
                     | ("repeat", 1) => Some("String".to_string()),
                     ("charAt", 1) => Some("char".to_string()),
                     ("toCharArray", 0) => Some("char[]".to_string()),
+                    ("getBytes", 0 | 1) => Some("byte[]".to_string()),
                     _ => None,
                 }
             }
@@ -8352,6 +8353,29 @@ impl Compiler {
         // `String` as a primitive value rather than an instance, so constructing
         // one is exactly the conversion `String.valueOf` performs.
         if !self.classes.contains_key(class) && class == "String" {
+            // `new String(byte[] [, offset, length] [, charsetName])` decodes
+            // the bytes; only the static type tells a `byte[]` from the
+            // `char[]` a code-point array also is.
+            if args
+                .first()
+                .is_some_and(|a| self.expr_java_type(a).as_deref() == Some("byte[]"))
+            {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let class_c = self.b.add_constant(Value::str("String".to_string()));
+                self.b.emit(Op::LoadConst(class_c), line);
+                let method_c = self.b.add_constant(Value::str("#fromBytes".to_string()));
+                self.b.emit(Op::LoadConst(method_c), line);
+                self.emit_raising_builtin(
+                    crate::host::JSTATIC_DISPATCH,
+                    args.len() as u8 + 2,
+                    line,
+                );
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::JNEW_STRING, 1), line);
+                return Ok(());
+            }
             match args.first() {
                 // A `char[]` argument is a code-point array; `String.valueOf`
                 // concatenates its *characters*, so convert element-wise first.
@@ -10246,7 +10270,8 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Float", "floatToIntBits" | "floatToRawIntBits") => "int",
         ("Float", "intBitsToFloat") => "float",
         ("Integer", "toString") | ("String", "valueOf") | ("String", "format") => "String",
-        ("Arrays", "toString") => "String",
+        ("Arrays", "toString" | "deepToString") => "String",
+        ("Arrays", "hashCode" | "deepHashCode") => "int",
         // The collection factories answer the interface type, which is what
         // lets a call such as `l.remove(List.of(x))` select `remove(Object)`.
         ("List", "of" | "copyOf") | ("Arrays", "asList") => "List",
@@ -10835,6 +10860,11 @@ fn is_breakable(s: &Stmt) -> bool {
 /// their literal value at compile time rather than read from a field.
 fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
     Some(match (class, name) {
+        // `java.nio.charset.StandardCharsets`: a `Charset` is modeled as its
+        // canonical name, which is also what its `toString()` answers.
+        ("StandardCharsets", "UTF_8") => (Value::str("UTF-8".to_string()), "Charset"),
+        ("StandardCharsets", "ISO_8859_1") => (Value::str("ISO-8859-1".to_string()), "Charset"),
+        ("StandardCharsets", "US_ASCII") => (Value::str("US-ASCII".to_string()), "Charset"),
         ("Integer", "MAX_VALUE") => (Value::Int(i32::MAX as i64), "int"),
         ("Integer", "MIN_VALUE") => (Value::Int(i32::MIN as i64), "int"),
         ("Long", "MAX_VALUE") => (Value::Int(i64::MAX), "long"),

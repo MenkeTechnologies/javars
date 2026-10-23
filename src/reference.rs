@@ -903,6 +903,13 @@ pub const REFERENCE: &[Entry] = &[
         "System.out.println(\"Hello\".charAt(1));   // e",
     ),
     (
+        "getBytes",
+        "String Methods",
+        "byte[] getBytes()   |   byte[] getBytes(String charsetName)   |   byte[] getBytes(Charset cs)",
+        "The string encoded as Java's signed bytes: UTF-8 by default (the JDK 18+ default charset), or `UTF-8`, `ISO-8859-1` or `US-ASCII` by name or by a `StandardCharsets` constant, where a character the charset cannot hold becomes `?`. Any other name is `UnsupportedEncodingException`. `new String(bytes [, offset, length] [, charset])` decodes them back, malformed input becoming U+FFFD.",
+        "byte[] b = \"hi\".getBytes();\nSystem.out.println(b[0] + \" \" + new String(b));   // 104 hi",
+    ),
+    (
         "substring",
         "String Methods",
         "String substring(int beginIndex)",
@@ -1525,6 +1532,13 @@ pub const REFERENCE: &[Entry] = &[
         "long Long.decode(String s)",
         "`Integer.decode`'s grammar and messages at 64 bits, so `-0x8000000000000000` is `Long.MIN_VALUE`.",
         "System.out.println(Long.decode(\"#ff\") + \" \" + Long.decode(\"-010\"));   // 255 -8",
+    ),
+    (
+        "Arrays.deepHashCode",
+        "Static Library",
+        "int Arrays.hashCode(T[] a)   |   int Arrays.deepHashCode(Object[] a)",
+        "The `31 * h + e` fold seeded at 1 over the elements' hashes, wrapping at 32 bits; a `null` array is 0. `deepHashCode` folds a nested array by its own `deepHashCode` rather than its identity.",
+        "System.out.println(Arrays.deepHashCode(new int[][]{{1, 2}, {3}}));   // 31809",
     ),
     (
         "Arrays.parallelPrefix",

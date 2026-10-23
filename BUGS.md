@@ -1370,6 +1370,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
+- **`Character.getNumericValue` knows only the digits and the Latin letters.**
+  A letter number, a superscript or circled digit, or a fraction has a numeric
+  value in Java's table — U+216B (Roman numeral twelve) is 12, U+00B2 is 2,
+  U+2460 is 1, and a vulgar fraction such as U+00BD is -2 — and javars answers
+  -1 for each. The decimal digits of every script and the Latin letters,
+  full-width forms included, agree. Measured on `openjdk 21.0.12.1`.
 - **An array type in `instanceof`.** `o instanceof int[]` and the pattern form
   `o instanceof int[] ia` are parse errors (`expected RParen but found
   LBracket`). A reference array carries no element type at run time (see the
@@ -1915,14 +1921,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
     `Deque`/`Queue` methods (`push`/`pop`/`peek*`/`poll*`/`add*`/`offer*`/
     `get*`/`remove*`/`element`) produce the reference's element order and the
     reference's empty-receiver behaviour — the throwing family and the
-    null-answering family are distinguished — but two things the list shape
-    cannot carry differ: `getClass().getSimpleName()` is `ArrayList`, and a null
-    element is accepted where the real `ArrayDeque` throws a
-    `NullPointerException`.
-
-  One further limit is about reach rather than about the answer: pattern binding
-  (`x instanceof Point p`) does not parse, the right-hand side being a bare type
-  name.
+    null-answering family are distinguished — and, like the real one, it
+    refuses a `null` element from every method of its add family (`addAll`
+    adds the elements before the first `null`, then throws). What the list
+    shape cannot carry is the class: `getClass().getSimpleName()` is
+    `ArrayList`.
 
   The *reference cast* reads the same answer. It used to keep its own, narrower
   copy of "what class is this value" — one that named a `String`, a boxed
