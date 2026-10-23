@@ -2804,3 +2804,36 @@ sw 3
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// "Double brace" initialization — an anonymous subclass of a JDK collection whose only member is an instance initializer — builds the collection and runs the block against it: a bare call to one of the collection's own methods (or `this.m(…)`) is a call on it, shadowing an outer method only where the collection declares the name (`put(4)` in an `ArrayList` initializer is the outer static).
+#[test]
+fn double_brace_initialization_of_a_jdk_collection() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static int put(int x) { return x * 10; }
+    public static void main(String[] a) {
+        int base = 5;
+        List<Integer> l = new ArrayList<>() {{ add(1); add(base); this.add(3); addAll(List.of(7, 8)); remove(Integer.valueOf(7)); }};
+        System.out.println(l + " " + l.size());
+        Map<String, Integer> m = new HashMap<>() {{ put("a", 1); put("b", 2); merge("a", 10, Integer::sum); }};
+        System.out.println(m);
+        Set<String> s = new TreeSet<>() {{ add("z"); add("a"); if (size() > 1) add("m"); }};
+        System.out.println(s);
+        List<Integer> l2 = new ArrayList<>() {{ add(put(4)); }};
+        System.out.println(l2 + " " + new LinkedHashMap<String, String>() {{ put("k", "v"); }}.get("k"));
+        Deque<Integer> d = new ArrayDeque<>() {{ push(1); push(2); }};
+        System.out.println(d.peek());
+    }
+}
+"####;
+    let expected = r####"[1, 5, 3, 8] 4
+{a=11, b=2}
+[a, m, z]
+[40] v
+2
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

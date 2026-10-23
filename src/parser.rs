@@ -3998,6 +3998,9 @@ impl Parser {
     /// `toString`/`equals`/`hashCode`, or a *class* supertype — and is lifted to
     /// one by [`Parser::lift_anonymous_class`].
     fn anonymous_class(&mut self, ty: &str, args: Vec<Expr>, line: u32) -> Result<Expr, String> {
+        if let Some(e) = self.double_brace(ty, &args, line)? {
+            return Ok(e);
+        }
         let open = self.pos;
         let class_super = ty == "Object" || !args.is_empty() || self.is_class_name(ty);
         if !class_super {
@@ -4022,6 +4025,212 @@ impl Parser {
             self.pos = open;
         }
         self.lift_anonymous_class(ty, args, class_super, line)
+    }
+
+    /// `new ArrayList<>() {{ add(1); add(2); }}` — the "double brace"
+    /// initialization of a JDK collection: an anonymous subclass whose only
+    /// member is an instance initializer. javars models a collection as a host
+    /// value rather than a class it could subclass, so this is lowered to what
+    /// it computes — the collection, built and then filled by the block, in
+    /// which a bare call to one of the collection's methods (and `this.m(…)`)
+    /// is a call on it, as the inherited member shadows any outer one (JLS
+    /// 6.4.1). `None` for any other anonymous body, which keeps the ordinary
+    /// path (and its refusal).
+    fn double_brace(&mut self, ty: &str, args: &[Expr], line: u32) -> Result<Option<Expr>, String> {
+        let members: &[&str] = match ty {
+            "ArrayList" | "LinkedList" | "Vector" | "Stack" | "ArrayDeque" | "PriorityQueue" => &[
+                "add",
+                "addAll",
+                "remove",
+                "removeAll",
+                "retainAll",
+                "clear",
+                "contains",
+                "containsAll",
+                "size",
+                "isEmpty",
+                "get",
+                "set",
+                "indexOf",
+                "lastIndexOf",
+                "sort",
+                "removeIf",
+                "replaceAll",
+                "forEach",
+                "iterator",
+                "stream",
+                "toArray",
+                "subList",
+                "offer",
+                "poll",
+                "peek",
+                "push",
+                "pop",
+                "addFirst",
+                "addLast",
+                "removeFirst",
+                "removeLast",
+                "getFirst",
+                "getLast",
+                "element",
+                "toString",
+                "hashCode",
+                "equals",
+            ],
+            "HashSet" | "LinkedHashSet" | "TreeSet" => &[
+                "add",
+                "addAll",
+                "remove",
+                "removeAll",
+                "retainAll",
+                "clear",
+                "contains",
+                "containsAll",
+                "size",
+                "isEmpty",
+                "removeIf",
+                "forEach",
+                "iterator",
+                "stream",
+                "toArray",
+                "first",
+                "last",
+                "toString",
+                "hashCode",
+                "equals",
+            ],
+            "HashMap" | "LinkedHashMap" | "TreeMap" => &[
+                "put",
+                "putAll",
+                "putIfAbsent",
+                "remove",
+                "clear",
+                "get",
+                "getOrDefault",
+                "containsKey",
+                "containsValue",
+                "size",
+                "isEmpty",
+                "keySet",
+                "values",
+                "entrySet",
+                "merge",
+                "compute",
+                "computeIfAbsent",
+                "computeIfPresent",
+                "replace",
+                "replaceAll",
+                "forEach",
+                "firstKey",
+                "lastKey",
+                "toString",
+                "hashCode",
+                "equals",
+            ],
+            _ => return Ok(None),
+        };
+        if self.is_class_name(ty) {
+            return Ok(None);
+        }
+        // Exactly `{ { … } }`: one initializer block and nothing else.
+        let open = self.pos;
+        if !matches!(self.toks.get(open + 1).map(|t| &t.kind), Some(Tok::LBrace)) {
+            return Ok(None);
+        }
+        let inner_end = block_end(&self.toks, open + 2);
+        if !matches!(
+            self.toks.get(inner_end + 1).map(|t| &t.kind),
+            Some(Tok::RBrace)
+        ) {
+            return Ok(None);
+        }
+        const SELF: &str = "#dbl";
+        self.double_brace_rewrite(open, members, SELF);
+        self.double_brace_parse(ty, args, line, SELF)
+    }
+
+    /// Retarget the initializer block's bare calls to the collection's own
+    /// methods, and its `this.`, at `self_name`. An insertion moves every later
+    /// token, so each pass rescans; a rewritten call follows a `.` and is not
+    /// matched again.
+    fn double_brace_rewrite(&mut self, open: usize, members: &[&str], self_name: &str) {
+        loop {
+            let inner_end = block_end(&self.toks, open + 2);
+            let next = (open + 2..inner_end).find(|&k| {
+                let after_dot = k > 0 && matches!(self.toks[k - 1].kind, Tok::Dot);
+                let call = matches!(self.toks.get(k + 1).map(|t| &t.kind), Some(Tok::LParen));
+                match &self.toks[k].kind {
+                    Tok::Ident(w) if w == "this" => {
+                        matches!(self.toks.get(k + 1).map(|t| &t.kind), Some(Tok::Dot))
+                    }
+                    Tok::Ident(w) => !after_dot && call && members.contains(&w.as_str()),
+                    _ => false,
+                }
+            });
+            let Some(k) = next else {
+                return;
+            };
+            if matches!(&self.toks[k].kind, Tok::Ident(w) if w == "this") {
+                self.toks[k].kind = Tok::Ident(self_name.to_string());
+            } else {
+                let mut dot = self.toks[k].clone();
+                dot.kind = Tok::Dot;
+                let mut recv = self.toks[k].clone();
+                recv.kind = Tok::Ident(self_name.to_string());
+                self.toks.splice(k..k, [recv, dot]);
+            }
+        }
+    }
+
+    /// Parse the rewritten `{ { … } }` into `((Supplier) () -> { var #dbl =
+    /// new T<>(args); …; return #dbl; }).get()`.
+    fn double_brace_parse(
+        &mut self,
+        ty: &str,
+        args: &[Expr],
+        line: u32,
+        self_name: &str,
+    ) -> Result<Option<Expr>, String> {
+        self.eat(&Tok::LBrace)?;
+        self.eat(&Tok::LBrace)?;
+        self.scope.push((self_name.to_string(), ty.to_string()));
+        let mut body = vec![Stmt::new(
+            line,
+            StmtKind::Local {
+                ty: ty.to_string(),
+                targs: Vec::new(),
+                name: self_name.to_string(),
+                init: Some(Expr::NewObject {
+                    class: ty.to_string(),
+                    args: args.to_vec(),
+                    targs: Some(Vec::new()),
+                    outer: None,
+                    line,
+                }),
+            },
+        )];
+        body.extend(self.block()?);
+        self.eat(&Tok::RBrace)?;
+        body.push(Stmt::new(
+            line,
+            StmtKind::Return(Some(Expr::Var(self_name.to_string()))),
+        ));
+        self.uses_functional = true;
+        Ok(Some(Expr::MethodCall {
+            recv: Box::new(Expr::Cast {
+                ty: "Supplier".to_string(),
+                targs: Vec::new(),
+                expr: Box::new(Expr::Lambda {
+                    params: Vec::new(),
+                    body: LambdaBody::Block(body),
+                    line,
+                }),
+                line,
+            }),
+            method: "get".to_string(),
+            args: Vec::new(),
+            line,
+        }))
     }
 
     /// The lambda an anonymous class body abbreviates, or `None` when the body

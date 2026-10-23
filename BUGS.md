@@ -1438,7 +1438,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   members a subclass can inherit or override, so there is nothing for `super`
   to name. The access-ordered `new LinkedHashMap<>(cap, load, true)` itself is
   modeled (a read or overwrite moves the entry to the end); only the flag's
-  literal `true`/`false` is accepted.
+  literal `true`/`false` is accepted. The one anonymous subclass that is
+  modeled is the "double brace" initializer (`new ArrayList<>() {{ add(1);
+  }}`), lowered to the collection it fills, so its `getClass()` names the
+  collection (`java.util.ArrayList`) where Java names the anonymous class
+  (`T$1`).
 - **Whole library areas that are not modeled are refused by name**, never run
   with a guessed meaning: `java.time`,
   threads and executors (`Thread`, `Executors`, `ConcurrentHashMap`), `UUID`,
