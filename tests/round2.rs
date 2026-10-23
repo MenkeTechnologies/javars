@@ -2248,3 +2248,42 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// The type arguments `javac` infers or states outside a declaration type their expressions too: a JDK factory's from its arguments (`List.of(0.1f)` is a `List<Float>`, `Map.of("a", 1)` a `Map<String, Integer>`, arguments of different types typing nothing), a diamond's from its constructor arguments (`var b = new Box<>(0.1f)`, `new ArrayList<>(aListOfFloat)`), an explicit `new ArrayList<Float>(…)`, and a cast (`(List<Float>) o`, which also targets a lambda it applies to).
+#[test]
+fn jdk_factories_diamonds_and_casts_carry_type_arguments() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    static class Box<V> { V v; Box(V v) { this.v = v; } V get() { return v; } }
+    static <E> void each(List<E> l, Consumer<E> c) { for (E e : l) c.accept(e); }
+    public static void main(String[] args) {
+        Integer[] arr = {2_000_000_000};
+        System.out.println(List.of(0.1f).get(0) + 1 + " " + List.of(2_000_000_000, 1).get(0) * 2 + " " + Arrays.asList(arr).get(0) * 2 + " " + Map.of("a", 2_000_000_000).get("a") * 2 + " " + (Map.entry("k", 0.1f).getValue() + 1) + " " + Optional.of(2_000_000_000).get() * 2);
+        System.out.println(Stream.of(2_000_000_000).map(x -> x * 2).toList() + " " + (Set.of(0.1f).iterator().next() + 1) + " " + (Collections.nCopies(2, 0.1f).get(1) + 1) + " " + (List.copyOf(List.of(0.1f)).get(0) + 1) + " " + List.of(1, 2L).get(0) + " " + List.of(1, 2.5).get(1));
+        each(List.of(2_000_000_000), x -> System.out.println(x + x));
+        var b = new Box<>(0.1f);
+        var bx = new Box<Integer>(2_000_000_000);
+        var l = new ArrayList<Float>(List.of(0.1f));
+        var l2 = new ArrayList<>(List.of(0.1f));
+        var m = new TreeMap<>(Map.of("z", 2_000_000_000));
+        System.out.println(b.get() + 1 + " " + bx.get() * 2 + " " + (l.get(0) + 1) + " " + (l2.get(0) + 1) + " " + m.get("z") * 2 + " " + m.firstEntry().getValue() * 2);
+        Object o = new ArrayList<>(List.of(0.1f));
+        Set<Integer> hs = new TreeSet<>(List.of(2_000_000_000));
+        Object f = (Function<Integer, Integer>) x -> x * 2;
+        System.out.println(((List<Float>) o).get(0) + 1 + " " + (((TreeSet<Integer>) hs).first() + 2_000_000_000) + " " + ((Function<Integer, Integer>) f).apply(2_000_000_000));
+    }
+}
+"####;
+    let expected = r####"1.1 -294967296 -294967296 -294967296 1.1 -294967296
+[-294967296] 1.1 1.1 1.1 1 2.5
+-294967296
+1.1 -294967296 1.1 1.1 -294967296 -294967296
+1.1 -294967296 -294967296
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

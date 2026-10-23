@@ -817,7 +817,10 @@ at the bottom, and are summarized in the section right after this one.
   through the receiver (`Box<Float>`'s `V get()` is a `Float`, a member a
   superclass declares in its own variables excepted), and a user generic
   method's variables are inferred from its arguments' static types
-  (`static <X> X first(List<X>)` on a `List<Float>`). They also
+  (`static <X> X first(List<X>)` on a `List<Float>`), as a JDK factory's are
+  (`List.of(0.1f)` is a `List<Float>`) and a diamond's from its constructor
+  arguments; an explicit `new ArrayList<Float>(…)` and a generic cast
+  (`(List<Float>) o`) carry theirs. They also
   type a lambda: assigned to `Function<Integer, Integer>` (as a local, field,
   argument, or `return` value) its parameter and result are `Integer`, and
   passed to a JDK generic method (`List<Integer>.replaceAll`, `Map.merge`,
@@ -1327,21 +1330,16 @@ storage-model differences:
   `double` width.** A declared type's arguments now type the JDK collection,
   `Optional`, `Iterator`, `Stream` and `java.util.function` members (see
   "Generics" under "Implemented"), so `l.get(0) + 1` on a `List<Float>` is
-  `1.1`, and a user generic class's type variables are substituted and a user
-  generic method's inferred from its arguments the same way. Three positions
-  still carry no type argument: a generic cast (`((List<Float>) o).get(0)`), a
-  `var` initialized by an explicit `new ArrayList<Float>(…)`, and the result of
-  a JDK factory whose type argument `javac` infers (`List.of(0.1f).get(0)`).
-  Measured on `openjdk 21.0.12.1`, each prints `1.1` in Java and
-  `1.1000000014901161` here:
+  `1.1`; a user generic class's type variables are substituted, a generic
+  method's and a JDK factory's inferred from their arguments, and a diamond, an
+  explicit `new ArrayList<Float>(…)` and a generic cast carry theirs the same
+  way. What still carries no type argument is a member a class *inherits* from
+  a parameterized superclass, whose type variable the subclass's `extends`
+  clause binds: with `class FBox extends Box<Float>`, `new FBox(0.1f).get() + 1`
+  is `1.1` in Java and `1.1000000014901161` here (measured on
+  `openjdk 21.0.12.1`).
 
-  ```java
-  Object o = new ArrayList<>(List.of(0.1f));   ((List<Float>) o).get(0) + 1
-  var l = new ArrayList<Float>(List.of(0.1f)); l.get(0) + 1
-  List.of(0.1f).get(0) + 1
-  ```
-
-  Assigning the element to a typed local first (`float g = l.get(0);`) gives
+  Assigning the element to a typed local first (`float g = f.get();`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
 - **`Character.getNumericValue` knows only the digits and the Latin letters.**
@@ -1853,11 +1851,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   conversion itself is performed (see "Widening primitive conversion" under
   "Implemented"), but it is emitted only when the value's own type is
   statically integral, so a value arriving from an erased generic position is
-  left alone: `double e = List.of(9).get(0);` prints `9`, where Java infers
-  `List<Integer>`, unboxes and widens to `9.0` (a declared or inferred type
-  argument does type its position: `double e = l.get(0);` on a
-  `List<Integer>`, and `double d = id(7);` through `static <T> T id(T x)`, are
-  `9.0` and `7.0`). This is the same erasure limit as the `s.get() / 2` entry
+  left alone: with `class IBox extends Box<Integer>`, `double e = new
+  IBox(9).get();` prints `9`, where Java unboxes and widens to `9.0` (a declared
+  or inferred type argument does type its position: `double e = l.get(0);` on
+  a `List<Integer>`, `List.of(9).get(0)`, and `double d = id(7);` through
+  `static <T> T id(T x)` are all widened). This is the same erasure limit as the `s.get() / 2` entry
   above. Every source javars can type — a literal, a local,
   a field, an array element, a declared-return method — converts.
 - **`==` on objects and on strings is reference identity.** Object and array

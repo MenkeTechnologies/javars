@@ -2465,6 +2465,7 @@ impl Parser {
         let npe = Stmt::new(
             line,
             StmtKind::Throw(Expr::NewObject {
+                targs: None,
                 class: "NullPointerException".to_string(),
                 args: vec![Expr::Str(
                     "Cannot enter synchronized block because the monitor is null".to_string(),
@@ -3407,7 +3408,9 @@ impl Parser {
             name = seg.clone();
             j += 2;
         }
-        // Type arguments are erased, so they only have to be stepped over.
+        // Type arguments are erased from the cast's class, so they are stepped
+        // over here and read for static typing once this is known to be a cast.
+        let lt_at = matches!(at(j), Tok::Lt).then_some(j);
         if matches!(at(j), Tok::Lt) {
             let mut depth = 0;
             loop {
@@ -3459,6 +3462,13 @@ impl Parser {
             return Ok(None);
         }
         let line = self.toks[j].line;
+        let targs = match lt_at {
+            Some(p) if !name.ends_with("[]") => {
+                self.pos = p;
+                self.type_args()
+            }
+            _ => Vec::new(),
+        };
         self.pos = j + 1;
         // JLS 15.16: a reference cast may also apply to a lambda, which gives
         // the lambda its target type (`(Runnable) () -> go()`, `(UnaryOperator<T>)
@@ -3470,6 +3480,7 @@ impl Parser {
         };
         Ok(Some(Expr::Cast {
             ty: name,
+            targs,
             expr: Box::new(expr),
             line,
         }))
@@ -3490,10 +3501,15 @@ impl Parser {
                 if self.is(&Tok::New) {
                     e = match self.new_expr()? {
                         Expr::NewObject {
-                            class, args, line, ..
+                            class,
+                            args,
+                            targs,
+                            line,
+                            ..
                         } => Expr::NewObject {
                             class,
                             args,
+                            targs,
                             outer: Some(Box::new(e)),
                             line,
                         },
@@ -3584,6 +3600,7 @@ impl Parser {
                     };
                     e = Expr::Cast {
                         ty: "Comparator".to_string(),
+                        targs: Vec::new(),
                         expr: Box::new(lambda),
                         line,
                     };
@@ -3869,8 +3886,8 @@ impl Parser {
             ty = self.ident()?;
         }
         // Diamond / explicit type arguments (`new Box<>()`, `new Box<Integer>()`)
-        // — erased.
-        self.skip_generics();
+        // — erased from the class, kept beside it for static typing.
+        let targs = self.is(&Tok::Lt).then(|| self.type_args());
         if self.is(&Tok::LBracket) {
             self.advance();
             if self.is(&Tok::RBracket) {
@@ -3936,6 +3953,7 @@ impl Parser {
         Ok(Expr::NewObject {
             class: ty,
             args,
+            targs,
             outer: None,
             line,
         })
@@ -4182,6 +4200,7 @@ impl Parser {
         Ok(Expr::NewObject {
             class: binary,
             args,
+            targs: None,
             outer: None,
             line,
         })

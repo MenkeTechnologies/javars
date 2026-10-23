@@ -1729,6 +1729,17 @@ impl Compiler {
     fn expr_generic(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Var(name) => self.var_generic(name),
+            // `(List<Float>) o` states the type outright.
+            Expr::Cast { ty, targs, .. } => with_targs(ty, targs),
+            // `new Box<Float>(…)` names its arguments; the diamond infers
+            // them from the constructor's arguments, as `javac` does when no
+            // target type supplies them (a `var` initializer).
+            Expr::NewObject {
+                class, args, targs, ..
+            } => match targs.as_deref()? {
+                [] => self.diamond_generic(class, args),
+                t => with_targs(class, t),
+            },
             Expr::Field { recv, name } => {
                 if let Some((owner, _)) = self.static_field_ref(e) {
                     let (_, g) = self.classes.get(&owner)?.field_generic.get(name)?;
@@ -1748,6 +1759,11 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                if let Expr::Var(class) = recv.as_ref() {
+                    if is_static_class(class) && !self.is_declared_var(class) {
+                        return self.jdk_factory_generic(class, method, args);
+                    }
+                }
                 if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys = self.arg_types(args);
                     let resolved = self.resolve_static_on(&class, method, &arg_tys)?;
@@ -1992,6 +2008,101 @@ impl Compiler {
             ("map", "reversed", 0) => of(base, targs),
             ("entry", "getKey", 0) => arg(0),
             ("entry", "getValue", 0) | ("entry", "setValue", 1) => arg(1),
+            _ => None,
+        }
+    }
+
+    /// The generic type a diamond `new C<>(args)` infers: a user class's type
+    /// variables bound from its constructor's parameters, or a JDK
+    /// collection's element types copied from the collection it is built from
+    /// (`new ArrayList<>(aListOfFloat)` is an `ArrayList<Float>`).
+    fn diamond_generic(&self, class: &str, args: &[Expr]) -> Option<String> {
+        if let Some(info) = self.classes.get(class) {
+            let (param_tys, _) = self.resolve_ctor(class, &self.arg_types(args))?;
+            let mangled = mangle(class, "<init>", &param_tys);
+            let bound: Vec<String> = info
+                .type_params
+                .iter()
+                .map(|p| self.inferred(&mangled, args, &format!("#{p}")))
+                .collect();
+            return bound
+                .iter()
+                .any(|t| is_known_type(t))
+                .then(|| format!("{class}<{}>", bound.join(",")));
+        }
+        let [src] = args else {
+            return None;
+        };
+        let (base, targs) = crate::ast::generic_parts(&self.expr_generic(src)?);
+        let (want, have) = (collection_kind(class)?, collection_kind(&base)?);
+        let same = (want == "map") == (have == "map") && have != "entry";
+        same.then(|| with_targs(class, &targs)).flatten()
+    }
+
+    /// The generic type a JDK static factory answers when `javac` infers its
+    /// type argument from the arguments alone: `List.of(0.1f)` is a
+    /// `List<Float>`, `Map.of("a", 1)` a `Map<String, Integer>`. Arguments of
+    /// different types meet at a least upper bound javars does not compute, so
+    /// they type nothing.
+    fn jdk_factory_generic(&self, class: &str, method: &str, args: &[Expr]) -> Option<String> {
+        let ty = |a: &Expr| -> Option<String> {
+            self.expr_generic(a).or_else(|| {
+                let t = self.expr_java_type(a)?;
+                Some(wrapper_of(&t).map_or(t.clone(), str::to_string))
+            })
+        };
+        // One type shared by every expression in `es`.
+        let common = |es: &[&Expr]| -> Option<String> {
+            let mut tys = es.iter().map(|e| ty(e));
+            let first = tys.next()??;
+            (is_known_type(&crate::ast::generic_parts(&first).0) && first != NULL_LITERAL)
+                .then_some(())?;
+            tys.all(|t| t.as_deref() == Some(first.as_str()))
+                .then_some(first)
+        };
+        let elems: Vec<&Expr> = args.iter().collect();
+        let of = |outer: &str, inner: Option<String>| inner.map(|t| format!("{outer}<{t}>"));
+        match (class, method) {
+            ("List" | "Set" | "Stream", "of") | ("Arrays", "asList") => {
+                let outer = if class == "Arrays" { "List" } else { class };
+                // A lone reference array is the varargs array itself.
+                if let [one] = args {
+                    if let Some(el) = self
+                        .expr_java_type(one)
+                        .and_then(|t| t.strip_suffix("[]").map(str::to_string))
+                        .filter(|el| is_reference_type(el))
+                    {
+                        return of(outer, Some(el));
+                    }
+                }
+                of(outer, common(&elems))
+            }
+            ("Optional", "of" | "ofNullable") | ("Collections", "singletonList") => {
+                let outer = if class == "Optional" {
+                    "Optional"
+                } else {
+                    "List"
+                };
+                of(outer, common(&elems))
+            }
+            ("Collections", "singleton") => of("Set", common(&elems)),
+            ("Collections", "nCopies") => of("List", common(elems.get(1..)?)),
+            ("List" | "Set", "copyOf") => {
+                let (base, targs) = crate::ast::generic_parts(&self.expr_generic(args.first()?)?);
+                matches!(collection_kind(&base)?, "list" | "set" | "pq")
+                    .then(|| of(class, targs.into_iter().next()))
+                    .flatten()
+            }
+            ("Map", "of") if args.len() % 2 == 0 && !args.is_empty() => {
+                let keys: Vec<&Expr> = args.iter().step_by(2).collect();
+                let vals: Vec<&Expr> = args.iter().skip(1).step_by(2).collect();
+                Some(format!("Map<{},{}>", common(&keys)?, common(&vals)?))
+            }
+            ("Map", "entry") if args.len() == 2 => Some(format!(
+                "Entry<{},{}>",
+                common(&elems[..1])?,
+                common(&elems[1..])?
+            )),
             _ => None,
         }
     }
@@ -5202,6 +5313,7 @@ impl Compiler {
                 return Ok(Some(lambda(
                     ps.clone(),
                     Expr::NewObject {
+                        targs: None,
                         class: name.to_string(),
                         args: vars(&ps),
                         outer: None,
@@ -5254,6 +5366,7 @@ impl Compiler {
         // only reachable through a functional type javars would have to infer.
         if method == "new" && has_no_arg_constructor(name) {
             let fresh = |args: Vec<Expr>| Expr::NewObject {
+                targs: None,
                 class: name.to_string(),
                 args,
                 outer: None,
@@ -7681,6 +7794,7 @@ impl Compiler {
                 args,
                 outer,
                 line,
+                ..
             } => self.new_object(class, args, outer.as_deref(), *line)?,
             Expr::InstanceOf {
                 expr,
@@ -7731,7 +7845,23 @@ impl Compiler {
                     UnOp::Plus => {}
                 }
             }
-            Expr::Cast { ty, expr, line } => self.cast(ty, expr, *line)?,
+            Expr::Cast {
+                ty,
+                targs,
+                expr,
+                line,
+            } => {
+                // `(Function<Integer, Integer>) x -> x * 2` gives the lambda its
+                // target (JLS 15.16), typed by the cast's arguments as a
+                // declaration's would type it.
+                if matches!(expr.as_ref(), Expr::Lambda { .. }) {
+                    self.lambda_target = Some(ty.clone());
+                    self.lambda_generic = with_targs(ty, targs);
+                }
+                let r = self.cast(ty, expr, *line);
+                self.lambda_generic = None;
+                r?
+            }
             Expr::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs)?,
             Expr::Ternary { cond, then, els } => self.ternary(cond, then, els)?,
             // Println/PostIncDec in value position are handled as statements;
@@ -12177,6 +12307,7 @@ fn check_duplicate_params(params: &[Param], owner: &str, line: u32) -> Result<()
 /// element type, which an erased receiver does not carry).
 fn enum_set_factory(method: &str, args: &[Expr], line: u32) -> Option<Expr> {
     let tree_set = |args: Vec<Expr>| Expr::NewObject {
+        targs: None,
         class: "TreeSet".to_string(),
         args,
         outer: None,

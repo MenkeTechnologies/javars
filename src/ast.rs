@@ -538,6 +538,9 @@ pub enum Expr {
     /// because the host heap already carries each object's class.
     Cast {
         ty: String,
+        /// The type arguments written on the cast type (`(List<Float>) o`), see
+        /// [`StmtKind::Local::targs`].
+        targs: Vec<String>,
         expr: Box<Expr>,
         line: u32,
     },
@@ -601,6 +604,10 @@ pub enum Expr {
     NewObject {
         class: String,
         args: Vec<Expr>,
+        /// The type arguments written on the class (`new Box<Float>(…)`), in
+        /// [`generic_parts`] form: `None` for a raw `new Box(…)`, empty for the
+        /// diamond `new Box<>(…)`, whose arguments are inferred.
+        targs: Option<Vec<String>>,
         /// The explicit enclosing instance of `outer.new Inner(…)`; `None` for
         /// a bare `new`, whose enclosing instance (for an inner class) is the
         /// innermost `this` of the right type.
