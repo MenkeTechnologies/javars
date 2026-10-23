@@ -3058,6 +3058,14 @@ impl Parser {
                     j += 1;
                 }
             }
+            // `case int[] ia` — an array type pattern.
+            let mut class = class;
+            while matches!(self.toks[j].kind, Tok::LBracket)
+                && matches!(self.toks.get(j + 1).map(|t| &t.kind), Some(Tok::RBracket))
+            {
+                class.push_str("[]");
+                j += 2;
+            }
             // `case Pt(int x, int y)` — a record pattern, told apart by the
             // `(` that no constant label can have here.
             if matches!(self.toks[j].kind, Tok::LParen) {
@@ -3205,10 +3213,19 @@ impl Parser {
                 // `List`. `ident()` alone stopped at the first segment and left
                 // the `.` for the expression parser, which then reported a
                 // missing `)`.
-                let class = self.simple_type_name()?;
+                let mut class = self.simple_type_name()?;
                 // `o instanceof List<?>` — the type argument is erased, so it is
                 // parsed and discarded exactly as every other type position's is.
                 self.skip_generics();
+                // `o instanceof int[]` — an array type, answered from the type
+                // the array's creation recorded.
+                while self.is(&Tok::LBracket)
+                    && matches!(self.toks[self.pos + 1].kind, Tok::RBracket)
+                {
+                    self.advance();
+                    self.advance();
+                    class.push_str("[]");
+                }
                 // A *type pattern* names a variable after the type
                 // (`o instanceof String s`), which Java binds to the tested
                 // value wherever the pattern definitely matched. An identifier

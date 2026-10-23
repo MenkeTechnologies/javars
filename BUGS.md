@@ -1414,11 +1414,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   put three quotes in a block) closes it early and the rest of the line is a
   lex error (``unexpected character `\` ``). Measured on `openjdk 25.0.2`.
 
-- **An array type in `instanceof`.** `o instanceof int[]` and the pattern form
-  `o instanceof int[] ia` are parse errors (`expected RParen but found
-  LBracket`). A reference array carries no element type at run time (see the
-  `ArrayStoreException` entry below), so the test could not distinguish
-  `int[]` from `String[]` even once it parsed.
+- **`instanceof` an array type needs the array's recorded type.** `o
+  instanceof int[]` (and the `int[] ia` pattern) reads the type the array's
+  creation recorded: `new`, a typed literal, varargs, `values()`, `split`,
+  `toCharArray`, `getBytes`, `toArray`, `clone`, `copyOf`. An array made
+  anywhere else (a bare `{…}` with no declared type to read, or a host method
+  not in that list) has no recorded type, and the test stops with
+  ``javars: `instanceof int[]` on an array whose element type javars did not
+  record`` rather than guess.
 - **The JVM-describing `System.getProperty` keys, `Character.isEmoji` and
   `Character.getName`** are refused. The first describe a JVM, and the last
   two need Unicode tables javars does not carry (the general category,

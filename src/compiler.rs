@@ -1330,7 +1330,17 @@ impl Compiler {
         let name = name.clone();
         self.declare_local(&name, "String[]", NumType::Other);
         self.b.emit(Op::CallBuiltin(crate::host::JARGV, 0), 0);
+        self.emit_array_tag("String[]", 0);
         self.emit_set(&name, 0);
+    }
+
+    /// Record the array on top of the stack as having type `ty` (see
+    /// [`crate::host::JARRAY_TAG`]), leaving it there.
+    fn emit_array_tag(&mut self, ty: &str, line: u32) {
+        let c = self.b.add_constant(Value::str(ty.to_string()));
+        self.b.emit(Op::LoadConst(c), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JARRAY_TAG, 2), line);
     }
 
     /// The class declaring the `static` field an unqualified `name` refers to,
@@ -1557,6 +1567,7 @@ impl Compiler {
             }
             self.b.emit(array_build_op(i, len), line);
         }
+        self.emit_array_tag(&format!("{class}[]"), line);
     }
 
     /// `Enum.valueOf(Color.class, s)` rewritten to the `Color.valueOf(s)` it is
@@ -8191,6 +8202,8 @@ impl Compiler {
                         0,
                     );
                 }
+                let dims = sizes.len() + extra_dims;
+                self.emit_array_tag(&format!("{elem_ty}{}", "[]".repeat(dims)), 0);
             }
             Expr::ArrayLit { elems, elem_ty } => {
                 let elem_ty = elem_ty.clone();
@@ -10675,6 +10688,9 @@ impl Compiler {
                 self.expr_targeted(el, elem_ty)?;
             }
             self.b.emit(array_build_op(i, len), 0);
+        }
+        if let Some(t) = elem_ty {
+            self.emit_array_tag(&format!("{t}[]"), 0);
         }
         Ok(())
     }

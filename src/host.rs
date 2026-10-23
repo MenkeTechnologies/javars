@@ -411,6 +411,12 @@ pub const JITER_GET: u16 = 758;
 /// `argc == 2`.
 pub const JCLASS_STR: u16 = 759;
 
+/// Record an array's type (`int[]`, `String[][]`) for `instanceof` to read —
+/// the element type a `HostObj::Array` does not carry. Stack `[array, type]`;
+/// `argc == 2`; answers the array. A multi-dimensional type tags the nested
+/// arrays it holds with the inner types too.
+pub const JARRAY_TAG: u16 = 760;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -3051,6 +3057,7 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JSB_NEW, b_sb_new);
     vm.register_builtin(JCOLL_DISPATCH, b_coll_dispatch);
     vm.register_builtin(JITER_ARRAY, b_iter_array);
+    vm.register_builtin(JARRAY_TAG, b_array_tag);
 }
 
 /// `main`'s `String[] args` — a fresh array of the program arguments.
@@ -4295,7 +4302,7 @@ fn collection_to_array(
     items: Vec<Value>,
     arg: Option<&Value>,
 ) -> Result<Value, Fault> {
-    let fresh = |items: Vec<Value>| Ok(Value::Obj(heap_alloc(HostObj::Array(items))));
+    let fresh = |items: Vec<Value>| Ok(typed_array(items, "Object[]"));
     let target = match arg {
         None => return fresh(items),
         Some(Value::Undef) => return Err(Fault::java("NullPointerException", String::new())),
@@ -4327,7 +4334,9 @@ fn collection_to_array(
     if filled {
         Ok(target)
     } else {
-        fresh(items)
+        // Too short: a new array of the argument's runtime type.
+        let ty = array_type(&target).unwrap_or_else(|| "Object[]".to_string());
+        Ok(typed_array(items, &ty))
     }
 }
 
@@ -6038,6 +6047,10 @@ thread_local! {
     /// a `Set` whatever it wraps.
     static PLAIN_VIEWS: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// Each array's type where its creation knew it (see [`JARRAY_TAG`]):
+    /// the element type a `HostObj::Array` erases, which `instanceof int[]`
+    /// needs. An array made where javars knows no element type is absent.
+    static ARRAY_TYPES: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::default());
     /// The JDK wrapper class each `Collections.unmodifiable*` view (and the
     /// `System.getenv()` map) is an instance of — what `getClass()` names,
     /// which the view's own shape cannot tell (`Collections$UnmodifiableMap`
@@ -6939,6 +6952,81 @@ fn build_nested(sizes: &[i64], default: &Value) -> Option<Value> {
     Some(Value::Obj(heap_alloc(HostObj::Array(elems))))
 }
 
+/// Record `ty` as the type of the array `v` and, for a multi-dimensional
+/// type, of the arrays it holds.
+fn tag_array(v: &Value, ty: &str) {
+    let Value::Obj(id) = v else {
+        return;
+    };
+    let Some(items) = array_items(v) else {
+        return;
+    };
+    ARRAY_TYPES.with(|t| t.borrow_mut().insert(*id, ty.to_string()));
+    if let Some(inner) = ty.strip_suffix("[]").filter(|t| t.ends_with("[]")) {
+        for item in &items {
+            if ARRAY_TYPES.with(|t| {
+                !t.borrow().contains_key(&match item {
+                    Value::Obj(i) => *i,
+                    _ => u32::MAX,
+                })
+            }) {
+                tag_array(item, inner);
+            }
+        }
+    }
+}
+
+/// The recorded type of the array `v`, if any.
+fn array_type(v: &Value) -> Option<String> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    ARRAY_TYPES.with(|t| t.borrow().get(id).cloned())
+}
+
+/// A fresh array of `items` whose type is `ty`.
+fn typed_array(items: Vec<Value>, ty: &str) -> Value {
+    let v = Value::Obj(heap_alloc(HostObj::Array(items)));
+    tag_array(&v, ty);
+    v
+}
+
+/// [`JARRAY_TAG`].
+fn b_array_tag(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let arr = args.first().cloned().unwrap_or(Value::Undef);
+    if let Some(ty) = args.get(1) {
+        tag_array(&arr, &ty.as_str_cow());
+    }
+    arr
+}
+
+/// Whether an array of type `have` is an instance of the array type `want`
+/// (JLS 4.10.3): the same type, or a reference array where the elements are
+/// themselves instances — `String[]` is an `Object[]`, `Dog[]` an `Animal[]`,
+/// `int[][]` an `Object[]`; a primitive array is only itself.
+fn array_type_is(have: &str, want: &str) -> bool {
+    if have == want {
+        return true;
+    }
+    let (Some(h), Some(w)) = (have.strip_suffix("[]"), want.strip_suffix("[]")) else {
+        return false;
+    };
+    let primitive = |t: &str| {
+        matches!(
+            t,
+            "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean"
+        )
+    };
+    if primitive(h) || primitive(w) {
+        return false;
+    }
+    if w == "Object" || h.ends_with("[]") || w.ends_with("[]") {
+        return w == "Object" || array_type_is(h, w);
+    }
+    is_subclass_of(h, w)
+}
+
 /// `{a, b, …}` — build an array from the popped element values.
 fn b_array_lit(vm: &mut VM, argc: u8) -> Value {
     let elems = pop_args(vm, argc);
@@ -7147,6 +7235,21 @@ fn b_instanceof(vm: &mut VM, argc: u8) -> Value {
         .get(1)
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
+    // An array type is answered from the type the array's creation recorded.
+    if target.ends_with("[]") {
+        if array_items(&obj).is_none() {
+            return Value::bool(false);
+        }
+        return match array_type(&obj) {
+            Some(have) => Value::bool(array_type_is(&have, &target)),
+            None => raise(
+                vm,
+                Fault::internal(format!(
+                    "javars: `instanceof {target}` on an array whose element type javars did not record"
+                )),
+            ),
+        };
+    }
     Value::bool(is_instance_of(&obj, &target))
 }
 
@@ -10050,7 +10153,15 @@ fn stream_method(
         ),
         // ── terminal ──
         ("toList", 0) => Ok(list_value(all(vm), Fixity::Immutable)),
-        ("toArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(all(vm))))),
+        ("toArray", 0) => {
+            let ty = match kind {
+                StreamKind::Ref => "Object[]",
+                StreamKind::Int => "int[]",
+                StreamKind::Long => "long[]",
+                StreamKind::Double => "double[]",
+            };
+            Ok(typed_array(all(vm), ty))
+        }
         // `toArray(generator)`: the elements, in the array the generator makes.
         ("toArray", 1) => {
             let items = all(vm);
@@ -11879,7 +11990,11 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // shallow copy, so the rows of a cloned `int[][]` are shared.
     if method == "clone" && args.is_empty() {
         if let Some(items) = array_items(&recv) {
-            return Value::Obj(heap_alloc(HostObj::Array(items)));
+            let copy = Value::Obj(heap_alloc(HostObj::Array(items)));
+            if let (Some(ty), Value::Obj(id)) = (array_type(&recv), &copy) {
+                ARRAY_TYPES.with(|t| t.borrow_mut().insert(*id, ty));
+            }
+            return copy;
         }
     }
     // A method call on a `null` reference is Java's NPE, not an empty string.
@@ -12476,9 +12591,10 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
-        ("toCharArray", 0) => Ok(Value::Obj(heap_alloc(HostObj::Array(
+        ("toCharArray", 0) => Ok(typed_array(
             s.chars().map(|c| Value::Int(c as i64)).collect(),
-        )))),
+            "char[]",
+        )),
         // `getBytes()` is UTF-8, the JDK 18+ default charset; the bytes are
         // Java's signed ones.
         ("getBytes", 0 | 1) => {
@@ -12486,12 +12602,13 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
                 Some(c) => charset_named(&c.as_str_cow())?,
                 None => Charset::Utf8,
             };
-            Ok(Value::Obj(heap_alloc(HostObj::Array(
+            Ok(typed_array(
                 cs.encode(s)
                     .into_iter()
                     .map(|b| Value::Int(i64::from(b as i8)))
                     .collect(),
-            ))))
+                "byte[]",
+            ))
         }
         // `"%s".formatted(x)` is `String.format("%s", x)` with the receiver as
         // the format string.
@@ -12504,9 +12621,10 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
             let limit = args.get(1).map_or(0, JavaNumeric::jint);
             let parts = pat.split(s, limit).map_err(engine_fault)?;
-            Ok(Value::Obj(heap_alloc(HostObj::Array(
+            Ok(typed_array(
                 parts.into_iter().map(Value::str).collect(),
-            ))))
+                "String[]",
+            ))
         }
         ("replaceAll", 2) | ("replaceFirst", 2) => {
             let compiled = crate::regex::compile(&args[0].as_str_cow());
@@ -16076,7 +16194,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             let pad = array_pad(&args[2..], &items);
             let mut out = items;
             out.resize(len as usize, pad);
-            Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
+            Ok(match array_type(&args[0]) {
+                Some(ty) => typed_array(out, &ty),
+                None => Value::Obj(heap_alloc(HostObj::Array(out))),
+            })
         }
         ("Arrays", "copyOfRange", 3 | 4) => {
             let items = array_items(&args[0]).unwrap_or_default();
@@ -16102,7 +16223,10 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 .unwrap_or_default()
                 .to_vec();
             out.resize(to - from, pad);
-            Ok(Value::Obj(heap_alloc(HostObj::Array(out))))
+            Ok(match array_type(&args[0]) {
+                Some(ty) => typed_array(out, &ty),
+                None => Value::Obj(heap_alloc(HostObj::Array(out))),
+            })
         }
         // `Arrays.binarySearch` returns `-(insertion point) - 1` when absent,
         // exactly as the JDK does — and when the key is present *more than

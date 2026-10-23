@@ -2754,3 +2754,53 @@ true
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `o instanceof int[]` and the `int[] ia` pattern (in `instanceof` and `switch`) answer from the array type its creation recorded — `new`, a typed literal, varargs, `values()`, `split`, `toCharArray`, `toArray`, `clone`, `copyOf` — with Java's covariance: `String[]` and `int[][]` are `Object[]`, `Dog[]` an `Animal[]`, `int[]` nothing but itself.
+#[test]
+fn instanceof_an_array_type_reads_the_recorded_element_type() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static class Animal {} static class Dog extends Animal {}
+    static String kind(Object o) {
+        if (o instanceof int[] ia) return "int[" + ia.length + "]";
+        if (o instanceof char[]) return "char[]";
+        if (o instanceof String[] sa) return "String[" + sa.length + "]";
+        if (o instanceof Animal[]) return "Animal[]";
+        if (o instanceof int[][]) return "int[][]";
+        if (o instanceof Object[] oa) return "Object[" + oa.length + "]";
+        return "other";
+    }
+    static boolean varargs(int... xs) { Object o = xs; return o instanceof int[]; }
+    enum C { R, G }
+    public static void main(String[] args) {
+        Object[] samples = { new int[3], new char[]{'a'}, "a,b".split(","), new Dog[2], new Animal[1], new int[2][2], new Integer[]{1}, "x".toCharArray(), C.values(), List.of(1, 2).toArray(), new int[][]{{1}}, new int[2][2][0], "s", 5, null, "ab".getBytes(), new long[0], args };
+        StringBuilder sb = new StringBuilder();
+        for (Object o : samples) sb.append(kind(o)).append(' ');
+        System.out.println(sb);
+        int[][] g = new int[2][3];
+        Object row = g[1];
+        System.out.println((row instanceof int[]) + " " + (((Object) g) instanceof Object[]) + " " + (((Object) new String[0]) instanceof Object[]) + " " + (((Object) new int[0]) instanceof Object[]));
+        Object cl = new int[]{4, 5}.clone();
+        System.out.println(cl instanceof int[] && !(cl instanceof long[]));
+        Object cp = Arrays.copyOf(new String[]{"q"}, 3);
+        System.out.println(cp instanceof String[] s ? s.length : -1);
+        System.out.println(java.util.stream.IntStream.range(0, 3).toArray() instanceof int[]);
+        Object fromList = List.of(1).toArray(new Integer[0]);
+        System.out.println((fromList instanceof Integer[]) + " " + (List.of("a").stream().toArray(String[]::new) instanceof String[]) + " " + varargs(1, 2));
+        switch (samples[0]) { case int[] ia -> System.out.println("sw " + ia.length); default -> System.out.println("d"); }
+    }
+}
+"####;
+    let expected = r####"int[3] char[] String[2] Animal[] Animal[] int[][] Object[1] char[] Object[2] Object[2] int[][] Object[2] other other other other other String[0] 
+true true true false
+true
+3
+true
+true true true
+sw 3
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
