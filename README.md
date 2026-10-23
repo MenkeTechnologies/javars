@@ -385,7 +385,7 @@ Implemented and checked against the reference `java`:
   combiner)`, and `Double::sum`/`max`/`min` and `Integer::toBinaryString`
   and its radix siblings are nameable statics.
 - **`java.util` collections** — `List`/`ArrayList`/`LinkedList`,
-  `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
+  `Stack`/`Vector`, `Deque`/`Queue`/`ArrayDeque`, `Map`/`HashMap`/
   `LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/`TreeSet`, the copy
   constructors, `Arrays.asList`, `List.of`/`Set.of`, `EnumMap` and
   `EnumSet.of`/`noneOf`/`allOf`/`copyOf` (ordinal order, as the `TreeMap`/
@@ -677,8 +677,8 @@ Next waves, in priority order:
    iteration order the JDK randomizes per run. See [`BUGS.md`](BUGS.md) for the
    stages and collectors that do run.
 2. **Generic type arguments** — javars erases them at parse time, so an element
-   read back out of a `List<Float>` or `List<Character>` is untyped and
-   computes at the wrong width (see [`BUGS.md`](BUGS.md)).
+   read back out of a `List<Float>` is untyped and computes at `double` width
+   (see [`BUGS.md`](BUGS.md)).
 
 See [`BUGS.md`](BUGS.md) for the honest known-gaps list.
 

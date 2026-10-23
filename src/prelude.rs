@@ -57,6 +57,7 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ("PatternSyntaxException", "IllegalArgumentException"),
     ("ConcurrentModificationException", "RuntimeException"),
     ("NoSuchElementException", "RuntimeException"),
+    ("EmptyStackException", "RuntimeException"),
     ("InputMismatchException", "NoSuchElementException"),
     ("IOException", "Exception"),
     ("ArrayStoreException", "RuntimeException"),
@@ -128,6 +129,7 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
         "IOException" => format!("java.io.{name}"),
         "ConcurrentModificationException"
         | "NoSuchElementException"
+        | "EmptyStackException"
         | "InputMismatchException"
         | "IllegalFormatException"
         | "IllegalFormatConversionException"

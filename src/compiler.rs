@@ -550,6 +550,11 @@ struct Compiler {
     /// parameters stay untyped; what the hint buys is the boxing conversion on
     /// the result, which is what turns a `char` body into a `Character`.
     lambda_ret_hint: Option<String>,
+    /// Set while lowering an arithmetic `Binary` whose result a numeric cast or
+    /// a numeric target consumes, so an operand of unknown type that turns out
+    /// to be a `char` that crossed an erased call as its one-character String
+    /// adds as its code point rather than concatenating. Taken by the `Binary` it is set for.
+    numeric_operands: bool,
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
@@ -707,6 +712,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_counter: 0,
         lambda_target: None,
         lambda_ret_hint: None,
+        numeric_operands: false,
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
@@ -3638,10 +3644,10 @@ impl Compiler {
     /// The wrapper class `e` autoboxes into when it crosses into a reference
     /// position, or `None` when it crosses unchanged.
     ///
-    /// `char` and `boolean` are absent on purpose. A `char` in a collection is
-    /// javars's one-character String (see BUGS.md), which is what makes
-    /// `System.out.println(aCharacterList)` print `[p, q]`; `boolean` is not a
-    /// boxed class here at all. An expression javars cannot type is left alone,
+    /// `char` and `boolean` are absent on purpose. A `char` is boxed to its
+    /// `Character` by each caller that needs one, since several positions want
+    /// its one-character String instead (a `String`-method argument, a string
+    /// conversion); `boolean` is not a boxed class here at all. An expression javars cannot type is left alone,
     /// so it compares by value exactly as it did before.
     fn autobox_code(&self, e: &Expr) -> Option<i64> {
         let ty = self.expr_java_type(e)?;
@@ -4276,9 +4282,7 @@ impl Compiler {
             // makes `((Object) 'x').getClass()` answer `java.lang.Character` and
             // `o instanceof Character` `true`. A `Character` box renders as its
             // character, so it prints exactly as the one-character String this
-            // used to produce; a *collection* element still takes that String
-            // (see the note at `JCOLL_DISPATCH`), which is the one place the two
-            // models still differ.
+            // used to produce. A collection element boxes the same way.
             // The *primitive* `char` only: a `Character`-typed expression is
             // already a reference, and boxing it again would make
             // `Character c = 'z'; Object o = c; o == c` `false` where Java —
@@ -4307,6 +4311,12 @@ impl Compiler {
                 }
             }
             let widen = self.widen_target(target, e);
+            self.numeric_operands = target.is_some_and(|t| {
+                matches!(
+                    t,
+                    "int" | "long" | "short" | "byte" | "char" | "double" | "float"
+                )
+            }) && is_arithmetic_binary(e);
             self.expr(e)?;
             // Unboxing runs *before* any widening and boxing *after* it, which
             // is the order Java converts in: `double d = anInteger` unboxes to
@@ -7463,7 +7473,11 @@ impl Compiler {
                     // stores `2.0`.
                     let fill_value =
                         class == "Arrays" && method == "fill" && i > 0 && i + 1 == args.len();
-                    if stringify {
+                    // A factory element boxes a `char` to its `Character` below
+                    // rather than taking the text.
+                    let boxed_char = (box_args || class == "Collections")
+                        && self.expr_java_type(a).as_deref() == Some("char");
+                    if stringify && !boxed_char {
                         self.emit_converted_arg(a, floats)?;
                     } else if fill_value {
                         let elem = self
@@ -7474,7 +7488,7 @@ impl Compiler {
                         self.expr(a)?;
                     }
                     self.lambda_ret_hint = None;
-                    if box_args {
+                    if box_args || boxed_char {
                         // `autobox_code` has no `char` arm — a `char` is a code
                         // point, not one of the numeric boxes — so the
                         // `Character` box is named here, the same way
@@ -7788,10 +7802,9 @@ impl Compiler {
                         .is_some_and(|t| !matches!(t.as_str(), "int" | "short" | "byte" | "char")));
             let method = if by_value { "removeObject" } else { method };
             self.expr(recv)?;
-            // A collection element is a *boxed* `Character`, which javars models
-            // as the one-character String — so it prints and compares like Java's.
-            // Every other primitive entering an element or key position is boxed
-            // for real, which is what keeps a `Map` keyed on `1`, `1.0` and `1L`
+            // A `char` entering an element or key position boxes to a real
+            // `Character`, as every other primitive boxes to its wrapper —
+            // which is what keeps a `Map` keyed on `1`, which is what keeps a `Map` keyed on `1`, `1.0` and `1L`
             // at three entries the way Java's is. An *index* argument is not an
             // element and stays the `int` it is.
             for (i, a) in args.iter().enumerate() {
@@ -7814,6 +7827,16 @@ impl Compiler {
                     // rule, and the text would make `l.get(0) * 2` a type error
                     // and `l.get(0) + 1` a concatenation.
                     self.expr(a)
+                } else if self.expr_java_type(a).as_deref() == Some("char") {
+                    // Likewise a `char` is the `Character` it boxes to, not its
+                    // text: `stack.peek() == '('` unboxes it, `c + 1` adds it,
+                    // and `getClass()` is `Character`.
+                    self.expr(a).map(|()| {
+                        let code = crate::host::box_class_code("Character")
+                            .expect("`Character` is a boxed class");
+                        self.b.emit(Op::LoadInt(code), line);
+                        self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                    })
                 } else {
                     self.emit_char_string(a)
                 };
@@ -7945,11 +7968,21 @@ impl Compiler {
         // with. Only `equals` gets this — every other erased call reads its
         // argument as a number, where a box would be an allocation for nothing.
         let box_arg = method == "equals" && args.len() == 1;
+        // Every other `char` argument boxes to its `Character` too — the
+        // receiver may be an erased collection (`m.get(k).add(c)`), where the
+        // element must be the box a typed `add` makes — except for the
+        // `String`/`StringBuilder` methods that take a `char` as one
+        // (`replace('a', 'b')`, `append('c')`), which read text, and `remove`,
+        // where javac widens a `char` to the `remove(int)` index.
+        let box_char = !matches!(
+            method,
+            "replace" | "append" | "insert" | "setCharAt" | "remove"
+        );
         let ref_result = self.lambda_returns_reference(recv, method);
         if targets.is_empty() {
             self.expr(recv)?;
             for a in args {
-                self.emit_erased_arg_hinted(a, raw_args, box_arg, ref_result)?;
+                self.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)?;
             }
             fallback(self);
             return Ok(());
@@ -7962,7 +7995,7 @@ impl Compiler {
             .iter()
             .map(|a| {
                 let t = self.temp();
-                self.emit_erased_arg_hinted(a, raw_args, box_arg, ref_result)?;
+                self.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -8026,12 +8059,13 @@ impl Compiler {
         a: &Expr,
         raw: bool,
         boxed: bool,
+        box_char: bool,
         ref_result: bool,
     ) -> Result<(), String> {
         if ref_result && matches!(a, Expr::Lambda { .. }) {
             self.lambda_ret_hint = Some("Object".to_string());
         }
-        let r = self.emit_erased_arg(a, raw, boxed);
+        let r = self.emit_erased_arg(a, raw, boxed, box_char);
         self.lambda_ret_hint = None;
         r
     }
@@ -8142,7 +8176,13 @@ impl Compiler {
     /// receiver wants that); otherwise a `char` becomes the one-character String
     /// the rest of the frontend uses. `boxed` additionally autoboxes a primitive
     /// — see the note at [`Compiler::emit_erased_call`]'s `box_arg`.
-    fn emit_erased_arg(&mut self, a: &Expr, raw: bool, boxed: bool) -> Result<(), String> {
+    fn emit_erased_arg(
+        &mut self,
+        a: &Expr,
+        raw: bool,
+        boxed: bool,
+        box_char: bool,
+    ) -> Result<(), String> {
         if raw {
             return self.expr(a);
         }
@@ -8150,7 +8190,7 @@ impl Compiler {
         // becoming the one-character String: `((Object) 'z').equals('z')` is
         // `true` in Java, and a String argument would compare against the box's
         // code point and answer `false`.
-        if boxed && self.expr_java_type(a).as_deref() == Some("char") {
+        if (boxed || box_char) && self.expr_java_type(a).as_deref() == Some("char") {
             self.expr(a)?;
             let code = crate::host::box_class_code("Character").expect("`Character` is boxed");
             self.b.emit(Op::LoadInt(code), 0);
@@ -9187,6 +9227,7 @@ impl Compiler {
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<(), String> {
+        let numeric_operands = std::mem::take(&mut self.numeric_operands);
         // `&&` / `||` short-circuit: keep the deciding operand as the result.
         match op {
             BinOp::And => {
@@ -9275,7 +9316,7 @@ impl Compiler {
                     self.expr(e)?;
                 }
             }
-        } else if op == BinOp::Add && self.has_user_tostring {
+        } else if op == BinOp::Add && self.has_user_tostring && !numeric_operands {
             // Neither operand is statically a String or a user class, yet one may
             // be an object at run time (an erased `get()`): a heap object that is
             // not a box is stringified, so `+` concatenates it through its
@@ -9290,8 +9331,15 @@ impl Compiler {
         } else {
             // Every other operator here is numeric, and numeric promotion
             // unboxes a wrapper operand first — a `null` one throws (JLS 5.6).
-            self.expr_unboxed(lhs)?;
-            self.expr_unboxed(rhs)?;
+            // In a numeric context an operand of unknown type that holds a
+            // `Character` element converts to its code point (see
+            // `numeric_operands`).
+            for e in [lhs, rhs] {
+                self.expr_unboxed(e)?;
+                if numeric_operands && self.expr_java_type(e).is_none() {
+                    self.emit_checked_unbox("Character");
+                }
+            }
         }
         // Integral `%` by zero throws `ArithmeticException` in Java, exactly as
         // `/` does; the floating `%` yields NaN and needs no check.
@@ -9497,6 +9545,7 @@ impl Compiler {
             }
             return self.reference_cast(ty, e, line);
         }
+        self.numeric_operands = ty != "boolean" && is_arithmetic_binary(e);
         if identity {
             return self.expr(e);
         }
@@ -10548,7 +10597,7 @@ fn array_build_op(span_index: usize, len: usize) -> Op {
 
 fn collection_kind(ty: &str) -> Option<&'static str> {
     Some(match ty {
-        "ArrayList" | "LinkedList" | "ArrayDeque" => "list",
+        "ArrayList" | "LinkedList" | "ArrayDeque" | "Vector" | "Stack" => "list",
         "List" | "Collection" | "Iterable" | "Deque" | "Queue" => "list",
         "HashMap" | "LinkedHashMap" | "TreeMap" | "EnumMap" | "Map" | "SortedMap"
         | "NavigableMap" => "map",
@@ -10585,6 +10634,8 @@ fn is_concrete_collection(ty: &str) -> bool {
         "ArrayList"
             | "LinkedList"
             | "ArrayDeque"
+            | "Vector"
+            | "Stack"
             | "HashMap"
             | "LinkedHashMap"
             | "TreeMap"
@@ -10601,6 +10652,8 @@ fn collection_call_java_type(kind: &str, method: &str, argc: usize) -> Option<&'
     Some(match (method, argc) {
         ("size", 0) | ("indexOf", 1) | ("lastIndexOf", 1) => "int",
         ("isEmpty", 0) | ("contains", 1) | ("containsKey", 1) | ("containsValue", 1) => "boolean",
+        ("empty", 0) if kind == "list" => "boolean",
+        ("search", 1) | ("capacity", 0) if kind == "list" => "int",
         ("add", 1) | ("addAll", 1) | ("equals", 1) => "boolean",
         ("remove", 1) if kind == "set" || kind == "pq" => "boolean",
         // The compiler-selected `List.remove(Object)` overload.
@@ -11333,4 +11386,16 @@ fn input_call_java_type(recv_ty: &str, method: &str) -> Option<&'static str> {
         (_, "getAverage") if recv_ty.ends_with("SummaryStatistics") => "double",
         _ => return None,
     })
+}
+
+/// True when `e` is an arithmetic `Binary` — the shape a numeric cast or a
+/// numeric target can put into a numeric context (see `numeric_operands`).
+fn is_arithmetic_binary(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            ..
+        }
+    )
 }

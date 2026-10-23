@@ -1716,99 +1716,105 @@ xs.add("a");</code></pre>
         <article class="doc-entry" id="doc-collection-types-3">
           <h3><a class="doc-anchor" href="#doc-collection-types-3">#</a> <code>ArrayDeque</code></h3>
           <pre><code class="lang-java">new ArrayDeque&lt;&gt;()   |   new ArrayDeque&lt;&gt;(other)</code></pre>
-          <p>A double-ended queue, on the same vector the lists use with the head at index 0. Every <code>Deque</code>/<code>Queue</code> method produces the reference's element order and its empty-receiver behaviour. Two things the shared shape cannot carry differ from the JDK's: <code>getClass()</code> names <code>ArrayList</code>, and a null element is accepted where the real <code>ArrayDeque</code> throws.</p>
+          <p>A double-ended queue, on the same vector the lists use with the head at index 0. Every <code>Deque</code>/<code>Queue</code> method produces the reference's element order and its empty-receiver behaviour, and the add family refuses a <code>null</code> element with <code>NullPointerException</code> as the JDK's does. What the shared shape cannot carry is the class: <code>getClass()</code> names <code>ArrayList</code>.</p>
           <pre><code class="lang-java">Deque&lt;Integer&gt; q = new ArrayDeque&lt;&gt;();\nq.push(1);\nq.addLast(2);\nSystem.out.println(q);   // [1, 2]</code></pre>
         </article>
         <article class="doc-entry" id="doc-collection-types-4">
-          <h3><a class="doc-anchor" href="#doc-collection-types-4">#</a> <code>PriorityQueue</code></h3>
+          <h3><a class="doc-anchor" href="#doc-collection-types-4">#</a> <code>Stack</code></h3>
+          <pre><code class="lang-java">new Stack&lt;&gt;()   |   new Vector&lt;&gt;()   |   new Vector&lt;&gt;(int capacity)   |   new Vector&lt;&gt;(other)</code></pre>
+          <p><code>java.util.Stack</code> and the <code>Vector</code> it extends, on the same vector the lists use with the top of a <code>Stack</code> at the end — so it iterates and prints bottom first, as the JDK's does. <code>push</code> returns its argument; <code>pop</code>/<code>peek</code> on an empty stack throw <code>EmptyStackException</code>; <code>search</code> is the 1-based distance from the top, or -1. <code>Vector</code>'s own members (<code>elementAt</code>, <code>firstElement</code>/<code>lastElement</code>, <code>addElement</code>, <code>insertElementAt</code>, <code>removeElementAt</code>, <code>setElementAt</code>, <code>removeElement</code>, <code>removeAllElements</code>, <code>capacity</code>) and its index messages are the JDK's, including a negative index naming the backing array's capacity, which grows as the JDK's does.</p>
+          <pre><code class="lang-java">Stack&lt;Integer&gt; s = new Stack&lt;&gt;();\ns.push(1);\ns.push(2);\nSystem.out.println(s.pop() + " " + s + " " + s.search(1));   // 2 [1] 1</code></pre>
+        </article>
+        <article class="doc-entry" id="doc-collection-types-5">
+          <h3><a class="doc-anchor" href="#doc-collection-types-5">#</a> <code>PriorityQueue</code></h3>
           <pre><code class="lang-java">new PriorityQueue&lt;&gt;()   |   new PriorityQueue&lt;&gt;(cmp)   |   new PriorityQueue&lt;&gt;(cap, cmp)   |   new PriorityQueue&lt;&gt;(collection)</code></pre>
           <p>The JDK's binary heap, laid out by its own <code>siftUp</code>/<code>siftDown</code>/<code>heapify</code>, so <code>toString</code> and iteration show the heap array's order, not a sorted one. <code>poll</code>/<code>remove()</code> take the least element by the comparator (natural order when none is given, <code>comparator()</code> then answering <code>null</code>); a <code>PriorityQueue</code> seed hands over its comparator. The iterator's <code>remove()</code> follows <code>PriorityQueue.Itr</code>, deferring a lifted element to the end of the walk.</p>
           <pre><code class="lang-java">PriorityQueue&lt;Integer&gt; pq = new PriorityQueue&lt;&gt;(List.of(5, 1, 4, 2));\nSystem.out.println(pq + " " + pq.poll() + " " + pq);   // [1, 2, 4, 5] 1 [2, 5, 4]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-5">
-          <h3><a class="doc-anchor" href="#doc-collection-types-5">#</a> <code>Deque</code></h3>
+        <article class="doc-entry" id="doc-collection-types-6">
+          <h3><a class="doc-anchor" href="#doc-collection-types-6">#</a> <code>Deque</code></h3>
           <pre><code class="lang-java">Deque&lt;T&gt; q = new ArrayDeque&lt;&gt;()</code></pre>
           <p>The declaration-only interface an <code>ArrayDeque</code> or <code>LinkedList</code> satisfies. Like <code>List</code> and <code>Map</code> it cannot be constructed directly.</p>
           <pre><code class="lang-java">Deque&lt;String&gt; q = new ArrayDeque&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-6">
-          <h3><a class="doc-anchor" href="#doc-collection-types-6">#</a> <code>Queue</code></h3>
+        <article class="doc-entry" id="doc-collection-types-7">
+          <h3><a class="doc-anchor" href="#doc-collection-types-7">#</a> <code>Queue</code></h3>
           <pre><code class="lang-java">Queue&lt;T&gt; q = new ArrayDeque&lt;&gt;()</code></pre>
           <p>The declaration-only single-ended view of the same shape: <code>offer</code> adds at the tail and <code>poll</code>/<code>peek</code> read the head.</p>
           <pre><code class="lang-java">Queue&lt;String&gt; q = new LinkedList&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-7">
-          <h3><a class="doc-anchor" href="#doc-collection-types-7">#</a> <code>HashMap</code></h3>
+        <article class="doc-entry" id="doc-collection-types-8">
+          <h3><a class="doc-anchor" href="#doc-collection-types-8">#</a> <code>HashMap</code></h3>
           <pre><code class="lang-java">new HashMap&lt;&gt;()   |   new HashMap&lt;&gt;(other)</code></pre>
           <p>A <code>Map</code> whose iteration and <code>toString</code> order reproduce Java's real bucket order: entries are laid out in a power-of-two table indexed by <code>(capacity - 1) &amp; (h ^ (h &gt;&gt;&gt; 16))</code>, which makes the order a stable sort of the insertion sequence by bucket. Verified against OpenJDK 26 for <code>String</code> and <code>Integer</code> keys, including across the resize at 13 entries.</p>
           <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new HashMap&lt;&gt;();
 m.put("one", 1);</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-8">
-          <h3><a class="doc-anchor" href="#doc-collection-types-8">#</a> <code>LinkedHashMap</code></h3>
+        <article class="doc-entry" id="doc-collection-types-9">
+          <h3><a class="doc-anchor" href="#doc-collection-types-9">#</a> <code>LinkedHashMap</code></h3>
           <pre><code class="lang-java">new LinkedHashMap&lt;&gt;()   |   new LinkedHashMap&lt;&gt;(other)</code></pre>
           <p>A <code>Map</code> that iterates in insertion order. Since javars always *stores* entries in insertion order, this implementation is the one that costs nothing extra.</p>
           <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new LinkedHashMap&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-9">
-          <h3><a class="doc-anchor" href="#doc-collection-types-9">#</a> <code>TreeMap</code></h3>
+        <article class="doc-entry" id="doc-collection-types-10">
+          <h3><a class="doc-anchor" href="#doc-collection-types-10">#</a> <code>TreeMap</code></h3>
           <pre><code class="lang-java">new TreeMap&lt;&gt;()   |   new TreeMap&lt;&gt;(other)</code></pre>
           <p>A <code>Map</code> that iterates in ascending natural key order: numbers numerically, strings lexicographically by <code>char</code>, <code>null</code> first. The key-navigation methods (<code>firstKey</code>, <code>floorKey</code>, <code>ceilingEntry</code>, <code>pollFirstEntry</code>, …) are implemented; the range views (<code>headMap</code>, <code>tailMap</code>, <code>descendingMap</code>, …) are not.</p>
           <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new TreeMap&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-10">
-          <h3><a class="doc-anchor" href="#doc-collection-types-10">#</a> <code>HashSet</code></h3>
+        <article class="doc-entry" id="doc-collection-types-11">
+          <h3><a class="doc-anchor" href="#doc-collection-types-11">#</a> <code>HashSet</code></h3>
           <pre><code class="lang-java">new HashSet&lt;&gt;()   |   new HashSet&lt;&gt;(other)</code></pre>
           <p>A <code>Set</code> with <code>HashMap</code>'s bucket iteration order. Building one from a sequence keeps the first of each repeated value.</p>
           <pre><code class="lang-java">Set&lt;String&gt; s = new HashSet&lt;&gt;();
 s.add("a");</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-11">
-          <h3><a class="doc-anchor" href="#doc-collection-types-11">#</a> <code>LinkedHashSet</code></h3>
+        <article class="doc-entry" id="doc-collection-types-12">
+          <h3><a class="doc-anchor" href="#doc-collection-types-12">#</a> <code>LinkedHashSet</code></h3>
           <pre><code class="lang-java">new LinkedHashSet&lt;&gt;()   |   new LinkedHashSet&lt;&gt;(other)</code></pre>
           <p>A <code>Set</code> that iterates in insertion order.</p>
           <pre><code class="lang-java">Set&lt;String&gt; s = new LinkedHashSet&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-12">
-          <h3><a class="doc-anchor" href="#doc-collection-types-12">#</a> <code>TreeSet</code></h3>
+        <article class="doc-entry" id="doc-collection-types-13">
+          <h3><a class="doc-anchor" href="#doc-collection-types-13">#</a> <code>TreeSet</code></h3>
           <pre><code class="lang-java">new TreeSet&lt;&gt;()   |   new TreeSet&lt;&gt;(other)</code></pre>
           <p>A <code>Set</code> that iterates in ascending natural order of its elements.</p>
           <pre><code class="lang-java">Set&lt;String&gt; s = new TreeSet&lt;&gt;();
 s.add("z"); s.add("a");
 System.out.println(s);   // [a, z]</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-13">
-          <h3><a class="doc-anchor" href="#doc-collection-types-13">#</a> <code>List</code></h3>
+        <article class="doc-entry" id="doc-collection-types-14">
+          <h3><a class="doc-anchor" href="#doc-collection-types-14">#</a> <code>List</code></h3>
           <pre><code class="lang-java">List&lt;T&gt; name = …;   |   List.of(…)</code></pre>
           <p>Declaration-only: the interface types the variable but cannot be instantiated — <code>new List&lt;&gt;()</code> is not a thing in Java either. A user class named <code>List</code> wins over this modeling, so declaring your own is still legal.</p>
           <pre><code class="lang-java">List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-14">
-          <h3><a class="doc-anchor" href="#doc-collection-types-14">#</a> <code>Collection</code></h3>
+        <article class="doc-entry" id="doc-collection-types-15">
+          <h3><a class="doc-anchor" href="#doc-collection-types-15">#</a> <code>Collection</code></h3>
           <pre><code class="lang-java">Collection&lt;T&gt; name = …;</code></pre>
           <p>Declaration-only, treated as a list-shaped receiver for the purpose of typing a call's result.</p>
           <pre><code class="lang-java">Collection&lt;String&gt; c = new ArrayList&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-15">
-          <h3><a class="doc-anchor" href="#doc-collection-types-15">#</a> <code>Iterable</code></h3>
+        <article class="doc-entry" id="doc-collection-types-16">
+          <h3><a class="doc-anchor" href="#doc-collection-types-16">#</a> <code>Iterable</code></h3>
           <pre><code class="lang-java">Iterable&lt;T&gt; name = …;</code></pre>
           <p>Declaration-only, list-shaped. An enhanced <code>for</code> over any collection works through the <code>JITER_ARRAY</code> builtin regardless of the declared type; there is no <code>Iterator</code> object to obtain.</p>
           <pre><code class="lang-java">Iterable&lt;String&gt; it = new ArrayList&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-16">
-          <h3><a class="doc-anchor" href="#doc-collection-types-16">#</a> <code>AbstractMap.SimpleEntry</code></h3>
+        <article class="doc-entry" id="doc-collection-types-17">
+          <h3><a class="doc-anchor" href="#doc-collection-types-17">#</a> <code>AbstractMap.SimpleEntry</code></h3>
           <pre><code class="lang-java">new AbstractMap.SimpleEntry&lt;&gt;(k, v)   |   new AbstractMap.SimpleEntry&lt;&gt;(entry)   |   new AbstractMap.SimpleImmutableEntry&lt;&gt;(…)</code></pre>
           <p>A <code>Map.Entry</code> that belongs to no map: <code>getKey</code>/<code>getValue</code>, <code>equals</code>/<code>hashCode</code>/<code>toString</code> as every entry has them, and <code>null</code> accepted on either side. <code>SimpleEntry.setValue</code> replaces its own value and answers the old one; <code>SimpleImmutableEntry.setValue</code> is <code>UnsupportedOperationException</code>. The one-argument form copies any entry's key and value.</p>
           <pre><code class="lang-java">var e = new AbstractMap.SimpleEntry&lt;&gt;("k", 1);\ne.setValue(2);\nSystem.out.println(e);   // k=2</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-17">
-          <h3><a class="doc-anchor" href="#doc-collection-types-17">#</a> <code>Map</code></h3>
+        <article class="doc-entry" id="doc-collection-types-18">
+          <h3><a class="doc-anchor" href="#doc-collection-types-18">#</a> <code>Map</code></h3>
           <pre><code class="lang-java">Map&lt;K,V&gt; name = …;</code></pre>
           <p>Declaration-only. The map methods available on the variable are the ones the modeled implementations provide, <code>entrySet</code> among them — it answers a set of <code>Map.Entry</code> objects, one per key, that read through to the map.</p>
           <pre><code class="lang-java">Map&lt;String,Integer&gt; m = new HashMap&lt;&gt;();</code></pre>
         </article>
-        <article class="doc-entry" id="doc-collection-types-18">
-          <h3><a class="doc-anchor" href="#doc-collection-types-18">#</a> <code>Set</code></h3>
+        <article class="doc-entry" id="doc-collection-types-19">
+          <h3><a class="doc-anchor" href="#doc-collection-types-19">#</a> <code>Set</code></h3>
           <pre><code class="lang-java">Set&lt;T&gt; name = …;   |   Set.of(…)</code></pre>
           <p>Declaration-only as a type, though <code>Set.of</code> is a usable static factory.</p>
           <pre><code class="lang-java">Set&lt;String&gt; s = new HashSet&lt;&gt;();</code></pre>

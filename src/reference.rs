@@ -1706,8 +1706,15 @@ pub const REFERENCE: &[Entry] = &[
         "ArrayDeque",
         "Collection Types",
         "new ArrayDeque<>()   |   new ArrayDeque<>(other)",
-        "A double-ended queue, on the same vector the lists use with the head at index 0. Every `Deque`/`Queue` method produces the reference's element order and its empty-receiver behaviour. Two things the shared shape cannot carry differ from the JDK's: `getClass()` names `ArrayList`, and a null element is accepted where the real `ArrayDeque` throws.",
+        "A double-ended queue, on the same vector the lists use with the head at index 0. Every `Deque`/`Queue` method produces the reference's element order and its empty-receiver behaviour, and the add family refuses a `null` element with `NullPointerException` as the JDK's does. What the shared shape cannot carry is the class: `getClass()` names `ArrayList`.",
         "Deque<Integer> q = new ArrayDeque<>();\\nq.push(1);\\nq.addLast(2);\\nSystem.out.println(q);   // [1, 2]",
+    ),
+    (
+        "Stack",
+        "Collection Types",
+        "new Stack<>()   |   new Vector<>()   |   new Vector<>(int capacity)   |   new Vector<>(other)",
+        "`java.util.Stack` and the `Vector` it extends, on the same vector the lists use with the top of a `Stack` at the end — so it iterates and prints bottom first, as the JDK's does. `push` returns its argument; `pop`/`peek` on an empty stack throw `EmptyStackException`; `search` is the 1-based distance from the top, or -1. `Vector`'s own members (`elementAt`, `firstElement`/`lastElement`, `addElement`, `insertElementAt`, `removeElementAt`, `setElementAt`, `removeElement`, `removeAllElements`, `capacity`) and its index messages are the JDK's, including a negative index naming the backing array's capacity, which grows as the JDK's does.",
+        "Stack<Integer> s = new Stack<>();\\ns.push(1);\\ns.push(2);\\nSystem.out.println(s.pop() + \" \" + s + \" \" + s.search(1));   // 2 [1] 1",
     ),
     (
         "PriorityQueue",

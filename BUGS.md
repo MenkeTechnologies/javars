@@ -95,7 +95,8 @@ at the bottom, and are summarized in the section right after this one.
   It runs as its code point and takes Java's *string conversion* (JLS 5.1.11)
   back to the one-character String at every boundary where Java applies one —
   `println(c)`, `"x" + c`, `String.valueOf`/`format`/`join`, a `String`-method
-  argument (`indexOf('l')`, `replace('l', 'L')`), and boxing into a collection.
+  argument (`indexOf('l')`, `replace('l', 'L')`). Entering a collection element or
+  key it boxes to a real `Character`, as in Java.
   A `char[]` (from `toCharArray()`, a `{'a', 'b'}` literal, or `Arrays.copyOf`)
   holds code points, so its elements do arithmetic and `Arrays.sort` orders them
   numerically, while `Arrays.toString`, `new String(cs)`, and `String.valueOf(cs)`
@@ -1303,23 +1304,26 @@ storage-model differences:
   System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
   System.out.println(String.class);               // both: class java.lang.String
   ```
-- **A `Float` or `Character` read back out of a generic container computes as
-  the wrong type.** Type arguments are erased at parse time, so `l.get(0)` on a
+- **A `Float` read back out of a generic container computes at `double`
+  width.** Type arguments are erased at parse time, so `l.get(0)` on a
   `List<Float>` has no static type: the `Float` box it returns is right (it
   prints `0.1` and `equals` compares it as a `Float`), but arithmetic on it is
-  the `double` operation, and a `Character` element — javars's one-character
-  String — concatenates where Java adds. Measured on `openjdk 21.0.12.1`:
+  the `double` operation. Measured on `openjdk 21.0.12.1`:
 
   ```java
   List<Float> l = new ArrayList<>(List.of(0.1f));
   System.out.println(l.get(0) + 1);            // Java: 1.1   javars: 1.1000000014901161
-  List<Character> c = new ArrayList<>(List.of('d'));
-  System.out.println((char) (c.get(0) + 1));   // Java: e     javars: U+0000
   ```
 
   Assigning the element to a typed local first (`float g = l.get(0);`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
+- **`Character.getNumericValue` knows only the digits and the Latin letters.**
+  A letter number, a superscript or circled digit, or a fraction has a numeric
+  value in Java's table — U+216B (Roman numeral twelve) is 12, U+00B2 is 2,
+  U+2460 is 1, and a vulgar fraction such as U+00BD is -2 — and javars answers
+  -1 for each. The decimal digits of every script and the Latin letters,
+  full-width forms included, agree. Measured on `openjdk 21.0.12.1`.
 - **`Arrays.asList(array)` copies the array instead of viewing it.** Java's
   list writes through: `Integer[] a = {5, 2}; Arrays.asList(a).set(0, 99);`
   leaves `a[0] == 99`, and a later write to `a` shows in the list. javars's
@@ -1370,12 +1374,6 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
-- **`Character.getNumericValue` knows only the digits and the Latin letters.**
-  A letter number, a superscript or circled digit, or a fraction has a numeric
-  value in Java's table — U+216B (Roman numeral twelve) is 12, U+00B2 is 2,
-  U+2460 is 1, and a vulgar fraction such as U+00BD is -2 — and javars answers
-  -1 for each. The decimal digits of every script and the Latin letters,
-  full-width forms included, agree. Measured on `openjdk 21.0.12.1`.
 - **An array type in `instanceof`.** `o instanceof int[]` and the pattern form
   `o instanceof int[] ia` are parse errors (`expected RParen but found
   LBracket`). A reference array carries no element type at run time (see the
@@ -1410,11 +1408,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   accepted and printed but cannot be a `switch` selector. `isProbablePrime` is a
   deterministic Miller-Rabin test over fixed bases rather than the JDK's
   randomized one, so the two agree except on contrived pseudoprimes.
-- **A `char` element is two things in a collection.** One built from a literal or
-  `charAt` is held as a one-character string; one from `mapToObj(c -> (char) c)`
-  or `Character.valueOf` is a code point. Lookups that mix the two
-  (`Map.of('A', 1).get("A".charAt(0))`, `list.contains(Character.valueOf('b'))`
-  on a stream-built list) miss where Java finds the key.
+- ~~**A `char` element is two things in a collection.**~~ — fixed. Every `char`
+  entering a collection element or key — `add`, `push`, `put`, the `List.of`/
+  `Set.of`/`Map.of`/`Arrays.asList` factories, the `Collections` statics, a
+  stream's `mapToObj(c -> (char) c)` — is a real `Character` box, so
+  `Map.of('A', 1).get("A".charAt(0))` finds its key, `stack.peek() == '('`
+  unboxes, `(char) (list.get(0) + 1)` adds, and `getClass()` is `Character`.
+  Measured on `openjdk 21.0.12.1`.
 - **`Stream.iterator()` and `IntStream.iterator()`** are refused
   (``unsupported Stream method `iterator` ``). A JDK stream iterator pulls
   elements lazily, one `next()` at a time, so a `peek` or a side-effecting
@@ -1870,8 +1870,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   makes `List<Integer> l; l.add(128); l.add(128); l.get(0) == l.get(1)` the
   `false` Java answers. An *index* argument is not an element and stays the
   `int` it is; the list methods that take one are a closed set
-  (`Compiler::list_index_arg`). A `char` element is still javars's
-  one-character String — see the `Character` entry below.
+  (`Compiler::list_index_arg`). A `char` element boxes to a `Character` the
+  same way.
 
   The collection *factories* — `List.of`, `Set.of`, `Map.of`, `Arrays.asList` —
   box their arguments for the same reason, so `List.of(128, 128).get(0) ==
@@ -1951,18 +1951,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `java.util.HashMap$Values`. The control flow is right and only the class in the
   message is wrong; naming it exactly needs the view to be a shape of its own,
   which is the same change that would make it alias.
-- **A `Character` in a collection is a one-character String.** The `char`
-  *type* is a real 16-bit integral value (see the "`char` arithmetic" entry
-  under "Implemented"), and a `char` crossing into a statically-typed reference
-  slot — a `Character` variable, an `Object` one, a cast — now boxes as a real
-  `Character` (see the boxing entry above), so `((Object) 'x').getClass()` is
-  `java.lang.Character`. A `char` entering a **collection** element or key
-  position is still stored as its one-character String, deliberately: that is
-  what makes the rendering below work, and it is the one position where the two
-  models still differ. That is what makes
-  `System.out.println(list)` print `[p, q]` like Java's. The visible difference
-  is `==` between two such values: Java compares `Character` references, javars
-  compares the strings by value — the same String-`==` model above.
+- ~~**A `Character` in a collection is a one-character String.**~~ — fixed: a
+  `char` entering a collection boxes to a real `Character` (see the boxing
+  entry above), so a list of them prints `[p, q]` through the box's rendering,
+  and `==` between two elements is reference identity under the JLS 5.1.7
+  cache — `true` for the same character up to `\u007F`, `false` above, as
+  in Java.
 - **`java Foo.java` is `javac Foo.java && java Foo`, not the JDK's source-file
   mode.** The two entry points select a different class to run. JDK 21's
   source-file launcher runs the FIRST top-level class in the file; `java -cp . T`
@@ -2071,9 +2065,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
   The second gap: a value whose class javars erases — an array (element type
   gone), a collection, a lambda — passes any cast rather than inventing a
-  failure, so `(String) anIntArray` succeeds where Java throws. A boxed
-  `Character` is the one-character String javars models it as, so a failing cast
-  from one names `java.lang.String` and `(String) aBoxedChar` succeeds.
+  failure, so `(String) anIntArray` succeeds where Java throws.
 - **A `float` reaching `String.format` through a *non-literal* format string
   prints its `double` form under `%s`.** `String.format` is the one place a
   `float` argument splits by conversion — `%s` wants `Float.toString`, `%f` and

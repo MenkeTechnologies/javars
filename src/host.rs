@@ -248,8 +248,8 @@ pub const JCAST: u16 = 734;
 /// the one-character String. `argc == 1`. A `char` runs as an integer so that
 /// `'a' + 1` is 98, and the compiler emits this at every point where the value
 /// crosses into a String — `println(c)`, `"x" + c`, `String.valueOf(c)`, a
-/// `String`-method argument — and where a `char` is boxed to a `Character` (a
-/// collection element, which javars models as the one-character String). A
+/// `String`-method argument, an argument of a call whose receiver javars cannot
+/// type. A
 /// `char[]` operand converts element-wise, which is what makes
 /// `Arrays.toString(s.toCharArray())` print `[a, b, c]`. Any other value passes
 /// through unchanged.
@@ -2557,6 +2557,7 @@ pub fn heap_reset() {
     // program's object in that slot.
     PLAIN_VIEWS.with(|p| p.borrow_mut().clear());
     ARRAY_DEQUES.with(|d| d.borrow_mut().clear());
+    VECTORS.with(|v| v.borrow_mut().clear());
     FILED_HASH.with(|f| f.borrow_mut().clear());
     COMPUTING.with(|c| c.borrow_mut().clear());
     INTERNED.with(|i| i.borrow_mut().clear());
@@ -2809,6 +2810,8 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         // `LinkedHashSet` extend their hash counterparts; the tree kinds do not,
         // which is the pair a name-matching answer gets wrong.
         "ArrayList" => &["AbstractList", "RandomAccess", "Cloneable", "Serializable"],
+        "Vector" => &["AbstractList", "RandomAccess", "Cloneable", "Serializable"],
+        "Stack" => &["Vector"],
         "HashMap" => &["AbstractMap", "Cloneable", "Serializable"],
         "LinkedHashMap" => &["HashMap", "SequencedMap"],
         "TreeMap" => &["AbstractMap", "NavigableMap", "Cloneable", "Serializable"],
@@ -3222,10 +3225,24 @@ fn b_unbox(vm: &mut VM, argc: u8) -> Value {
 fn b_unbox_nonnull(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
     let v = args.first().cloned().unwrap_or(Value::Undef);
+    let code = args.get(1).map(|c| c.jint()).unwrap_or(0);
+    // A `char` that crossed an erased call (one whose receiver javars cannot
+    // type) arrives as its one-character String. Unboxing that to a primitive
+    // can only mean the `Character`, since a `String` never unboxes, so the
+    // text becomes its code point.
+    if let Value::Str(s) = &v {
+        let mut cs = s.chars();
+        if let (Some(c), None, true) = (
+            cs.next(),
+            cs.next(),
+            usize::try_from(code).is_ok_and(|i| i < BOX_CLASSES.len()),
+        ) {
+            return Value::Int(i64::from(u32::from(c)));
+        }
+    }
     if !matches!(v, Value::Undef) {
         return deboxed(&v);
     }
-    let code = args.get(1).map(|c| c.jint()).unwrap_or(0);
     let (class, prim) = match usize::try_from(code).ok().and_then(|i| BOX_CLASSES.get(i)) {
         Some(&class) => (class, unboxed_primitive(class)),
         None => ("Boolean", "boolean"),
@@ -3251,6 +3268,15 @@ fn unboxed_primitive(class: &str) -> &'static str {
         "Character" => "char",
         "Float" => "float",
         _ => "double",
+    }
+}
+
+/// The single character of a one-character string, or `None`.
+fn one_char(s: &str) -> Option<char> {
+    let mut cs = s.chars();
+    match (cs.next(), cs.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }
 
@@ -5776,7 +5802,7 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
     // one, in its class's own words; `ArrayDeque` alone accepts it.
     if let Value::Int(n @ ..0) = seed {
         let what = match kind {
-            "ArrayList" | "List" => Some("Illegal Capacity"),
+            "ArrayList" | "List" | "Vector" => Some("Illegal Capacity"),
             "HashMap" | "Map" | "HashSet" | "Set" | "LinkedHashMap" | "LinkedHashSet" => {
                 Some("Illegal initial capacity")
             }
@@ -5797,7 +5823,8 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
         // before it, an `ArrayDeque` answers `getClass().getSimpleName()` with
         // `ArrayList`. Its refusal of a `null` element is [`array_deque_null`]'s.
         // BUGS.md records the class.
-        "ArrayList" | "LinkedList" | "ArrayDeque" | "Deque" | "Queue" | "List" => HostObj::List {
+        "ArrayList" | "LinkedList" | "ArrayDeque" | "Deque" | "Queue" | "List" | "Vector"
+        | "Stack" => HostObj::List {
             mods: 0,
             items: sequence_items(seed).unwrap_or_default(),
             fixed: Fixity::Mutable,
@@ -5897,6 +5924,20 @@ fn new_collection(vm: &mut VM, kind: &str, seed: &Value) -> Result<Value, Fault>
     if kind == "ArrayDeque" {
         ARRAY_DEQUES.with(|d| d.borrow_mut().insert(id));
     }
+    if let Some(class) = match kind {
+        "Vector" => Some(VectorClass::Vector),
+        "Stack" => Some(VectorClass::Stack),
+        _ => None,
+    } {
+        // `new Vector<>()` and `new Stack<>()` start at capacity 10, a sized
+        // `Vector` at the size it names, and a copy at its source's length.
+        let cap = match seed {
+            Value::Int(n) => *n as usize,
+            Value::Undef => 10,
+            _ => sequence_items(seed).map_or(10, |s| s.len()),
+        };
+        VECTORS.with(|v| v.borrow_mut().insert(id, (class, cap)));
+    }
     if let Some(t) = table {
         let v = Value::Obj(id);
         store_hash_table(&v, t);
@@ -5971,6 +6012,10 @@ thread_local! {
     /// what lets the add family check.
     static ARRAY_DEQUES: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// The lists made by `new Vector<>(…)` and `new Stack<>()`, each with its
+    /// class and its capacity — which `capacity()` reports and the JDK's
+    /// message for a negative index names.
+    static VECTORS: RefCell<HashMap<u32, (VectorClass, usize)>> = RefCell::new(HashMap::new());
 }
 
 /// Refresh the `unmodifiableX` view at `id` from the collection it shows. A
@@ -7133,7 +7178,9 @@ fn value_class(v: &Value) -> Option<String> {
                     // `ArrayList`s, and a `subList` view is a third answer
                     // again — see the note in [`jdk_supers`].
                     HostObj::List { fixed, .. } => match fixed {
-                        Fixity::Mutable => "ArrayList".to_string(),
+                        Fixity::Mutable => vector_class(*id)
+                            .map_or("ArrayList", VectorClass::name)
+                            .to_string(),
                         Fixity::FixedSize => "List$fixed".to_string(),
                         Fixity::Immutable => "List$immutable".to_string(),
                     },
@@ -7473,7 +7520,196 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
         touch_access_order(recv, method, args);
         return out;
     }
-    coll_method_inner(vm, recv, method, args)
+    let out = coll_method_inner(vm, recv, method, args);
+    // A `Vector`'s capacity follows its size; see [`vector_settle`].
+    vector_settle(recv);
+    out
+}
+
+/// Which of the two legacy synchronized lists a [`VECTORS`] entry is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorClass {
+    Vector,
+    Stack,
+}
+
+impl VectorClass {
+    fn name(self) -> &'static str {
+        match self {
+            VectorClass::Vector => "Vector",
+            VectorClass::Stack => "Stack",
+        }
+    }
+}
+
+/// The class of a `Vector`/`Stack` list, or `None` for any other list.
+fn vector_class(id: u32) -> Option<VectorClass> {
+    VECTORS.with(|v| v.borrow().get(&id).map(|(c, _)| *c))
+}
+
+/// `Vector`'s growth rule with no capacity increment: to hold `need`, the
+/// array grows to `old + max(need - old, old)` — doubling, or exactly `need`
+/// when doubling falls short (`ArraysSupport.newLength`).
+fn vector_grown(old: usize, need: usize) -> usize {
+    if need > old {
+        old + (need - old).max(old)
+    } else {
+        old
+    }
+}
+
+/// After any call on a `Vector`/`Stack`, its capacity grows to cover the size
+/// the call left — one growth per call, as each JDK method grows once.
+fn vector_settle(recv: &Value) {
+    let Value::Obj(id) = recv else { return };
+    let Some(len) = sequence_len(recv) else {
+        return;
+    };
+    VECTORS.with(|v| {
+        if let Some((_, cap)) = v.borrow_mut().get_mut(id) {
+            *cap = vector_grown(*cap, len);
+        }
+    });
+}
+
+/// The `Vector`/`Stack` members the shared list shape does not have, and the
+/// index failures whose messages differ from `ArrayList`'s (measured on
+/// openjdk 21.0.12.1). `None` hands the call to the ordinary list methods.
+///
+/// A negative index reaches the backing array in the JDK, so its message
+/// names the array's *capacity* (`Index -1 out of bounds for length 10`); an
+/// index past the end is caught by `Vector` itself first.
+fn vector_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    let (class, cap) = VECTORS.with(|v| v.borrow().get(id).copied())?;
+    let len = sequence_len(recv)? as i64;
+    let aioobe = |m: String| Fault::java("ArrayIndexOutOfBoundsException", m);
+    let past_capacity = |i: i64| aioobe(format!("Index {i} out of bounds for length {cap}"));
+    let out_of_range = |i: i64| aioobe(format!("Array index out of range: {i}"));
+    let set_cap = |c: usize| VECTORS.with(|v| v.borrow_mut().insert(*id, (class, c)));
+    let call = |vm: &mut VM, m: &str, a: &[Value]| coll_method_inner(vm, recv, m, a);
+    let fail = |vm: &mut VM, f: Fault| Some(raise(vm, f));
+    let stack = class == VectorClass::Stack;
+    match (method, args) {
+        ("push", [e]) if stack => {
+            call(vm, "add", std::slice::from_ref(e));
+            Some(e.clone())
+        }
+        ("pop" | "peek", []) if stack => {
+            if len == 0 {
+                return fail(vm, Fault::java("EmptyStackException", String::new()));
+            }
+            let m = if method == "pop" { "remove" } else { "get" };
+            Some(call(vm, m, &[Value::Int(len - 1)]))
+        }
+        ("empty", []) if stack => Some(Value::bool(len == 0)),
+        // The 1-based distance of the topmost occurrence from the top.
+        ("search", [o]) if stack => {
+            let at = call(vm, "lastIndexOf", std::slice::from_ref(o)).jint();
+            Some(Value::Int(if at < 0 { -1 } else { len - at }))
+        }
+        ("capacity", []) => Some(Value::Int(cap as i64)),
+        ("trimToSize", []) => {
+            set_cap(len as usize);
+            Some(Value::Undef)
+        }
+        ("ensureCapacity", [n]) => {
+            set_cap(vector_grown(cap, n.jint().max(0) as usize));
+            Some(Value::Undef)
+        }
+        ("firstElement" | "lastElement", []) => {
+            if len == 0 {
+                return fail(vm, Fault::java("NoSuchElementException", String::new()));
+            }
+            let at = if method == "firstElement" { 0 } else { len - 1 };
+            Some(call(vm, "get", &[Value::Int(at)]))
+        }
+        ("addElement", [e]) => {
+            call(vm, "add", std::slice::from_ref(e));
+            Some(Value::Undef)
+        }
+        ("removeElement", [o]) => Some(call(vm, "removeObject", std::slice::from_ref(o))),
+        ("removeAllElements", []) => Some(call(vm, "clear", &[])),
+        ("elementAt" | "removeElementAt" | "setElementAt", _) => {
+            let (i, rest) = match (method, args) {
+                ("setElementAt", [e, i]) => (i.jint(), Some(e)),
+                (_, [i]) => (i.jint(), None),
+                _ => return None,
+            };
+            if i >= len {
+                return fail(vm, aioobe(format!("{i} >= {len}")));
+            }
+            if i < 0 {
+                let f = if method == "removeElementAt" {
+                    out_of_range(i)
+                } else {
+                    past_capacity(i)
+                };
+                return fail(vm, f);
+            }
+            match rest {
+                Some(e) => {
+                    call(vm, "set", &[Value::Int(i), e.clone()]);
+                    Some(Value::Undef)
+                }
+                None if method == "elementAt" => Some(call(vm, "get", &[Value::Int(i)])),
+                None => {
+                    call(vm, "remove", &[Value::Int(i)]);
+                    Some(Value::Undef)
+                }
+            }
+        }
+        ("get" | "remove", [Value::Int(i)]) | ("set", [Value::Int(i), _]) => {
+            let i = *i;
+            if i >= len {
+                return fail(vm, out_of_range(i));
+            }
+            if i < 0 {
+                return fail(vm, past_capacity(i));
+            }
+            None
+        }
+        ("add", [Value::Int(_), _]) | ("insertElementAt", [_, _]) => {
+            // `insertElementAt(e, i)` takes the element first; its index is not
+            // one the compiler knows to keep unboxed, hence `jint`.
+            let (i, e) = match args {
+                [i, e] if method == "add" => (i.jint(), e),
+                [e, i] => (i.jint(), e),
+                _ => return None,
+            };
+            if i > len {
+                return fail(vm, aioobe(format!("{i} > {len}")));
+            }
+            if i < 0 {
+                // The array grows before the copy that fails, so a full vector
+                // is a size bigger afterwards and the message names that.
+                let grown = if len as usize == cap {
+                    vector_grown(cap, cap + 1)
+                } else {
+                    cap
+                };
+                set_cap(grown);
+                return fail(
+                    vm,
+                    aioobe(format!(
+                        "arraycopy: source index {i} out of bounds for object array[{grown}]"
+                    )),
+                );
+            }
+            if method == "add" {
+                return None;
+            }
+            call(vm, "add", &[Value::Int(i), e.clone()]);
+            Some(Value::Undef)
+        }
+        ("listIterator", [i]) if !(0..=len).contains(&i.jint()) => fail(
+            vm,
+            Fault::java("IndexOutOfBoundsException", format!("Index: {}", i.jint())),
+        ),
+        _ => None,
+    }
 }
 
 /// `ArrayDeque` refuses `null`: each method of its add family throws
@@ -7542,6 +7778,9 @@ fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) ->
         return raise(vm, f);
     }
     if let Some(out) = array_deque_null(vm, recv, method, args) {
+        return out;
+    }
+    if let Some(out) = vector_method(vm, recv, method, args) {
         return out;
     }
     if naturally_ordered(recv) {
@@ -8326,7 +8565,21 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
     // `remove(Object)`, so `m.values().remove(1)` removes the value 1 rather
     // than the element at index 1 — the reading the compiler picks for a
     // receiver it can only type as a list.
-    let method = if method == "remove" && args.len() == 1 && is_values_view(*id) {
+    // A *boxed* argument to a list's `remove` selects `remove(Object)` too:
+    // the compiler keeps a statically integral index unboxed, so a box here is
+    // a reference javac would have bound to the by-value overload —
+    // `l.remove(map.get(k))` on an erased receiver, or `remove(Character)`.
+    let boxed_list_arg = method == "remove"
+        && args.len() == 1
+        && unboxed(&args[0]).is_some()
+        && HEAP.with(|h| {
+            matches!(
+                h.borrow().get(*id as usize),
+                Some(HostObj::List { .. } | HostObj::SubList { .. })
+            )
+        });
+    let method = if method == "remove" && args.len() == 1 && (is_values_view(*id) || boxed_list_arg)
+    {
         "removeObject"
     } else {
         method
@@ -11564,6 +11817,17 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     // the value, not the handle.
     let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
     let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    // A `Character` compared with the one-character String a `char` argument
+    // became on an erased call: both are code points (`Integer.compareTo` of a
+    // `String` does not compile, so the pair can only be two `Character`s).
+    let as_code_point = |v: Value, other: &Value| match (&v, other) {
+        (Value::Str(s), Value::Int(_)) => {
+            one_char(s).map_or(v.clone(), |c| Value::Int(i64::from(u32::from(c))))
+        }
+        _ => v,
+    };
+    let (a0, b0) = (a.clone(), b.clone());
+    let (a, b) = (as_code_point(a, &b0), as_code_point(b, &a0));
     if let (Some(x), Some(y)) = (big_of(&a), big_of(&b)) {
         return Value::Int(x.cmp(&y) as i64);
     }
@@ -11639,8 +11903,8 @@ fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
         "Integer" | "int" | "Long" | "long" => as_i64(&a).cmp(&as_i64(&b)) as i64,
         // Difference: `Character.compareTo` is `this.value - other.value`, and
         // `Byte`/`Short` are the same subtraction. `as_i64` reads a boxed
-        // `Character` in either of the two shapes javars stores it in — the code
-        // point, and the one-character String a collection element carries.
+        // `Character` in either shape it reaches here in — the code point, and
+        // the one-character String a `char` argument of an erased call becomes.
         "Character" | "char" | "Short" | "short" | "Byte" | "byte" => as_i64(&a) - as_i64(&b),
         "Double" | "double" | "Float" | "float" => double_compare(as_f64(&a), as_f64(&b)),
         "Boolean" | "boolean" => i64::from(a.is_truthy()) - i64::from(b.is_truthy()),
@@ -19812,6 +20076,28 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     if is_java_number(a) && is_java_number(b) {
         return java_numeric(op, &deboxed(a), &deboxed(b));
     }
+    // A `char` that crossed an erased call (one whose receiver javars cannot
+    // type) arrives as its one-character String. Every operator but `+` that
+    // pairs it with a number (`c == '('`, `c - 'a'`, `c < 'z'`) is one Java
+    // accepts only for a `Character`, never for a `String`, so the text is the
+    // code point it stands for. `+` stays ambiguous: `String + char` concatenates.
+    if op != NumOp::Add {
+        let code_point = |v: &Value| match v {
+            Value::Str(s) => {
+                let mut cs = s.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(c), None) => Some(Value::Int(i64::from(u32::from(c)))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match (code_point(a), code_point(b)) {
+            (Some(x), None) if is_java_number(b) => return java_numeric(op, &x, &deboxed(b)),
+            (None, Some(y)) if is_java_number(a) => return java_numeric(op, &deboxed(a), &y),
+            _ => {}
+        }
+    }
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
         // Java's value-to-string rules.
@@ -19904,6 +20190,23 @@ fn b_cast(vm: &mut VM, _argc: u8) -> Value {
     let ty = vm.stack.pop().unwrap_or(Value::Undef);
     let ty = ty.as_str_cow().into_owned();
     let v = vm.stack.pop().unwrap_or(Value::Undef);
+    // A primitive cast of a one-character String can only be of a `char` that
+    // crossed an erased call as its text (a `String` does not cast to a
+    // primitive), so it converts from the code point.
+    let v = match &v {
+        Value::Str(s) if ty != "boolean" => match one_char(s) {
+            Some(c)
+                if matches!(
+                    ty.as_str(),
+                    "int" | "long" | "short" | "byte" | "char" | "double" | "float"
+                ) =>
+            {
+                Value::Int(i64::from(u32::from(c)))
+            }
+            _ => v,
+        },
+        _ => v,
+    };
     match ty.as_str() {
         "int" => Value::Int(match &v {
             Value::Float(f) => *f as i32 as i64,
@@ -20350,6 +20653,8 @@ fn jdk_name(n: &str) -> String {
         "List"
         | "ArrayList"
         | "LinkedList"
+        | "Vector"
+        | "Stack"
         | "Set"
         | "HashSet"
         | "LinkedHashSet"

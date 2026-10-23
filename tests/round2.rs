@@ -1456,3 +1456,231 @@ Range [5, 5 + 99) out of bounds for length 9
     );
     assert_eq!(out, expected);
 }
+
+/// A `char` entering a collection (`add`, `push`, `put`, the factories, `Collections`, an erased receiver such as `m.get(k).add(c)`) is a real `Character` box: `stack.peek() == '('` was `false`, `(char) (deque.pop() + 1)` concatenated, `Map.of('(', ')').get(s.charAt(0))` missed, and `getClass()` said `String`. Expected output from openjdk 21.0.12.1.
+#[test]
+fn character_elements_are_character_boxes() {
+    let src = r####"
+import java.util.*;
+public class T {
+  public static void main(String[] args) {
+    Stack<Character> st = new Stack<>(); Deque<Character> dq = new ArrayDeque<>(); List<Character> l = new ArrayList<>();
+    for (char c : "({[".toCharArray()) { st.push(c); dq.push(c); l.add(c); }
+    System.out.println(st.peek() == '[' ); System.out.println(dq.peek() == '['); System.out.println(l.get(0) == '(');
+    System.out.println(st.pop() + 1); System.out.println((char) (dq.pop() + 1)); System.out.println(l.get(1) - 'a');
+    char top = st.peek(); System.out.println(top + 1); int code = l.get(2); System.out.println(code);
+    Map<Character, Character> pairs = Map.of(')', '(', ']', '['); System.out.println(pairs.get(')') == '(' ? "match" : "no");
+    System.out.println(pairs.get(']').equals('[') + " " + (pairs.get(']') == l.get(2)));
+    Map<Character, Integer> cnt = new HashMap<>(); for (char c : "aab".toCharArray()) cnt.put(c, cnt.getOrDefault(c, 0) + 1);
+    for (char c = 'a'; c <= 'b'; c++) System.out.print(cnt.get(c) + " "); System.out.println();
+    StringBuilder sb = new StringBuilder(); for (Character c : l) sb.append(c); System.out.println(sb);
+    List<Character> sorted = new ArrayList<>(List.of('z', 'a', 'm')); Collections.sort(sorted); System.out.println(sorted + " " + (sorted.get(0) < sorted.get(1)) + " " + Character.isLetter(sorted.get(0)) + " " + Character.toUpperCase(sorted.get(2)));
+    String s = ""; for (char c : st) s += c; System.out.println(s + " " + st);
+    Character boxed = 'x'; System.out.println(boxed + 1); System.out.println((char) (boxed + 1)); int sw = switch (l.get(0)) { case '(' -> 1; default -> 0; }; System.out.println(sw);
+  }
+}
+"####;
+    let expected = r####"true
+true
+true
+92
+\
+26
+124
+91
+match
+true true
+2 1 
+({[
+[a, m, z] true true Z
+({ [(, {]
+121
+y
+1
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// The same `Character` boxes reached through streams (`mapToObj(c -> (char) c)`, `groupingBy(s -> s.charAt(0))`), `Collections.frequency`, `compareTo` on an erased element, and `indexOf`/`contains`/`remove(Character)` on an erased receiver. Expected output from openjdk 21.0.12.1.
+#[test]
+fn character_elements_from_streams_and_erased_receivers() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T { public static void main(String[] a) {
+  List<Character> l = "hello".chars().mapToObj(c -> (char) c).collect(Collectors.toList());
+  System.out.println(l + " " + l.get(0).getClass().getSimpleName() + " " + (l.get(0) + 1) + " " + l.contains('e') + " " + l.indexOf('l') + " " + (l.get(2) == l.get(3)) + " " + (l.get(1) == 'e'));
+  Map<Character, List<String>> g = Stream.of("apple", "avocado", "banana").collect(Collectors.groupingBy(s -> s.charAt(0)));
+  System.out.println(g + " " + g.get('a').size() + " " + g.containsKey("b".charAt(0)) + " " + g.keySet().iterator().next().getClass().getSimpleName());
+  Set<Character> seen = new HashSet<>(); for (char c : "mississippi".toCharArray()) seen.add(c); System.out.println(seen + " " + seen.contains('s') + " " + seen.size());
+  Map<Character, Integer> f = new HashMap<>(); for (char c : "aabbbc".toCharArray()) f.merge(c, 1, Integer::sum);
+  char best = ' '; int bc = 0; for (Map.Entry<Character, Integer> e : f.entrySet()) if (e.getValue() > bc) { bc = e.getValue(); best = e.getKey(); } System.out.println(best + " " + bc + " " + (best + 1) + " " + f);
+  List<Character> sorted = l.stream().sorted(Comparator.reverseOrder()).toList(); System.out.println(sorted + " " + l.stream().distinct().count() + " " + l.stream().map(String::valueOf).collect(Collectors.joining("-")));
+  StringBuilder sb = new StringBuilder(); for (Character c : l) sb.append(c); for (char c : l) sb.append((char) (c - 32)); System.out.println(sb);
+  Deque<Character> st = new ArrayDeque<>(); String expr = "{[()]}"; boolean ok = true;
+  for (char c : expr.toCharArray()) { if (c == '(' || c == '[' || c == '{') st.push(c); else { if (st.isEmpty()) { ok = false; break; } char o = st.pop(); if ((c == ')' && o != '(') || (c == ']' && o != '[') || (c == '}' && o != '{')) ok = false; } }
+  System.out.println(ok && st.isEmpty());
+  Character[] arr = {'z', 'a'}; Arrays.sort(arr); System.out.println(Arrays.toString(arr) + " " + Arrays.asList(arr).contains('a') + " " + List.of('q').get(0).compareTo('r') + " " + Collections.max(l) + " " + Collections.frequency(l, 'l'));
+  Optional<Character> oc = l.stream().filter(Character::isUpperCase).findFirst(); System.out.println(oc + " " + l.stream().filter(c -> c > 'h').toList());
+} }
+"####;
+    let expected = r####"[h, e, l, l, o] Character 105 true 2 true true
+{a=[apple, avocado], b=[banana]} 2 true Character
+[p, s, i, m] true 4
+b 3 99 {a=2, b=3, c=1}
+[o, l, l, h, e] 4 h-e-l-l-o
+helloHELLO
+true
+[a, z] true -1 o 2
+Optional.empty [l, l, o]
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// A `char` argument to an erased receiver: `String.indexOf`/`replace` and `StringBuilder.append`/`insert`/`setCharAt` read it as a character, a collection stores the `Character`, and `remove(Character.valueOf(c))` removes by value. Expected output from openjdk 21.0.12.1.
+#[test]
+fn char_arguments_through_erased_receivers() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+  static Object id(Object o) { return o; }
+  public static void main(String[] a) {
+    Map<String, String> ms = new HashMap<>(); ms.put("k", "hello");
+    System.out.println(ms.get("k").indexOf('l') + " " + ms.get("k").lastIndexOf('l') + " " + ms.get("k").indexOf('l', 3) + " " + ms.get("k").replace('l', 'L') + " " + ms.get("k").indexOf("lo"));
+    Map<String, StringBuilder> sbs = new HashMap<>(); sbs.put("s", new StringBuilder("ab")); sbs.get("s").append('c').insert(0, 'z').setCharAt(1, 'A'); System.out.println(sbs.get("s") + " " + sbs.get("s").indexOf("c"));
+    Map<String, List<Character>> m = new HashMap<>(); m.put("x", new ArrayList<>(List.of('p', 'q'))); System.out.println(m.get("x").indexOf('q') + " " + m.get("x").lastIndexOf('p') + " " + m.get("x").contains('q') + " " + m.get("x").remove(Character.valueOf('p')) + m.get("x"));
+    Function<String, Integer> f = s -> s.indexOf('b'); System.out.println(f.apply("abc"));
+    List<String> strs = List.of("ab", "cb"); strs.forEach(s -> System.out.print(s.indexOf('b') + s.charAt(0) + " ")); System.out.println();
+    Map<Character, Integer> cm = new HashMap<>(); Map<String, Map<Character, Integer>> nest = new HashMap<>(); nest.put("n", cm); nest.get("n").put('z', 1); nest.get("n").merge('z', 5, Integer::sum); System.out.println(nest + " " + nest.get("n").get('z') + " " + nest.get("n").containsKey('z'));
+  }
+}
+"####;
+    let expected = r####"2 3 3 heLLo 3
+zAbc 3
+1 0 true true[q]
+1
+98 100 
+{n={z=6}} 6 true
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// `java.util.Stack` and `Vector` (both refused as unknown classes): `push`/`pop`/`peek`/`empty`/`search`, `firstElement`/`lastElement`/`elementAt`/`addElement`/`insertElementAt`, `EmptyStackException`, `Vector`'s own index messages, `getClass()` and `instanceof Vector`. Expected output from openjdk 21.0.12.1.
+#[test]
+fn java_util_stack_and_vector() {
+    let src = r####"
+import java.util.*;
+public class T { public static void main(String[] a) {
+  Stack<Integer> s = new Stack<>();
+  System.out.println(s.push(1) + " " + s.push(2) + " " + s.push(3) + " " + s + " " + s.peek() + " " + s.search(1) + " " + s.search(3) + " " + s.search(9) + " " + s.empty() + " " + s.size() + " " + s.get(0) + " " + s.firstElement() + " " + s.lastElement());
+  System.out.println(s.pop() + " " + s + " " + s.getClass().getName() + " " + (s instanceof List) + " " + (s instanceof Vector) + " " + s.capacity());
+  for (int x : s) System.out.print(x); System.out.println();
+  s.addElement(7); s.insertElementAt(0, 0); System.out.println(s + " " + s.elementAt(1) + " " + s.indexOf(7) + " " + s.remove(Integer.valueOf(7)) + " " + s.remove(0) + s);
+  try { s.get(5); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.get(-1); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.elementAt(5); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.set(5, 1); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.remove(5); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.add(9, 1); } catch (RuntimeException e) { System.out.println(e); }
+  s.clear(); try { s.pop(); } catch (EmptyStackException e) { System.out.println(e + " " + e.getMessage()); }
+  try { s.peek(); } catch (RuntimeException e) { System.out.println(e); }
+  try { s.firstElement(); } catch (RuntimeException e) { System.out.println(e); }
+  Vector<String> v = new Vector<>(List.of("a", "b")); v.add("c"); System.out.println(v + " " + v.getClass().getSimpleName() + " " + v.lastElement() + " " + v.contains("b") + " " + v.equals(List.of("a", "b", "c")) + " " + v.hashCode());
+  Stack<Character> cs = new Stack<>(); for (char c : "abc".toCharArray()) cs.push(c); StringBuilder sb = new StringBuilder(); while (!cs.isEmpty()) sb.append(cs.pop()); System.out.println(sb + " " + cs.empty());
+  Iterator<Integer> it = new Stack<Integer>().iterator(); System.out.println(it.hasNext());
+  Stack<Integer> st = new Stack<>(); st.push(5); st.push(6); System.out.println(st.stream().map(x -> x * 2).toList() + " " + new ArrayList<>(st) + " " + st.toArray().length + " " + st.contains(6));
+} }
+"####;
+    let expected = r####"1 2 3 [1, 2, 3] 3 3 1 -1 false 3 1 1 3
+3 [1, 2] java.util.Stack true true 10
+12
+[0, 1, 2, 7] 1 3 true 0[1, 2]
+java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 5
+java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 10
+java.lang.ArrayIndexOutOfBoundsException: 5 >= 2
+java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 5
+java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 5
+java.lang.ArrayIndexOutOfBoundsException: 9 > 2
+java.util.EmptyStackException null
+java.util.EmptyStackException
+java.util.NoSuchElementException
+[a, b, c] Vector c true true 126145
+cba true
+false
+[10, 12] [5, 6] 2 true
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// `Vector.capacity()` follows the JDK growth rule (double, or exactly the need when doubling falls short; `trimToSize`, `ensureCapacity`), and a negative index reports the backing array's capacity as the JDK's message does — including the growth an `add(-1, e)` performs before it fails. Expected output from openjdk 21.0.12.1.
+#[test]
+fn vector_capacity_and_negative_index_messages() {
+    let src = r####"
+import java.util.*;
+public class T { public static void main(String[] a) {
+  Vector<Integer> v = new Vector<>(List.of(1, 2));
+  Runnable[] rs = { () -> v.set(-1, 0), () -> v.remove(-1), () -> v.add(-1, 0), () -> v.removeElementAt(-1), () -> v.removeElementAt(5), () -> v.setElementAt(0, -1), () -> v.setElementAt(0, 5), () -> v.insertElementAt(0, -1), () -> v.elementAt(-1), () -> new Vector<Integer>(-1), () -> v.subList(0, 9), () -> v.listIterator(9) };
+  for (Runnable r : rs) { try { r.run(); System.out.println("ok"); } catch (RuntimeException e) { System.out.println(e); } }
+  System.out.println(v.capacity()); v.add(3); System.out.println(v.capacity()); v.addAll(List.of(4, 5, 6, 7, 8)); System.out.println(v.capacity()); v.trimToSize(); System.out.println(v.capacity()); v.ensureCapacity(9); System.out.println(v.capacity()); v.ensureCapacity(100); System.out.println(v.capacity());
+  Vector<Integer> w = new Vector<>(3); System.out.println(w.capacity()); for (int i = 0; i < 4; i++) w.add(i); System.out.println(w.capacity()); w.clear(); System.out.println(w.capacity() + " " + new Vector<>(0).capacity()); Vector<Integer> z = new Vector<>(0); z.add(1); System.out.println(z.capacity()); z.add(2); z.add(3); System.out.println(z.capacity());
+  Stack<Integer> s = new Stack<>(); for (int i = 0; i < 11; i++) s.push(i); System.out.println(s.capacity());
+} }
+"####;
+    let expected = r####"java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 2
+java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 2
+java.lang.ArrayIndexOutOfBoundsException: arraycopy: source index -1 out of bounds for object array[4]
+java.lang.ArrayIndexOutOfBoundsException: Array index out of range: -1
+java.lang.ArrayIndexOutOfBoundsException: 5 >= 2
+java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 4
+java.lang.ArrayIndexOutOfBoundsException: 5 >= 2
+java.lang.ArrayIndexOutOfBoundsException: arraycopy: source index -1 out of bounds for object array[4]
+java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 4
+java.lang.IllegalArgumentException: Illegal Capacity: -1
+java.lang.IndexOutOfBoundsException: toIndex = 9
+java.lang.IndexOutOfBoundsException: Index: 9
+4
+4
+8
+8
+16
+100
+3
+6
+6 0
+1
+4
+20
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
