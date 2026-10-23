@@ -520,9 +520,10 @@ Implemented and checked against the reference `java`:
   `log`/`log10`/`log1p`/`expm1`, `cbrt`, `hypot`, `pow`, the hyperbolic
   functions and their inverses, `IEEEremainder` and `scalb` come from a
   line-for-line port of the JDK's own fdlibm (`src/fdlibm.rs`), so they print
-  the JDK's last digit; `Math.sin`/`cos` are refused, because the JVM's own
-  intrinsic for them is not fdlibm. `StrictMath` is supported, `sin`/`cos`
-  included (fdlibm by specification). `Double.doubleToLongBits`/`longBitsToDouble`
+  the JDK's last digit; `Math.sin`/`cos`, whose JVM intrinsic is not fdlibm,
+  come from a port of HotSpot's aarch64 `dsin`/`dcos` stub
+  (`src/hotspot_trig.rs`) and print that JVM's last digit. `StrictMath` is
+  supported, `sin`/`cos` included (fdlibm by specification). `Double.doubleToLongBits`/`longBitsToDouble`
   and the `Float` pair round-trip a value through its bits.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
   compiles to a cached cdylib whose exported functions are callable by name

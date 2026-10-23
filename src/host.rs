@@ -15788,9 +15788,17 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // is that same value, which is negative" (Math.abs javadoc). The `int`
         // overload's identical case is narrowed by the compiler's trailing
         // `emit_wrap32`; this is the 64-bit one, which had no guard at all.
-        ("Math", "abs", 1) => Ok(match &args[0] {
-            Value::Int(n) => Value::Int(n.wrapping_abs()),
-            other => Value::float(other.jfloat().abs()),
+        //
+        // A boxed operand — the element a `map(Math::abs)` over a `Stream`
+        // receives — selects the overload of its unboxed type: an `Integer`
+        // is `abs(int)` and wraps at 32 bits itself, since the compiler saw an
+        // untyped lambda parameter and emitted no narrowing.
+        ("Math", "abs", 1) => Ok(match (deboxed(&args[0]), box_class(&args[0])) {
+            (Value::Int(n), Some("Integer" | "Short" | "Byte")) => {
+                Value::Int((n as i32).wrapping_abs() as i64)
+            }
+            (Value::Int(n), _) => Value::Int(n.wrapping_abs()),
+            (other, _) => Value::float(other.jfloat().abs()),
         }),
         ("Math", "max", 2) => Ok(if both_int(&args[0], &args[1]) {
             Value::Int(args[0].jint().max(args[1].jint()))
@@ -15920,11 +15928,11 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // except where HotSpot has an intrinsic, and on aarch64 every intrinsic
         // here agrees with `StrictMath` bit for bit (200,000 random arguments
         // each, openjdk 27). `sin` and `cos` are the exception — their aarch64
-        // intrinsic disagrees with fdlibm on 3.9% of arguments — so they stay
-        // unregistered: a clear error rather than a silently different last
-        // digit.
-        // `StrictMath.sin`/`cos` are fdlibm by specification, unlike the
-        // `Math` pair above.
+        // intrinsic disagrees with fdlibm on 3.9% of arguments — so `Math`'s
+        // pair is answered by a port of that intrinsic (`crate::hotspot_trig`)
+        // and `StrictMath`'s, fdlibm by specification, by the fdlibm port.
+        ("Math", "sin", 1) => Ok(Value::float(crate::hotspot_trig::sin(args[0].jfloat()))),
+        ("Math", "cos", 1) => Ok(Value::float(crate::hotspot_trig::cos(args[0].jfloat()))),
         ("StrictMath", "sin", 1) => Ok(Value::float(crate::fdlibm::sin(args[0].jfloat()))),
         ("StrictMath", "cos", 1) => Ok(Value::float(crate::fdlibm::cos(args[0].jfloat()))),
         ("Math", "tan", 1) => Ok(Value::float(crate::fdlibm::tan(args[0].jfloat()))),

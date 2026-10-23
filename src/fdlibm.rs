@@ -37,27 +37,27 @@ const HUGE: f64 = 1.0e300;
 const PI: f64 = std::f64::consts::PI;
 
 /// `__HI(x)`: the high 32 bits of `x`'s bit pattern.
-fn hi(x: f64) -> i32 {
+pub(crate) fn hi(x: f64) -> i32 {
     (x.to_bits() >> 32) as i32
 }
 
 /// `__LO(x)`: the low 32 bits of `x`'s bit pattern.
-fn lo(x: f64) -> i32 {
+pub(crate) fn lo(x: f64) -> i32 {
     x.to_bits() as i32
 }
 
 /// `__HI(x, high)`: `x` with its high word replaced.
-fn with_hi(x: f64, high: i32) -> f64 {
+pub(crate) fn with_hi(x: f64, high: i32) -> f64 {
     f64::from_bits((x.to_bits() & 0x0000_0000_FFFF_FFFF) | ((high as u32 as u64) << 32))
 }
 
 /// `__LO(x, low)`: `x` with its low word replaced.
-fn with_lo(x: f64, low: i32) -> f64 {
+pub(crate) fn with_lo(x: f64, low: i32) -> f64 {
     f64::from_bits((x.to_bits() & 0xFFFF_FFFF_0000_0000) | (low as u32 as u64))
 }
 
 /// `__HI_LO(high, low)`: the `double` with these two words.
-fn hi_lo(high: i32, low: i32) -> f64 {
+pub(crate) fn hi_lo(high: i32, low: i32) -> f64 {
     f64::from_bits(((high as u32 as u64) << 32) | (low as u32 as u64))
 }
 
@@ -139,15 +139,17 @@ pub fn cos(x: f64) -> f64 {
     }
 }
 
+// `__kernel_sin`'s polynomial, shared with `crate::hotspot_trig`.
+pub(crate) const S1: f64 = -f64::from_bits(0x3fc5_5555_5555_5549); // -0x1.5555555555549p-3
+pub(crate) const S2: f64 = f64::from_bits(0x3f81_1111_1110_f8a6); // 0x1.111111110f8a6p-7
+pub(crate) const S3: f64 = -f64::from_bits(0x3f2a_01a0_19c1_61d5); // -0x1.a01a019c161d5p-13
+pub(crate) const S4: f64 = f64::from_bits(0x3ec7_1de3_57b1_fe7d); // 0x1.71de357b1fe7dp-19
+pub(crate) const S5: f64 = -f64::from_bits(0x3e5a_e5e6_8a2b_9ceb); // -0x1.ae5e68a2b9cebp-26
+pub(crate) const S6: f64 = f64::from_bits(0x3de5_d93a_5acf_d57c); // 0x1.5d93a5acfd57cp-33
+
 /// `FdLibm.Sin.__kernel_sin`: sin on [-pi/4, pi/4], `y` the tail of `x` and
 /// `iy` whether that tail is meaningful.
 fn kernel_sin(x: f64, y: f64, iy: i32) -> f64 {
-    const S1: f64 = -f64::from_bits(0x3fc5_5555_5555_5549); // -0x1.5555555555549p-3
-    const S2: f64 = f64::from_bits(0x3f81_1111_1110_f8a6); // 0x1.111111110f8a6p-7
-    const S3: f64 = -f64::from_bits(0x3f2a_01a0_19c1_61d5); // -0x1.a01a019c161d5p-13
-    const S4: f64 = f64::from_bits(0x3ec7_1de3_57b1_fe7d); // 0x1.71de357b1fe7dp-19
-    const S5: f64 = -f64::from_bits(0x3e5a_e5e6_8a2b_9ceb); // -0x1.ae5e68a2b9cebp-26
-    const S6: f64 = f64::from_bits(0x3de5_d93a_5acf_d57c); // 0x1.5d93a5acfd57cp-33
     let ix = hi(x) & EXP_SIGNIF_BITS;
     if ix < 0x3e40_0000 && x as i32 == 0 {
         // |x| < 2**-27
@@ -163,14 +165,16 @@ fn kernel_sin(x: f64, y: f64, iy: i32) -> f64 {
     }
 }
 
+// `__kernel_cos`'s polynomial, shared with `crate::hotspot_trig`.
+pub(crate) const C1: f64 = f64::from_bits(0x3fa5_5555_5555_554c); // 0x1.555555555554cp-5
+pub(crate) const C2: f64 = -f64::from_bits(0x3f56_c16c_16c1_5177); // -0x1.6c16c16c15177p-10
+pub(crate) const C3: f64 = f64::from_bits(0x3efa_01a0_19cb_1590); // 0x1.a01a019cb159p-16
+pub(crate) const C4: f64 = -f64::from_bits(0x3e92_7e4f_809c_52ad); // -0x1.27e4f809c52adp-22
+pub(crate) const C5: f64 = f64::from_bits(0x3e21_ee9e_bdb4_b1c4); // 0x1.1ee9ebdb4b1c4p-29
+pub(crate) const C6: f64 = -f64::from_bits(0x3da8_fae9_be88_38d4); // -0x1.8fae9be8838d4p-37
+
 /// `FdLibm.Cos.__kernel_cos`: cos on [-pi/4, pi/4], `y` the tail of `x`.
 fn kernel_cos(x: f64, y: f64) -> f64 {
-    const C1: f64 = f64::from_bits(0x3fa5_5555_5555_554c); // 0x1.555555555554cp-5
-    const C2: f64 = -f64::from_bits(0x3f56_c16c_16c1_5177); // -0x1.6c16c16c15177p-10
-    const C3: f64 = f64::from_bits(0x3efa_01a0_19cb_1590); // 0x1.a01a019cb159p-16
-    const C4: f64 = -f64::from_bits(0x3e92_7e4f_809c_52ad); // -0x1.27e4f809c52adp-22
-    const C5: f64 = f64::from_bits(0x3e21_ee9e_bdb4_b1c4); // 0x1.1ee9ebdb4b1c4p-29
-    const C6: f64 = -f64::from_bits(0x3da8_fae9_be88_38d4); // -0x1.8fae9be8838d4p-37
     let ix = hi(x) & EXP_SIGNIF_BITS;
     if ix < 0x3e40_0000 && x as i32 == 0 {
         // |x| < 2**-27
@@ -285,34 +289,47 @@ fn kernel_tan(x: f64, y: f64, iy: i32) -> f64 {
     }
 }
 
+// The argument-reduction tables `RemPio2` and `KernelRemPio2` read, shared
+// with the HotSpot intrinsic port in `crate::hotspot_trig`, which reduces with
+// the same constants.
+pub(crate) const TWO_OVER_PI: [i32; 66] = [
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C, 0x439041, 0xFE5163,
+    0xABDEBB, 0xC561B7, 0x246E3A, 0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
+    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41, 0x3991D6, 0x398353, 0x39F49C,
+    0x845F8B, 0xBDF928, 0x3B1FF8, 0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
+    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5, 0xF17B3D, 0x0739F7, 0x8A5292,
+    0xEA6BFB, 0x5FB11F, 0x8D5D08, 0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
+    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880, 0x4D7327, 0x310606, 0x1556CA,
+    0x73A8C9, 0x60E27B, 0xC08C6B,
+];
+pub(crate) const NPIO2_HW: [i32; 32] = [
+    0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C, 0x4025FDBB, 0x402921FB,
+    0x402C463A, 0x402F6A7A, 0x4031475C, 0x4032D97C, 0x40346B9C, 0x4035FDBB, 0x40378FDB, 0x403921FB,
+    0x403AB41B, 0x403C463A, 0x403DD85A, 0x403F6A7A, 0x40407E4C, 0x4041475C, 0x4042106C, 0x4042D97C,
+    0x4043A28C, 0x40446B9C, 0x404534AC, 0x4045FDBB, 0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB,
+];
+pub(crate) const INVPIO2: f64 = f64::from_bits(0x3fe4_5f30_6dc9_c883);
+pub(crate) const PIO2_1: f64 = f64::from_bits(0x3ff9_21fb_5440_0000);
+pub(crate) const PIO2_1T: f64 = f64::from_bits(0x3dd0_b461_1a62_6331);
+pub(crate) const PIO2_2: f64 = f64::from_bits(0x3dd0_b461_1a60_0000);
+pub(crate) const PIO2_2T: f64 = f64::from_bits(0x3ba3_198a_2e03_7073);
+pub(crate) const PIO2_3: f64 = f64::from_bits(0x3ba3_198a_2e00_0000);
+pub(crate) const PIO2_3T: f64 = f64::from_bits(0x397b_839a_2520_49c1);
+pub(crate) const PIO2: [f64; 8] = [
+    f64::from_bits(0x3ff9_21fb_4000_0000),
+    f64::from_bits(0x3e74_442d_0000_0000),
+    f64::from_bits(0x3cf8_4698_8000_0000),
+    f64::from_bits(0x3b78_cc51_6000_0000),
+    f64::from_bits(0x39f0_1b83_8000_0000),
+    f64::from_bits(0x387a_2520_4000_0000),
+    f64::from_bits(0x36e3_8222_8000_0000),
+    f64::from_bits(0x3569_f31d_0000_0000),
+];
+pub(crate) const TWON24: f64 = f64::from_bits(0x3e70_0000_0000_0000);
+
 /// `FdLibm.RemPio2.__ieee754_rem_pio2`: `x` reduced by the nearest multiple
 /// `n` of pi/2, as the pair `y[0] + y[1]`; answers `n`.
 fn rem_pio2(x: f64, y: &mut [f64; 2]) -> i32 {
-    const TWO_OVER_PI: [i32; 66] = [
-        0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C, 0x439041, 0xFE5163,
-        0xABDEBB, 0xC561B7, 0x246E3A, 0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
-        0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41, 0x3991D6, 0x398353, 0x39F49C,
-        0x845F8B, 0xBDF928, 0x3B1FF8, 0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
-        0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5, 0xF17B3D, 0x0739F7, 0x8A5292,
-        0xEA6BFB, 0x5FB11F, 0x8D5D08, 0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
-        0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880, 0x4D7327, 0x310606, 0x1556CA,
-        0x73A8C9, 0x60E27B, 0xC08C6B,
-    ];
-    const NPIO2_HW: [i32; 32] = [
-        0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C, 0x4025FDBB,
-        0x402921FB, 0x402C463A, 0x402F6A7A, 0x4031475C, 0x4032D97C, 0x40346B9C, 0x4035FDBB,
-        0x40378FDB, 0x403921FB, 0x403AB41B, 0x403C463A, 0x403DD85A, 0x403F6A7A, 0x40407E4C,
-        0x4041475C, 0x4042106C, 0x4042D97C, 0x4043A28C, 0x40446B9C, 0x404534AC, 0x4045FDBB,
-        0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB,
-    ];
-    const INVPIO2: f64 = f64::from_bits(0x3fe4_5f30_6dc9_c883);
-    const PIO2_1: f64 = f64::from_bits(0x3ff9_21fb_5440_0000);
-    const PIO2_1T: f64 = f64::from_bits(0x3dd0_b461_1a62_6331);
-    const PIO2_2: f64 = f64::from_bits(0x3dd0_b461_1a60_0000);
-    const PIO2_2T: f64 = f64::from_bits(0x3ba3_198a_2e03_7073);
-    const PIO2_3: f64 = f64::from_bits(0x3ba3_198a_2e00_0000);
-    const PIO2_3T: f64 = f64::from_bits(0x397b_839a_2520_49c1);
-
     let hx = hi(x);
     let ix = hx & EXP_SIGNIF_BITS;
     if ix <= 0x3fe9_21fb {
@@ -433,17 +450,6 @@ fn kernel_rem_pio2(
     ipio2: &[i32],
 ) -> i32 {
     const INIT_JK: [i32; 4] = [2, 3, 4, 6];
-    const PIO2: [f64; 8] = [
-        f64::from_bits(0x3ff9_21fb_4000_0000),
-        f64::from_bits(0x3e74_442d_0000_0000),
-        f64::from_bits(0x3cf8_4698_8000_0000),
-        f64::from_bits(0x3b78_cc51_6000_0000),
-        f64::from_bits(0x39f0_1b83_8000_0000),
-        f64::from_bits(0x387a_2520_4000_0000),
-        f64::from_bits(0x36e3_8222_8000_0000),
-        f64::from_bits(0x3569_f31d_0000_0000),
-    ];
-    const TWON24: f64 = f64::from_bits(0x3e70_0000_0000_0000);
 
     let mut iq = [0i32; 20];
     let mut f = [0.0f64; 20];

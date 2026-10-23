@@ -3473,3 +3473,45 @@ after
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Math.sin`/`cos` answer HotSpot's aarch64 intrinsic, which differs from `StrictMath` (fdlibm) in the last digit on some arguments — each row prints both, so a regression to either side shows; `Math::sin`/`cos` work as references; `Math::abs` over boxed `Integer`/`Long` elements keeps the integral overload (and `abs(int)`'s wrap); `Character::toString` over `int` elements is the static `toString(int)`.
+#[test]
+fn math_sin_cos_follow_the_hotspot_intrinsic_and_static_refs_pick_the_right_overload() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] args) {
+        double[] xs = {0.4220066749876157, 0.6311240641732248, 1.0168250634395086, 2.9401753950975253, -3.911333546022714, 823551.0, 7.49005363202941e90, 1e-9, -0.0};
+        for (double x : xs) {
+            System.out.println(Math.sin(x) + " " + StrictMath.sin(x) + " " + Math.cos(x) + " " + StrictMath.cos(x));
+        }
+        System.out.println(Math.sin(Double.NaN) + " " + Math.cos(Double.POSITIVE_INFINITY) + " " + Long.toHexString(Double.doubleToRawLongBits(Math.sin(Double.NEGATIVE_INFINITY))));
+        double sum = 0;
+        for (int deg = 0; deg < 360; deg += 15) sum += Math.sin(Math.toRadians(deg)) * Math.cos(Math.toRadians(deg));
+        System.out.println(sum);
+        System.out.println(Stream.of(1.0, 2.0).map(Math::sin).toList() + " " + DoubleStream.of(0.5, 1.5).map(Math::cos).sum());
+        System.out.println(Stream.of(-2, Integer.MIN_VALUE).map(Math::abs).toList() + " " + Stream.of(-2L, Long.MIN_VALUE).map(Math::abs).toList() + " " + Stream.of(-2.5).map(Math::abs).toList());
+        System.out.println(Stream.of(72, 105).map(Character::toString).collect(Collectors.joining()) + " " + IntStream.of(97, 98).mapToObj(Character::toString).toList());
+    }
+}
+"####;
+    let expected = r####"0.4095919035945747 0.40959190359457476 0.9122688597720371 0.9122688597720371
+0.5900526603259414 0.5900526603259414 0.8073647614568519 0.8073647614568518
+0.8504420763323796 0.8504420763323796 0.5260686977985586 0.5260686977985585
+0.2000581384847717 0.2000581384847717 -0.9797840278479784 -0.9797840278479782
+0.695949199174333 0.6959491991743331 -0.7180910194178761 -0.7180910194178761
+0.9724260310972328 0.9724260310972327 0.23321152210918683 0.23321152210918683
+0.972518181381139 0.9725181813811391 0.2328269462135384 0.2328269462135384
+1.0E-9 1.0E-9 1.0 1.0
+-0.0 -0.0 1.0 1.0
+NaN NaN 7ff0000000000001
+5.551115123125783E-16
+[0.8414709848078965, 0.9092974268256817] 0.9483197635580757
+[2, -2147483648] [2, -9223372036854775808] [2.5]
+Hi [a, b]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

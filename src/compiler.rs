@@ -12301,14 +12301,14 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Long", "parseUnsignedLong") => "long",
         // The `double`-returning `Math` statics: the exactly specified ones (an
         // IEEE operation or a bit-pattern walk) and the transcendentals answered
-        // from the fdlibm port (`crate::fdlibm`); `sin`/`cos` stay out (see
-        // `static_method`).
+        // from the fdlibm port (`crate::fdlibm`), `sin`/`cos` from the port of
+        // HotSpot's aarch64 intrinsic (`crate::hotspot_trig`).
         (
             "Math",
             "pow" | "sqrt" | "floor" | "ceil" | "rint" | "copySign" | "ulp" | "nextUp" | "nextDown"
-            | "nextAfter" | "fma" | "scalb" | "tan" | "asin" | "acos" | "atan" | "atan2" | "exp"
-            | "log" | "log10" | "log1p" | "expm1" | "cbrt" | "hypot" | "sinh" | "cosh" | "tanh"
-            | "asinh" | "acosh" | "atanh" | "IEEEremainder",
+            | "nextAfter" | "fma" | "scalb" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+            | "atan2" | "exp" | "log" | "log10" | "log1p" | "expm1" | "cbrt" | "hypot" | "sinh"
+            | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "IEEEremainder",
         ) => "double",
         ("Math", "getExponent") => "int",
         // `StrictMath`'s own two; every other `StrictMath` member is aliased
@@ -12778,12 +12778,10 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Float", "valueOf")
         | ("Double", "parseDouble")
         // The `java.lang.Math` statics javars models at arity 1, the fdlibm
-        // transcendentals among them. `sin` and `cos` are unmodelled (see the
-        // note in `host::static_method`), so naming one here would synthesize a
-        // lambda whose body cannot run.
+        // transcendentals among them.
         | (
             "Math",
-            "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "log1p" | "expm1"
+            "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "log" | "log10" | "log1p" | "expm1"
             | "cbrt" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh",
         )
         | ("StrictMath", "sin" | "cos")
@@ -12823,12 +12821,18 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         // the same name, so a reference to one is unambiguous. The case maps are
         // left out: their `(int)` overload answers an `int` and their `(char)`
         // one a `char`, which only the target type javars lacks can choose.
+        //
+        // `Character::toString` names the static `toString(char)`/`(int)` and
+        // the instance `toString()`. `javac` rejects it as ambiguous wherever
+        // the element is a `Character` and selects the static `(int)` overload
+        // wherever it is an `int` or `Integer` (`Stream.of(65)` maps to `"A"`),
+        // so the static call is the reading of every program it compiles.
         | (
             "Character",
             "isLetter" | "isDigit" | "isLetterOrDigit" | "isAlphabetic" | "isWhitespace"
             | "isSpaceChar" | "isUpperCase" | "isLowerCase" | "isISOControl"
             | "isJavaIdentifierStart" | "isJavaIdentifierPart" | "getNumericValue"
-            | "charCount",
+            | "charCount" | "toString",
         )
  => 1,
         ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,

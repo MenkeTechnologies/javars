@@ -1149,6 +1149,20 @@ pub const REFERENCE: &[Entry] = &[
         "System.out.println(StrictMath.sin(1.0) + \" \" + StrictMath.cos(2.0));",
     ),
     (
+        "Math.sin",
+        "Static Library",
+        "double Math.sin(double a)",
+        "The sine. Ported from HotSpot's aarch64 `dsin` intrinsic, which every `Math.sin` call on that JVM runs, so the result is its to the last bit — and differs from `StrictMath.sin` (fdlibm) in the last place on some arguments.",
+        "System.out.println(Math.sin(Math.PI / 6));",
+    ),
+    (
+        "Math.cos",
+        "Static Library",
+        "double Math.cos(double a)",
+        "The cosine. Ported from HotSpot's aarch64 `dcos` intrinsic, which every `Math.cos` call on that JVM runs, so the result is its to the last bit — and differs from `StrictMath.cos` (fdlibm) in the last place on some arguments.",
+        "System.out.println(Math.cos(1.0));",
+    ),
+    (
         "Math.tan",
         "Static Library",
         "double Math.tan(double a)",

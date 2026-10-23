@@ -1636,7 +1636,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   when it is reached, and any other field is refused at parse time. A `Scanner` reads in the root locale only, as every
   other javars formatter does, and takes no custom delimiter
   (`useDelimiter`), radix, `findInLine`, or pattern argument.
-- **`Math.sin` and `Math.cos`.** Every other transcendental — `tan`, `asin`,
+- ~~**`Math.sin` and `Math.cos`**~~ — implemented. Every other transcendental — `tan`, `asin`,
   `acos`, `atan`, `atan2`, `exp`, `log`, `log10`, `log1p`, `expm1`, `cbrt`,
   `hypot`, `sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `IEEEremainder`,
   `pow`, and `scalb` — is answered by `src/fdlibm.rs`, a line-for-line port of
@@ -1649,12 +1649,23 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   that agrees with it on aarch64 (200,000 random arguments each, measured on
   openjdk 27; an x86_64 JVM's Intel-derived intrinsics may round the last place
   differently). `sin` and `cos` are the two where it does not: their aarch64
-  intrinsic disagrees with fdlibm on 7,725 and 6,507 of 200,000 arguments, so a
-  port would print a different last digit than the program's own JVM. They stay
-  unregistered — a clear error rather than a silently different digit.
-  `StrictMath.sin`/`cos` are supported: `StrictMath` *is* fdlibm, so the same
-  port answers them exactly, and every other `StrictMath` member is read as
-  its `Math` namesake.
+  intrinsic disagrees with fdlibm on 7,725 and 6,507 of 200,000 arguments. They
+  are answered by `src/hotspot_trig.rs`, a port of the stub
+  `MacroAssembler::generate_dsin_dcos` emits
+  (`macroAssembler_aarch64_trig.cpp`, openjdk 27): fdlibm's algorithm with its
+  multiply-adds fused, the large reduction's first products summed in the
+  opposite order, and `kernel_cos` reading the unreduced argument's high word
+  (so its `qx` is always 0.28125 after a reduction). It matches `Math.sin`/`cos`
+  of openjdk 25 and 27 on aarch64 bit for bit over 800,598 arguments
+  spanning its three reduction branches, on which fdlibm differs for 85,880,
+  the stub's NaN (`0x7ff0000000000001`, visible through
+  `doubleToRawLongBits`) included. An
+  x86_64 JVM answers them from its Intel-derived stub instead and may print a
+  different last digit; javars prints the aarch64 one on every host.
+  `Math::sin`/`Math::cos` are method references like the other transcendentals.
+  `StrictMath.sin`/`cos` stay fdlibm: `StrictMath` *is* fdlibm, so that port
+  answers them exactly, and every other `StrictMath` member is read as its
+  `Math` namesake.
   `sqrt`, `abs`, `floor`, `ceil`, `round`, `max`, `min`, `signum`,
   `floorDiv`, `floorMod`, `toRadians`, and `toDegrees` are exact and supported,
   as are the `Math.PI`/`Math.E` constants — and so are `rint`, `copySign`,

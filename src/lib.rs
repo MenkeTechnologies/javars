@@ -13,6 +13,7 @@ pub mod compiler;
 pub mod dap;
 pub mod fdlibm;
 pub mod host;
+pub mod hotspot_trig;
 pub mod jbig;
 pub mod jbigdec;
 pub mod jbitset;
