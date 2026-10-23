@@ -2883,3 +2883,113 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Arrays.asList(array)` is a view of the array: a `set` (through the list or a `subList` of it), `sort`, `replaceAll` or `Collections.sort`/`reverse`/`swap` writes the array, and an array store or `Arrays.fill` shows in every list viewing it; `Arrays.asList(1, 2, 3)` views a fresh array of its own.
+#[test]
+fn arrays_as_list_views_its_array() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        Integer[] arr = {5, 2, 9};
+        List<Integer> v = Arrays.asList(arr);
+        v.set(0, 99);
+        arr[1] = 7;
+        System.out.println(Arrays.toString(arr) + " " + v);
+        Collections.sort(v);
+        System.out.println(Arrays.toString(arr) + " " + v);
+        v.sort(Comparator.reverseOrder());
+        System.out.println(Arrays.toString(arr));
+        Arrays.fill(arr, 1);
+        System.out.println(v + " " + v.get(2));
+        v.replaceAll(x -> x + 1);
+        System.out.println(Arrays.toString(arr));
+        List<Integer> w = Arrays.asList(arr);
+        w.set(1, 42);
+        System.out.println(v + " " + w + " " + arr[1]);
+        v.subList(1, 3).set(1, 8);
+        System.out.println(Arrays.toString(arr) + " " + w);
+        Collections.reverse(v); Collections.swap(v, 0, 1);
+        System.out.println(Arrays.toString(arr));
+        String[] s = {"b", "a"};
+        Arrays.sort(s);
+        List<String> ls = Arrays.asList(s);
+        s[0] = "z";
+        System.out.println(ls + " " + ls.contains("z") + " " + ls.indexOf("b"));
+        List<Integer> fresh = Arrays.asList(1, 2, 3);
+        fresh.set(0, 0);
+        System.out.println(fresh);
+        try { v.add(3); } catch (UnsupportedOperationException e) { System.out.println("UOE"); }
+    }
+}
+"####;
+    let expected = r####"[99, 7, 9] [99, 7, 9]
+[7, 9, 99] [7, 9, 99]
+[99, 9, 7]
+[1, 1, 1] 1
+[2, 2, 2]
+[2, 42, 2] [2, 42, 2] 42
+[2, 42, 8] [2, 42, 8]
+[42, 8, 2]
+[z, b] true 1
+[0, 2, 3]
+UOE
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// JDK 21's `List.reversed()` (and a deque's) is a view: a write through it — `set`, `add`, `remove`, `removeFirst`, `Collections.sort` — lands in the list backwards, a change to the list shows in it, an iterator over it fails fast when the list changes, reversing it again answers the list itself, and its class is `ReverseOrderListView$Rand` (`ReverseOrderDequeView` for a deque).
+#[test]
+fn reversed_is_a_view_of_its_list() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        List<Integer> r = l.reversed();
+        r.set(0, 9);
+        l.add(4);
+        System.out.println(l + " " + r + " " + r.size() + " " + r.get(0));
+        r.add(0);
+        System.out.println(l + " " + r);
+        r.remove(Integer.valueOf(2));
+        r.removeFirst();
+        System.out.println(l + " " + r);
+        for (int x : r) System.out.print(x + ",");
+        System.out.println();
+        Collections.sort(r);
+        System.out.println(l + " " + r + " " + r.reversed() + " " + (r.reversed() == l));
+        l.clear();
+        System.out.println(r + " " + r.isEmpty());
+        List<Integer> im = List.of(1, 2).reversed();
+        try { im.set(0, 5); } catch (UnsupportedOperationException e) { System.out.println("UOE"); }
+        System.out.println(im + " " + new ArrayList<>(List.of(5, 6)).reversed().indexOf(5));
+        List<Integer> base = new ArrayList<>(List.of(1, 2));
+        System.out.println(base.reversed().getClass().getName() + " " + new ArrayDeque<>(List.of(1)).reversed().getClass().getName());
+        Iterator<Integer> it = base.reversed().iterator(); base.add(3);
+        try { it.next(); } catch (ConcurrentModificationException e) { System.out.println("CME"); }
+        Deque<Integer> d = new ArrayDeque<>(List.of(1, 2));
+        Deque<Integer> rd = d.reversed();
+        d.addLast(3);
+        System.out.println(rd + " " + rd.peekFirst());
+    }
+}
+"####;
+    let expected = r####"[1, 2, 9, 4] [4, 9, 2, 1] 4 4
+[0, 1, 2, 9, 4] [4, 9, 2, 1, 0]
+[0, 1, 9] [9, 1, 0]
+9,1,0,
+[9, 1, 0] [0, 1, 9] [9, 1, 0] true
+[] true
+UOE
+[2, 1] 1
+java.util.ReverseOrderListView$Rand java.util.ReverseOrderDequeView
+CME
+[3, 2, 1] 3
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

@@ -2616,6 +2616,12 @@ pub fn heap_reset() {
     // Both are keyed by heap handle, so a surviving entry would mark the next
     // program's object in that slot.
     PLAIN_VIEWS.with(|p| p.borrow_mut().clear());
+    VIEW_CLASSES.with(|v| v.borrow_mut().clear());
+    VIEWS.with(|v| v.borrow_mut().clear());
+    REVERSED_VIEWS.with(|r| r.borrow_mut().clear());
+    ARRAY_TYPES.with(|t| t.borrow_mut().clear());
+    ARRAY_LISTS.with(|m| m.borrow_mut().clear());
+    LIST_ARRAY.with(|m| m.borrow_mut().clear());
     ARRAY_DEQUES.with(|d| d.borrow_mut().clear());
     VECTORS.with(|v| v.borrow_mut().clear());
     FILED_HASH.with(|f| f.borrow_mut().clear());
@@ -6043,10 +6049,21 @@ thread_local! {
     /// shows. The view is an immutable copy that [`sync_view`] re-copies from
     /// its target whenever it is read, which is what makes it a *view*.
     static VIEWS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// The [`VIEWS`] that are a list's `reversed()` view rather than an
+    /// unmodifiable one: [`sync_view`] reads the target backwards into them,
+    /// and a write through one is carried back ([`sync_reversed_back`]).
+    static REVERSED_VIEWS: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
     /// The views made by `unmodifiableCollection`, which is neither a `List` nor
     /// a `Set` whatever it wraps.
     static PLAIN_VIEWS: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// The `Arrays.asList(array)` lists viewing each array, and the array each
+    /// such list views: Java's list writes through to its array and an array
+    /// store shows in the list, so a write to either is carried to the other
+    /// ([`sync_linked_list`], [`sync_array_lists`]).
+    static ARRAY_LISTS: RefCell<HashMap<u32, Vec<u32>>> = RefCell::new(HashMap::default());
+    static LIST_ARRAY: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::default());
     /// Each array's type where its creation knew it (see [`JARRAY_TAG`]):
     /// the element type a `HostObj::Array` erases, which `instanceof int[]`
     /// needs. An array made where javars knows no element type is absent.
@@ -6093,12 +6110,32 @@ fn sync_view(id: u32) {
         Some(HostObj::Map { entries, order, .. }) => Some(Snap::Map(entries.clone(), *order)),
         _ => None,
     });
-    let snap = snap.or_else(|| sequence_items(&Value::Obj(target)).map(Snap::List));
+    let reversed = REVERSED_VIEWS.with(|r| r.borrow().contains(&id));
+    let snap = snap.or_else(|| {
+        sequence_items(&Value::Obj(target)).map(|mut items| {
+            if reversed {
+                items.reverse();
+            }
+            Snap::List(items)
+        })
+    });
     let Some(snap) = snap else {
         return;
     };
+    // A `reversed()` view shares its list's modification count, so an
+    // iterator over the view fails fast when the list changes under it.
+    let base_mods = if reversed {
+        list_mods(target as usize)
+    } else {
+        None
+    };
     HEAP.with(|h| match (h.borrow_mut().get_mut(id as usize), snap) {
-        (Some(HostObj::List { items, .. }), Snap::List(new)) => *items = new,
+        (Some(HostObj::List { items, mods, .. }), Snap::List(new)) => {
+            *items = new;
+            if let Some(m) = base_mods {
+                *mods = m;
+            }
+        }
         (
             Some(HostObj::Set {
                 items,
@@ -7119,6 +7156,9 @@ fn b_array_set(vm: &mut VM, argc: u8) -> Value {
             _ => Err(Fault::internal("javars: not an array")),
         }
     });
+    if stored.is_ok() && !ARRAY_LISTS.with(|m| m.borrow().is_empty()) {
+        sync_array_lists(id, None, Some(idx as usize));
+    }
     match stored {
         Ok(()) => val,
         Err(f) => raise(vm, f),
@@ -7651,6 +7691,144 @@ fn navigate(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<V
 /// `keySet()`/`entrySet()`/`values()` is carried back to the map — see
 /// [`write_through`].
 fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
+    let out = coll_method_unlinked(vm, recv, method, args);
+    sync_linked_list(recv, method, args);
+    sync_reversed_back(recv, method);
+    out
+}
+
+/// After `method` ran on a `reversed()` view, write the view's elements back
+/// into its list, backwards — a structural change bumping the list's
+/// modification count as one made directly would. Methods that only read
+/// leave the list alone.
+fn sync_reversed_back(recv: &Value, method: &str) {
+    let Value::Obj(id) = recv else {
+        return;
+    };
+    if REVERSED_VIEWS.with(|r| r.borrow().is_empty() || !r.borrow().contains(id)) {
+        return;
+    }
+    let writes = matches!(
+        method,
+        "set"
+            | "add"
+            | "addAll"
+            | "remove"
+            | "removeObject"
+            | "removeAll"
+            | "retainAll"
+            | "removeIf"
+            | "clear"
+            | "sort"
+            | "replaceAll"
+            | "addFirst"
+            | "addLast"
+            | "removeFirst"
+            | "removeLast"
+            | "#all"
+    );
+    let Some(base) = VIEWS
+        .with(|v| v.borrow().get(id).copied())
+        .filter(|_| writes)
+    else {
+        return;
+    };
+    let Some(mut items) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::List { items, .. }) => Some(items.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    items.reverse();
+    HEAP.with(|h| {
+        if let Some(HostObj::List {
+            items: dst, mods, ..
+        }) = h.borrow_mut().get_mut(base as usize)
+        {
+            if dst.len() != items.len() {
+                *mods += 1;
+            }
+            *dst = items;
+        }
+    });
+}
+
+/// After `method` ran on `recv`, carry what it wrote into the array an
+/// `Arrays.asList` list views — one element for a `set`, the whole list for a
+/// method that rewrites it (`sort`, `replaceAll`, or `#all` from a static).
+/// A method that only reads, and every list that views no array, costs one
+/// empty-map check.
+fn sync_linked_list(recv: &Value, method: &str, args: &[Value]) {
+    if LIST_ARRAY.with(|m| m.borrow().is_empty()) {
+        return;
+    }
+    let Value::Obj(id) = recv else {
+        return;
+    };
+    // A `subList` writes its root list, which is the one that views the array.
+    let (root, offset) = if is_sublist(*id as usize) {
+        match resolve_window(*id as usize) {
+            Some((root, offset, _)) => (root as u32, offset),
+            None => return,
+        }
+    } else {
+        (*id, 0)
+    };
+    let Some(arr) = LIST_ARRAY.with(|m| m.borrow().get(&root).copied()) else {
+        return;
+    };
+    if !matches!(method, "set" | "sort" | "replaceAll" | "#all") {
+        return;
+    }
+    let Some(items) = sequence_items(&Value::Obj(root)) else {
+        return;
+    };
+    HEAP.with(|h| {
+        if let Some(HostObj::Array(a)) = h.borrow_mut().get_mut(arr as usize) {
+            match (method, args.first()) {
+                ("set", Some(i)) => {
+                    let i = i.jint() as usize + offset;
+                    if let (Some(slot), Some(v)) = (a.get_mut(i), items.get(i)) {
+                        *slot = v.clone();
+                    }
+                }
+                _ if a.len() == items.len() => *a = items,
+                _ => {}
+            }
+        }
+    });
+    sync_array_lists(arr, Some(root), None);
+}
+
+/// After the array `arr` was written, carry the write into every
+/// `Arrays.asList` list viewing it (but `skip`, the list the write came from):
+/// the one element `index` names, or all of them.
+fn sync_array_lists(arr: u32, skip: Option<u32>, index: Option<usize>) {
+    let Some(lists) = ARRAY_LISTS.with(|m| m.borrow().get(&arr).cloned()) else {
+        return;
+    };
+    let Some(items) = array_items(&Value::Obj(arr)) else {
+        return;
+    };
+    HEAP.with(|h| {
+        let mut heap = h.borrow_mut();
+        for l in lists.into_iter().filter(|l| Some(*l) != skip) {
+            if let Some(HostObj::List { items: dst, .. }) = heap.get_mut(l as usize) {
+                match index {
+                    Some(i) => {
+                        if let (Some(slot), Some(v)) = (dst.get_mut(i), items.get(i)) {
+                            *slot = v.clone();
+                        }
+                    }
+                    None if dst.len() == items.len() => *dst = items.clone(),
+                    None => {}
+                }
+            }
+        }
+    });
+}
+
+fn coll_method_unlinked(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value {
     if let Value::Obj(id) = recv {
         sync_view(*id);
     }
@@ -7737,12 +7915,33 @@ fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> 
     };
     let empty = || sequence_len(recv).unwrap_or(0) == 0;
     match (shape, method, args) {
+        // A view (JDK 21's `ReverseOrderListView`): re-read backwards from the
+        // list on every use, and a write through it carried back.
         (Shape::List, "reversed", []) => {
+            // Reversing a reversed view answers the list itself.
+            if REVERSED_VIEWS.with(|r| r.borrow().contains(id)) {
+                if let Some(base) = VIEWS.with(|v| v.borrow().get(id).copied()) {
+                    return Some(Value::Obj(base));
+                }
+            }
             let (items, fixed) = HEAP.with(|h| match h.borrow().get(*id as usize) {
                 Some(HostObj::List { items, fixed, .. }) => Some((items.clone(), *fixed)),
                 _ => None,
             })?;
-            Some(list_value(items.into_iter().rev().collect(), fixed))
+            let view = list_value(items.into_iter().rev().collect(), fixed);
+            if let Value::Obj(v) = view {
+                VIEWS.with(|m| m.borrow_mut().insert(v, *id));
+                REVERSED_VIEWS.with(|r| r.borrow_mut().insert(v));
+                // `ArrayDeque.reversed()` is a deque view, every list's the
+                // `RandomAccess` list view.
+                let class = if ARRAY_DEQUES.with(|d| d.borrow().contains(id)) {
+                    "java.util.ReverseOrderDequeView"
+                } else {
+                    "java.util.ReverseOrderListView$Rand"
+                };
+                VIEW_CLASSES.with(|m| m.borrow_mut().insert(v, class));
+            }
+            Some(view)
         }
         (Shape::SortedSet, "getFirst" | "getLast", []) => Some(call(
             vm,
@@ -12965,7 +13164,16 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
     // The collection statics come first: two of them (`Collections.sort` with a
     // comparator) run user code, which `static_method` — which has no VM — could
     // not do.
-    match collection_static(vm, &class, &method, &args) {
+    let static_result = collection_static(vm, &class, &method, &args);
+    // `Collections.sort(Arrays.asList(a))` and the other in-place statics
+    // write through to the array the list views.
+    if class == "Collections" {
+        if let Some(first) = args.first() {
+            sync_linked_list(first, "#all", &[]);
+            sync_reversed_back(first, "#all");
+        }
+    }
+    match static_result {
         Some(Ok(v)) => return v,
         Some(Err(f)) => return raise(vm, f),
         None => {}
@@ -14021,7 +14229,18 @@ fn collection_static(
     };
     Some(match (class, method) {
         // `Arrays.asList` is a fixed-size *view*: `set` works, `add` throws.
-        ("Arrays", "asList") => list(varargs_items(args), Fixity::FixedSize),
+        // When the argument is one array, the list views it: a write through
+        // either shows in the other (see [`ARRAY_LISTS`]).
+        ("Arrays", "asList") => {
+            let made = list(varargs_items(args), Fixity::FixedSize);
+            if let ([Value::Obj(arr)], Ok(Value::Obj(l))) = (args, &made) {
+                if array_items(&args[0]).is_some() {
+                    ARRAY_LISTS.with(|m| m.borrow_mut().entry(*arr).or_default().push(*l));
+                    LIST_ARRAY.with(|m| m.borrow_mut().insert(*l, *arr));
+                }
+            }
+            made
+        }
         ("List", "of") => {
             let items = varargs_items(args);
             if let Err(f) = reject_null_element(&items) {
@@ -18421,7 +18640,7 @@ fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault>
             "null array".to_string(),
         ));
     };
-    HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
+    let done = HEAP.with(|h| match h.borrow_mut().get_mut(*id as usize) {
         Some(HostObj::Array(a)) => {
             f(a);
             Ok(())
@@ -18430,7 +18649,12 @@ fn array_mutate(v: &Value, f: impl FnOnce(&mut Vec<Value>)) -> Result<(), Fault>
             "NullPointerException",
             "null array".to_string(),
         )),
-    })
+    });
+    // An `Arrays.fill`/`sort`/… on an array a list views shows in the list.
+    if done.is_ok() {
+        sync_array_lists(*id, None, None);
+    }
+    done
 }
 
 /// The value `Arrays.copyOf` pads a grown copy with. The element type is erased
