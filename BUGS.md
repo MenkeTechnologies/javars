@@ -1346,12 +1346,6 @@ storage-model differences:
   Assigning the element to a typed local first (`float g = ap(…);`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
-- **`Character.getNumericValue` knows only the digits and the Latin letters.**
-  A letter number, a superscript or circled digit, or a fraction has a numeric
-  value in Java's table — U+216B (Roman numeral twelve) is 12, U+00B2 is 2,
-  U+2460 is 1, and a vulgar fraction such as U+00BD is -2 — and javars answers
-  -1 for each. The decimal digits of every script and the Latin letters,
-  full-width forms included, agree. Measured on `openjdk 21.0.12.1`.
 - **`reversed()` on a list, deque or insertion-ordered set or map is a copy.**
   Java 21's `reversed()` is a view: `List<Integer> r = l.reversed(); r.set(0, 9);`
   writes `l`'s last element, and a later change to `l` shows in `r`. javars
@@ -1429,10 +1423,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   keys, `Character.isEmoji` and `Character.getName`** are refused. The first
   is ordered by the JVM's own environment class, the second describes a JVM,
   and the last two need Unicode tables javars does not carry.
-- **`Enum.valueOf` on a `Class` value, `Character.getType` and
-  `Character.isIdeographic`** are refused (`cannot find symbol: Enum`,
-  ``unsupported static method``). `Enum.valueOf(Color.class, name)` with the
-  class literal written out is modeled, as `Color.valueOf(name)` is.
+- **`Enum.valueOf` on a `Class` value** is refused (`cannot find symbol:
+  Enum`). `Enum.valueOf(Color.class, name)` with the class literal written out
+  is modeled, as `Color.valueOf(name)` is.
 - **A user class cannot extend a JDK collection.** `class Lru<K, V> extends
   LinkedHashMap<K, V> { protected boolean removeEldestEntry(…) { … } }` — the
   usual LRU cache — and `class Stack2 extends ArrayList<Integer>` are refused

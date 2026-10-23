@@ -2556,3 +2556,36 @@ x
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Character.getType`, `getNumericValue` and `isIdeographic` answer from tables generated from the JDK's own answers for every code point: a Roman numeral's numeric value is its number, a vulgar fraction's -2, a lone surrogate's category `SURROGATE`, and the category constants are the JDK's `byte` codes; a checksum over every 101st code point pins the tables.
+#[test]
+fn character_properties_come_from_the_jdks_unicode_tables() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        StringBuilder sb = new StringBuilder();
+        int[] cps = {'a', 'A', '1', ' ', '$', '_', 0x216B, 0xB2, 0xBD, 0x2460, 0x4E00, 0xD800, 0x1F600, 0x10FFFF, 0x0378, 0x01C5, 0x0300, 0x2028, 0xE000, '\t', 0x0F33, 0x1D7CE, 0xFF21, 0x3007};
+        for (int cp : cps) sb.append(Character.getType(cp)).append(':').append(Character.getNumericValue(cp)).append(':').append(Character.isIdeographic(cp)).append(' ');
+        System.out.println(sb);
+        System.out.println(Character.getType('x') == Character.LOWERCASE_LETTER);
+        System.out.println(Character.UPPERCASE_LETTER + Character.DECIMAL_DIGIT_NUMBER + " " + Character.getNumericValue('Ⅻ') + Character.getNumericValue('z'));
+        byte b = Character.CURRENCY_SYMBOL;
+        System.out.println(b + " " + (Character.getType('€') == Character.CURRENCY_SYMBOL));
+        long h = 0;
+        for (int cp = 0; cp <= 0x10FFFF; cp += 101) { h = h * 31 + Character.getType(cp); h = h * 31 + Character.getNumericValue(cp); h = h * 31 + (Character.isIdeographic(cp) ? 1 : 0); }
+        System.out.println(h);
+        switch (Character.getType('q')) { case Character.LOWERCASE_LETTER -> System.out.println("lower"); default -> System.out.println("other"); }
+    }
+}
+"####;
+    let expected = r####"2:10:false 1:10:false 9:1:false 12:-1:false 26:-1:false 23:-1:false 10:12:false 11:2:false 11:-2:false 11:1:false 5:-1:true 19:-1:false 28:-1:false 0:-1:false 0:-1:false 3:-1:false 6:-1:false 13:-1:false 18:-1:false 15:-1:false 11:-2:false 9:0:false 1:10:false 10:0:true 
+true
+10 1235
+26 true
+-7949689484782339716
+lower
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

@@ -11937,10 +11937,11 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Short", "reverseBytes") => "short",
         ("Math", "multiplyHigh" | "unsignedMultiplyHigh") => "long",
         ("Character", "toString") => "String",
-        ("Character", "getNumericValue") => "int",
+        ("Character", "getNumericValue" | "getType") => "int",
         (
             "Character",
-            "isDigit"
+            "isIdeographic"
+            | "isDigit"
             | "isLetter"
             | "isLetterOrDigit"
             | "isWhitespace"
@@ -12616,6 +12617,38 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Float", "MAX_EXPONENT") => (Value::Int(127), "int"),
         ("Float", "MIN_EXPONENT") => (Value::Int(-126), "int"),
         ("Float", "PRECISION") => (Value::Int(24), "int"),
+        // The general-category codes `getType` answers, as the JDK declares them
+        // (`byte`).
+        ("Character", "UNASSIGNED") => (Value::Int(0), "byte"),
+        ("Character", "UPPERCASE_LETTER") => (Value::Int(1), "byte"),
+        ("Character", "LOWERCASE_LETTER") => (Value::Int(2), "byte"),
+        ("Character", "TITLECASE_LETTER") => (Value::Int(3), "byte"),
+        ("Character", "MODIFIER_LETTER") => (Value::Int(4), "byte"),
+        ("Character", "OTHER_LETTER") => (Value::Int(5), "byte"),
+        ("Character", "NON_SPACING_MARK") => (Value::Int(6), "byte"),
+        ("Character", "ENCLOSING_MARK") => (Value::Int(7), "byte"),
+        ("Character", "COMBINING_SPACING_MARK") => (Value::Int(8), "byte"),
+        ("Character", "DECIMAL_DIGIT_NUMBER") => (Value::Int(9), "byte"),
+        ("Character", "LETTER_NUMBER") => (Value::Int(10), "byte"),
+        ("Character", "OTHER_NUMBER") => (Value::Int(11), "byte"),
+        ("Character", "SPACE_SEPARATOR") => (Value::Int(12), "byte"),
+        ("Character", "LINE_SEPARATOR") => (Value::Int(13), "byte"),
+        ("Character", "PARAGRAPH_SEPARATOR") => (Value::Int(14), "byte"),
+        ("Character", "CONTROL") => (Value::Int(15), "byte"),
+        ("Character", "FORMAT") => (Value::Int(16), "byte"),
+        ("Character", "PRIVATE_USE") => (Value::Int(18), "byte"),
+        ("Character", "SURROGATE") => (Value::Int(19), "byte"),
+        ("Character", "DASH_PUNCTUATION") => (Value::Int(20), "byte"),
+        ("Character", "START_PUNCTUATION") => (Value::Int(21), "byte"),
+        ("Character", "END_PUNCTUATION") => (Value::Int(22), "byte"),
+        ("Character", "CONNECTOR_PUNCTUATION") => (Value::Int(23), "byte"),
+        ("Character", "OTHER_PUNCTUATION") => (Value::Int(24), "byte"),
+        ("Character", "MATH_SYMBOL") => (Value::Int(25), "byte"),
+        ("Character", "CURRENCY_SYMBOL") => (Value::Int(26), "byte"),
+        ("Character", "MODIFIER_SYMBOL") => (Value::Int(27), "byte"),
+        ("Character", "OTHER_SYMBOL") => (Value::Int(28), "byte"),
+        ("Character", "INITIAL_QUOTE_PUNCTUATION") => (Value::Int(29), "byte"),
+        ("Character", "FINAL_QUOTE_PUNCTUATION") => (Value::Int(30), "byte"),
         ("Character", "MIN_RADIX") => (Value::Int(2), "int"),
         ("Character", "MAX_RADIX") => (Value::Int(36), "int"),
         ("Character", "MIN_CODE_POINT") => (Value::Int(0), "int"),

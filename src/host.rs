@@ -15678,11 +15678,30 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ))),
         ("Character", "toTitleCase", 1) => Ok(Value::Int(title_case(char_arg(&args[0])))),
         ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
-        // `getNumericValue` is `digit(c, 36)` for every script's decimal digits
-        // and the Latin letters (fullwidth included); the characters whose
-        // numeric value is not a digit (Roman numerals, fractions) are -1 here.
+        // The JDK's own answers for every code point, from the generated
+        // tables (`src/unicode_tables.rs`): a Roman numeral's numeric value is
+        // its number, a fraction's -2, a surrogate's category `SURROGATE`.
         ("Character", "getNumericValue", 1) => {
-            Ok(Value::Int(java_digit(char_arg(&args[0]) as u32, 36)))
+            use crate::unicode_tables::{lookup, NUMERIC_VALUE};
+            Ok(Value::Int(i64::from(lookup(
+                NUMERIC_VALUE,
+                code_point_arg(&args[0]),
+                -1,
+            ))))
+        }
+        ("Character", "getType", 1) => {
+            use crate::unicode_tables::{lookup, GENERAL_CATEGORY};
+            Ok(Value::Int(i64::from(lookup(
+                GENERAL_CATEGORY,
+                code_point_arg(&args[0]),
+                0,
+            ))))
+        }
+        ("Character", "isIdeographic", 1) => {
+            use crate::unicode_tables::{lookup, IDEOGRAPHIC};
+            Ok(Value::bool(
+                lookup(IDEOGRAPHIC, code_point_arg(&args[0]), 0) == 1,
+            ))
         }
 
         // ── java.lang.Boolean ──
