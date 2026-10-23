@@ -1292,8 +1292,22 @@ pub const REFERENCE: &[Entry] = &[
         "Random",
         "Static Library",
         "new Random()   |   new Random(long seed)",
-        "`java.util.Random`, the JDK's 48-bit linear congruential generator, so a seeded generator draws exactly the JDK's sequence: `nextInt()`, `nextInt(bound)`, `nextInt(origin, bound)`, `nextLong()` and its bounded forms, `nextDouble()` and its bounded forms, `nextFloat`, `nextBoolean`, `nextGaussian` (fdlibm's `log`, as `StrictMath` computes it), `nextBytes` and `setSeed`. A bad bound is the JDK's `IllegalArgumentException` (`bound must be positive`, `bound must be greater than origin`). An unseeded generator is seeded from the clock, as the JDK's is.",
+        "`java.util.Random`, the JDK's 48-bit linear congruential generator, so a seeded generator draws exactly the JDK's sequence: `nextInt()`, `nextInt(bound)`, `nextInt(origin, bound)`, `nextLong()` and its bounded forms, `nextDouble()` and its bounded forms, `nextFloat`, `nextBoolean`, `nextGaussian` (fdlibm's `log`, as `StrictMath` computes it), `nextBytes` and `setSeed`. The sized stream factories `ints(n)`, `ints(n, origin, bound)` and the `longs`/`doubles` pairs draw the same sequence the matching `next…` calls would; the unsized (infinite) forms are not modeled. A bad bound is the JDK's `IllegalArgumentException` (`bound must be positive`, `bound must be greater than origin`). An unseeded generator is seeded from the clock, as the JDK's is.",
         "Random r = new Random(42);\\nSystem.out.println(r.nextInt(100));   // 30",
+    ),
+    (
+        "Locale",
+        "Static Library",
+        "Locale.ROOT   |   Locale.US   |   Locale.UK   |   Locale.ENGLISH   |   Locale.CANADA",
+        "The locales whose number formatting is the root locale's, which is the only formatting javars does. As the leading argument of `String.format`, `printf`/`format` or `toUpperCase`/`toLowerCase` the call is the one without it; `toString()` is the JDK's (`en_US`, the empty string for `ROOT`). The other locales are not modeled.",
+        "System.out.println(String.format(Locale.US, \"%,.2f\", 1234.5));   // 1,234.50",
+    ),
+    (
+        "System.getProperty",
+        "Static Library",
+        "String System.getProperty(String key)   |   (String key, String def)   |   String System.getenv(String name)",
+        "`line.separator`, `file.separator` and `path.separator` answer the platform's values; any other key in a namespace that describes the JVM (`java.`, `os.`, `user.`, …) is refused, since javars is not one; any other key was never set, so it is `null` or the default. `getenv` reads the process environment.",
+        "System.out.println(System.getProperty(\"app.mode\", \"dev\"));   // dev",
     ),
     (
         "Math.random",

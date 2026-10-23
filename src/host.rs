@@ -7526,6 +7526,223 @@ fn coll_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Value
     out
 }
 
+/// The Java 21 `SequencedCollection`/`SequencedSet`/`SequencedMap` members on
+/// the receivers that have them, expressed through the operations those
+/// receivers already model. `None` hands every other call on.
+///
+/// * a sorted set or map (`TreeSet`/`TreeMap`): `getFirst`/`getLast` are
+///   `first`/`last`, `removeFirst`/`removeLast` poll (and throw
+///   `NoSuchElementException` when empty), `reversed()` is the descending
+///   view, and `addFirst`/`addLast`/`putFirst`/`putLast` are
+///   `UnsupportedOperationException`, since a sorted collection decides its
+///   own order;
+/// * an insertion-ordered set or map (`LinkedHashSet`/`LinkedHashMap`): the
+///   ends are the first and last of the insertion order, `addFirst`/`putFirst`
+///   move an existing element or key to the front (`addLast`/`putLast` to the
+///   back), and a map's `firstEntry`/`lastEntry`/`poll…Entry` answer an
+///   immutable snapshot pair;
+/// * a list or deque: `reversed()`.
+///
+/// `reversed()` here is a reversed *copy* with the source's fixity, not the
+/// JDK's write-through view (see BUGS.md); a sorted collection's is its
+/// descending view, on the terms that view already has.
+fn sequenced_method(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    #[derive(Clone, Copy, PartialEq)]
+    enum Shape {
+        List,
+        SortedSet,
+        SortedMap,
+        LinkedSet,
+        LinkedMap,
+    }
+    let shape = HEAP.with(|h| {
+        Some(match h.borrow().get(*id as usize)? {
+            HostObj::List { view: None, .. } => Shape::List,
+            HostObj::Set {
+                order: Order::Sorted { .. },
+                view: SetView::Own,
+                ..
+            } => Shape::SortedSet,
+            // A `LinkedHashMap`'s key or entry view is an insertion-ordered set
+            // too; a removal through it is carried back to the map.
+            HostObj::Set {
+                order: Order::Insertion | Order::Access,
+                ..
+            } => Shape::LinkedSet,
+            HostObj::Map {
+                order: Order::Sorted { .. },
+                ..
+            } => Shape::SortedMap,
+            HostObj::Map {
+                order: Order::Insertion | Order::Access,
+                ..
+            } => Shape::LinkedMap,
+            _ => return None,
+        })
+    })?;
+    let call = |vm: &mut VM, m: &str, a: &[Value]| coll_method(vm, recv, m, a);
+    let uoe = |vm: &mut VM| {
+        Some(raise(
+            vm,
+            Fault::java("UnsupportedOperationException", String::new()),
+        ))
+    };
+    let nse = |vm: &mut VM| {
+        Some(raise(
+            vm,
+            Fault::java("NoSuchElementException", String::new()),
+        ))
+    };
+    let empty = || sequence_len(recv).unwrap_or(0) == 0;
+    match (shape, method, args) {
+        (Shape::List, "reversed", []) => {
+            let (items, fixed) = HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HostObj::List { items, fixed, .. }) => Some((items.clone(), *fixed)),
+                _ => None,
+            })?;
+            Some(list_value(items.into_iter().rev().collect(), fixed))
+        }
+        (Shape::SortedSet, "getFirst" | "getLast", []) => Some(call(
+            vm,
+            if method == "getFirst" {
+                "first"
+            } else {
+                "last"
+            },
+            &[],
+        )),
+        (Shape::SortedSet, "removeFirst" | "removeLast", []) => {
+            if empty() {
+                return nse(vm);
+            }
+            Some(call(
+                vm,
+                if method == "removeFirst" {
+                    "pollFirst"
+                } else {
+                    "pollLast"
+                },
+                &[],
+            ))
+        }
+        (Shape::SortedSet, "reversed", []) => Some(call(vm, "descendingSet", &[])),
+        (Shape::SortedMap, "reversed", []) => Some(call(vm, "descendingMap", &[])),
+        (Shape::SortedSet, "addFirst" | "addLast", [_])
+        | (Shape::SortedMap, "putFirst" | "putLast", [_, _]) => uoe(vm),
+        (
+            Shape::LinkedSet | Shape::LinkedMap,
+            "getFirst" | "getLast" | "firstEntry" | "lastEntry" | "pollFirstEntry"
+            | "pollLastEntry" | "removeFirst" | "removeLast",
+            [],
+        ) => {
+            let map = shape == Shape::LinkedMap;
+            let entry = method.ends_with("Entry");
+            if map != entry {
+                return None;
+            }
+            let first = method.to_ascii_lowercase().contains("first");
+            let end = HEAP.with(|h| match h.borrow().get(*id as usize) {
+                Some(HostObj::Set { items, .. }) => {
+                    let v = if first { items.first() } else { items.last() };
+                    Some(v.cloned().map(|k| (k, Value::Undef)))
+                }
+                Some(HostObj::Map { entries, .. }) => Some(
+                    if first {
+                        entries.first()
+                    } else {
+                        entries.last()
+                    }
+                    .cloned(),
+                ),
+                _ => None,
+            })?;
+            let Some((key, value)) = end else {
+                // `getFirst`/`removeFirst` on an empty set throw; the map's
+                // entry methods answer `null`.
+                return if map { Some(Value::Undef) } else { nse(vm) };
+            };
+            let removes = method.starts_with("poll") || method.starts_with("remove");
+            if removes {
+                call(vm, "remove", std::slice::from_ref(&key));
+            }
+            Some(if map {
+                alloc_entry(key, value, None)
+            } else {
+                key
+            })
+        }
+        (Shape::LinkedSet, "addFirst" | "addLast", [e]) => {
+            call(vm, "remove", std::slice::from_ref(e));
+            call(vm, "add", std::slice::from_ref(e));
+            if method == "addFirst" {
+                HEAP.with(|h| {
+                    if let Some(HostObj::Set { items, index, .. }) =
+                        h.borrow_mut().get_mut(*id as usize)
+                    {
+                        if let Some(v) = items.pop() {
+                            items.insert(0, v);
+                            index.invalidate();
+                        }
+                    }
+                });
+            }
+            Some(Value::Undef)
+        }
+        (Shape::LinkedMap, "putFirst" | "putLast", [k, v]) => {
+            let old = call(vm, "remove", std::slice::from_ref(k));
+            call(vm, "put", &[k.clone(), v.clone()]);
+            if method == "putFirst" {
+                HEAP.with(|h| {
+                    if let Some(HostObj::Map { entries, index, .. }) =
+                        h.borrow_mut().get_mut(*id as usize)
+                    {
+                        if let Some(e) = entries.pop() {
+                            entries.insert(0, e);
+                            index.invalidate();
+                        }
+                    }
+                });
+            }
+            Some(old)
+        }
+        (Shape::LinkedSet | Shape::LinkedMap, "reversed", []) => Some(HEAP.with(|h| {
+            let obj = match h.borrow().get(*id as usize) {
+                Some(HostObj::Set { items, fixed, .. }) => HostObj::Set {
+                    items: items.iter().rev().cloned().collect(),
+                    order: Order::Insertion,
+                    fixed: *fixed,
+                    view: SetView::Own,
+                    index: KeyIndex::default(),
+                },
+                Some(HostObj::Map { entries, fixed, .. }) => HostObj::Map {
+                    entries: entries.iter().rev().cloned().collect(),
+                    order: Order::Insertion,
+                    fixed: *fixed,
+                    index: KeyIndex::default(),
+                },
+                _ => return Value::Undef,
+            };
+            Value::Obj(heap_alloc(obj))
+        })),
+        (
+            Shape::LinkedMap | Shape::SortedMap,
+            "sequencedKeySet" | "sequencedValues" | "sequencedEntrySet",
+            [],
+        ) => {
+            let m = match method {
+                "sequencedKeySet" => "keySet",
+                "sequencedValues" => "values",
+                _ => "entrySet",
+            };
+            Some(call(vm, m, &[]))
+        }
+        _ => None,
+    }
+}
+
 /// Which of the two legacy synchronized lists a [`VECTORS`] entry is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VectorClass {
@@ -7781,6 +7998,9 @@ fn coll_method_inner(vm: &mut VM, recv: &Value, method: &str, args: &[Value]) ->
         return out;
     }
     if let Some(out) = vector_method(vm, recv, method, args) {
+        return out;
+    }
+    if let Some(out) = sequenced_method(vm, recv, method, args) {
         return out;
     }
     if naturally_ordered(recv) {
@@ -9885,7 +10105,9 @@ fn stream_method(
             }
             Ok(optional_of(kind.optional_class(), acc))
         }
-        ("reduce", 2) => {
+        // `reduce(identity, accumulator, combiner)`: a sequential stream never
+        // combines, so it is the two-argument fold over the accumulator.
+        ("reduce", 2 | 3) => {
             let items = all(vm);
             let f = args[1].clone();
             let mut acc = args[0].clone();
@@ -12565,6 +12787,36 @@ fn system_static(
             Ok(Value::Int(ORIGIN.with(|o| o.elapsed().as_nanos() as i64)))
         }
         ("System", "lineSeparator", []) => Ok(Value::str("\n".to_string())),
+        // The three separator properties are fixed on the platforms javars
+        // runs on. Any other `java.`/`os.`/`user.`… property describes the
+        // JVM itself, which javars is not, so it is refused rather than
+        // invented; a property outside those namespaces was never set, so it
+        // is `null` or the caller's default, as on a JVM started without `-D`.
+        ("System", "getProperty", [key] | [key, _]) => {
+            let key = key.as_str_cow();
+            let fallback = args.get(1).cloned().unwrap_or(Value::Undef);
+            match key.as_ref() {
+                "line.separator" => Ok(Value::str("\n".to_string())),
+                "file.separator" => Ok(Value::str("/".to_string())),
+                "path.separator" => Ok(Value::str(":".to_string())),
+                k if [
+                    "java.", "jdk.", "os.", "user.", "sun.", "file.", "line.", "path.", "native.",
+                    "stdout.", "stderr.",
+                ]
+                .iter()
+                .any(|p| k.starts_with(p)) =>
+                {
+                    Err(Fault::internal(format!(
+                        "javars: the JVM property `{k}` describes a JVM, which javars is not"
+                    )))
+                }
+                _ => Ok(fallback),
+            }
+        }
+        // The process environment is the one a JVM would see.
+        ("System", "getenv", [name]) => {
+            Ok(std::env::var(name.as_str_cow().as_ref()).map_or(Value::Undef, Value::str))
+        }
         // `System.out` and `System.err` named as values rather than as the
         // receiver of a `print` call.
         ("System", "#out", []) => Ok(Value::Obj(std_writer(false))),
@@ -12841,6 +13093,53 @@ fn random_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
             .map(|b| Value::Int(i64::from(b)))
             .collect();
         return Some(array_mutate(&args[0], |a| *a = filled).map(|()| Value::Undef));
+    }
+    // The sized stream factories — `ints(n)`, `ints(n, origin, bound)` and the
+    // `longs`/`doubles` pairs — draw each element as the matching `next…`
+    // call would, in order (`RandomSupport.boundedNext…` for the ranged
+    // forms). The unsized ones are infinite streams and are not modeled.
+    if matches!(method, "ints" | "longs" | "doubles") && matches!(args.len(), 1 | 3) {
+        let n = args[0].jint();
+        if n < 0 {
+            return Some(Err(iae("size must be non-negative")));
+        }
+        if let [_, o, b] = args {
+            let ok = if method == "doubles" {
+                o.jfloat() < b.jfloat() && (b.jfloat() - o.jfloat()).is_finite()
+            } else {
+                o.jint() < b.jint()
+            };
+            if !ok {
+                return Some(Err(iae(crate::jrandom::BAD_RANGE)));
+            }
+        }
+        let kind = match method {
+            "ints" => StreamKind::Int,
+            "longs" => StreamKind::Long,
+            _ => StreamKind::Double,
+        };
+        let drawn = with_random(recv, |r| -> Result<Vec<Value>, &str> {
+            (0..n)
+                .map(|_| {
+                    Ok(match (method, &args[1..]) {
+                        ("ints", []) => Value::Int(i64::from(r.next_int())),
+                        ("ints", [o, b]) => Value::Int(i64::from(
+                            r.next_int_range(o.jint() as i32, b.jint() as i32)?,
+                        )),
+                        ("longs", []) => Value::Int(r.next_long()),
+                        ("longs", [o, b]) => Value::Int(r.next_long_range(o.jint(), b.jint())?),
+                        ("doubles", []) => Value::float(r.next_double()),
+                        (_, [o, b]) => Value::float(r.next_double_range(o.jfloat(), b.jfloat())?),
+                        _ => Value::Undef,
+                    })
+                })
+                .collect()
+        })?;
+        return Some(
+            drawn
+                .map(|items| unsized_stream_of(items, kind))
+                .map_err(iae),
+        );
     }
     with_random(recv, |r| match (method, args) {
         ("nextInt", []) => Ok(Value::Int(i64::from(r.next_int()))),

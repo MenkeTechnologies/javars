@@ -7130,6 +7130,28 @@ impl Compiler {
             };
             return self.method_call(recv, "#printf", &[text], line);
         }
+        // A leading `Locale` constant — `String.format(Locale.US, …)`,
+        // `s.toUpperCase(Locale.ROOT)` — names one of the locales javars's
+        // root-locale formatting already matches (see `wrapper_constant`), so
+        // the call is the one without it. Only a constant or a variable is
+        // dropped, since neither has a side effect to lose.
+        let locale_first = args.first().is_some_and(|l| {
+            (matches!(l, Expr::Var(_))
+                || matches!(l, Expr::Field { recv: c, .. } if matches!(c.as_ref(), Expr::Var(n) if n == "Locale")))
+                && self.expr_java_type(l).as_deref() == Some("Locale")
+        });
+        if locale_first {
+            let string_static =
+                matches!(recv, Expr::Var(c) if c == "String" && !self.is_declared_var(c));
+            let strips = match method {
+                "format" => string_static && args.len() >= 2,
+                "toUpperCase" | "toLowerCase" => args.len() == 1 && !string_static,
+                _ => false,
+            };
+            if strips {
+                return self.method_call(recv, method, &args[1..], line);
+            }
+        }
         if method == "mapMulti" && args.len() == 1 && self.expr_class(recv).is_none() {
             let adapter = Expr::MethodCall {
                 recv: Box::new(Expr::Var("BiConsumer".to_string())),
@@ -10242,7 +10264,7 @@ fn boxed_call_java_type(method: &str, argc: usize) -> Option<&'static str> {
 fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
     Some(match (class, method) {
         ("System", "currentTimeMillis" | "nanoTime") => "long",
-        ("System", "lineSeparator") => "String",
+        ("System", "lineSeparator" | "getProperty" | "getenv") => "String",
         ("System", "#in") => "InputStream",
         ("System", "#out" | "#err") => "PrintStream",
         ("PrintWriter", "#new") => "PrintWriter",
@@ -10913,6 +10935,15 @@ fn is_breakable(s: &Stmt) -> bool {
 /// their literal value at compile time rather than read from a field.
 fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
     Some(match (class, name) {
+        // `java.util.Locale`'s English constants and `ROOT`, modeled as the
+        // text their `toString()` answers. Each formats numbers exactly as the
+        // root locale javars always formats in, which is why only these are
+        // named: `Locale.GERMANY` would need a `,` decimal separator.
+        ("Locale", "ROOT") => (Value::str(String::new()), "Locale"),
+        ("Locale", "US") => (Value::str("en_US".to_string()), "Locale"),
+        ("Locale", "UK") => (Value::str("en_GB".to_string()), "Locale"),
+        ("Locale", "ENGLISH") => (Value::str("en".to_string()), "Locale"),
+        ("Locale", "CANADA") => (Value::str("en_CA".to_string()), "Locale"),
         // `java.nio.charset.StandardCharsets`: a `Charset` is modeled as its
         // canonical name, which is also what its `toString()` answers.
         ("StandardCharsets", "UTF_8") => (Value::str("UTF-8".to_string()), "Charset"),

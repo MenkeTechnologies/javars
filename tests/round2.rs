@@ -1684,3 +1684,100 @@ java.lang.IndexOutOfBoundsException: Index: 9
     );
     assert_eq!(out, expected);
 }
+
+/// The Java 21 SequencedCollection/SequencedSet/SequencedMap members, refused before: List/Deque.reversed(), LinkedHashMap putFirst/putLast/firstEntry/lastEntry/pollFirstEntry/reversed/sequencedKeySet, LinkedHashSet addFirst/addLast/getFirst/getLast/removeFirst/removeLast/reversed, and the sorted collections' getFirst/removeFirst/reversed with their UnsupportedOperationException for addFirst/putFirst. Expected output from openjdk 21.0.12.1.
+#[test]
+fn java21_sequenced_collection_members() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> l = new ArrayList<>(List.of(1, 2, 3));
+        System.out.println(l.reversed() + " " + l.getFirst() + " " + l.getLast() + " " + List.of(4, 5).reversed() + " " + new ArrayDeque<>(List.of(1, 2)).reversed());
+        try { List.of(1).reversed().add(2); } catch (UnsupportedOperationException e) { System.out.println("uoe"); }
+        LinkedHashMap<String, Integer> m = new LinkedHashMap<>();
+        m.put("a", 1); m.put("b", 2); m.putFirst("z", 0); m.putLast("a", 5);
+        System.out.println(m + " " + m.firstEntry() + " " + m.lastEntry() + " " + m.sequencedKeySet().reversed() + " " + m.pollFirstEntry() + " " + m.reversed() + " " + m.sequencedValues() + " " + m.sequencedEntrySet());
+        try { m.firstEntry().setValue(9); } catch (UnsupportedOperationException e) { System.out.println("snapshot"); }
+        System.out.println(new LinkedHashMap<String, Integer>().firstEntry() + " " + new LinkedHashMap<String, Integer>().pollLastEntry());
+        LinkedHashSet<Integer> s = new LinkedHashSet<>(List.of(3, 1, 2));
+        s.addFirst(9); s.addLast(3);
+        System.out.println(s + " " + s.getFirst() + " " + s.getLast() + " " + s.reversed() + " " + s.removeFirst() + s + " " + s.removeLast() + s);
+        try { new LinkedHashSet<Integer>().getFirst(); } catch (NoSuchElementException e) { System.out.println("nse " + e.getMessage()); }
+        TreeSet<Integer> t = new TreeSet<>(List.of(5, 1, 3));
+        System.out.println(t.getFirst() + " " + t.getLast() + " " + t.reversed() + " " + t.removeFirst() + t + " " + t.removeLast() + t);
+        try { t.addFirst(0); } catch (UnsupportedOperationException e) { System.out.println("sorted uoe"); }
+        try { new TreeSet<Integer>().removeFirst(); } catch (NoSuchElementException e) { System.out.println("sorted nse"); }
+        TreeMap<Integer, String> tm = new TreeMap<>(Map.of(1, "x", 2, "y"));
+        System.out.println(tm.reversed() + " " + tm.sequencedKeySet() + " " + tm.firstEntry());
+        try { tm.putFirst(0, "w"); } catch (UnsupportedOperationException e) { System.out.println("map uoe"); }
+    }
+}
+"####;
+    let expected = r####"[3, 2, 1] 1 3 [5, 4] [2, 1]
+uoe
+{z=0, b=2, a=5} z=0 a=5 [a, b, z] z=0 {a=5, b=2} [2, 5] [b=2, a=5]
+snapshot
+null null
+[9, 1, 2, 3] 9 3 [3, 2, 1, 9] 9[1, 2, 3] 3[1, 2]
+nse null
+1 5 [5, 3, 1] 1[3, 5] 5[3]
+sorted uoe
+sorted nse
+{2=y, 1=x} [1, 2] 1=x
+map uoe
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}
+
+/// Locale.US/ROOT/UK/ENGLISH/CANADA (a leading Locale argument to String.format/printf and the case maps is the root-locale call), Random.ints/longs/doubles(n [, origin, bound]) drawing the JDK's sequence, Stream.reduce(identity, accumulator, combiner), and System.getProperty/getenv, each refused before. Expected output from openjdk 21.0.12.1.
+#[test]
+fn locale_constants_random_streams_reduce3_and_properties() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+import java.io.*;
+public class T {
+    public static void main(String[] a) {
+        System.out.println(String.format(Locale.US, "%,.2f|%d|%s", 1234.5, 7, "x") + " " + String.format(Locale.ROOT, "%e", 12345.678) + " " + "ABC".toLowerCase(Locale.ROOT) + "abc".toUpperCase(Locale.ENGLISH));
+        System.out.println(Locale.US + "|" + Locale.ROOT + "|" + Locale.UK + "|" + Locale.ENGLISH + "|" + Locale.CANADA);
+        System.out.printf(Locale.US, "%.3f%n", Math.E);
+        PrintWriter pw = new PrintWriter(System.out); pw.printf(Locale.US, "%08.2f%n", -3.5); pw.flush();
+        Locale l = Locale.US; System.out.println(String.format(l, "%.1f", 2.25));
+        Random r = new Random(1); int[] arr = r.ints(5, 0, 10).toArray(); System.out.println(Arrays.toString(arr) + " " + r.nextInt());
+        System.out.println(new Random(2).doubles(2).sum() + " " + new Random(3).ints(3).boxed().toList() + " " + new Random(4).longs(2).boxed().toList() + " " + new Random(5).longs(3, -5, 5).sum() + " " + new Random(6).doubles(2, 1.0, 2.0).boxed().toList());
+        System.out.println(new Random(7).ints(4, -3, 3).map(x -> x * x).sum() + " " + new Random(8).ints(0).count() + " " + new Random(9).ints(6, 0, 1 << 20).max().getAsInt());
+        try { new Random().ints(-1); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { new Random().ints(0, 5, 1); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        System.out.println(Stream.of(1, 2, 3).reduce(10, (acc, x) -> acc + x * x, Integer::sum) + " " + Stream.of("a", "bb").reduce(0, (n, s) -> n + s.length(), (p, q) -> p + q));
+        System.out.println(System.getProperty("line.separator").length() + " " + System.getProperty("file.separator") + System.getProperty("path.separator") + " " + System.getProperty("my.flag") + " " + System.getProperty("my.flag", "dflt") + " " + System.getenv("JAVARS_SURELY_UNSET_VAR"));
+    }
+}
+"####;
+    let expected = r####"1,234.50|7|x 1.234568e+04 abcABC
+en_US||en_GB|en|en_CA
+2.718
+-0003.50
+2.3
+[5, 8, 7, 3, 4] 155629808
+1.6325945600499603 [-1155099828, -1879439976, 304908421] [-4969378402838085704, -1499461942424923123] -12 [1.7307886238322472, 1.5796252073129176]
+3 0 851619
+size must be non-negative
+bound must be greater than origin
+24 3
+1 /: null dflt null
+"####;
+    let (out, ok) = run(src);
+    assert!(
+        ok,
+        "program failed:
+{out}"
+    );
+    assert_eq!(out, expected);
+}

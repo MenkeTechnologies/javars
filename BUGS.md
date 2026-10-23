@@ -1324,6 +1324,12 @@ storage-model differences:
   U+2460 is 1, and a vulgar fraction such as U+00BD is -2 — and javars answers
   -1 for each. The decimal digits of every script and the Latin letters,
   full-width forms included, agree. Measured on `openjdk 21.0.12.1`.
+- **`reversed()` on a list, deque or insertion-ordered set or map is a copy.**
+  Java 21's `reversed()` is a view: `List<Integer> r = l.reversed(); r.set(0, 9);`
+  writes `l`'s last element, and a later change to `l` shows in `r`. javars
+  answers a reversed copy with the source's fixity, so neither direction
+  follows. Measured on `openjdk 21.0.12.1`. A sorted collection's `reversed()`
+  is its descending view, on the terms recorded for those views above.
 - **`Arrays.asList(array)` copies the array instead of viewing it.** Java's
   list writes through: `Integer[] a = {5, 2}; Arrays.asList(a).set(0, 99);`
   leaves `a[0] == 99`, and a later write to `a` shows in the list. javars's
@@ -1379,6 +1385,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   LBracket`). A reference array carries no element type at run time (see the
   `ArrayStoreException` entry below), so the test could not distinguish
   `int[]` from `String[]` even once it parsed.
+- **`System.getenv()` (the whole map), the JVM-describing `System.getProperty`
+  keys, the unsized `Random.ints()`/`longs()`/`doubles()` streams,
+  `Character.isEmoji` and `Character.getName`** are refused. The first is
+  ordered by the JVM's own environment class, the second describes a JVM,
+  the third are infinite streams, and the last two need Unicode tables javars
+  does not carry.
 - **`Enum.valueOf(Cls.class, name)`, `Character.getType` and
   `Character.isIdeographic`** are refused (`cannot find symbol: Enum`,
   ``unsupported static method``). `Cls.valueOf(name)` is the modeled spelling
