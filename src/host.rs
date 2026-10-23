@@ -6038,6 +6038,11 @@ thread_local! {
     /// a `Set` whatever it wraps.
     static PLAIN_VIEWS: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// The JDK wrapper class each `Collections.unmodifiable*` view (and the
+    /// `System.getenv()` map) is an instance of — what `getClass()` names,
+    /// which the view's own shape cannot tell (`Collections$UnmodifiableMap`
+    /// rather than the immutable factory's `ImmutableCollections$MapN`).
+    static VIEW_CLASSES: RefCell<HashMap<u32, &'static str>> = RefCell::new(HashMap::default());
     /// The lists made by `new ArrayDeque<>(…)`. They share the mutable-list
     /// shape, but an `ArrayDeque` refuses a `null` element, which this set is
     /// what lets the add family check.
@@ -12707,6 +12712,44 @@ fn char_index_of(s: &str, needle: &str) -> i64 {
 /// arguments, then evaluates the corresponding static method. A faulting call
 /// (bad arity, `NumberFormatException`, unknown method) surfaces as a `javars:`
 /// error rather than a wrong value.
+/// The process environment in the order `System.getenv()` iterates it. The
+/// JDK's `ProcessEnvironment` puts the `environ` entries into a
+/// `HashMap<Variable, Value>` presized to `count + 3`, walking `environ` from
+/// its *end*, and a `Variable` hashes as `Arrays.hashCode` of its bytes — so
+/// the order is that map's: by bucket of the spread hash in the final table,
+/// and within a bucket by insertion.
+fn jdk_environment_order() -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = std::env::vars_os()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    vars.reverse();
+    let mut n = (vars.len() + 3).next_power_of_two().max(1);
+    while vars.len() > n / 4 * 3 {
+        n *= 2;
+    }
+    let bucket = |k: &str| {
+        let h = k.bytes().fold(1i32, |h, b| {
+            h.wrapping_mul(31).wrapping_add(i32::from(b as i8))
+        });
+        ((h ^ ((h as u32) >> 16) as i32) as u32 as usize) & (n - 1)
+    };
+    // A later duplicate name replaces the earlier entry in place.
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in vars {
+        match out.iter_mut().find(|(ok, _)| *ok == k) {
+            Some(slot) => slot.1 = v,
+            None => out.push((k, v)),
+        }
+    }
+    out.sort_by_key(|(k, _)| bucket(k));
+    out
+}
+
 /// `EnumSet.range(from, to)` and `EnumSet.complementOf(s)`, which the
 /// compiler hands the enum's `values()` array first because only the static
 /// type knows the element type: the constants from `from` through `to` in
@@ -12931,6 +12974,31 @@ fn system_static(
                 }
                 _ => Ok(fallback),
             }
+        }
+        // The whole environment: the JDK's unmodifiable view of the
+        // `HashMap` `ProcessEnvironment` fills, so it iterates in that map's
+        // order (see [`jdk_environment_order`]).
+        ("System", "getenv", []) => {
+            let entries: Vec<(Value, Value)> = jdk_environment_order()
+                .into_iter()
+                .map(|(k, v)| (Value::str(k), Value::str(v)))
+                .collect();
+            let map = Value::Obj(heap_alloc(HostObj::Map {
+                entries,
+                order: Order::Insertion,
+                fixed: Fixity::Mutable,
+                index: KeyIndex::default(),
+            }));
+            let Some(view) = unmodifiable_view(&map, false) else {
+                return Some(Err(Fault::internal("javars: environment view")));
+            };
+            if let Value::Obj(id) = view {
+                VIEW_CLASSES.with(|m| {
+                    m.borrow_mut()
+                        .insert(id, "java.util.Collections$UnmodifiableMap")
+                });
+            }
+            Ok(view)
         }
         // The process environment is the one a JVM would see.
         ("System", "getenv", [name]) => {
@@ -14109,8 +14177,29 @@ fn collection_static(
             | "unmodifiableNavigableMap"
             | "unmodifiableSequencedCollection",
         ) if args.len() == 1 => {
+            // `unmodifiableList` wraps a random-access list in its `RandomAccess`
+            // subclass, and every list javars models is one (a `LinkedList` is
+            // the mutable list an `ArrayList` is; see BUGS.md).
+            let class = match method {
+                "unmodifiableList" => "java.util.Collections$UnmodifiableRandomAccessList",
+                "unmodifiableSet" => "java.util.Collections$UnmodifiableSet",
+                "unmodifiableMap" => "java.util.Collections$UnmodifiableMap",
+                "unmodifiableSortedSet" => "java.util.Collections$UnmodifiableSortedSet",
+                "unmodifiableSortedMap" => "java.util.Collections$UnmodifiableSortedMap",
+                "unmodifiableNavigableSet" => "java.util.Collections$UnmodifiableNavigableSet",
+                "unmodifiableNavigableMap" => "java.util.Collections$UnmodifiableNavigableMap",
+                "unmodifiableSequencedCollection" => {
+                    "java.util.Collections$UnmodifiableSequencedCollection"
+                }
+                _ => "java.util.Collections$UnmodifiableCollection",
+            };
             match unmodifiable_view(&args[0], method == "unmodifiableCollection") {
-                Some(v) => Ok(v),
+                Some(v) => {
+                    if let Value::Obj(id) = v {
+                        VIEW_CLASSES.with(|m| m.borrow_mut().insert(id, class));
+                    }
+                    Ok(v)
+                }
                 None => Err(Fault::java("NullPointerException", String::new())),
             }
         }
@@ -20850,6 +20939,11 @@ fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
 /// An array is the one shape with no answer at all: its element type is gone,
 /// and `[I` and `[Ljava.lang.String;` differ only by it.
 fn binary_name(class: &str, v: &Value) -> Option<String> {
+    if let Value::Obj(id) = v {
+        if let Some(c) = VIEW_CLASSES.with(|m| m.borrow().get(id).copied()) {
+            return Some(c.to_string());
+        }
+    }
     let len = || sequence_len(v).unwrap_or(0);
     Some(match class {
         "[]" => return None,

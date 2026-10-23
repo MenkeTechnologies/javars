@@ -2669,3 +2669,88 @@ Negative buffer size
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `System.getenv()` is the JDK's unmodifiable view of the `HashMap`
+/// `ProcessEnvironment` fills by walking `environ` from its end, with names
+/// hashed as `Arrays.hashCode` of their bytes — so it iterates in that map's
+/// order (`BB` before `Aa`, whose hashes collide, because `Aa` comes first in
+/// `environ`). The program runs under a controlled environment, which
+/// `Command` passes in name order; the expected output was read off the
+/// reference JDK run under the same environment in the same order, skipping
+/// the `__CF_USER_TEXT_ENCODING` macOS injects into every process.
+#[test]
+fn system_getenv_iterates_in_the_jdk_environment_maps_order() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        Map<String, String> e = System.getenv();
+        StringJoiner j = new StringJoiner(", ", "{", "}");
+        for (Map.Entry<String, String> en : e.entrySet()) if (!en.getKey().startsWith("__CF")) j.add(en.getKey() + "=" + en.getValue());
+        System.out.println(j);
+        System.out.println(e.getClass().getName() + " " + e.get("K7") + " " + e.containsKey("ALPHA") + " " + e.containsKey("NOPE") + " " + System.getenv("ZED"));
+        try { e.remove("ALPHA"); } catch (UnsupportedOperationException x) { System.out.println("UOE"); }
+    }
+}
+"####;
+    let dir = std::env::temp_dir().join(format!("javars_round2_{}", fnv1a(src)));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("T.java");
+    std::fs::write(&path, src).expect("write program");
+    let env = [
+        ("ALPHA", "1"),
+        ("BETA", "2"),
+        ("GAMMA", "3"),
+        ("DELTA", "4"),
+        ("PATH_X", "/a"),
+        ("ZED", "z"),
+        ("Aa", "x"),
+        ("BB", "y"),
+        ("K1", "a"),
+        ("K2", "b"),
+        ("K3", "c"),
+        ("K4", "d"),
+        ("K5", "e"),
+        ("K6", "f"),
+        ("K7", "g"),
+        ("K8", "h"),
+        ("K9", "i"),
+        ("K10", "j"),
+        ("K11", "k"),
+        ("K12", "l"),
+        ("K13", "m"),
+        ("K14", "n"),
+    ];
+    let out = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .current_dir(&dir)
+        .env_clear()
+        .envs(env)
+        .output()
+        .expect("spawn java");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    let expected = r####"
+{BB=y, Aa=x, DELTA=4, K1=a, K2=b, K10=j, K3=c, K4=d, K12=l, K5=e, K11=k, K6=f, K14=n, K7=g, K13=m, K8=h, K9=i, ALPHA=1, ZED=z, PATH_X=/a, GAMMA=3, BETA=2}
+java.util.Collections$UnmodifiableMap g true false z
+UOE
+"####;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), &expected[1..]);
+}
+
+/// A `Collections.unmodifiable*` wrapper's `getClass()` names the JDK wrapper class (`Collections$UnmodifiableMap`, `$UnmodifiableRandomAccessList`, `$UnmodifiableSortedSet`, …) rather than the immutable factory's.
+#[test]
+fn unmodifiable_wrappers_name_their_jdk_classes() {
+    let src = r####"
+import java.util.*;
+public class T { public static void main(String[] a) { System.out.println(Collections.unmodifiableMap(new HashMap<>()).getClass().getName()); System.out.println(Collections.unmodifiableList(new ArrayList<>()).getClass().getName() + " " + Collections.unmodifiableList(List.of(1)).getClass().getSimpleName()); System.out.println(Collections.unmodifiableSet(new HashSet<>()).getClass().getName() + " " + Collections.unmodifiableSortedSet(new TreeSet<>()).getClass().getName() + " " + Collections.unmodifiableNavigableMap(new TreeMap<>()).getClass().getName() + " " + Collections.unmodifiableCollection(List.of()).getClass().getName()); System.out.println(Collections.unmodifiableList(new ArrayList<>(List.of(1))) instanceof RandomAccess); } }
+"####;
+    let expected = r####"java.util.Collections$UnmodifiableMap
+java.util.Collections$UnmodifiableRandomAccessList UnmodifiableRandomAccessList
+java.util.Collections$UnmodifiableSet java.util.Collections$UnmodifiableSortedSet java.util.Collections$UnmodifiableNavigableMap java.util.Collections$UnmodifiableCollection
+true
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

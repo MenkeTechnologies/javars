@@ -1419,10 +1419,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   LBracket`). A reference array carries no element type at run time (see the
   `ArrayStoreException` entry below), so the test could not distinguish
   `int[]` from `String[]` even once it parsed.
-- **`System.getenv()` (the whole map), the JVM-describing `System.getProperty`
-  keys, `Character.isEmoji` and `Character.getName`** are refused. The first
-  is ordered by the JVM's own environment class, the second describes a JVM,
-  and the last two need Unicode tables javars does not carry.
+- **The JVM-describing `System.getProperty` keys, `Character.isEmoji` and
+  `Character.getName`** are refused. The first describe a JVM, and the last
+  two need Unicode tables javars does not carry (the general category,
+  numeric value and ideograph tables it does carry are generated from the
+  JDK).
 - **`Enum.valueOf` on a `Class` value** is refused (`cannot find symbol:
   Enum`). `Enum.valueOf(Color.class, name)` with the class literal written out
   is modeled, as `Color.valueOf(name)` is.
