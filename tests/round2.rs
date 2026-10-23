@@ -2374,10 +2374,16 @@ fn a_long_typed_call_chain_compiles_in_linear_time() {
     let src = format!(
         "import java.util.*;\nimport java.util.stream.*;\npublic class T {{\n    public static void main(String[] a) {{\n        List<Integer> l = new ArrayList<>(List.of(3, 1, 2));\n        System.out.println(l.stream(){stages}.collect(Collectors.toList()));\n    }}\n}}\n"
     );
-    let dir = std::env::temp_dir().join(format!("javars_round2_{}", fnv1a(&src)));
+    assert_eq!(run_within_60s(&src), "[15, 13, 14]\n");
+}
+
+/// Run `src` like [`run`], failing (rather than hanging) when it does not
+/// finish within 60 seconds; answers its stdout and requires success.
+fn run_within_60s(src: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("javars_round2_{}", fnv1a(src)));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join("T.java");
-    std::fs::write(&path, &src).expect("write program");
+    std::fs::write(&path, src).expect("write program");
     let mut child = Command::new(env!("CARGO_BIN_EXE_java"))
         .arg(&path)
         .current_dir(&dir)
@@ -2389,12 +2395,26 @@ fn a_long_typed_call_chain_compiles_in_linear_time() {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = std::fs::remove_dir_all(&dir);
-            panic!("a 24-stage pipeline did not compile and run within 60s");
+            panic!("the program did not compile and run within 60s");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let out = child.wait_with_output().expect("collect java");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "[15, 13, 14]\n");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A nest of calls to a plain (non-generic) static method is typed once per
+/// level: only a name with a generic overload is resolved for its generic
+/// return type, so `f(f(…f(5)…))` thirty deep compiles at once.
+#[test]
+fn nested_plain_static_calls_compile_in_linear_time() {
+    let depth = 30;
+    let src = format!(
+        "public class T {{\n    static int f(int x) {{ return x + 1; }}\n    public static void main(String[] a) {{\n        System.out.println({}5{});\n    }}\n}}\n",
+        "f(".repeat(depth),
+        ")".repeat(depth)
+    );
+    assert_eq!(run_within_60s(&src), "35\n");
 }

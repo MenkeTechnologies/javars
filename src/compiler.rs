@@ -1767,11 +1767,14 @@ impl Compiler {
                 Some(self.through_receiver(owner, &rc, g, sig))
             }
             // A user method declared to return a generic type.
-            Expr::Call { name, args, .. } => {
+            // Asked only of a name with a generic overload, so a nest of plain
+            // calls (`f(g(h(x)))`) is not typed twice per level.
+            Expr::Call { name, args, .. } if self.has_generic_return(name) => {
                 let arg_tys = self.arg_types(args);
                 let resolved = self.resolve_static_call(name, &arg_tys)?;
                 let ret = self.ret_generics.get(&resolved.mangled)?;
-                Some(self.inferred(&resolved.mangled, args, ret))
+                let (names, types) = self.infer_bindings(&resolved.mangled, args);
+                Some(subst_tvars(ret, &names, &types))
             }
             Expr::MethodCall {
                 recv, method, args, ..
@@ -1782,10 +1785,14 @@ impl Compiler {
                     }
                 }
                 if let Some(class) = self.user_class_ref(recv) {
+                    if !self.has_generic_return(method) {
+                        return None;
+                    }
                     let arg_tys = self.arg_types(args);
                     let resolved = self.resolve_static_on(&class, method, &arg_tys)?;
                     let ret = self.ret_generics.get(&resolved.mangled)?;
-                    return Some(self.inferred(&resolved.mangled, args, ret));
+                    let (names, types) = self.infer_bindings(&resolved.mangled, args);
+                    return Some(subst_tvars(ret, &names, &types));
                 }
                 // A user type has its own signatures, read through the
                 // receiver's arguments; the prelude's functional interfaces are
@@ -2100,10 +2107,11 @@ impl Compiler {
         if let Some(info) = self.classes.get(class) {
             let (param_tys, _) = self.resolve_ctor(class, &self.arg_types(args))?;
             let mangled = mangle(class, "<init>", &param_tys);
+            let (names, types) = self.infer_bindings(&mangled, args);
             let bound: Vec<String> = info
                 .type_params
                 .iter()
-                .map(|p| self.inferred(&mangled, args, &format!("#{p}")))
+                .map(|p| subst_tvars(&format!("#{p}"), &names, &types))
                 .collect();
             return bound
                 .iter()
@@ -5159,26 +5167,38 @@ impl Compiler {
         param_tys: &[String],
         mangled: &str,
     ) -> Result<(), String> {
+        let (names, types) = self.infer_bindings(mangled, args);
         let generics: Vec<Option<String>> = self
             .param_generics
             .get(mangled)
             .map(|gs| {
                 gs.iter()
-                    .map(|g| g.as_ref().map(|g| self.inferred(mangled, args, g)))
+                    .map(|g| g.as_ref().map(|g| subst_tvars(g, &names, &types)))
                     .collect()
             })
             .unwrap_or_default();
         self.call_args_with_generics(args, param_tys, &generics)
     }
 
-    /// `sig` with the type variables a call to `mangled` binds from its
-    /// arguments substituted, the simple cases of `javac`'s inference (JLS
-    /// 18.5.1): a parameter typed `E` binds `E` to its argument's static type
-    /// (boxed, as a primitive argument is), and a `List<E>` parameter binds it
-    /// to the argument's own type argument. A variable no argument binds stays.
-    fn inferred(&self, mangled: &str, args: &[Expr], sig: &str) -> String {
+    /// True when some user `static` method named `name` declares a generic
+    /// return type — the only calls [`Compiler::expr_generic`] has to resolve.
+    fn has_generic_return(&self, name: &str) -> bool {
+        self.methods.get(name).is_some_and(|sigs| {
+            sigs.iter().any(|s| {
+                self.ret_generics
+                    .contains_key(&mangle_static(&s.owner, name, &s.param_tys))
+            })
+        })
+    }
+
+    /// The type variables a call to `mangled` binds from its arguments, as
+    /// parallel name and type lists for [`subst_tvars`] — the simple cases of
+    /// `javac`'s inference (JLS 18.5.1): a parameter typed `E` binds `E` to its
+    /// argument's static type (boxed, as a primitive argument is), and a
+    /// `List<E>` parameter binds it to the argument's own type argument.
+    fn infer_bindings(&self, mangled: &str, args: &[Expr]) -> (Vec<String>, Vec<String>) {
         let Some(params) = self.param_generics.get(mangled) else {
-            return sig.to_string();
+            return (Vec::new(), Vec::new());
         };
         let mut bound: Vec<(String, String)> = Vec::new();
         for (p, a) in params.iter().zip(args) {
@@ -5191,8 +5211,7 @@ impl Compiler {
                 unify_tvars(p, &actual, &mut bound);
             }
         }
-        let (names, types): (Vec<String>, Vec<String>) = bound.into_iter().unzip();
-        subst_tvars(sig, &names, &types)
+        bound.into_iter().unzip()
     }
 
     /// Lower a call's arguments, each targeted at its parameter's type and
