@@ -424,7 +424,8 @@ pub const JCLASS_STR: u16 = 759;
 /// .compareTo(9)` with `-8` (`'1' - '9'`) where Java answers `1`.
 ///
 /// `tag` is the receiver's static Java type when the compiler knew it, else the
-/// empty string, in which case the runtime value picks the rule.
+/// empty string. A *boxed* receiver's own class overrides it, since the box is
+/// the runtime truth; otherwise an empty tag lets the runtime value pick.
 pub const JCOMPARE_TO: u16 = 740;
 
 /// `String.format(fmt, args…)`. Stack `[fmt, arg0, …, argN, tags]` (`tags` on
@@ -12011,11 +12012,20 @@ fn double_compare(a: f64, b: f64) -> i64 {
 /// [`JCOMPARE_TO`] — `compareTo` on a boxed primitive or a `String`.
 fn b_compare_to(vm: &mut VM, _argc: u8) -> Value {
     let tag_name = pop_name(vm);
-    let tag = tag_name.as_str_cow();
+    let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    let raw_a = vm.stack.pop().unwrap_or(Value::Undef);
+    // A boxed receiver carries its runtime class, and that class picks the
+    // rule, whatever static type the compiler saw — a `Comparable<Character>`
+    // local, an erased `List.get`, a type variable: a `Character` compares by
+    // difference, not sign. Read it before deboxing. An unboxed receiver
+    // falls back to the static tag.
+    let tag = match box_class(&raw_a) {
+        Some(class) => std::borrow::Cow::Borrowed(class),
+        None => tag_name.as_str_cow(),
+    };
     // Through any box, for the same reason [`natural_cmp`] is: `compareTo` reads
     // the value, not the handle.
-    let b = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
-    let a = deboxed(&vm.stack.pop().unwrap_or(Value::Undef));
+    let a = deboxed(&raw_a);
     if let (Some(x), Some(y)) = (big_of(&a), big_of(&b)) {
         return Value::Int(x.cmp(&y) as i64);
     }

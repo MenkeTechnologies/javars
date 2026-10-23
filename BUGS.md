@@ -1380,6 +1380,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 
 ## Not implemented (parse or compile errors today)
 
+- **An escaped quote run inside a text block.** The lexer ends a text block
+  at the first `"""` without skipping escapes, so `\"""` (JLS 3.10.6's way to
+  put three quotes in a block) closes it early and the rest of the line is a
+  lex error (``unexpected character `\` ``). Measured on `openjdk 25.0.2`.
+
 - **An array type in `instanceof`.** `o instanceof int[]` and the pattern form
   `o instanceof int[] ia` are parse errors (`expected RParen but found
   LBracket`). A reference array carries no element type at run time (see the
@@ -1427,6 +1432,16 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Map.of('A', 1).get("A".charAt(0))` finds its key, `stack.peek() == '('`
   unboxes, `(char) (list.get(0) + 1)` adds, and `getClass()` is `Character`.
   Measured on `openjdk 21.0.12.1`.
+- ~~**A `char` cast to a reference type stayed a bare code point.**~~ — fixed.
+  `(Object) c`, `(Comparable<Character>) c` and any other reference cast of a
+  `char` now box it to `Character` (JLS 5.1.7), the way an assignment
+  `Object o = c` already did; before, `println((Object) 'c')` printed `99`,
+  its class was `Integer`, and `((Object) c).equals(99)` was `true`. Alongside
+  it, `compareTo` on a boxed receiver whose static type the compiler could not
+  name — a `Comparable<Character>` local, an erased `List.get`,
+  `Comparator.naturalOrder()` — now reads the box's own class, so a
+  `Character`, `Short` or `Byte` answers the difference (`'c'` vs `'a'` is 2)
+  rather than the sign `Integer.compareTo` gives. Measured on `openjdk 25.0.2`.
 - **`Stream.iterator()` and `IntStream.iterator()`** are refused
   (``unsupported Stream method `iterator` ``). A JDK stream iterator pulls
   elements lazily, one `next()` at a time, so a `peek` or a side-effecting

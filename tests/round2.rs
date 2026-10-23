@@ -1781,3 +1781,42 @@ bound must be greater than origin
     );
     assert_eq!(out, expected);
 }
+
+/// A `char` cast to a reference type boxes to `Character` (JLS 5.1.7): `(Object) c` prints `c`, its class is `Character`, and `equals(99)` is false. A boxed `Character`/`Short`/`Byte` receiver whose static type the compiler could not name (a `Comparable<Character>` local, an erased `List.get`, `naturalOrder()`) compares by difference, not sign.
+#[test]
+fn char_cast_to_reference_boxes_and_boxed_compare_to_follows_the_runtime_class() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static String show(Object o) { return o + ":" + o.getClass().getSimpleName(); }
+    public static void main(String[] a) {
+        char c = 'c';
+        System.out.println((Object) c);
+        System.out.println(show((Object) c) + " " + show((Comparable<Character>) c) + " " + ((Object) 'z').getClass().getName());
+        System.out.println(((Object) c).equals('c') + " " + ((Object) c).equals(99) + " " + ((Object) c).hashCode() + " " + (((Object) c) instanceof Character) + " " + (((Object) c) instanceof Integer));
+        System.out.println(String.valueOf((Object) c) + Objects.toString((Object) c) + String.format("%s", (Object) c));
+        List<Object> l = new ArrayList<>(); l.add((Object) c); Object[] arr = {(Object) c};
+        System.out.println(l + " " + Arrays.toString(arr) + " " + l.get(0).getClass().getSimpleName());
+        Comparable<Character> cc = 'c';
+        List<Character> cs = new ArrayList<>(List.of('z', 'a'));
+        Comparator<Character> nat = Comparator.naturalOrder();
+        System.out.println(cc.compareTo('a') + " " + cs.get(0).compareTo(cs.get(1)) + " " + nat.compare('c', 'a') + " " + ((Comparable<Character>) (Character) 'a').compareTo('c'));
+        List<Short> ss = List.of((short) 9, (short) 2); List<Byte> bs = List.of((byte) -3, (byte) 4); List<Integer> is = List.of(9, 2);
+        System.out.println(ss.get(0).compareTo(ss.get(1)) + " " + bs.get(0).compareTo(bs.get(1)) + " " + is.get(0).compareTo(is.get(1)) + " " + Comparator.<Short>naturalOrder().compare((short) 1, (short) 8));
+        cs.sort(null); System.out.println(cs + " " + Collections.max(cs));
+    }
+}
+"####;
+    let expected = r####"c
+c:Character c:Character java.lang.Character
+true false 99 true false
+ccc
+[c] [c] Character
+2 25 2 -2
+7 -7 1 -7
+[a, z] z
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

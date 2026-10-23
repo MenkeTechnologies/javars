@@ -9609,6 +9609,17 @@ impl Compiler {
             // autoboxes into when the target is `Object` or another supertype.
             // `(Integer) someObj` still checks, because there the operand is
             // already a reference.
+            // A `char` boxes to `Character` (JLS 5.1.7) whatever reference type
+            // the cast names, so `(Object) c` prints `c` and its class is
+            // `Character`. [`Compiler::autobox_code`] leaves `char` out because
+            // its other callers turn a `char` into a String first.
+            if src.as_deref() == Some("char") {
+                let code = crate::host::box_class_code("Character").expect("`Character` is boxed");
+                self.expr(e)?;
+                self.b.emit(Op::LoadInt(code), line);
+                self.b.emit(Op::CallBuiltin(crate::host::JBOX, 2), line);
+                return Ok(());
+            }
             if src.as_deref().is_some_and(|t| !is_reference_type(t)) {
                 let code = crate::host::box_class_code(ty).or_else(|| self.autobox_code(e));
                 if let Some(code) = code {
