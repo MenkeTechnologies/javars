@@ -96,7 +96,9 @@ cost tie settled by most-specific, so `f(1)` picks `f(int)` over `f(Integer)`
 and `f(null)` picks `f(String)` over `f(Object)`), annotations (parsed and
 dropped: none has a run-time effect without reflection), and
 **type-erased generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends
-X>`, the diamond, erased library type args) all run. `String.format` and
+X>`, the diamond, and library type arguments kept for static typing, so
+`List<Float>.get` is a `Float` and a `Function<Integer, Integer>` lambda wraps
+at 32 bits) all run. `String.format` and
 `System.out.printf` (a `Formatter` subset covering `%d %s %S %f %e %E %g %G %a %A
 %b %B %h %H %x %X %o %c`, all seven `-`/`#`/`+`/` `/`0`/`,`/`(` flags, width,
 precision, and explicit and relative `%<s` argument indexes), the mutable **`StringBuilder`/`StringBuffer`**
@@ -645,7 +647,8 @@ dispatch through an interface type), **method overloading by parameter type**
 variable-arity — phase, so a `T...` parameter is callable with loose arguments
 at every call site), **type-erased
 generics** (`class Box<T>`, `<T> T id(T x)`, bounded `<T extends X>`, the
-diamond), **`static` fields** with `static { }` initializer blocks, **instance
+diamond, with a declared type's arguments typing the JDK members and lambdas
+that use it), **`static` fields** with `static { }` initializer blocks, **instance
 initialization in JLS 12.5 order** (superclass constructor, then this class's
 field initializers and bare `{ }` blocks in textual order, then the constructor
 body — so a virtual call made from a superclass constructor sees the subclass's

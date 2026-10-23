@@ -168,6 +168,9 @@ pub fn enum_body_class(enum_name: &str, constant: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldDecl {
     pub ty: String,
+    /// The declared type's type arguments (`Map<String, Integer>` → `String`,
+    /// `Integer`), see [`StmtKind::Local::targs`].
+    pub targs: Vec<String>,
     pub name: String,
     /// True when the declaration carried `final`.
     ///
@@ -211,6 +214,9 @@ pub struct Method {
     /// The declared return type (retained for diagnostics and numeric-division
     /// typing; not otherwise checked).
     pub ret: String,
+    /// The declared return type's type arguments, see
+    /// [`StmtKind::Local::targs`].
+    pub ret_targs: Vec<String>,
     pub body: Vec<Stmt>,
     /// True for a bodyless method — an interface abstract method (`void m();`)
     /// or an `abstract` class method. No subroutine is emitted; the method is a
@@ -225,6 +231,8 @@ pub struct Method {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub ty: String,
+    /// The declared type's type arguments, see [`StmtKind::Local::targs`].
+    pub targs: Vec<String>,
     pub name: String,
     /// True for the variable-arity parameter (`int... xs`). `ty` is already the
     /// array type (`int[]`) — inside the body the parameter *is* that array —
@@ -258,6 +266,13 @@ pub enum StmtKind {
     /// typed on the fusevm value model, so it does not gate execution yet.
     Local {
         ty: String,
+        /// The type arguments of the declared type, outermost level, each in
+        /// [`generic_parts`] form: `Map<String, List<Integer>>` holds `String`
+        /// and `List<Integer>`. `ty` itself stays erased (`Map`); these are
+        /// what types a `get` or a lambda parameter the way `javac` does.
+        /// Empty for a raw or non-generic type, a type variable erases to
+        /// `Object`, and a wildcard reads as its upper bound.
+        targs: Vec<String>,
         name: String,
         init: Option<Expr>,
     },
@@ -322,6 +337,8 @@ pub enum StmtKind {
         /// The declared element type (`String`, `int`, `var`, …) — recorded for
         /// `/`-truncation typing and class-typed dispatch of the loop variable.
         ty: String,
+        /// The element type's type arguments, see [`StmtKind::Local::targs`].
+        targs: Vec<String>,
         name: String,
         /// The array expression, evaluated exactly once before the loop.
         iter: Expr,
@@ -730,4 +747,97 @@ pub enum BinOp {
     Shr,
     /// `>>>` — logical (zero-fill) right shift.
     Ushr,
+}
+
+/// Split a type in the form [`StmtKind::Local::targs`] records into its erased
+/// name and its top-level type arguments: `Map<String,List<Integer>>` is `Map`
+/// with `String` and `List<Integer>`; `Integer` is `Integer` with none.
+///
+/// A trailing array suffix belongs to the whole type, so `List<Integer>[]`
+/// splits as `List[]` with no arguments — an array's own methods never see its
+/// element's type arguments.
+pub fn generic_parts(ty: &str) -> (String, Vec<String>) {
+    let Some(open) = ty.find('<') else {
+        return (ty.to_string(), Vec::new());
+    };
+    let close = ty.rfind('>').unwrap_or(ty.len() - 1);
+    let suffix = &ty[close + 1..];
+    let name = format!("{}{suffix}", &ty[..open]);
+    if !suffix.is_empty() {
+        return (name, Vec::new());
+    }
+    (name, split_top_level(&ty[open + 1..close]))
+}
+
+/// The comma-separated items of a type-argument list, splitting only at depth
+/// zero so `String,List<Integer>` is two items.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Normalize the source text of one type argument (`? extends Number`,
+/// `java.util.List<Integer>`, `int[]`) into [`generic_parts`] form: a wildcard
+/// reads as its upper bound — `Object` when it has none or a lower one — and a
+/// package or enclosing-type qualifier is dropped, as every other type position
+/// drops it.
+pub fn normalize_type_arg(raw: &str) -> String {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix('?') {
+        let rest = rest.trim_start();
+        return match rest.strip_prefix("extends") {
+            Some(bound) if bound.starts_with(char::is_whitespace) => {
+                // `? extends A & B` cannot occur (only a type parameter takes
+                // an intersection bound), so the bound is one type.
+                normalize_type_arg(bound)
+            }
+            _ => "Object".to_string(),
+        };
+    }
+    let (head, tail) = match s.find(['<', '[']) {
+        Some(i) => s.split_at(i),
+        None => (s, ""),
+    };
+    let simple = head.rsplit('.').next().unwrap_or(head).trim();
+    let Some(inner) = tail.strip_prefix('<') else {
+        return format!("{simple}{}", tail.replace(' ', ""));
+    };
+    let mut depth = 1i32;
+    let mut end = inner.len();
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let args: Vec<String> = split_top_level(&inner[..end])
+        .iter()
+        .map(|a| normalize_type_arg(a))
+        .collect();
+    let rest = inner.get(end + 1..).unwrap_or("").replace(' ', "");
+    format!("{simple}<{}>{rest}", args.join(","))
 }

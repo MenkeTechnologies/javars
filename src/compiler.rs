@@ -217,6 +217,10 @@ struct ClassInfo {
     fields: Vec<FieldInit>,
     /// Declared type of every field (own + inherited), for static typing.
     field_types: HashMap<String, String>,
+    /// The declared type, with its type arguments, of every field of this
+    /// class that carries any (own, inherited and `static` alike) — see
+    /// [`with_targs`].
+    field_generic: HashMap<String, String>,
     /// Declared type of every `static` field visible on this class — its own
     /// plus every ancestor's, because Java inherits statics by name. Maps the
     /// field name to `(declaring class, declared type)`; the declaring class is
@@ -323,6 +327,9 @@ struct MethodScope {
     types: HashMap<String, NumType>,
     /// Declared type name of each local/parameter (raw, e.g. `Point`, `int[]`).
     decl_types: HashMap<String, String>,
+    /// The declared type of each local/parameter *with* its type arguments
+    /// (`List<Float>`), for the ones that carry any — see [`with_targs`].
+    decl_generic: HashMap<String, String>,
     /// Names actually declared as a local or parameter here — distinguishes a
     /// true local from an implicit-`this` field reference.
     declared: HashSet<String>,
@@ -351,6 +358,7 @@ impl MethodScope {
             next_slot: first,
             types: HashMap::default(),
             decl_types: HashMap::default(),
+            decl_generic: HashMap::default(),
             declared: HashSet::default(),
             this_slot: None,
         }
@@ -506,6 +514,8 @@ struct Compiler {
     /// Declared type name of each `main`-scope local (parallel to
     /// [`Compiler::global_types`] but the raw type string, for class typing).
     global_decl_types: HashMap<String, String>,
+    /// [`MethodScope::decl_generic`] for the `main`-scope locals.
+    global_decl_generic: HashMap<String, String>,
     /// Resolved metadata (fields/methods/ctors, inheritance-flattened) for every
     /// user class. Keyed by class name; populated before any body is lowered.
     classes: HashMap<String, ClassInfo>,
@@ -550,6 +560,25 @@ struct Compiler {
     /// parameters stay untyped; what the hint buys is the boxing conversion on
     /// the result, which is what turns a `char` body into a `Character`.
     lambda_ret_hint: Option<String>,
+    /// The generic type a lambda literal is being assigned to, when the
+    /// declaration names its type arguments (`Function<Integer, Integer>`) —
+    /// what substitutes the `java.util.function` interface's erased `Object`
+    /// parameters and result (see [`functional_type_arg_slots`]).
+    lambda_generic: Option<String>,
+    /// The parameter types, with type arguments, of a lambda literal passed to
+    /// a JDK generic method whose receiver's type arguments are known —
+    /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
+    /// See [`Compiler::lambda_param_generics`].
+    lambda_param_hint: Option<Vec<String>>,
+    /// Each user method's and constructor's parameter types with their type
+    /// arguments, keyed by its mangled name — only the ones declaring any.
+    param_generics: HashMap<String, Vec<Option<String>>>,
+    /// Each user method's return type with its type arguments, keyed by its
+    /// mangled name — only the ones declaring any.
+    ret_generics: HashMap<String, String>,
+    /// The enclosing method's [`Compiler::ret_generics`] entry while its body
+    /// is lowered, so a `return x -> …` reads the declared type's arguments.
+    current_ret_generic: Option<String>,
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
@@ -577,6 +606,10 @@ struct PendingLambda {
     /// when it did not, in which case the parameters are statically untyped and
     /// arithmetic on them falls back to the runtime's own rules.
     param_tys: Vec<String>,
+    /// The parameters' types with their type arguments, where known (a
+    /// `Function<List<Integer>, …>` parameter is a `List<Integer>`), parallel
+    /// to `params`.
+    param_generic: Vec<Option<String>>,
     /// The target interface's declared *return* type, when the literal's context
     /// named a target. It drives the assignment conversion on the body's result
     /// — a `double`-returning single abstract method widens an integral body.
@@ -603,6 +636,8 @@ struct PendingLambda {
 struct Capture {
     name: String,
     decl_ty: Option<String>,
+    /// The captured local's [`MethodScope::decl_generic`] entry.
+    generic: Option<String>,
     num_ty: NumType,
 }
 
@@ -633,6 +668,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             varargs: is_varargs(&m.params),
         });
     }
+    let (param_generics, ret_generics) = signature_generics(prog);
     let classes = resolve_classes(prog)?;
     // One whole-program question, asked once: does any class supply a
     // `toString()` body? It gates the concatenation rerouting in
@@ -696,6 +732,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         scope: None,
         methods,
         global_decl_types: HashMap::default(),
+        global_decl_generic: HashMap::default(),
         classes,
         this_class: None,
         current_class: Some(prog.class_name.clone()),
@@ -707,6 +744,11 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_counter: 0,
         lambda_target: None,
         lambda_ret_hint: None,
+        lambda_generic: None,
+        lambda_param_hint: None,
+        param_generics,
+        ret_generics,
+        current_ret_generic: None,
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
@@ -845,6 +887,15 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         }
         let mut fields = Vec::new();
         let mut field_types = HashMap::default();
+        let mut field_generic: HashMap<String, String> = HashMap::default();
+        for anc_name in &ancestry {
+            let anc = by_name[anc_name.as_str()];
+            for f in anc.fields.iter().chain(&anc.static_fields) {
+                if let Some(g) = with_targs(&f.ty, &f.targs) {
+                    field_generic.insert(f.name.clone(), g);
+                }
+            }
+        }
         // `static` fields, ancestors first so a subclass re-declaration shadows
         // the inherited one (and interface constants are visible too).
         let mut static_fields = HashMap::default();
@@ -958,6 +1009,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 enum_constants: cl.enum_constants.iter().map(|c| c.name.clone()).collect(),
                 fields,
                 field_types,
+                field_generic,
                 static_fields,
                 methods,
                 ctors,
@@ -1296,7 +1348,11 @@ impl Compiler {
             return self.static_update(&global, ty, op, value, Yield::Nothing, line);
         }
         let ty = ty.to_string();
-        self.expr_targeted(value, Some(&ty))?;
+        let generic = self
+            .classes
+            .get(class)
+            .and_then(|ci| ci.field_generic.get(name).cloned());
+        self.expr_targeted_generic(value, Some(&ty), generic)?;
         self.emit_global_set(&global, line);
         Ok(())
     }
@@ -1536,11 +1592,13 @@ impl Compiler {
         match &mut self.scope {
             Some(scope) => {
                 scope.decl_types.insert(name.to_string(), ty.to_string());
+                scope.decl_generic.remove(name);
                 scope.declared.insert(name.to_string());
             }
             None => {
                 self.global_decl_types
                     .insert(name.to_string(), ty.to_string());
+                self.global_decl_generic.remove(name);
             }
         }
     }
@@ -1585,6 +1643,293 @@ impl Compiler {
         match &self.scope {
             Some(scope) => scope.decl_types.get(name).map(|s| s.as_str()),
             None => self.global_decl_types.get(name).map(|s| s.as_str()),
+        }
+    }
+
+    /// Record the type arguments a just-declared local carries (see
+    /// [`MethodScope::decl_generic`]). [`Compiler::declare_local`] has already
+    /// dropped whatever an earlier same-named local recorded.
+    fn declare_generic(&mut self, name: &str, generic: Option<String>) {
+        let Some(g) = generic else {
+            return;
+        };
+        match &mut self.scope {
+            Some(scope) => scope.decl_generic.insert(name.to_string(), g),
+            None => self.global_decl_generic.insert(name.to_string(), g),
+        };
+    }
+
+    /// The generic declared type of a local/parameter in the active scope.
+    fn local_generic(&self, name: &str) -> Option<String> {
+        match &self.scope {
+            Some(scope) => scope.decl_generic.get(name).cloned(),
+            None => self.global_decl_generic.get(name).cloned(),
+        }
+    }
+
+    /// The generic declared type of a bare name, resolved the way
+    /// [`Compiler::bare_var_type`] resolves its erased one: a local first (and
+    /// a local without type arguments hides a generic field), then a field of
+    /// `this`, then an unqualified `static`.
+    fn var_generic(&self, name: &str) -> Option<String> {
+        if self.var_decl_type(name).is_some() {
+            return self.local_generic(name);
+        }
+        if let Some(ci) = self.this_class.as_ref().and_then(|t| self.classes.get(t)) {
+            if ci.field_types.contains_key(name) {
+                return ci.field_generic.get(name).cloned();
+            }
+        }
+        let (owner, _) = self.static_field_owner(name)?;
+        self.classes.get(&owner)?.field_generic.get(name).cloned()
+    }
+
+    /// The static type of `e` with its type arguments, when it has any:
+    /// `List<Float>` for a local so declared, `Float` for its `get(0)`,
+    /// `Entry<String,Integer>` for an element of a map's `entrySet()`. This is
+    /// the part of `javac`'s typing that erasure-at-parse-time used to lose, and
+    /// [`Compiler::expr_java_type`] reads its erasure.
+    fn expr_generic(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(name) => self.var_generic(name),
+            Expr::Field { recv, name } => {
+                if let Some((owner, _)) = self.static_field_ref(e) {
+                    return self.classes.get(&owner)?.field_generic.get(name).cloned();
+                }
+                let rc = self.expr_class(recv)?;
+                self.classes.get(&rc)?.field_generic.get(name).cloned()
+            }
+            // A user method declared to return a generic type.
+            Expr::Call { name, args, .. } => {
+                let arg_tys = self.arg_types(args);
+                let resolved = self.resolve_static_call(name, &arg_tys)?;
+                self.ret_generics.get(&resolved.mangled).cloned()
+            }
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
+                if let Some(class) = self.user_class_ref(recv) {
+                    let arg_tys = self.arg_types(args);
+                    let resolved = self.resolve_static_on(&class, method, &arg_tys)?;
+                    return self.ret_generics.get(&resolved.mangled).cloned();
+                }
+                if let Some(g) = self
+                    .expr_class(recv)
+                    .and_then(|rc| self.instance_ret_generic(&rc, method, args))
+                {
+                    return Some(g);
+                }
+                let (base, targs) = crate::ast::generic_parts(&self.expr_generic(recv)?);
+                // A user type has its own signatures; the prelude's
+                // functional interfaces are the JDK's, typed by the table.
+                if self.classes.contains_key(&base) && functional_type_arg_slots(&base).is_none() {
+                    return None;
+                }
+                self.generic_member_type(&base, &targs, method, args)
+            }
+            _ => None,
+        }
+    }
+
+    /// The generic return type of the instance method `rc.method(args)`
+    /// resolves to, when its declaration names type arguments.
+    fn instance_ret_generic(&self, rc: &str, method: &str, args: &[Expr]) -> Option<String> {
+        let arg_tys = self.arg_types(args);
+        let resolved = self.resolve_instance_call(rc, method, &arg_tys)?;
+        let meta = self
+            .classes
+            .get(rc)?
+            .methods
+            .iter()
+            .find(|m| m.name == method && m.param_tys == resolved.param_tys)?;
+        let mangled = mangle(&meta.defining, method, &meta.param_tys);
+        self.ret_generics.get(&mangled).cloned()
+    }
+
+    /// The type a JDK generic type's member answers for a receiver typed
+    /// `base<targs>`, substituted the way the JDK's own signature declares it
+    /// (`List<E>.get` is `E`, `Map<K,V>.entrySet` is `Set<Map.Entry<K,V>>`).
+    /// `None` for a member whose result does not mention a type argument —
+    /// the erased tables already type those.
+    fn generic_member_type(
+        &self,
+        base: &str,
+        targs: &[String],
+        method: &str,
+        args: &[Expr],
+    ) -> Option<String> {
+        let arg = |i: usize| targs.get(i).cloned();
+        let of = |outer: &str, inner: &[String]| -> Option<String> {
+            (!inner.is_empty()).then(|| format!("{outer}<{}>", inner.join(",")))
+        };
+        let elem = || targs.first().map(std::slice::from_ref).unwrap_or(&[]);
+        let n = args.len();
+        // `List.remove` is `remove(int)` — the element — exactly when the
+        // argument is integral below `long`; otherwise it is `remove(Object)`.
+        let index_arg = || {
+            args.first()
+                .and_then(|a| self.expr_java_type(a))
+                .is_some_and(|t| matches!(t.as_str(), "int" | "short" | "byte" | "char"))
+        };
+        let is_list = matches!(
+            base,
+            "List" | "ArrayList" | "LinkedList" | "Vector" | "Stack"
+        );
+        match (base, method, n) {
+            ("Optional", "get" | "orElseThrow", 0) | ("Optional", "orElse" | "orElseThrow", 1) => {
+                return arg(0)
+            }
+            ("Optional", "filter" | "or", 1) => return of("Optional", elem()),
+            ("Iterator" | "ListIterator", "next" | "previous", 0) => return arg(0),
+            (
+                "Stream",
+                "filter" | "sorted" | "distinct" | "limit" | "skip" | "peek" | "takeWhile"
+                | "dropWhile" | "parallel" | "sequential" | "unordered",
+                _,
+            ) => return of("Stream", elem()),
+            ("Stream", "findFirst" | "findAny", 0)
+            | ("Stream", "min" | "max", 1)
+            | ("Stream", "reduce", 1) => return of("Optional", elem()),
+            ("Stream", "reduce", 2) => return arg(0),
+            ("Stream", "toList", 0) => return of("List", elem()),
+            ("Stream", _, _) => return None,
+            ("Function", "apply", 1) | ("BiFunction", "apply", 2) => return arg(n),
+            ("UnaryOperator", "apply", 1)
+            | ("BinaryOperator", "apply", 2)
+            | ("Supplier" | "Callable", "get" | "call", 0)
+            | ("IntFunction" | "LongFunction" | "DoubleFunction", "apply", 1) => return arg(0),
+            _ => {}
+        }
+        match (collection_kind(base)?, method, n) {
+            ("list", "get" | "elementAt", 1) if is_list => arg(0),
+            ("list", "remove", 1) if is_list && index_arg() => arg(0),
+            ("list", "set", 2) if is_list => arg(0),
+            ("list", "push", 1) if base == "Stack" => arg(0),
+            (
+                "list" | "set" | "pq",
+                "getFirst" | "getLast" | "removeFirst" | "removeLast" | "peek" | "peekFirst"
+                | "peekLast" | "poll" | "pollFirst" | "pollLast" | "pop" | "element"
+                | "firstElement" | "lastElement" | "first" | "last" | "remove",
+                0,
+            ) => arg(0),
+            ("set", "floor" | "ceiling" | "higher" | "lower", 1) => arg(0),
+            ("list" | "set" | "pq", "stream" | "parallelStream", 0) => of("Stream", elem()),
+            ("list" | "set" | "pq", "iterator" | "descendingIterator", 0)
+            | ("list", "listIterator", 0 | 1) => of("Iterator", elem()),
+            ("list", "subList", 2) => of("List", elem()),
+            ("list" | "set", "reversed", 0) => of(base, targs),
+            ("set", "headSet" | "tailSet", 1 | 2)
+            | ("set", "subSet", 2 | 4)
+            | ("set", "descendingSet", 0) => of("NavigableSet", elem()),
+            (
+                "map",
+                "get" | "remove" | "computeIfAbsent" | "computeIfPresent" | "compute"
+                | "getOrDefault" | "put" | "putIfAbsent" | "replace" | "merge",
+                _,
+            ) => match (method, n) {
+                ("get" | "remove", 1)
+                | ("computeIfAbsent" | "computeIfPresent" | "compute", 2)
+                | ("getOrDefault" | "put" | "putIfAbsent" | "replace", 2)
+                | ("merge", 3) => arg(1),
+                _ => None,
+            },
+            ("map", "firstKey" | "lastKey", 0)
+            | ("map", "floorKey" | "ceilingKey" | "higherKey" | "lowerKey", 1) => arg(0),
+            ("map", "keySet" | "navigableKeySet" | "descendingKeySet" | "sequencedKeySet", 0) => {
+                of("Set", elem())
+            }
+            ("map", "values" | "sequencedValues", 0) => {
+                of("Collection", targs.get(1..2).unwrap_or(&[]))
+            }
+            ("map", "entrySet" | "sequencedEntrySet", 0) => of("Set", &[of("Entry", targs)?]),
+            ("map", "firstEntry" | "lastEntry" | "pollFirstEntry" | "pollLastEntry", 0)
+            | ("map", "floorEntry" | "ceilingEntry" | "higherEntry" | "lowerEntry", 1) => {
+                of("Entry", targs)
+            }
+            ("map", "headMap" | "tailMap", 1 | 2)
+            | ("map", "subMap", 2 | 4)
+            | ("map", "descendingMap", 0) => of("NavigableMap", targs),
+            ("map", "reversed", 0) => of(base, targs),
+            ("entry", "getKey", 0) => arg(0),
+            ("entry", "getValue", 0) | ("entry", "setValue", 1) => arg(1),
+            _ => None,
+        }
+    }
+
+    /// The parameter types a lambda literal passed as argument `i` of
+    /// `recv.method(…)` (of `n` arguments) takes, read off the receiver's type
+    /// arguments the way the JDK signature declares them: `List<E>.replaceAll`
+    /// takes a `UnaryOperator<E>`, `Map<K,V>.merge`'s third argument a
+    /// `BiFunction<V,V,V>`. `None` when the receiver's arguments are unknown or
+    /// one of them erased to `Object`, which says no more than no hint does.
+    fn lambda_param_generics(
+        &self,
+        recv: &Expr,
+        method: &str,
+        n: usize,
+        i: usize,
+    ) -> Option<Vec<String>> {
+        let (base, targs) = crate::ast::generic_parts(&self.expr_generic(recv)?);
+        if self.classes.contains_key(&base) {
+            return None;
+        }
+        let pick = |idx: &[usize]| -> Option<Vec<String>> {
+            let v: Option<Vec<String>> = idx.iter().map(|&k| targs.get(k).cloned()).collect();
+            v.filter(|v| v.iter().all(|t| t != "Object"))
+        };
+        let kind = match base.as_str() {
+            "Optional" | "Stream" | "Iterator" | "ListIterator" => base.as_str(),
+            b => collection_kind(b)?,
+        };
+        match (kind, method, n, i) {
+            ("list" | "set" | "pq", "forEach" | "removeIf", 1, 0)
+            | ("list", "replaceAll", 1, 0)
+            | ("Iterator" | "ListIterator", "forEachRemaining", 1, 0)
+            | ("Optional", "map" | "flatMap" | "filter" | "ifPresent", 1, 0)
+            | ("Optional", "ifPresentOrElse", 2, 0)
+            | ("map", "computeIfAbsent", 2, 1)
+            | (
+                "Stream",
+                "filter" | "map" | "flatMap" | "forEach" | "forEachOrdered" | "anyMatch"
+                | "allMatch" | "noneMatch" | "peek" | "mapToInt" | "mapToLong" | "mapToDouble"
+                | "takeWhile" | "dropWhile",
+                1,
+                0,
+            ) => pick(&[0]),
+            ("list", "sort", 1, 0)
+            | ("Stream", "sorted" | "min" | "max", 1, 0)
+            | ("Stream", "reduce", 1, 0)
+            | ("Stream", "reduce", 2, 1) => pick(&[0, 0]),
+            ("map", "forEach" | "replaceAll", 1, 0)
+            | ("map", "computeIfPresent" | "compute", 2, 1) => pick(&[0, 1]),
+            ("map", "merge", 3, 2) => pick(&[1, 1]),
+            _ => None,
+        }
+    }
+
+    /// Lower one argument of a JDK generic call, handing a lambda literal the
+    /// parameter types [`Compiler::lambda_param_generics`] reads for it.
+    fn with_lambda_param_hint(
+        &mut self,
+        a: &Expr,
+        hint: Option<Vec<String>>,
+        lower: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if matches!(a, Expr::Lambda { .. }) {
+            self.lambda_param_hint = hint;
+        }
+        let r = lower(self);
+        self.lambda_param_hint = None;
+        r
+    }
+
+    /// The generic type of one element of `iter`, for an enhanced `for` over a
+    /// collection whose type arguments are known (`for (var e : m.entrySet())`).
+    fn foreach_elem_generic(&self, iter: &Expr) -> Option<String> {
+        let (base, targs) = crate::ast::generic_parts(&self.expr_generic(iter)?);
+        match collection_kind(&base)? {
+            "list" | "set" | "pq" => targs.into_iter().next(),
+            _ => None,
         }
     }
 
@@ -2074,6 +2419,18 @@ impl Compiler {
                         }
                         return None;
                     }
+                }
+                // A generic member on a receiver whose type arguments are
+                // known: `List<Float>.get` is a `Float`, and so is
+                // `Supplier<Float>.get` although the prelude declares that
+                // interface's `get` as answering `Object`. A type argument that
+                // erased to `Object` says no more than the tables below.
+                if let Some(t) = self
+                    .expr_generic(e)
+                    .map(|g| crate::ast::generic_parts(&g).0)
+                    .filter(|t| t != "Object")
+                {
+                    return Some(t);
                 }
                 let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 if let Some(rc) = self.expr_class(recv) {
@@ -3134,7 +3491,7 @@ impl Compiler {
         if !lambda_arm {
             if let Some(mangled) = only_body {
                 self.expr(recv)?; // this (deepest)
-                self.call_args_targeted(args, &param_tys)?;
+                self.call_args_generic(args, &param_tys, &mangled)?;
                 let idx = self.b.add_name(&mangled);
                 self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
                 self.emit_exc_check(line);
@@ -3811,7 +4168,10 @@ impl Compiler {
     /// two such variables would compare the handles they were copied from
     /// rather than the numbers they hold.
     fn emit_unboxing_conversion(&mut self, target: &str, e: &Expr) {
-        if is_reference_type(target) {
+        // A `void` target discards the value — the expression body of a
+        // `Runnable` lambda (`() -> map.put(k, null)`) converts nothing, so an
+        // `Integer` result that is `null` is not unboxed.
+        if is_reference_type(target) || target == "void" {
             return;
         }
         // A source javars cannot type unboxes too. `int x = list.get(0)` reads
@@ -3938,6 +4298,13 @@ impl Compiler {
             Expr::MethodCall {
                 recv, method, args, ..
             } => {
+                // A JDK generic member typed by its receiver's type arguments.
+                if let Some(nt) = self
+                    .expr_generic(e)
+                    .and_then(|g| numtype_of_ty(&crate::ast::generic_parts(&g).0))
+                {
+                    return nt;
+                }
                 // `T.helper(x)` — the named class's declared return type.
                 if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys: Vec<Option<String>> = self.arg_types(args);
@@ -4036,10 +4403,10 @@ impl Compiler {
     fn compile_method(&mut self, m: &Method) -> Result<(), String> {
         let entry = self.b.current_pos();
         let param_tys: Vec<String> = m.params.iter().map(|p| p.ty.clone()).collect();
-        let name_idx = self
-            .b
-            .add_name(&mangle_static(&m.owner, &m.name, &param_tys));
+        let mangled = mangle_static(&m.owner, &m.name, &param_tys);
+        let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
+        self.current_ret_generic = self.ret_generics.get(&mangled).cloned();
 
         let mut scope = MethodScope::new();
         register_params(&mut scope, &m.params);
@@ -4062,6 +4429,7 @@ impl Compiler {
         self.scope = None;
         self.current_class = saved_class;
         self.current_ret = saved_ret;
+        self.current_ret_generic = None;
         result
     }
 
@@ -4095,9 +4463,45 @@ impl Compiler {
         // conversion on the `return` makes it.
         let target = self.lambda_target.take();
         let hint = self.lambda_ret_hint.take();
+        let param_hint = self.lambda_param_hint.take();
+        let lambda_generic = self.lambda_generic.take();
         let sam = target.as_deref().and_then(|t| self.functional_sam_meta(t));
-        let param_tys: Vec<String> = sam.map(|s| s.param_tys.clone()).unwrap_or_default();
-        let ret_ty: Option<String> = sam.map(|s| s.ret.clone()).or(hint);
+        let mut param_tys: Vec<String> = sam.map(|s| s.param_tys.clone()).unwrap_or_default();
+        let mut ret_ty: Option<String> = sam.map(|s| s.ret.clone()).or(hint);
+        let mut param_generic: Vec<Option<String>> = vec![None; params.len()];
+        // A lambda handed to a JDK generic method takes its parameter types
+        // from the receiver's type arguments, there being no target interface
+        // in scope to read them off.
+        if let Some(hint) = param_hint.filter(|h| sam.is_none() && h.len() == params.len()) {
+            param_generic = hint.iter().map(|t| Some(t.clone())).collect();
+            param_tys = hint;
+        }
+        // `Function<Integer, Integer> f = x -> x * 2;` — javac types `x` and
+        // the result as `Integer`, so the product wraps at 32 bits.
+        if let Some((base, targs)) = lambda_generic
+            .map(|g| crate::ast::generic_parts(&g))
+            .filter(|(base, _)| target.as_deref() == Some(base.as_str()))
+        {
+            if let Some((slots, ret)) = functional_type_arg_slots(&base) {
+                for ((slot, g), &i) in param_tys.iter_mut().zip(&mut param_generic).zip(slots) {
+                    if let Some(t) = targs.get(i).filter(|_| slot == "Object") {
+                        *slot = t.clone();
+                        *g = Some(t.clone());
+                    }
+                }
+                if let Some(t) = ret.and_then(|i| targs.get(i)) {
+                    if ret_ty.as_deref() == Some("Object") {
+                        ret_ty = Some(t.clone());
+                    }
+                }
+            }
+        }
+        // A type argument keeps its own arguments; the slots take the erasure.
+        for t in param_tys.iter_mut().chain(ret_ty.as_mut()) {
+            if t.contains('<') {
+                *t = crate::ast::generic_parts(t).0;
+            }
+        }
         // Capture every name declared in the enclosing scope that the lambda's
         // own parameters do not shadow. Compiler temps are deliberately not in
         // `declared`, so none are captured.
@@ -4117,6 +4521,7 @@ impl Compiler {
             .filter(|n| !params.contains(n))
             .map(|n| Capture {
                 decl_ty: self.var_decl_type(&n).map(str::to_string),
+                generic: self.local_generic(&n),
                 num_ty: self.lookup_type(&n),
                 name: n,
             })
@@ -4137,6 +4542,7 @@ impl Compiler {
             name_idx,
             params: params.to_vec(),
             param_tys,
+            param_generic,
             ret_ty,
             captures,
             captures_this,
@@ -4177,6 +4583,15 @@ impl Compiler {
                     .types
                     .insert(p.clone(), numtype_of_ty(ty).unwrap_or(NumType::Other));
             }
+            if let Some(g) = pl
+                .param_generic
+                .get(i)
+                .cloned()
+                .flatten()
+                .filter(|g| g.contains('<'))
+            {
+                scope.decl_generic.insert(p.clone(), g);
+            }
         }
         for c in &pl.captures {
             scope.slot(&c.name);
@@ -4184,6 +4599,9 @@ impl Compiler {
             scope.types.insert(c.name.clone(), c.num_ty);
             if let Some(t) = &c.decl_ty {
                 scope.decl_types.insert(c.name.clone(), t.clone());
+            }
+            if let Some(g) = &c.generic {
+                scope.decl_generic.insert(c.name.clone(), g.clone());
             }
         }
         let total = pl.params.len() + pl.captures.len() + usize::from(pl.captures_this);
@@ -4202,6 +4620,7 @@ impl Compiler {
         let saved_finallys = std::mem::take(&mut self.finallys);
         let saved_exits = std::mem::take(&mut self.exit_ops);
         let saved_ret = std::mem::replace(&mut self.current_ret, pl.ret_ty.clone());
+        let saved_ret_generic = self.current_ret_generic.take();
 
         for i in (0..total).rev() {
             self.b.emit(Op::SetSlot(i as u16), line);
@@ -4231,6 +4650,7 @@ impl Compiler {
         self.tries = saved_tries;
         self.finallys = saved_finallys;
         self.current_ret = saved_ret;
+        self.current_ret_generic = saved_ret_generic;
         result
     }
 
@@ -4330,6 +4750,44 @@ impl Compiler {
         let result = self.expr(e);
         self.lambda_target = saved;
         result
+    }
+
+    /// [`Compiler::expr_targeted`] for a target whose type arguments are known:
+    /// a lambda literal reads its parameter and return types off them, the way
+    /// `Function<Integer, Integer> f = x -> x * 2` types `x` as an `Integer`.
+    fn expr_targeted_generic(
+        &mut self,
+        e: &Expr,
+        target: Option<&str>,
+        generic: Option<String>,
+    ) -> Result<(), String> {
+        if matches!(e, Expr::Lambda { .. }) {
+            self.lambda_generic = generic;
+        }
+        let r = self.expr_targeted(e, target);
+        self.lambda_generic = None;
+        r
+    }
+
+    /// [`Compiler::call_args_targeted`] for a call to the user method or
+    /// constructor `mangled`, whose parameters' type arguments (when it
+    /// declared any) reach the lambda literals passed to them.
+    fn call_args_generic(
+        &mut self,
+        args: &[Expr],
+        param_tys: &[String],
+        mangled: &str,
+    ) -> Result<(), String> {
+        let generics = self
+            .param_generics
+            .get(mangled)
+            .cloned()
+            .unwrap_or_default();
+        for (i, a) in args.iter().enumerate() {
+            let g = generics.get(i).cloned().flatten();
+            self.expr_targeted_generic(a, param_tys.get(i).map(String::as_str), g)?;
+        }
+        Ok(())
     }
 
     /// Lower a call's arguments, giving each the declared parameter type as its
@@ -4784,6 +5242,7 @@ impl Compiler {
         let mangled = mangle(class, &m.name, &param_tys);
         let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
+        self.current_ret_generic = self.ret_generics.get(&mangled).cloned();
 
         let mut scope = MethodScope::for_instance();
         register_params(&mut scope, &m.params);
@@ -4804,6 +5263,7 @@ impl Compiler {
         self.this_class = None;
         self.current_class = saved_class;
         self.current_ret = saved_ret;
+        self.current_ret_generic = None;
         result
     }
 
@@ -4931,7 +5391,12 @@ impl Compiler {
                 }
                 Ok(())
             }
-            StmtKind::Local { ty, name, init } => {
+            StmtKind::Local {
+                ty,
+                targs,
+                name,
+                init,
+            } => {
                 // Record the declared numeric type (for `/` truncation); `var`
                 // and untracked types are inferred from the initializer. The raw
                 // type string powers class-typed dispatch — for `var`, infer the
@@ -4952,9 +5417,17 @@ impl Compiler {
                 } else {
                     ty.clone()
                 };
+                // The type arguments come from the declaration, or for `var`
+                // from the initializer's own generic type.
+                let generic = if ty == "var" {
+                    init.as_ref().and_then(|e| self.expr_generic(e))
+                } else {
+                    with_targs(ty, targs)
+                };
                 self.declare_local(name, &raw, nt);
+                self.declare_generic(name, generic.clone());
                 if let Some(e) = init {
-                    self.expr_targeted(e, Some(&raw))?;
+                    self.expr_targeted_generic(e, Some(&raw), generic)?;
                     self.emit_set(name, line);
                 }
                 // An uninitialized local is simply unbound until first assigned
@@ -4987,7 +5460,8 @@ impl Compiler {
                 match op {
                     AssignOp::Assign => {
                         let target = self.var_decl_type(name).map(str::to_string);
-                        self.expr_targeted(value, target.as_deref())?;
+                        let generic = self.var_generic(name);
+                        self.expr_targeted_generic(value, target.as_deref(), generic)?;
                     }
                     // `x <op>= e` → `x = x <op> e`, through the one shared
                     // lowering that also handles `/=`'s int truncation, `%=`'s
@@ -5049,10 +5523,11 @@ impl Compiler {
             } => self.for_stmt(init, cond, update, body),
             StmtKind::ForEach {
                 ty,
+                targs,
                 name,
                 iter,
                 body,
-            } => self.foreach_stmt(ty, name, iter, body, line),
+            } => self.foreach_stmt(ty, targs, name, iter, body, line),
             StmtKind::Switch { disc, groups } => self.switch_stmt(disc, groups),
             StmtKind::Labeled { label, body } => {
                 // A label prefixing a loop/`switch` is consumed by that
@@ -5106,7 +5581,8 @@ impl Compiler {
                     match val {
                         Some(e) => {
                             let want = self.current_ret.clone();
-                            self.expr_targeted(e, want.as_deref())?;
+                            let generic = self.current_ret_generic.clone();
+                            self.expr_targeted_generic(e, want.as_deref(), generic)?;
                         }
                         None => {
                             self.b.emit(Op::LoadUndef, line);
@@ -5644,6 +6120,7 @@ impl Compiler {
         let mut loop_body = vec![Stmt::new(
             line,
             StmtKind::Local {
+                targs: Vec::new(),
                 ty: ty.to_string(),
                 name: name.to_string(),
                 init: Some(call(Expr::Var(it.clone()), "next")),
@@ -5654,6 +6131,7 @@ impl Compiler {
             init: vec![Stmt::new(
                 line,
                 StmtKind::Local {
+                    targs: Vec::new(),
                     ty: "Iterator".to_string(),
                     name: it.clone(),
                     init: Some(call(iter.clone(), "iterator")),
@@ -5669,6 +6147,7 @@ impl Compiler {
     fn foreach_stmt(
         &mut self,
         ty: &str,
+        targs: &[String],
         name: &str,
         iter: &Expr,
         body: &[Stmt],
@@ -5694,15 +6173,29 @@ impl Compiler {
         // `var` takes its type from the array's element type when that is
         // statically known (`String[]` → `String`), so the loop variable still
         // participates in `/` typing and class-typed dispatch.
+        // Over a collection it is the collection's element type argument, so
+        // `for (var e : m.entrySet())` is a `Map.Entry<K, V>`.
+        let generic = if ty == "var" {
+            self.foreach_elem_generic(iter)
+        } else {
+            with_targs(ty, targs)
+        };
         let elem_ty = if ty == "var" {
             self.expr_array_type(iter)
                 .and_then(|t| t.strip_suffix("[]").map(str::to_string))
+                .or_else(|| {
+                    generic
+                        .as_deref()
+                        .map(|g| crate::ast::generic_parts(g).0)
+                        .filter(|t| t != "Object")
+                })
                 .unwrap_or_else(|| ty.to_string())
         } else {
             ty.to_string()
         };
         let nt = numtype_of_ty(&elem_ty).unwrap_or(NumType::Other);
         self.declare_local(name, &elem_ty, nt);
+        self.declare_generic(name, generic);
 
         // The array and the index cursor, evaluated/initialised once. When the
         // iterable is not *statically* an array it goes through `JITER_ARRAY`,
@@ -7070,6 +7563,7 @@ impl Compiler {
         self.stmt(&Stmt::new(
             line,
             StmtKind::Local {
+                targs: Vec::new(),
                 ty: "Consumer".to_string(),
                 name: action,
                 init: Some(args[0].clone()),
@@ -7078,6 +7572,7 @@ impl Compiler {
         self.stmt(&Stmt::new(
             line,
             StmtKind::ForEach {
+                targs: Vec::new(),
                 ty: "var".to_string(),
                 name: each,
                 iter: recv.clone(),
@@ -7366,7 +7861,7 @@ impl Compiler {
                 if let Some(resolved) = self.resolve_static_on(&class, method, &arg_tys) {
                     let args =
                         Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
-                    self.call_args_targeted(&args, &resolved.param_tys)?;
+                    self.call_args_generic(&args, &resolved.param_tys, &resolved.mangled)?;
                     self.emit_class_init(&resolved.owner, line);
                     let name_idx = self.b.add_name(&resolved.mangled);
                     self.b.emit(Op::Call(name_idx, args.len() as u8), line);
@@ -7727,11 +8222,13 @@ impl Compiler {
                 };
                 let body = [
                     StmtKind::Local {
+                        targs: Vec::new(),
                         ty: rc.clone(),
                         name: it.clone(),
                         init: Some(recv.clone()),
                     },
                     StmtKind::Local {
+                        targs: Vec::new(),
                         ty: "Consumer".to_string(),
                         name: action.clone(),
                         init: Some(args[0].clone()),
@@ -7847,6 +8344,10 @@ impl Compiler {
                 if ref_result {
                     self.lambda_ret_hint = Some("Object".to_string());
                 }
+                if matches!(a, Expr::Lambda { .. }) {
+                    self.lambda_param_hint =
+                        self.lambda_param_generics(recv, method, args.len(), i);
+                }
                 let r = if self.is_float32_expr(a) {
                     // A `float` element boxes to the `Float` it is, not to its
                     // `Float.toString` text: the box renders through the same
@@ -7867,6 +8368,7 @@ impl Compiler {
                     self.emit_char_string(a)
                 };
                 self.lambda_ret_hint = None;
+                self.lambda_param_hint = None;
                 r?;
                 if let Some(code) = self.autobox_code(a) {
                     self.b.emit(Op::LoadInt(code), line);
@@ -8005,10 +8507,15 @@ impl Compiler {
             "replace" | "append" | "insert" | "setCharAt" | "remove"
         );
         let ref_result = self.lambda_returns_reference(recv, method);
+        let hints: Vec<Option<Vec<String>>> = (0..args.len())
+            .map(|i| self.lambda_param_generics(recv, method, args.len(), i))
+            .collect();
         if targets.is_empty() {
             self.expr(recv)?;
-            for a in args {
-                self.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)?;
+            for (a, hint) in args.iter().zip(&hints) {
+                self.with_lambda_param_hint(a, hint.clone(), |c| {
+                    c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+                })?;
             }
             fallback(self);
             return Ok(());
@@ -8019,9 +8526,12 @@ impl Compiler {
         self.emit_set(&recv_t, line);
         let arg_ts: Vec<String> = args
             .iter()
-            .map(|a| {
+            .zip(&hints)
+            .map(|(a, hint)| {
                 let t = self.temp();
-                self.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)?;
+                self.with_lambda_param_hint(a, hint.clone(), |c| {
+                    c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+                })?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -8664,8 +9174,8 @@ impl Compiler {
         if let Some((param_tys, vararg_from)) = ctor_sig {
             let args = Self::effective_args(args, &param_tys, vararg_from);
             self.emit_get(&obj, line); // this
-            self.call_args_targeted(&args, &param_tys)?;
             let mangled = mangle(ctor_class, "<init>", &param_tys);
+            self.call_args_generic(&args, &param_tys, &mangled)?;
             let name_idx = self.b.add_name(&mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8 + 1), line);
             self.emit_exc_check(line);
@@ -8779,10 +9289,14 @@ impl Compiler {
             return self.static_assign(&class, &ty, name, op, value, line);
         }
         let field_ty_name = self.field_type_name(recv, name);
+        let generic = self.expr_generic(&Expr::Field {
+            recv: Box::new(recv.clone()),
+            name: name.to_string(),
+        });
         self.expr(recv)?;
         let name_c = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
-        self.expr_targeted(value, field_ty_name.as_deref())?;
+        self.expr_targeted_generic(value, field_ty_name.as_deref(), generic)?;
         self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
         self.b.emit(Op::Pop, line);
         Ok(())
@@ -9131,7 +9645,7 @@ impl Compiler {
                 )
             })?;
             let args = Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
-            self.call_args_targeted(&args, &resolved.param_tys)?;
+            self.call_args_generic(&args, &resolved.param_tys, &resolved.mangled)?;
             self.emit_class_init(&resolved.owner, line);
             let name_idx = self.b.add_name(&resolved.mangled);
             self.b.emit(Op::Call(name_idx, args.len() as u8), line);
@@ -10112,8 +10626,79 @@ fn register_params(scope: &mut MethodScope, params: &[Param]) {
             numtype_of_ty(&p.ty).unwrap_or(NumType::Other),
         );
         scope.decl_types.insert(p.name.clone(), p.ty.clone());
+        if let Some(g) = with_targs(&p.ty, &p.targs) {
+            scope.decl_generic.insert(p.name.clone(), g);
+        }
         scope.declared.insert(p.name.clone());
     }
+}
+
+/// Which type argument of a `java.util.function` interface each parameter of
+/// its single abstract method, and its result, is declared as: `Function<T, R>`
+/// applies `T` and answers `R`, so it is `([0], Some(1))`. `None` for an
+/// interface whose abstract method mentions no type argument.
+fn functional_type_arg_slots(base: &str) -> Option<(&'static [usize], Option<usize>)> {
+    Some(match base {
+        "Function" => (&[0], Some(1)),
+        "BiFunction" => (&[0, 1], Some(2)),
+        "UnaryOperator" => (&[0], Some(0)),
+        "BinaryOperator" => (&[0, 0], Some(0)),
+        "Supplier" | "Callable" => (&[], Some(0)),
+        "Consumer" | "Predicate" => (&[0], None),
+        "BiConsumer" | "BiPredicate" => (&[0, 1], None),
+        "Comparator" => (&[0, 0], None),
+        "ToIntFunction" | "ToLongFunction" | "ToDoubleFunction" => (&[0], None),
+        "ToIntBiFunction" | "ToLongBiFunction" | "ToDoubleBiFunction" => (&[0, 1], None),
+        "IntFunction" | "LongFunction" | "DoubleFunction" => (&[], Some(0)),
+        "ObjIntConsumer" | "ObjLongConsumer" | "ObjDoubleConsumer" => (&[0], None),
+        _ => return None,
+    })
+}
+
+/// Every user method's and constructor's parameter and return types with their
+/// type arguments, keyed by the mangled name a call resolves to — the tables
+/// behind [`Compiler::param_generics`] and [`Compiler::ret_generics`]. A
+/// signature that declares no type arguments has no entry.
+#[allow(clippy::type_complexity)]
+fn signature_generics(
+    prog: &Program,
+) -> (
+    HashMap<String, Vec<Option<String>>>,
+    HashMap<String, String>,
+) {
+    let mut params = HashMap::default();
+    let mut rets = HashMap::default();
+    let mut record = |mangled: String, ps: &[Param], ret: Option<(&str, &[String])>| {
+        let gs: Vec<Option<String>> = ps.iter().map(|p| with_targs(&p.ty, &p.targs)).collect();
+        if gs.iter().any(Option::is_some) {
+            params.insert(mangled.clone(), gs);
+        }
+        if let Some(g) = ret.and_then(|(ty, targs)| with_targs(ty, targs)) {
+            rets.insert(mangled, g);
+        }
+    };
+    let tys = |ps: &[Param]| -> Vec<String> { ps.iter().map(|p| p.ty.clone()).collect() };
+    for m in &prog.methods {
+        let mangled = mangle_static(&m.owner, &m.name, &tys(&m.params));
+        record(mangled, &m.params, Some((&m.ret, &m.ret_targs)));
+    }
+    for cl in &prog.classes {
+        for m in &cl.methods {
+            let mangled = mangle(&cl.name, &m.name, &tys(&m.params));
+            record(mangled, &m.params, Some((&m.ret, &m.ret_targs)));
+        }
+        for c in &cl.ctors {
+            record(mangle(&cl.name, "<init>", &tys(&c.params)), &c.params, None);
+        }
+    }
+    (params, rets)
+}
+
+/// `ty` written with its type arguments (`List<Float>`), the form
+/// [`crate::ast::generic_parts`] splits — or `None` when there are none to
+/// record. An array type never carries its element's arguments.
+fn with_targs(ty: &str, targs: &[String]) -> Option<String> {
+    (!targs.is_empty() && !ty.ends_with("[]")).then(|| format!("{ty}<{}>", targs.join(",")))
 }
 
 /// The numeric category of an array's elements from its declared type string:

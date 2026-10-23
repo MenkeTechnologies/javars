@@ -1820,3 +1820,145 @@ ccc
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// Type arguments are kept beside the erased declared type (JLS 4.5) and type what a JDK generic member answers: `List<Float>.get` is a `Float` and computes at `float` width, `Map<String, Integer>.get` an `Integer` that wraps at 32 bits — through locals, `var`, fields, parameters, a method's declared return type, `Map.Entry`, `Optional`, `Iterator` and nested arguments — and `List.remove` of an `Integer`-typed element removes by value.
+#[test]
+fn generic_type_arguments_type_the_members_of_jdk_collections() {
+    let src = r####"
+import java.util.*;
+public class T {
+    static Map<String, Integer> counts = new HashMap<>();
+    List<Float> fs = new ArrayList<>(List.of(0.1f));
+    static int twice(List<Integer> xs) { return xs.get(0) + xs.get(0); }
+    static List<Integer> big() { return new ArrayList<>(List.of(2_000_000_000)); }
+    public static void main(String[] a) {
+        List<Float> l = new ArrayList<>(List.of(0.1f));
+        Map<String, Float> m = new HashMap<>(Map.of("x", 0.1f));
+        System.out.println(l.get(0) + 1 + " " + m.get("x") * 3 + " " + new T().fs.get(0) * 3);
+        List<Integer> li = new ArrayList<>(List.of(2_000_000_000));
+        Map<String, List<Integer>> ml = new HashMap<>(Map.of("k", li));
+        counts.put("z", 2_000_000_000);
+        System.out.println(li.get(0) + li.get(0) + " " + ml.get("k").get(0) * 2 + " " + (counts.get("z") + counts.get("z")) + " " + twice(li) + " " + (big().get(0) + big().get(0)));
+        for (Map.Entry<String, Integer> e : counts.entrySet()) System.out.print(e.getValue() + e.getValue() + " ");
+        for (var e : counts.entrySet()) System.out.print(e.getValue() * 2 + " ");
+        var v = li.get(0);
+        Optional<Integer> o = Optional.of(2_000_000_000);
+        Iterator<Integer> it = li.iterator();
+        Deque<Integer> st = new ArrayDeque<>(li);
+        TreeMap<Integer, String> tm = new TreeMap<>(Map.of(2_000_000_000, "b"));
+        System.out.println(v * 3 + " " + (o.get() + o.get()) + " " + (it.next() + 2_000_000_000) + " " + (st.peek() + st.peekLast()) + " " + (tm.lastKey() + tm.firstEntry().getKey()));
+        List<Short> sh = List.of((short) 30000); List<Character> lc = List.of('x'); List<String> ls = List.of("a");
+        System.out.println(sh.get(0) + sh.get(0) + " " + (lc.get(0) + lc.get(0)) + " " + ls.get(0) + 1 + 2 + " " + li.stream().toList().get(0) * 2);
+        List<Integer> src = new ArrayList<>(List.of(10, 20, 30)); List<Integer> key = List.of(20);
+        src.remove(key.get(0));
+        System.out.println(src + " " + (src.remove(0) + 1) + " " + src);
+    }
+}
+"####;
+    let expected = r####"1.1 0.3 0.3
+-294967296 -294967296 -294967296 -294967296 -294967296
+-294967296 -294967296 1705032704 -294967296 -294967296 -294967296 -294967296
+60000 240 a12 -294967296
+[10, 30] 11 [30]
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A lambda assigned to a parameterized functional interface types its parameters and result by the type arguments (JLS 15.27.3): `Function<Integer, Integer> f = x -> x * 2` wraps at 32 bits, whether the target is a local, an assignment, a static or instance field, a method parameter, or a method's return type; a `void` lambda body discards a `null` `Integer` without unboxing it.
+#[test]
+fn lambdas_take_parameter_and_result_types_from_the_declared_type_arguments() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static int ap(Function<Integer, Integer> f, int x) { return f.apply(x); }
+    static Function<Integer, Integer> mk() { return x -> x * 2; }
+    static Function<Integer, Integer> field = x -> x + x;
+    BinaryOperator<Integer> inst = (x, y) -> x * y;
+    public static void main(String[] a) {
+        Function<Integer, Integer> f = x -> x * 2;
+        BinaryOperator<Integer> add = (x, y) -> x + y;
+        Supplier<Integer> s = () -> Integer.MAX_VALUE + 1;
+        Comparator<Integer> c = (x, y) -> x - y;
+        Predicate<Integer> p = x -> x + 1 > 0;
+        System.out.println(f.apply(2_000_000_000) + " " + add.apply(2_000_000_000, 2_000_000_000) + " " + s.get() + " " + c.compare(-2_000_000_000, 2_000_000_000) + " " + p.test(Integer.MAX_VALUE));
+        Function<Integer, Integer> g; g = x -> x * 3;
+        System.out.println(g.apply(1_000_000_000) + " " + ap(x -> x * 2, 2_000_000_000) + " " + mk().apply(2_000_000_000) + " " + field.apply(2_000_000_000) + " " + new T().inst.apply(100000, 100000));
+        Supplier<Float> sf = () -> 0.1f;
+        Function<Float, Float> ff = x -> x * 3;
+        BiFunction<Integer, Integer, Integer> bf = (x, y) -> { int z = x * y; return z + x; };
+        Function<List<Integer>, Integer> fl = xs -> xs.get(0) + xs.get(0);
+        System.out.println(sf.get() + 1 + " " + ff.apply(0.1f) + " " + bf.apply(100000, 100000) + " " + fl.apply(List.of(2_000_000_000)));
+        Consumer<Integer> co = x -> System.out.println(x * 2);
+        co.accept(2_000_000_000);
+        Runnable r = () -> counts().put("k", null);
+        r.run();
+        System.out.println(counts());
+    }
+    static Map<String, Integer> M = new HashMap<>();
+    static Map<String, Integer> counts() { return M; }
+}
+"####;
+    let expected = r####"-294967296 -294967296 -2147483648 294967296 false
+-1294967296 -294967296 -294967296 -294967296 1410065408
+1.1 0.3 1410165408 -294967296
+-294967296
+{k=null}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A lambda passed to a JDK generic method takes its parameter types from the receiver's type arguments: `List<Integer>.replaceAll`'s `UnaryOperator<Integer>`, `Map.merge`'s `BiFunction<V, V, V>`, a `Stream<Integer>`'s `filter`/`map`/`reduce`/`max`, `Optional.ifPresent`, `Iterator.forEachRemaining` — so `Integer` arithmetic in the body wraps at 32 bits.
+#[test]
+fn lambdas_passed_to_jdk_generic_methods_take_the_receivers_element_type() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> li = new ArrayList<>(List.of(2_000_000_000, 1));
+        li.replaceAll(x -> x * 2);
+        System.out.print(li + " ");
+        li.sort((x, y) -> y - x);
+        System.out.print(li + " ");
+        li.forEach(x -> System.out.print(x + x + " "));
+        li.removeIf(x -> x + x > 0);
+        System.out.println(li);
+        Map<String, Integer> m = new LinkedHashMap<>(Map.of("a", 2_000_000_000));
+        m.merge("a", 2_000_000_000, (x, y) -> x + y);
+        System.out.print(m + " ");
+        m.compute("a", (k, v) -> v * 2);
+        m.computeIfPresent("a", (k, v) -> v + 2_000_000_000);
+        System.out.print(m + " ");
+        m.forEach((k, v) -> System.out.print(k + (v + v) + " "));
+        m.replaceAll((k, v) -> v * 3);
+        System.out.println(m);
+        List<Integer> src = List.of(10, 20, 30);
+        System.out.println(src.stream().filter(x -> x + 2_147_483_637 < 0).map(x -> x * 100_000_000).collect(Collectors.toList())
+            + " " + src.stream().reduce(0, (x, y) -> x + y * 100_000_000)
+            + " " + src.stream().max((x, y) -> x * 100_000_000 - y * 100_000_000).get()
+            + " " + src.stream().mapToLong(x -> x * 1_000_000_000).sum());
+        Optional<Integer> o = Optional.of(2_000_000_000);
+        o.ifPresent(v -> System.out.print(v + v + " "));
+        System.out.println(o.filter(v -> v + v < 0).isPresent() + " " + o.map(v -> v + v).get());
+        Iterator<Integer> it = src.iterator();
+        it.forEachRemaining(v -> System.out.print(v * 1_000_000_000 + " "));
+        System.out.println();
+    }
+}
+"####;
+    let expected = r####"[-294967296, 2] [2, -294967296] 4 -589934592 [-294967296]
+{a=-294967296} {a=1410065408} a-1474836480 {a=-64771072}
+[2000000000, -1294967296] 1705032704 30 -129542144
+-294967296 true -294967296
+1410065408 -1474836480 -64771072 
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+

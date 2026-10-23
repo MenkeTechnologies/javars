@@ -34,6 +34,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         enclosing_enum: None,
         anon_supers: Vec::new(),
         class_names: std::collections::HashSet::new(),
+        last_targs: Vec::new(),
     };
     // The names declared as classes (not interfaces) anywhere in the unit, so
     // an anonymous class can tell a superclass from an interface even when the
@@ -100,6 +101,10 @@ struct Parser {
     /// for an unbounded parameter and which leaves the call to dispatch on the
     /// receiver at run time.
     type_params: Vec<String>,
+    /// The type arguments of the type [`Parser::type_name`] read last, in
+    /// [`crate::ast::generic_parts`] form — what a declaration site copies into
+    /// its `targs`.
+    last_targs: Vec<String>,
     /// The binary names of the type declarations enclosing the cursor,
     /// innermost last — what a local type declared in a method body is named
     /// after.
@@ -488,6 +493,7 @@ impl Parser {
         });
         if let (Some(outer), Some(cl)) = (inner_of, classes.last_mut()) {
             let this0 = Param {
+                targs: Vec::new(),
                 ty: outer,
                 name: OUTER_THIS.to_string(),
                 varargs: false,
@@ -647,6 +653,7 @@ impl Parser {
 fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
     for c in &captures[own_from..] {
         cl.fields.push(FieldDecl {
+            targs: Vec::new(),
             ty: c.ty.clone(),
             name: c.name.clone(),
             is_final: true,
@@ -811,6 +818,7 @@ fn record_members(
 ) {
     for c in components {
         fields.push(FieldDecl {
+            targs: c.targs.clone(),
             ty: c.ty.clone(),
             name: c.name.clone(),
             init: None,
@@ -861,6 +869,7 @@ fn record_members(
             continue;
         }
         methods.push(Method {
+            ret_targs: c.targs.clone(),
             name: c.name.clone(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -899,6 +908,7 @@ fn record_members(
         }
         text = concat(text, Expr::Str("]".to_string()));
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "toString".to_string(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -924,6 +934,7 @@ fn record_members(
         let mut body = vec![Stmt::new(
             line,
             StmtKind::Local {
+                targs: Vec::new(),
                 ty: "int".to_string(),
                 name: acc.to_string(),
                 init: Some(Expr::Int(0)),
@@ -956,6 +967,7 @@ fn record_members(
             StmtKind::Return(Some(Expr::Var(acc.to_string()))),
         ));
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "hashCode".to_string(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -988,9 +1000,11 @@ fn record_members(
             };
         }
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "equals".to_string(),
             owner: name.to_string(),
             params: vec![Param {
+                targs: Vec::new(),
                 ty: "Object".to_string(),
                 name: other.to_string(),
                 varargs: false,
@@ -1087,6 +1101,7 @@ fn instance_declaration(
 /// alone. Called once per enum declaration.
 fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method>) {
     fields.push(FieldDecl {
+        targs: Vec::new(),
         ty: "String".to_string(),
         name: ENUM_NAME.to_string(),
         init: None,
@@ -1094,6 +1109,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         line,
     });
     fields.push(FieldDecl {
+        targs: Vec::new(),
         ty: "int".to_string(),
         name: ENUM_ORDINAL.to_string(),
         init: None,
@@ -1101,6 +1117,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         line,
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
+        ret_targs: Vec::new(),
         name: method.to_string(),
         owner: owner.to_string(),
         params: Vec::new(),
@@ -1136,6 +1153,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         .any(|m| m.name == "getDeclaringClass" && m.params.is_empty())
     {
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "getDeclaringClass".to_string(),
             owner: owner.to_string(),
             params: Vec::new(),
@@ -1157,9 +1175,11 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         .any(|m| m.name == "compareTo" && m.params.len() == 1)
     {
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "compareTo".to_string(),
             owner: owner.to_string(),
             params: vec![Param {
+                targs: Vec::new(),
                 ty: owner.to_string(),
                 name: "other".to_string(),
                 varargs: false,
@@ -1190,9 +1210,11 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         .any(|m| m.name == "equals" && m.params.len() == 1)
     {
         methods.push(Method {
+            ret_targs: Vec::new(),
             name: "equals".to_string(),
             owner: owner.to_string(),
             params: vec![Param {
+                targs: Vec::new(),
                 ty: "Object".to_string(),
                 name: "other".to_string(),
                 varargs: false,
@@ -1258,6 +1280,50 @@ impl Parser {
     /// Drop the `n` most recently declared type-parameter names.
     fn undeclare_generics(&mut self, n: usize) {
         self.type_params.truncate(self.type_params.len() - n);
+    }
+
+    /// Parse a *use's* type-argument group `<…>` (as [`Parser::skip_generics`]
+    /// does) and answer its top-level arguments in
+    /// [`crate::ast::generic_parts`] form. A name bound as a type parameter
+    /// erases to `Object`, the erasure `javac` gives it; an annotation on an
+    /// argument is dropped. Empty when the cursor is not on `<`.
+    fn type_args(&mut self) -> Vec<String> {
+        if !self.is(&Tok::Lt) {
+            return Vec::new();
+        }
+        let start = self.pos;
+        self.skip_generics();
+        let mut text = String::new();
+        let mut toks = self.toks[start..self.pos].iter().peekable();
+        while let Some(t) = toks.next() {
+            match &t.kind {
+                Tok::At => {
+                    toks.next();
+                }
+                Tok::Ident(w) => {
+                    if text.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '?') {
+                        text.push(' ');
+                    }
+                    let erased = self.type_params.contains(w) && !text.ends_with('.');
+                    text.push_str(if erased { "Object" } else { w });
+                }
+                Tok::Lt => text.push('<'),
+                Tok::Comma => text.push(','),
+                Tok::Question => text.push('?'),
+                Tok::Dot => text.push('.'),
+                Tok::LBracket => text.push('['),
+                Tok::RBracket => text.push(']'),
+                k => {
+                    for _ in 0..k.generic_closers() {
+                        text.push('>');
+                    }
+                }
+            }
+        }
+        let (_, args) = crate::ast::generic_parts(&format!("T{text}"));
+        args.iter()
+            .map(|a| crate::ast::normalize_type_arg(a))
+            .collect()
     }
 
     fn skip_generics(&mut self) {
@@ -1424,6 +1490,7 @@ impl Parser {
                 continue;
             }
             captures.push(Param {
+                targs: Vec::new(),
                 ty: ty.clone(),
                 name: name.clone(),
                 varargs: false,
@@ -1526,6 +1593,7 @@ impl Parser {
             return Ok(None);
         }
         let base_ty = self.type_name()?;
+        let targs = self.last_targs.clone();
         // A field is `type name` where name is not followed by `(` (that would be
         // a method the method-probe should have taken).
         let first_is_field = matches!(self.peek(), Tok::Ident(_))
@@ -1548,6 +1616,7 @@ impl Parser {
             };
             out.push(FieldDecl {
                 ty,
+                targs: targs.clone(),
                 name,
                 init,
                 is_final: saw_final,
@@ -1593,6 +1662,7 @@ impl Parser {
         }
         let line = self.line();
         let ret = self.type_name()?;
+        let ret_targs = self.last_targs.clone();
         // `<ret> name (` — anything else (e.g. `int COUNT =`) is a field.
         let name = match self.peek().clone() {
             Tok::Ident(n) if matches!(&self.toks[self.pos + 1].kind, Tok::LParen) => {
@@ -1625,6 +1695,7 @@ impl Parser {
                 owner: owner.to_string(),
                 params,
                 ret,
+                ret_targs,
                 body,
                 is_abstract,
                 line,
@@ -1665,6 +1736,7 @@ impl Parser {
                 self.advance();
             }
             let mut ty = self.type_name()?;
+            let targs = self.last_targs.clone();
             // A varargs parameter (`String... args`) *is* an array parameter —
             // inside the body it is a `String[]`. The dots additionally admit
             // Java's third resolution phase, so the flag rides along on the
@@ -1678,7 +1750,15 @@ impl Parser {
                 varargs = true;
             }
             let (name, ty) = self.declarator(&ty)?;
-            out.push(Param { ty, name, varargs });
+            // A varargs parameter is an array, whose members see no type
+            // arguments.
+            let targs = if varargs { Vec::new() } else { targs };
+            out.push(Param {
+                ty,
+                targs,
+                name,
+                varargs,
+            });
             if self.is(&Tok::Comma) {
                 self.advance();
             } else {
@@ -1762,13 +1842,15 @@ impl Parser {
         if crate::prelude::is_functional(&ty) {
             self.uses_functional = true;
         }
-        // Generic type arguments (`List<String>`, `Map<K, V>`) are erased — the
-        // erased type is just the raw name.
-        self.skip_generics();
+        // Generic type arguments (`List<String>`, `Map<K, V>`) are erased from
+        // the type itself, but kept beside it for a declaration to record. An
+        // array of a generic type keeps none: its own members never see them.
+        self.last_targs = self.type_args();
         while self.is(&Tok::LBracket) {
             self.advance();
             self.eat(&Tok::RBracket)?;
             ty.push_str("[]");
+            self.last_targs.clear();
         }
         Ok(ty)
     }
@@ -2020,6 +2102,7 @@ impl Parser {
                 self.advance();
             }
             let base_ty = self.type_name()?;
+            let targs = self.last_targs.clone();
             // Every declarator of the statement, in source order: `int a = 1,
             // b = 2;` is two, and `int a[], b;` gives them different types.
             let mut decls = Vec::new();
@@ -2033,7 +2116,15 @@ impl Parser {
                     None
                 };
                 self.scope.push((name.clone(), ty.clone()));
-                decls.push(Stmt::new(line, StmtKind::Local { ty, name, init }));
+                decls.push(Stmt::new(
+                    line,
+                    StmtKind::Local {
+                        ty,
+                        targs: targs.clone(),
+                        name,
+                        init,
+                    },
+                ));
                 if !self.is(&Tok::Comma) {
                     break;
                 }
@@ -2259,12 +2350,14 @@ impl Parser {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
         if let Some((ty, name)) = self.try_foreach_header()? {
+            let targs = self.last_targs.clone();
             let iter = self.expression()?;
             self.eat(&Tok::RParen)?;
             self.scope.push((name.clone(), ty.clone()));
             let body = self.braced_or_single()?;
             return Ok(StmtKind::ForEach {
                 ty,
+                targs,
                 name,
                 iter,
                 body,
@@ -2592,6 +2685,7 @@ impl Parser {
             let primary_decl = Stmt::new(
                 line,
                 StmtKind::Local {
+                    targs: Vec::new(),
                     ty: "Throwable".to_string(),
                     name: primary.clone(),
                     init: Some(var("null")),
@@ -2610,6 +2704,7 @@ impl Parser {
                     Stmt::new(
                         line,
                         StmtKind::Local {
+                            targs: Vec::new(),
                             ty,
                             name: r.name,
                             init: Some(init),
@@ -3995,6 +4090,7 @@ impl Parser {
         } else {
             let params: Vec<Param> = (0..args.len())
                 .map(|i| Param {
+                    targs: Vec::new(),
                     ty: "Object".to_string(),
                     name: format!("x{i}"),
                     varargs: false,
@@ -4037,6 +4133,7 @@ impl Parser {
         if !self.in_static {
             if let Some(outer) = self.enclosing_names.last().cloned() {
                 let this0 = Param {
+                    targs: Vec::new(),
                     ty: outer,
                     name: OUTER_THIS.to_string(),
                     varargs: false,

@@ -804,6 +804,20 @@ at the bottom, and are summarized in the section right after this one.
   bounded `<T extends Number>` / `<T extends Comparable<T>>`, the diamond
   `new Box<>()`, and library type arguments (`List<String>`, `Map<K, V>`) all
   parse and run with type arguments erased at runtime, exactly like `javac`.
+  The type arguments of a declared type are kept beside its erasure for
+  static typing, as `javac` keeps them: on a local, a `var` initialized from a
+  typed expression, a field, a parameter, a for-each variable and a method's
+  return type, they type what a JDK generic member answers (`List<E>.get` is
+  `E`, `Map<K, V>.entrySet()` a `Set<Map.Entry<K, V>>`, `Optional<T>.get`,
+  `Iterator<E>.next`, a `Stream<T>`'s `filter`/`reduce`/`findFirst`, nested
+  arguments included), so `l.get(0) + 1` on a `List<Float>` is the `float`
+  addition and `m.get(k) * 2` on a `Map<String, Integer>` wraps at 32 bits. A
+  wildcard reads as its upper bound, a type variable as `Object`. They also
+  type a lambda: assigned to `Function<Integer, Integer>` (as a local, field,
+  argument, or `return` value) its parameter and result are `Integer`, and
+  passed to a JDK generic method (`List<Integer>.replaceAll`, `Map.merge`,
+  `Stream.filter`, `Optional.ifPresent`, …) its parameters take the
+  receiver's element types.
 - **Exceptions.** `throw <expr>;`, `try`/`catch`/`finally`, multiple `catch`
   arms (first matching type wins) including the multi-catch `catch (A | B e)`
   (whose alternatives are tested in order against the throwable's class, and
@@ -1304,18 +1318,25 @@ storage-model differences:
   System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
   System.out.println(String.class);               // both: class java.lang.String
   ```
-- **A `Float` read back out of a generic container computes at `double`
-  width.** Type arguments are erased at parse time, so `l.get(0)` on a
-  `List<Float>` has no static type: the `Float` box it returns is right (it
-  prints `0.1` and `equals` compares it as a `Float`), but arithmetic on it is
-  the `double` operation. Measured on `openjdk 21.0.12.1`:
+- **A `Float` from a generic position the compiler cannot type computes at
+  `double` width.** A declared type's arguments now type the JDK collection,
+  `Optional`, `Iterator`, `Stream` and `java.util.function` members (see
+  "Generics" under "Implemented"), so `l.get(0) + 1` on a `List<Float>` is
+  `1.1`. Four positions still carry no type argument: a *user* generic class's
+  type variable (`Box<Float>`'s `V get()`), a generic cast
+  (`((List<Float>) o).get(0)`), a `var` initialized by an explicit `new
+  ArrayList<Float>(…)`, and the result of a call whose type argument `javac`
+  *infers* (`List.of(0.1f).get(0)`, `static <X> X first(List<X>)`). Measured on
+  `openjdk 21.0.12.1`, each prints `1.1` in Java and `1.1000000014901161` here:
 
   ```java
-  List<Float> l = new ArrayList<>(List.of(0.1f));
-  System.out.println(l.get(0) + 1);            // Java: 1.1   javars: 1.1000000014901161
+  Box<Float> b = new Box<>(0.1f);              b.get() + 1
+  Object o = new ArrayList<>(List.of(0.1f));   ((List<Float>) o).get(0) + 1
+  var l = new ArrayList<Float>(List.of(0.1f)); l.get(0) + 1
+  List.of(0.1f).get(0) + 1
   ```
 
-  Assigning the element to a typed local first (`float g = l.get(0);`) gives
+  Assigning the element to a typed local first (`float g = b.get();`) gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
 - **`Character.getNumericValue` knows only the digits and the Latin letters.**
@@ -1829,9 +1850,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   conversion itself is performed (see "Widening primitive conversion" under
   "Implemented"), but it is emitted only when the value's own type is
   statically integral, so a value arriving from an erased generic position is
-  left alone: `static <T> T id(T x)` makes `double d = id(7);` print `7`, and
-  `double e = l.get(0);` on a `List<Integer>` prints `9`, where Java unboxes and
-  widens both to `7.0`/`9.0`. This is the same erasure limit as the
+  left alone: `static <T> T id(T x)` makes `double d = id(7);` print `7`,
+  where Java unboxes and widens it to `7.0` (a declared type argument does
+  type its position: `double e = l.get(0);` on a `List<Integer>` is `9.0`). This is the same erasure limit as the
   `s.get() / 2` entry above. Every source javars can type — a literal, a local,
   a field, an array element, a declared-return method — converts.
 - **`==` on objects and on strings is reference identity.** Object and array
@@ -2253,14 +2274,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   primitive one (`int[]` → a 1-element `List<int[]>`); javars erases element
   types, so it cannot tell them apart and spreads both. The reference case —
   the one programs actually write — is exact.
-- **A lambda's result type is its interface's erasure.** `Supplier<Integer> s`
-  declares `Object get()` after erasure — exactly what `javac` compiles it to —
-  so javars cannot statically type `s.get()` as `int`. Division recovers it at
-  run time (`s.get() / 2` is `3`, see the `/` entry above); 32-bit wrapping does
-  not. Java recovers the type from the generic signature and inserts a
-  checked cast; javars does not model generic signatures (see the type-erasure
-  entry above). A lambda's *parameters* are typed, because those come from the
-  interface's own declaration rather than from a type argument.
+- **A lambda's result type is its interface's erasure when no type argument
+  names it.** `Supplier<Integer> s` types `s.get()` as `Integer` (see
+  "Generics" under "Implemented"), but a user generic functional interface
+  (`interface Gen<X> { X get(); }`) declares `Object get()` after erasure, and
+  its type variable is not substituted (the user-class limit above): on a
+  `Gen<Integer>` holding `Integer.MAX_VALUE`, `g.get() + 1` is `2147483648`
+  where Java wraps to `-2147483648` (measured on `openjdk 21.0.12.1`). Division
+  recovers the type at run time (`g.get() / 2` divides integrally, see the `/`
+  entry above).
 
 ## What the harnesses cannot see
 
