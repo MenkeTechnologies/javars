@@ -624,8 +624,9 @@ bit-twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`,
 `lowestOneBit`, `numberOfLeading`/`TrailingZeros`, `rotateLeft`/`rotateRight`,
 each answering at its declared width) and constant statics,
 `Boolean.parseBoolean`, the `Character` predicates (with `getType`,
-`getNumericValue` and `isIdeographic` answering from tables generated from the
-JDK's own answers for every code point), the `java.util.Objects`
+`getNumericValue`, `isIdeographic`, the emoji predicates and `getName`
+answering from data `scripts/GenUnicodeTables.java` generates from the JDK's
+own answers for every code point), the `java.util.Objects`
 statics (`hashCode`/`hash`/`toString`/`isNull`/`nonNull`/`equals`/
 `requireNonNull` (with a message or a message `Supplier`)/`requireNonNullElse`/
 `requireNonNullElseGet`, `compare`, and the `checkIndex`/`checkFromToIndex`/

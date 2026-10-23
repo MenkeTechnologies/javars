@@ -12008,7 +12008,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         ("Character", "toUpperCase" | "toLowerCase" | "toTitleCase" | "reverseBytes") => "char",
         ("Short", "reverseBytes") => "short",
         ("Math", "multiplyHigh" | "unsignedMultiplyHigh") => "long",
-        ("Character", "toString") => "String",
+        ("Character", "toString" | "getName") => "String",
         ("Character", "getNumericValue" | "getType") => "int",
         (
             "Character",

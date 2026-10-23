@@ -1422,11 +1422,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   not in that list) has no recorded type, and the test stops with
   ``javars: `instanceof int[]` on an array whose element type javars did not
   record`` rather than guess.
-- **The JVM-describing `System.getProperty` keys, `Character.isEmoji` and
-  `Character.getName`** are refused. The first describe a JVM, and the last
-  two need Unicode tables javars does not carry (the general category,
-  numeric value and ideograph tables it does carry are generated from the
-  JDK).
+- **The JVM-describing `System.getProperty` keys** are refused: they
+  describe a JVM.
 - **`Enum.valueOf` on a `Class` value** is refused (`cannot find symbol:
   Enum`). `Enum.valueOf(Color.class, name)` with the class literal written out
   is modeled, as `Color.valueOf(name)` is.

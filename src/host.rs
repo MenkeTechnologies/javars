@@ -16024,6 +16024,43 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 0,
             ))))
         }
+        // An out-of-range code point is the JDK's `IllegalArgumentException`, its
+        // value printed as the unsigned hex of the `int`.
+        ("Character", "getName", 1) => {
+            let cp = code_point_arg(&args[0]);
+            if cp > 0x10_FFFF {
+                Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("Not a valid Unicode code point: 0x{cp:X}"),
+                ))
+            } else {
+                Ok(crate::uninames::name(cp).map_or(Value::Undef, Value::str))
+            }
+        }
+        // The Java 21 emoji predicates, from the same generated tables.
+        (
+            "Character",
+            m @ ("isEmoji"
+            | "isEmojiPresentation"
+            | "isEmojiModifier"
+            | "isEmojiModifierBase"
+            | "isEmojiComponent"
+            | "isExtendedPictographic"),
+            1,
+        ) => {
+            use crate::unicode_tables::{lookup, EMOJI};
+            let bit = match m {
+                "isEmoji" => 1,
+                "isEmojiPresentation" => 2,
+                "isEmojiModifier" => 4,
+                "isEmojiModifierBase" => 8,
+                "isEmojiComponent" => 16,
+                _ => 32,
+            };
+            Ok(Value::bool(
+                lookup(EMOJI, code_point_arg(&args[0]), 0) & bit != 0,
+            ))
+        }
         ("Character", "isIdeographic", 1) => {
             use crate::unicode_tables::{lookup, IDEOGRAPHIC};
             Ok(Value::bool(

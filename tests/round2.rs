@@ -2837,3 +2837,49 @@ public class T {
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `Character.getName` answers from the names generated out of the JDK, falling back as the JDK does to the block name and hex code point for a code point with no name of its own (`CJK UNIFIED IDEOGRAPHS 4E00`, `PRIVATE USE AREA E000`), `null` for an unassigned one, and `IllegalArgumentException` for an invalid one; a checksum over every 13th code point pins the data.
+#[test]
+fn character_get_name_from_the_jdks_names() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        long h = 0;
+        int n = 0;
+        for (int cp = 0; cp <= 0x10FFFF; cp += 13) {
+            String s = Character.getName(cp);
+            if (s != null) { h = h * 31 + s.hashCode(); n++; } else h = h * 31 + 7;
+        }
+        System.out.println(n + " " + h);
+        System.out.println(Character.getName('a') + "|" + Character.getName(0x4E00) + "|" + Character.getName(0xAC00) + "|" + Character.getName(0xE000) + "|" + Character.getName(0x0378) + "|" + Character.getName(0xD800) + "|" + Character.getName(0x1F600) + "|" + Character.getName(' ').length());
+        try { Character.getName(-1); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+    }
+}
+"####;
+    let expected = r####"22203 -1203158446769370196
+LATIN SMALL LETTER A|CJK UNIFIED IDEOGRAPHS 4E00|HANGUL SYLLABLES AC00|PRIVATE USE AREA E000|null|HIGH SURROGATES D800|GRINNING FACE|5
+Not a valid Unicode code point: 0xFFFFFFFF
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// The Java 21 emoji predicates (`isEmoji`, `isEmojiPresentation`, `isEmojiModifier`, `isEmojiModifierBase`, `isEmojiComponent`, `isExtendedPictographic`) answer from the tables generated out of the JDK; a checksum over every 7th code point pins them.
+#[test]
+fn character_emoji_properties_from_the_jdk() {
+    let src = r####"
+public class T {
+ public static void main(String[] a) {
+ long h = 0;
+ for (int cp = 0; cp <= 0x10FFFF; cp += 7) { int b = (Character.isEmoji(cp) ? 1 : 0) | (Character.isEmojiPresentation(cp) ? 2 : 0) | (Character.isEmojiModifier(cp) ? 4 : 0) | (Character.isEmojiModifierBase(cp) ? 8 : 0) | (Character.isEmojiComponent(cp) ? 16 : 0) | (Character.isExtendedPictographic(cp) ? 32 : 0); h = h * 31 + b; }
+ System.out.println(h + " " + Character.isEmoji(0x1F600) + Character.isEmoji('a') + Character.isEmojiComponent('#'));
+ }
+}
+"####;
+    let expected = r####"5800059934130503542 truefalsetrue
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

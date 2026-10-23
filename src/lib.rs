@@ -27,6 +27,7 @@ pub mod regex;
 pub mod rust_ffi;
 pub mod tiers;
 pub mod unicode_tables;
+pub mod uninames;
 
 pub use banner::version_banner;
 use fusevm::{VMResult, Value, VM};
