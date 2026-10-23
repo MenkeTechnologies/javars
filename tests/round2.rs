@@ -2102,3 +2102,35 @@ a
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A local class or interface takes no access modifier, no `static` (JLS 14.3)
+/// and no `sealed`/`non-sealed` (JLS 8.1.1.2): `javac` rejects each, so the
+/// program never prints. `final`, `abstract` and `strictfp` are allowed.
+#[test]
+fn a_local_type_rejects_access_static_and_sealed_modifiers() {
+    let program = |decl: &str| {
+        format!(
+            "public class T {{\n    public static void main(String[] a) {{\n        {decl}\n        System.out.println(\"ok\");\n    }}\n}}\n"
+        )
+    };
+    for decl in [
+        "sealed interface S permits A {} final class A implements S {}",
+        "non-sealed class N {}",
+        "public class L {}",
+        "private class L {}",
+        "protected record R(int x) {}",
+        "static class L {}",
+        "static enum E { X }",
+    ] {
+        let (out, ok) = run(&program(decl));
+        assert!(
+            !ok && out.is_empty(),
+            "javac rejects `{decl}`, javars ran it: {out:?}"
+        );
+    }
+    let (out, ok) = run(&program(
+        "final class F {} abstract class G {} strictfp class H {}",
+    ));
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, "ok\n");
+}

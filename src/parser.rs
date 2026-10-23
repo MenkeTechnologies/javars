@@ -1395,6 +1395,24 @@ impl Parser {
             if n == 0 {
                 break;
             }
+            // JLS 14.3: a local class or interface takes no access modifier and
+            // no `static` (a local record, enum or interface is implicitly
+            // static), and JLS 8.1.1.2 forbids `sealed`/`non-sealed` on one.
+            let word = match &self.toks[j].kind {
+                Tok::Public => Some("public"),
+                Tok::Static => Some("static"),
+                Tok::Ident(w) if n == 3 => (w == "non").then_some("non-sealed"),
+                Tok::Ident(w) => ["private", "protected", "sealed"]
+                    .into_iter()
+                    .find(|m| m == w),
+                _ => None,
+            };
+            if let Some(m) = word {
+                return Err(format!(
+                    "javars: modifier `{m}` not allowed on a local class or interface (line {})",
+                    self.toks[j].line
+                ));
+            }
             j += n;
         }
         let name = match &self.toks[j + 1].kind {
