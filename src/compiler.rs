@@ -225,6 +225,9 @@ struct ClassInfo {
     type_params: Vec<String>,
     /// See [`crate::ast::Class::super_targs`].
     super_targs: Vec<String>,
+    /// The direct interfaces with their type arguments (see
+    /// [`crate::ast::Class::interface_targs`]).
+    interfaces: Vec<(String, Vec<String>)>,
     /// Declared type of every `static` field visible on this class — its own
     /// plus every ancestor's, because Java inherits statics by name. Maps the
     /// field name to `(declaring class, declared type)`; the declaring class is
@@ -1016,6 +1019,17 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 field_generic,
                 type_params: cl.type_params.clone(),
                 super_targs: cl.super_targs.clone(),
+                interfaces: cl
+                    .interfaces
+                    .iter()
+                    .cloned()
+                    .zip(
+                        cl.interface_targs
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::repeat(Vec::new())),
+                    )
+                    .collect(),
                 static_fields,
                 methods,
                 ctors,
@@ -1814,10 +1828,11 @@ impl Compiler {
     /// variables are replaced by the receiver's type arguments, so `V get()`
     /// on a `Box<Integer>` answers `Integer`.
     ///
-    /// A member `owner` declares in a superclass is written in that class's
-    /// type variables, which the `extends` clauses between `rc` and `owner`
-    /// bind: with `class FBox extends Box<Float>`, an `FBox`'s `V get()` is a
-    /// `Float`. A variable nothing binds keeps its `#T` and reads as `Object`.
+    /// A member `owner` declares in a supertype is written in that type's
+    /// variables, which the `extends`/`implements` clauses between `rc` and
+    /// `owner` bind: with `class FBox extends Box<Float>`, an `FBox`'s `V get()`
+    /// is a `Float`. A variable nothing binds keeps its `#T` and reads as
+    /// `Object`.
     fn through_receiver(
         &self,
         owner: &str,
@@ -1834,25 +1849,55 @@ impl Compiler {
             Some((base, targs)) if base == rc => targs,
             _ => info.type_params.iter().map(|p| format!("#{p}")).collect(),
         };
-        let mut cur = rc.to_string();
-        while cur != owner {
-            let Some(ci) = self.classes.get(&cur) else {
-                return sig.to_string();
-            };
-            let Some(sup) = ci.superclass.clone() else {
-                return sig.to_string();
-            };
-            args = ci
-                .super_targs
-                .iter()
-                .map(|t| subst_tvars(t, &ci.type_params, &args))
-                .collect();
-            cur = sup;
+        if rc != owner {
+            match self.supertype_args(rc, &args, owner, 0) {
+                Some(a) => args = a,
+                None => return sig.to_string(),
+            }
         }
         match self.classes.get(owner) {
             Some(oi) => subst_tvars(sig, &oi.type_params, &args),
             None => sig.to_string(),
         }
+    }
+
+    /// The type arguments `owner` takes as a supertype of `cur` when `cur`'s
+    /// own variables are `args`, found by walking the `extends` and
+    /// `implements` clauses (each in its declarer's variables). `None` when
+    /// `owner` is not a supertype of `cur`.
+    fn supertype_args(
+        &self,
+        cur: &str,
+        args: &[String],
+        owner: &str,
+        depth: usize,
+    ) -> Option<Vec<String>> {
+        if cur == owner {
+            return Some(args.to_vec());
+        }
+        let ci = self.classes.get(cur)?;
+        // A malformed cycle cannot reach here from a program `javac` accepts;
+        // the bound only keeps the walk finite.
+        if depth > 64 {
+            return None;
+        }
+        let up = |targs: &[String]| -> Vec<String> {
+            targs
+                .iter()
+                .map(|t| subst_tvars(t, &ci.type_params, args))
+                .collect()
+        };
+        let supers = ci
+            .superclass
+            .iter()
+            .map(|s| (s.as_str(), up(&ci.super_targs)))
+            .chain(ci.interfaces.iter().map(|(i, t)| (i.as_str(), up(t))));
+        for (sup, sup_args) in supers {
+            if let Some(found) = self.supertype_args(sup, &sup_args, owner, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// The user class a receiver is statically an instance of, with its generic

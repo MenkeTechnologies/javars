@@ -85,6 +85,9 @@ pub struct Class {
     /// The type arguments of the `extends` clause (`extends Box<Float>`), in
     /// the declaration's own type variables — what binds the superclass's.
     pub super_targs: Vec<String>,
+    /// The type arguments of each `implements` (or, for an interface,
+    /// `extends`) entry, parallel to [`Class::interfaces`].
+    pub interface_targs: Vec<Vec<String>>,
     pub name: String,
     /// Java's *binary* name for this type: `Outer$Nested` for a nested
     /// declaration, the simple name for a top-level one. javars flattens nesting

@@ -1333,15 +1333,15 @@ storage-model differences:
   `1.1`; a user generic class's type variables are substituted, a generic
   method's and a JDK factory's inferred from their arguments, and a diamond, an
   explicit `new ArrayList<Float>(…)` and a generic cast carry theirs the same
-  way, and a member inherited from a parameterized superclass is typed through
-  the `extends` clauses. What still carries no type argument is a `default`
-  method inherited from a parameterized *interface*, whose type variable the
-  `implements` clause binds: with `interface Holder<H> { H val(); default H
-  same() { return val(); } }` and `class IH implements Holder<Float>`,
-  `new IH().same() + 1` is `1.1` in Java and `1.1000000014901161` here
-  (measured on `openjdk 21.0.12.1`).
+  way, and a member inherited from a parameterized supertype is typed through
+  the `extends`/`implements` clauses. What still carries no type argument is a
+  type variable `javac` infers from a *lambda's* result: with `static <S, R> R
+  ap(S s, Function<S, R> f)`, `ap(1, x -> 0.1f) + 1` — and likewise
+  `stream().map(x -> 0.1f)`'s element — is `1.1` in Java and
+  `1.1000000014901161` here (measured on `openjdk 21.0.12.1`).
 
-  Assigning the element to a typed local first (`float g = h.same();`) gives
+  Assigning the element to a typed local first (`float g = ap(1, x -> 0.1f);`)
+  gives
   Java's answer, because the local's declared type drives the arithmetic. The
   `int` analogue is the 64-bit result in the first bullet above.
 - **`Character.getNumericValue` knows only the digits and the Latin letters.**
@@ -1363,6 +1363,15 @@ storage-model differences:
   `openjdk 21.0.12.1`. An array and a list are different host objects with
   separate storage; sharing it needs a list variant that reads and writes the
   array's slab.
+
+- **A generic method call whose inferred bounds conflict is accepted.**
+  `javac` infers a call's type variables from its arguments *and* its target
+  and rejects the call when the bounds disagree; javars infers only from
+  arguments' static types and never rejects one. With `static <S, R> R ap(S s,
+  Function<S, R> f)`, `double d = ap(1, x -> 9);` is `javac`'s "inference
+  variable R has incompatible bounds" error (the lambda makes `R` an
+  `Integer`, the `double` target asks for a `Double`); javars runs it and
+  prints `9`. Measured on `openjdk 21.0.12.1`.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1853,9 +1862,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   conversion itself is performed (see "Widening primitive conversion" under
   "Implemented"), but it is emitted only when the value's own type is
   statically integral, so a value arriving from an erased generic position is
-  left alone: with `class IH implements Holder<Integer>` (`Holder<H>`
-  declaring `default H same()`), `double e = new IH().same();` prints `9`,
-  where Java unboxes and widens to `9.0` (a declared
+  left alone: `double e = List.of(1).stream().map(x -> 9).toList().get(0);`
+  prints `9`, where Java infers `Integer` from the lambda, unboxes and widens
+  to `9.0` (a declared
   or inferred type argument does type its position: `double e = l.get(0);` on
   a `List<Integer>`, `List.of(9).get(0)`, and `double d = id(7);` through
   `static <T> T id(T x)` are all widened). This is the same erasure limit as the `s.get() / 2` entry

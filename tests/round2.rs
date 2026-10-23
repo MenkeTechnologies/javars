@@ -2329,3 +2329,37 @@ s1s6
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A `default` method inherited from a parameterized interface is typed through the `implements` (and an interface's `extends`) clauses: `class IH implements Holder<Float>` makes `H same()` a `Float`, `Named<N> extends Holder<N>` carries `NI implements Named<Integer>`'s argument through, and an abstract `AB<Q> implements Holder<Q>` passes its subclass's `Long` on.
+#[test]
+fn members_inherited_from_parameterized_interfaces_are_typed() {
+    let src = r####"
+import java.util.*;
+public class T {
+    interface Holder<H> { H val(); default H same() { return val(); } default List<H> both() { return List.of(val(), val()); } }
+    interface Named<N> extends Holder<N> { default N again() { return same(); } }
+    static class IH implements Holder<Float> { public Float val() { return 0.1f; } }
+    static class NI implements Named<Integer> { public Integer val() { return 2_000_000_000; } }
+    static abstract class AB<Q> implements Holder<Q> { }
+    static class Conc extends AB<Long> { public Long val() { return 3_000_000_000L; } }
+    public static void main(String[] a) {
+        IH h = new IH();
+        System.out.println(h.same() + 1 + " " + (h.both().get(1) + 1));
+        NI n = new NI();
+        System.out.println(n.again() + n.same() + " " + n.both().get(0) * 2);
+        Conc c = new Conc();
+        System.out.println(c.same() / 7 + " " + c.same() * 4);
+        Holder<Integer> anon = new Holder<>() { public Integer val() { return 2_000_000_000; } };
+        System.out.println(anon.same() * 2);
+    }
+}
+"####;
+    let expected = r####"1.1 1.1
+-294967296 -294967296
+428571428 12000000000
+-294967296
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
