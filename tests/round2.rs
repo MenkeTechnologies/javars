@@ -2170,3 +2170,81 @@ OptionalDouble[NaN] OptionalDouble[NaN] OptionalDouble[0.0] OptionalDouble[-0.0]
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// A user generic class's members are typed through the receiver's type arguments: `Box<Float>`'s `V get()` and `V v` are `Float`, `Pair<String, Integer>.second()` an `Integer` that wraps at 32 bits — through nested receivers (`lb.get(0).get()`), a lambda passed to `map(Function<V, R>)`, and a user generic functional interface (`Gen<Integer>`, `Fn2<Float, Float>`); a member inherited from a superclass written in its own type variable (`Sub<T> extends Base<String>`) is not substituted.
+#[test]
+fn user_generic_classes_substitute_their_type_variables() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static class Box<V> { V v; List<V> all = new ArrayList<>(); Box(V v) { this.v = v; all.add(v); } V get() { return v; } List<V> list() { return all; } <R> Box<R> map(Function<V, R> f) { return new Box<>(f.apply(v)); } }
+    static class Pair<A, B> { final A a; final B b; Pair(A a, B b) { this.a = a; this.b = b; } A first() { return a; } B second() { return b; } }
+    static class Base<T> { T t; Base(T t) { this.t = t; } T getT() { return t; } }
+    static class Sub<T> extends Base<String> { T u; Sub(T u) { super("s"); this.u = u; } T getU() { return u; } }
+    interface Gen<X> { X get(); }
+    interface Fn2<P, Q> { Q of(P p); }
+    public static void main(String[] args) {
+        Box<Float> bf = new Box<>(0.1f);
+        Box<Integer> bi = new Box<>(2_000_000_000);
+        System.out.println(bf.get() + 1 + " " + bf.v * 3 + " " + (bi.get() + bi.get()) + " " + bi.list().get(0) * 2 + " " + bi.map(x -> x * 2).get());
+        Pair<String, Integer> p = new Pair<>("k", 2_000_000_000);
+        Map<String, Pair<Integer, Integer>> mp = new HashMap<>(Map.of("z", new Pair<>(2_000_000_000, 1)));
+        List<Box<Integer>> lb = List.of(bi);
+        System.out.println(p.first() + p.second() + " " + (p.second() + p.b) + " " + (mp.get("z").first() + mp.get("z").a) + " " + (lb.get(0).get() + lb.get(0).v));
+        Sub<Integer> s = new Sub<>(2_000_000_000);
+        System.out.println(s.getT() + 1 + " " + (s.getU() + s.u));
+        Gen<Integer> g = () -> Integer.MAX_VALUE;
+        Fn2<Integer, Integer> f = x -> x * 2;
+        Fn2<Float, Float> ff = x -> x * 3;
+        Gen<Gen<Integer>> gg = () -> () -> 2_000_000_000;
+        System.out.println(g.get() + 1 + " " + f.of(2_000_000_000) + " " + ff.of(0.1f) + " " + (gg.get().get() + gg.get().get()));
+    }
+}
+"####;
+    let expected = r####"1.1 0.3 -294967296 -294967296 -294967296
+k2000000000 -294967296 -294967296 -294967296
+s1 -294967296
+-2147483648 -294967296 0.3 -294967296
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}
+
+/// A generic method's type variables are inferred from its arguments' static types, the simple cases of JLS 18.5.1: `first(List<X>)` on a `List<Float>` answers a `Float`, `id(big)` an `Integer`, `Box.of(0.1f)` a `Box<Float>`, a `Consumer<E>`/`Function<S, R>` argument's lambda takes the bound element type, and `double d = id(7)` widens the inferred `Integer`.
+#[test]
+fn generic_method_type_variables_are_inferred_from_arguments() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+    static class Box<T> { T v; Box(T v) { this.v = v; } T get() { return v; } static <T> Box<T> of(T t) { return new Box<>(t); } }
+    static <X> X first(List<X> xs) { return xs.get(0); }
+    static <A> A id(A a) { return a; }
+    static <K, V> V look(Map<K, V> m, K k) { return m.get(k); }
+    static <E> void each(List<E> l, Consumer<E> c) { for (E e : l) c.accept(e); }
+    static <S, R> List<R> mapAll(List<S> in, Function<S, R> f) { List<R> out = new ArrayList<>(); for (S t : in) out.add(f.apply(t)); return out; }
+    static <Q> Q pick(Q a, Q b) { return a; }
+    public static void main(String[] args) {
+        List<Float> lf = new ArrayList<>(List.of(0.1f));
+        List<Integer> li = new ArrayList<>(List.of(2_000_000_000));
+        Integer big = 2_000_000_000;
+        Map<String, Long> m = Map.of("a", 5L);
+        System.out.println(first(lf) + 1 + " " + (first(li) + first(li)) + " " + (id(0.1f) + 1) + " " + (id(big) + id(big)) + " " + look(m, "a") / 2 + " " + (Box.of(2_000_000_000).get() + Box.of(2_000_000_000).get()) + " " + (Box.of(0.1f).get() + 1));
+        each(li, x -> System.out.println(x + x));
+        System.out.println(mapAll(li, x -> x * 2) + " " + pick(null, "s") + " " + pick("q", null) + " " + (id('c') + 1));
+        double d = id(7);
+        System.out.println(d);
+    }
+}
+"####;
+    let expected = r####"1.1 -294967296 1.1 -294967296 2 -294967296 1.1
+-294967296
+[-294967296] null q 100
+7.0
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

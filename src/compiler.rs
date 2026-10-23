@@ -220,7 +220,9 @@ struct ClassInfo {
     /// The declared type, with its type arguments, of every field of this
     /// class that carries any (own, inherited and `static` alike) — see
     /// [`with_targs`].
-    field_generic: HashMap<String, String>,
+    field_generic: HashMap<String, (String, String)>,
+    /// The type variables the declaration binds, see [`crate::ast::Class::type_params`].
+    type_params: Vec<String>,
     /// Declared type of every `static` field visible on this class — its own
     /// plus every ancestor's, because Java inherits statics by name. Maps the
     /// field name to `(declaring class, declared type)`; the declaring class is
@@ -887,12 +889,12 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         }
         let mut fields = Vec::new();
         let mut field_types = HashMap::default();
-        let mut field_generic: HashMap<String, String> = HashMap::default();
+        let mut field_generic: HashMap<String, (String, String)> = HashMap::default();
         for anc_name in &ancestry {
             let anc = by_name[anc_name.as_str()];
             for f in anc.fields.iter().chain(&anc.static_fields) {
                 if let Some(g) = with_targs(&f.ty, &f.targs) {
-                    field_generic.insert(f.name.clone(), g);
+                    field_generic.insert(f.name.clone(), (anc_name.clone(), g));
                 }
             }
         }
@@ -1010,6 +1012,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 fields,
                 field_types,
                 field_generic,
+                type_params: cl.type_params.clone(),
                 static_fields,
                 methods,
                 ctors,
@@ -1351,7 +1354,8 @@ impl Compiler {
         let generic = self
             .classes
             .get(class)
-            .and_then(|ci| ci.field_generic.get(name).cloned());
+            .and_then(|ci| ci.field_generic.get(name))
+            .map(|(_, g)| g.clone());
         self.expr_targeted_generic(value, Some(&ty), generic)?;
         self.emit_global_set(&global, line);
         Ok(())
@@ -1709,11 +1713,12 @@ impl Compiler {
         }
         if let Some(ci) = self.this_class.as_ref().and_then(|t| self.classes.get(t)) {
             if ci.field_types.contains_key(name) {
-                return ci.field_generic.get(name).cloned();
+                return ci.field_generic.get(name).map(|(_, g)| g.clone());
             }
         }
         let (owner, _) = self.static_field_owner(name)?;
-        self.classes.get(&owner)?.field_generic.get(name).cloned()
+        let (_, g) = self.classes.get(&owner)?.field_generic.get(name)?;
+        Some(g.clone())
     }
 
     /// The static type of `e` with its type arguments, when it has any:
@@ -1726,16 +1731,19 @@ impl Compiler {
             Expr::Var(name) => self.var_generic(name),
             Expr::Field { recv, name } => {
                 if let Some((owner, _)) = self.static_field_ref(e) {
-                    return self.classes.get(&owner)?.field_generic.get(name).cloned();
+                    let (_, g) = self.classes.get(&owner)?.field_generic.get(name)?;
+                    return Some(g.clone());
                 }
-                let rc = self.expr_class(recv)?;
-                self.classes.get(&rc)?.field_generic.get(name).cloned()
+                let (rc, g) = self.recv_class_generic(recv)?;
+                let (owner, sig) = self.classes.get(&rc)?.field_generic.get(name)?;
+                Some(self.through_receiver(owner, &rc, g, sig))
             }
             // A user method declared to return a generic type.
             Expr::Call { name, args, .. } => {
                 let arg_tys = self.arg_types(args);
                 let resolved = self.resolve_static_call(name, &arg_tys)?;
-                self.ret_generics.get(&resolved.mangled).cloned()
+                let ret = self.ret_generics.get(&resolved.mangled)?;
+                Some(self.inferred(&resolved.mangled, args, ret))
             }
             Expr::MethodCall {
                 recv, method, args, ..
@@ -1743,17 +1751,16 @@ impl Compiler {
                 if let Some(class) = self.user_class_ref(recv) {
                     let arg_tys = self.arg_types(args);
                     let resolved = self.resolve_static_on(&class, method, &arg_tys)?;
-                    return self.ret_generics.get(&resolved.mangled).cloned();
+                    let ret = self.ret_generics.get(&resolved.mangled)?;
+                    return Some(self.inferred(&resolved.mangled, args, ret));
                 }
-                if let Some(g) = self
-                    .expr_class(recv)
-                    .and_then(|rc| self.instance_ret_generic(&rc, method, args))
-                {
+                // A user type has its own signatures, read through the
+                // receiver's arguments; the prelude's functional interfaces are
+                // the JDK's, typed by the table.
+                if let Some(g) = self.call_ret_generic(recv, method, args) {
                     return Some(g);
                 }
                 let (base, targs) = crate::ast::generic_parts(&self.expr_generic(recv)?);
-                // A user type has its own signatures; the prelude's
-                // functional interfaces are the JDK's, typed by the table.
                 if self.classes.contains_key(&base) && functional_type_arg_slots(&base).is_none() {
                     return None;
                 }
@@ -1763,9 +1770,71 @@ impl Compiler {
         }
     }
 
+    /// The parameter and result types of a user generic functional
+    /// interface's single abstract method, with the interface's type variables
+    /// replaced by `targs`: on a `Gen<Integer>`, `T get()` answers `Integer`.
+    #[allow(clippy::type_complexity)]
+    fn user_sam_generics(
+        &self,
+        iface: &str,
+        targs: &[String],
+    ) -> Option<(Vec<Option<String>>, Option<String>)> {
+        let sam = self.functional_sam_meta(iface)?;
+        let mangled = mangle(&sam.defining, &sam.name, &sam.param_tys);
+        let tparams = &self.classes.get(&sam.defining)?.type_params;
+        let sub = |s: &String| subst_tvars(s, tparams, targs);
+        let ps = match self.param_generics.get(&mangled) {
+            Some(gs) => gs.iter().map(|g| g.as_ref().map(sub)).collect(),
+            None => vec![None; sam.param_tys.len()],
+        };
+        Some((ps, self.ret_generics.get(&mangled).map(sub)))
+    }
+
+    /// `sig` — a member's declared generic type — as seen through a receiver
+    /// whose static type is `recv_generic`: the declaring class's type
+    /// variables are replaced by the receiver's type arguments, so `V get()`
+    /// on a `Box<Integer>` answers `Integer`.
+    ///
+    /// Only a member `owner` declares itself is substituted: an inherited one
+    /// is written in its superclass's type variables, which the receiver's
+    /// arguments do not bind, so it keeps them and reads as their erasure.
+    fn through_receiver(
+        &self,
+        owner: &str,
+        rc: &str,
+        recv_generic: Option<String>,
+        sig: &str,
+    ) -> String {
+        let (Some(info), Some(g)) = (self.classes.get(rc), recv_generic) else {
+            return sig.to_string();
+        };
+        let (base, targs) = crate::ast::generic_parts(&g);
+        if base != rc || owner != rc {
+            return sig.to_string();
+        }
+        subst_tvars(sig, &info.type_params, &targs)
+    }
+
+    /// The user class a receiver is statically an instance of, with its generic
+    /// type when it has one — read off the generic type when only that knows
+    /// the class (`boxes.get(0)` on a `List<Box<Integer>>`).
+    fn recv_class_generic(&self, recv: &Expr) -> Option<(String, Option<String>)> {
+        let g = self.expr_generic(recv);
+        let rc = self.expr_class(recv).or_else(|| {
+            let base = crate::ast::generic_parts(g.as_deref()?).0;
+            self.classes.contains_key(&base).then_some(base)
+        })?;
+        Some((rc, g))
+    }
+
     /// The generic return type of the instance method `rc.method(args)`
     /// resolves to, when its declaration names type arguments.
-    fn instance_ret_generic(&self, rc: &str, method: &str, args: &[Expr]) -> Option<String> {
+    fn instance_ret_generic(
+        &self,
+        rc: &str,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<(String, String)> {
         let arg_tys = self.arg_types(args);
         let resolved = self.resolve_instance_call(rc, method, &arg_tys)?;
         let meta = self
@@ -1775,7 +1844,46 @@ impl Compiler {
             .iter()
             .find(|m| m.name == method && m.param_tys == resolved.param_tys)?;
         let mangled = mangle(&meta.defining, method, &meta.param_tys);
-        self.ret_generics.get(&mangled).cloned()
+        let sig = self.ret_generics.get(&mangled)?;
+        Some((meta.defining.clone(), sig.clone()))
+    }
+
+    /// The generic parameter types of the instance method `rc.method`
+    /// overload `param_tys` names, seen through `recv`'s type arguments: on a
+    /// `Box<Integer>`, `map(Function<V, R>)` takes a `Function<Integer, #R>`.
+    fn instance_param_generics(
+        &self,
+        recv: &Expr,
+        rc: &str,
+        method: &str,
+        param_tys: &[String],
+    ) -> Vec<Option<String>> {
+        let Some(meta) = self.classes.get(rc).and_then(|ci| {
+            ci.methods
+                .iter()
+                .find(|m| m.name == method && m.param_tys == param_tys)
+        }) else {
+            return Vec::new();
+        };
+        let mangled = mangle(&meta.defining, method, &meta.param_tys);
+        let Some(sigs) = self.param_generics.get(&mangled) else {
+            return Vec::new();
+        };
+        let g = self.expr_generic(recv);
+        sigs.iter()
+            .map(|s| {
+                s.as_ref()
+                    .map(|s| self.through_receiver(&meta.defining, rc, g.clone(), s))
+            })
+            .collect()
+    }
+
+    /// [`Compiler::instance_ret_generic`] seen through `recv`'s own type
+    /// arguments.
+    fn call_ret_generic(&self, recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
+        let (rc, g) = self.recv_class_generic(recv)?;
+        let (owner, sig) = self.instance_ret_generic(&rc, method, args)?;
+        Some(self.through_receiver(&owner, &rc, g, &sig))
     }
 
     /// The type a JDK generic type's member answers for a receiver typed
@@ -1888,6 +1996,14 @@ impl Compiler {
         }
     }
 
+    /// The erasure of [`Compiler::expr_generic`] when it says more than
+    /// `Object` — a type argument or an inferred type variable.
+    fn known_generic_type(&self, e: &Expr) -> Option<String> {
+        self.expr_generic(e)
+            .map(|g| crate::ast::generic_parts(&g).0)
+            .filter(|t| is_known_type(t))
+    }
+
     /// The parameter types a lambda literal passed as argument `i` of
     /// `recv.method(…)` (of `n` arguments) takes, read off the receiver's type
     /// arguments the way the JDK signature declares them: `List<E>.replaceAll`
@@ -1907,7 +2023,7 @@ impl Compiler {
         }
         let pick = |idx: &[usize]| -> Option<Vec<String>> {
             let v: Option<Vec<String>> = idx.iter().map(|&k| targs.get(k).cloned()).collect();
-            v.filter(|v| v.iter().all(|t| t != "Object"))
+            v.filter(|v| v.iter().all(|t| is_known_type(t)))
         };
         let kind = match base.as_str() {
             "Optional" | "Stream" | "Iterator" | "ListIterator" => base.as_str(),
@@ -2319,6 +2435,16 @@ impl Compiler {
                 if let Some((_, ty)) = self.static_field_ref(e) {
                     return Some(ty);
                 }
+                // A field typed by a type variable, read through a receiver
+                // whose type arguments bind it: `Box<Float>`'s `V v` is a
+                // `Float`.
+                if let Some(t) = self
+                    .expr_generic(e)
+                    .map(|g| crate::ast::generic_parts(&g).0)
+                    .filter(|t| is_known_type(t))
+                {
+                    return Some(t);
+                }
                 let rc = self.expr_class(recv)?;
                 self.classes.get(&rc)?.field_types.get(name).cloned()
             }
@@ -2352,6 +2478,11 @@ impl Compiler {
                 if let Some(call) = self.implicit_enum_static(name, args, *line) {
                     return self.expr_java_type(&call);
                 }
+                // A generic method's result through what its arguments bind:
+                // `first(aListOfFloat)` is a `Float`.
+                if let Some(t) = self.known_generic_type(e) {
+                    return Some(t);
+                }
                 let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 self.resolve_static_call(name, &arg_tys).map(|s| s.ret_name)
             }
@@ -2362,6 +2493,14 @@ impl Compiler {
                     return self.expr_java_type(&call);
                 }
                 if let Some(t) = self.enum_static_type(recv, method, args.len()) {
+                    return Some(t);
+                }
+                // A generic member on a receiver whose type arguments are
+                // known: `List<Float>.get` is a `Float`, and so is
+                // `Supplier<Float>.get` although the prelude declares that
+                // interface's `get` as answering `Object` — or a generic
+                // method's result through what its arguments bind.
+                if let Some(t) = self.known_generic_type(e) {
                     return Some(t);
                 }
                 // `T.helper(x)` — the named class's `static` method, resolved in
@@ -2469,18 +2608,6 @@ impl Compiler {
                         }
                         return None;
                     }
-                }
-                // A generic member on a receiver whose type arguments are
-                // known: `List<Float>.get` is a `Float`, and so is
-                // `Supplier<Float>.get` although the prelude declares that
-                // interface's `get` as answering `Object`. A type argument that
-                // erased to `Object` says no more than the tables below.
-                if let Some(t) = self
-                    .expr_generic(e)
-                    .map(|g| crate::ast::generic_parts(&g).0)
-                    .filter(|t| t != "Object")
-                {
-                    return Some(t);
                 }
                 let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 if let Some(rc) = self.expr_class(recv) {
@@ -3508,6 +3635,7 @@ impl Compiler {
             self.functional_sam(rc),
             Some((sam, arity)) if sam == method && arity == args.len()
         );
+        let arg_generics = self.instance_param_generics(recv, rc, method, &param_tys);
         // A functional interface's *other* methods — its `default` ones
         // (`Predicate.negate`, `Function.andThen`) — are reachable on a lambda
         // receiver too, and a closure's runtime class matches no concrete-class
@@ -3541,7 +3669,7 @@ impl Compiler {
         if !lambda_arm {
             if let Some(mangled) = only_body {
                 self.expr(recv)?; // this (deepest)
-                self.call_args_generic(args, &param_tys, &mangled)?;
+                self.call_args_with_generics(args, &param_tys, &arg_generics)?;
                 let idx = self.b.add_name(&mangled);
                 self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
                 self.emit_exc_check(line);
@@ -3564,7 +3692,8 @@ impl Compiler {
             .map(|(i, a)| {
                 let t = self.temp();
                 let want = param_tys.get(i).cloned();
-                self.expr_targeted(a, want.as_deref())?;
+                let g = arg_generics.get(i).cloned().flatten();
+                self.expr_targeted_generic(a, want.as_deref(), g)?;
                 self.emit_set(&t, line);
                 Ok(t)
             })
@@ -4340,6 +4469,9 @@ impl Compiler {
                 }
             }
             Expr::Call { name, args, .. } => {
+                if let Some(nt) = self.known_generic_type(e).and_then(|t| numtype_of_ty(&t)) {
+                    return nt;
+                }
                 let arg_tys: Vec<Option<String>> = self.arg_types(args);
                 self.resolve_static_call(name, &arg_tys)
                     .map(|s| s.ret)
@@ -4532,16 +4664,26 @@ impl Compiler {
             .map(|g| crate::ast::generic_parts(&g))
             .filter(|(base, _)| target.as_deref() == Some(base.as_str()))
         {
-            if let Some((slots, ret)) = functional_type_arg_slots(&base) {
-                for ((slot, g), &i) in param_tys.iter_mut().zip(&mut param_generic).zip(slots) {
-                    if let Some(t) = targs.get(i).filter(|_| slot == "Object") {
+            // The JDK interfaces by their table, a user generic interface by
+            // its single abstract method's own declared generic signature.
+            let sigs = match functional_type_arg_slots(&base) {
+                Some((slots, ret)) => Some((
+                    slots.iter().map(|&i| targs.get(i).cloned()).collect(),
+                    ret.and_then(|i| targs.get(i).cloned()),
+                )),
+                None => self.user_sam_generics(&base, &targs),
+            };
+            let known = |t: &String| is_known_type(&crate::ast::generic_parts(t).0);
+            if let Some((ps, ret)) = sigs {
+                for ((slot, g), t) in param_tys.iter_mut().zip(&mut param_generic).zip(ps) {
+                    if let Some(t) = t.filter(|t| slot == "Object" && known(t)) {
                         *slot = t.clone();
-                        *g = Some(t.clone());
+                        *g = Some(t);
                     }
                 }
-                if let Some(t) = ret.and_then(|i| targs.get(i)) {
+                if let Some(t) = ret.filter(known) {
                     if ret_ty.as_deref() == Some("Object") {
-                        ret_ty = Some(t.clone());
+                        ret_ty = Some(t);
                     }
                 }
             }
@@ -4828,11 +4970,50 @@ impl Compiler {
         param_tys: &[String],
         mangled: &str,
     ) -> Result<(), String> {
-        let generics = self
+        let generics: Vec<Option<String>> = self
             .param_generics
             .get(mangled)
-            .cloned()
+            .map(|gs| {
+                gs.iter()
+                    .map(|g| g.as_ref().map(|g| self.inferred(mangled, args, g)))
+                    .collect()
+            })
             .unwrap_or_default();
+        self.call_args_with_generics(args, param_tys, &generics)
+    }
+
+    /// `sig` with the type variables a call to `mangled` binds from its
+    /// arguments substituted, the simple cases of `javac`'s inference (JLS
+    /// 18.5.1): a parameter typed `E` binds `E` to its argument's static type
+    /// (boxed, as a primitive argument is), and a `List<E>` parameter binds it
+    /// to the argument's own type argument. A variable no argument binds stays.
+    fn inferred(&self, mangled: &str, args: &[Expr], sig: &str) -> String {
+        let Some(params) = self.param_generics.get(mangled) else {
+            return sig.to_string();
+        };
+        let mut bound: Vec<(String, String)> = Vec::new();
+        for (p, a) in params.iter().zip(args) {
+            let Some(p) = p else { continue };
+            let actual = self.expr_generic(a).or_else(|| {
+                self.expr_java_type(a)
+                    .map(|t| wrapper_of(&t).map_or(t.clone(), str::to_string))
+            });
+            if let Some(actual) = actual.filter(|t| t != NULL_LITERAL) {
+                unify_tvars(p, &actual, &mut bound);
+            }
+        }
+        let (names, types): (Vec<String>, Vec<String>) = bound.into_iter().unzip();
+        subst_tvars(sig, &names, &types)
+    }
+
+    /// Lower a call's arguments, each targeted at its parameter's type and
+    /// handed that parameter's generic type for a lambda literal to read.
+    fn call_args_with_generics(
+        &mut self,
+        args: &[Expr],
+        param_tys: &[String],
+        generics: &[Option<String>],
+    ) -> Result<(), String> {
         for (i, a) in args.iter().enumerate() {
             let g = generics.get(i).cloned().flatten();
             self.expr_targeted_generic(a, param_tys.get(i).map(String::as_str), g)?;
@@ -6237,7 +6418,7 @@ impl Compiler {
                     generic
                         .as_deref()
                         .map(|g| crate::ast::generic_parts(g).0)
-                        .filter(|t| t != "Object")
+                        .filter(|t| is_known_type(t))
                 })
                 .unwrap_or_else(|| ty.to_string())
         } else {
@@ -10776,7 +10957,75 @@ fn signature_generics(
 /// [`crate::ast::generic_parts`] splits — or `None` when there are none to
 /// record. An array type never carries its element's arguments.
 fn with_targs(ty: &str, targs: &[String]) -> Option<String> {
+    // A declaration typed by a bare type variable (`T v`) records the
+    // variable itself, `#T`, as its one argument over the erasure `Object`.
+    if let [t] = targs {
+        if ty == "Object" && t.starts_with('#') {
+            return Some(t.clone());
+        }
+    }
     (!targs.is_empty() && !ty.ends_with("[]")).then(|| format!("{ty}<{}>", targs.join(",")))
+}
+
+/// Replace each type variable `#P` in the generic type text `sig` by the
+/// argument at `P`'s position in `params`, where `args` has one; a variable it
+/// does not bind stays `#P`, which reads as `Object`.
+fn subst_tvars(sig: &str, params: &[String], args: &[String]) -> String {
+    let mut out = String::with_capacity(sig.len());
+    let mut rest = sig;
+    while let Some(i) = rest.find('#') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let end = tail
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(tail.len());
+        let name = &tail[..end];
+        match params
+            .iter()
+            .position(|p| p == name)
+            .and_then(|k| args.get(k))
+        {
+            Some(a) => out.push_str(a),
+            None => {
+                out.push('#');
+                out.push_str(name);
+            }
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Bind the type variables of the declared generic type `sig` against the
+/// argument type `actual`, appending to `out`; the first binding of a variable
+/// wins. Only a matching shape binds: `#E` against anything known, `List<#E>`
+/// against a `List<…>` (or another collection of the same kind).
+fn unify_tvars(sig: &str, actual: &str, out: &mut Vec<(String, String)>) {
+    if let Some(name) = sig.strip_prefix('#') {
+        if is_known_type(&crate::ast::generic_parts(actual).0)
+            && !out.iter().any(|(n, _)| n == name)
+        {
+            out.push((name.to_string(), actual.to_string()));
+        }
+        return;
+    }
+    let (sb, sargs) = crate::ast::generic_parts(sig);
+    let (ab, aargs) = crate::ast::generic_parts(actual);
+    let same_shape =
+        sb == ab || collection_kind(&sb).is_some_and(|k| collection_kind(&ab) == Some(k));
+    if sargs.is_empty() || sargs.len() != aargs.len() || !same_shape {
+        return;
+    }
+    for (s, a) in sargs.iter().zip(&aargs) {
+        unify_tvars(s, a, out);
+    }
+}
+
+/// True when a type from a generic position says more than its erasure: not
+/// `Object`, and not a type variable (`#T`) no type argument has replaced.
+fn is_known_type(t: &str) -> bool {
+    t != "Object" && !t.starts_with('#')
 }
 
 /// The numeric category of an array's elements from its declared type string:

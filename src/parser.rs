@@ -472,8 +472,10 @@ impl Parser {
                 &mut inst_methods,
             );
         }
+        let type_params = self.type_params[self.type_params.len() - class_generics..].to_vec();
         self.undeclare_generics(class_generics);
         classes.push(Class {
+            type_params,
             name,
             binary,
             superclass,
@@ -608,6 +610,7 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok(Class {
+            type_params: Vec::new(),
             // An enum constant body is a synthetic subclass javars mints; Java
             // names its own `Outer$Enum$1`, which is a counter this frontend does
             // not model, so the synthetic name stands in.
@@ -1304,8 +1307,13 @@ impl Parser {
                     if text.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '?') {
                         text.push(' ');
                     }
-                    let erased = self.type_params.contains(w) && !text.ends_with('.');
-                    text.push_str(if erased { "Object" } else { w });
+                    // A type variable is kept as `#T`, which a use site
+                    // substitutes from its receiver's type arguments and
+                    // otherwise reads as its erasure, `Object`.
+                    if self.type_params.contains(w) && !text.ends_with('.') {
+                        text.push('#');
+                    }
+                    text.push_str(w);
                 }
                 Tok::Lt => text.push('<'),
                 Tok::Comma => text.push(','),
@@ -1850,8 +1858,11 @@ impl Parser {
     fn type_name(&mut self) -> Result<String, String> {
         let mut ty = self.simple_type_name()?;
         // A name bound as a type parameter erases to `Object`, not to itself —
-        // see [`Parser::type_params`].
-        if self.type_params.contains(&ty) {
+        // see [`Parser::type_params`]. Its one "type argument" is the variable
+        // itself, `#T`, which is how a declaration records that its type is
+        // one (see [`crate::ast::StmtKind::Local::targs`]).
+        let tvar = self.type_params.contains(&ty).then(|| format!("#{ty}"));
+        if tvar.is_some() {
             ty = "Object".to_string();
         }
         // Naming a functional interface pulls in the prelude that declares it,
@@ -1864,6 +1875,9 @@ impl Parser {
         // the type itself, but kept beside it for a declaration to record. An
         // array of a generic type keeps none: its own members never see them.
         self.last_targs = self.type_args();
+        if let Some(t) = tvar {
+            self.last_targs = vec![t];
+        }
         while self.is(&Tok::LBracket) {
             self.advance();
             self.eat(&Tok::RBracket)?;
@@ -4131,6 +4145,7 @@ impl Parser {
             _ => (None, vec![ty.to_string()]),
         };
         let mut cl = Class {
+            type_params: Vec::new(),
             name: binary.clone(),
             binary: binary.clone(),
             superclass,

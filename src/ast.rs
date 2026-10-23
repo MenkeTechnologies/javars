@@ -78,6 +78,10 @@ pub const OUTER_THIS: &str = "this$0";
 /// `HostObj::Instance`) at runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Class {
+    /// The names of the type parameters the declaration binds (`class Box<T>`
+    /// binds `T`), in order — what a use's type arguments substitute into the
+    /// members' `#T`-marked types.
+    pub type_params: Vec<String>,
     pub name: String,
     /// Java's *binary* name for this type: `Outer$Nested` for a nested
     /// declaration, the simple name for a top-level one. javars flattens nesting
