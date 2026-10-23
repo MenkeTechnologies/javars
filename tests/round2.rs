@@ -2518,3 +2518,41 @@ fn a_lambda_result_conflicting_with_a_primitive_target_is_rejected() {
         assert_eq!(out, "ok\n");
     }
 }
+
+/// A reference to a static overloaded on arity resolves at the arity its target fixes — the declared functional interface's, or the JDK method slot's it is passed to: `flatMapToInt(Arrays::stream)` is `Arrays.stream(int[])`, `map(Objects::toString)` the one-argument `toString`, a `BiFunction` the two-argument one.
+#[test]
+fn arity_overloaded_static_references_resolve_by_their_target() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        int[][] m = {{1, 2, 3}, {4, 5, 6}};
+        System.out.println(Arrays.stream(m).flatMapToInt(Arrays::stream).filter(x -> x % 2 == 0).count());
+        System.out.println(Arrays.stream(m).flatMapToInt(Arrays::stream).sum());
+        String[][] s = {{"a", "b"}, {"c"}};
+        System.out.println(Arrays.stream(s).flatMap(Arrays::stream).collect(Collectors.joining()));
+        Function<int[], IntStream> f = Arrays::stream;
+        System.out.println(f.apply(new int[]{7, 8}).sum());
+        List<Object> l = new ArrayList<>(); l.add(null); l.add(3);
+        System.out.println(l.stream().map(Objects::toString).toList());
+        BiFunction<Object, String, String> ts = Objects::toString;
+        System.out.println(ts.apply(null, "dflt"));
+        Supplier<String> bad = () -> "x";
+        System.out.println(bad.get());
+    }
+}
+"####;
+    let expected = r####"3
+21
+abc
+15
+[null, 3]
+dflt
+x
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "program failed:\n{out}");
+    assert_eq!(out, expected);
+}

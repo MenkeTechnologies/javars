@@ -577,6 +577,11 @@ struct Compiler {
     /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
     /// See [`Compiler::lambda_param_generics`].
     lambda_param_hint: Option<Vec<String>>,
+    /// The parameter count a method reference argument's functional interface
+    /// takes, when the JDK method it is passed to fixes one — what picks the
+    /// overload of an arity-overloaded reference (`flatMapToInt(Arrays::stream)`
+    /// is `Arrays.stream(int[])`, not `(int[], int, int)`).
+    ref_arity_hint: Option<usize>,
     /// The parameters of a lambda whose body is being *typed* (not lowered)
     /// to infer its result, innermost last — see
     /// [`Compiler::lambda_result_type`].
@@ -765,6 +770,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_ret_hint: None,
         lambda_generic: None,
         lambda_param_hint: None,
+        ref_arity_hint: None,
         lambda_param_types: Default::default(),
         generic_memo: Default::default(),
         java_type_memo: Default::default(),
@@ -2470,6 +2476,23 @@ impl Compiler {
         }
         let r = lower(self);
         self.lambda_param_hint = None;
+        r
+    }
+
+    /// Lower an erased call's argument `i` of `n`, handing a method reference
+    /// the parameter count of the functional interface the JDK method takes
+    /// there (see [`jdk_functional_arity`]).
+    fn with_ref_arity_hint(
+        &mut self,
+        a: &Expr,
+        arity: Option<usize>,
+        lower: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if matches!(a, Expr::MethodRef { .. }) {
+            self.ref_arity_hint = arity;
+        }
+        let r = lower(self);
+        self.ref_arity_hint = None;
         r
     }
 
@@ -5892,7 +5915,10 @@ impl Compiler {
             return Ok(None);
         }
         // `Integer::parseInt` — a modeled stdlib static.
-        if let Some(arity) = stdlib_static_ref_arity(name, method) {
+        let overloaded = self
+            .ref_arity_hint
+            .filter(|n| stdlib_static_ref_arities(name, method).contains(n));
+        if let Some(arity) = stdlib_static_ref_arity(name, method).or(overloaded) {
             let ps = mk(arity);
             return Ok(Some(lambda(
                 ps.clone(),
@@ -8301,7 +8327,17 @@ impl Compiler {
             Expr::SwitchExpr { disc, arms, line } => self.switch_expr(disc, arms, *line, None)?,
             Expr::Lambda { params, body, line } => self.compile_lambda(params, body, *line)?,
             Expr::MethodRef { recv, method, line } => {
-                let lambda = self.desugar_method_ref(recv, method, *line)?;
+                // The arity a reference to an arity-overloaded method resolves
+                // at: the target interface's, or the JDK method's slot's.
+                let target_arity = self
+                    .lambda_target
+                    .as_deref()
+                    .and_then(|t| self.functional_sam(t))
+                    .map(|(_, n)| n);
+                self.ref_arity_hint = target_arity.or(self.ref_arity_hint.take());
+                let lambda = self.desugar_method_ref(recv, method, *line);
+                self.ref_arity_hint = None;
+                let lambda = lambda?;
                 self.expr(&lambda)?;
             }
         }
@@ -9298,11 +9334,17 @@ impl Compiler {
         let hints: Vec<Option<Vec<String>>> = (0..args.len())
             .map(|i| self.lambda_param_generics(recv, method, args.len(), i))
             .collect();
+        let arities: Vec<Option<usize>> = (0..args.len())
+            .map(|i| jdk_functional_arity(method, args.len(), i))
+            .collect();
         if targets.is_empty() {
             self.expr(recv)?;
-            for (a, hint) in args.iter().zip(&hints) {
-                self.with_lambda_param_hint(a, hint.clone(), |c| {
-                    c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+            for (i, (a, hint)) in args.iter().zip(&hints).enumerate() {
+                let arity = arities[i];
+                self.with_ref_arity_hint(a, arity, |c| {
+                    c.with_lambda_param_hint(a, hint.clone(), |c| {
+                        c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+                    })
                 })?;
             }
             fallback(self);
@@ -9315,10 +9357,13 @@ impl Compiler {
         let arg_ts: Vec<String> = args
             .iter()
             .zip(&hints)
-            .map(|(a, hint)| {
+            .zip(&arities)
+            .map(|((a, hint), arity)| {
                 let t = self.temp();
-                self.with_lambda_param_hint(a, hint.clone(), |c| {
-                    c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+                self.with_ref_arity_hint(a, *arity, |c| {
+                    c.with_lambda_param_hint(a, hint.clone(), |c| {
+                        c.emit_erased_arg_hinted(a, raw_args, box_arg, box_char, ref_result)
+                    })
                 })?;
                 self.emit_set(&t, line);
                 Ok(t)
@@ -12262,6 +12307,38 @@ fn collection_instance_ref_arity(method: &str) -> Option<usize> {
     })
 }
 
+/// The parameter counts of a modeled stdlib static overloaded on *arity*,
+/// whose reference only a target's arity resolves: `Arrays::stream` is
+/// `stream(T[])` for a one-parameter interface and the `(array, from, to)`
+/// form for a three-parameter one. Each is static-only, so no instance method
+/// makes the reference ambiguous the way `Integer::toString` is.
+fn stdlib_static_ref_arities(class: &str, method: &str) -> &'static [usize] {
+    match (class, method) {
+        ("Arrays", "stream") => &[1, 3],
+        ("Objects", "toString" | "requireNonNull") => &[1, 2],
+        _ => &[],
+    }
+}
+
+/// The parameter count of the functional interface a JDK method takes as
+/// argument `i` of `n`, for the names whose every overload agrees: a stream's
+/// `map`/`filter`/`flatMap*`/`forEach`… take one, its `reduce` and `sorted`
+/// two.
+fn jdk_functional_arity(method: &str, n: usize, i: usize) -> Option<usize> {
+    match (method, n, i) {
+        (
+            "map" | "filter" | "flatMap" | "flatMapToInt" | "flatMapToLong" | "flatMapToDouble"
+            | "mapToObj" | "mapToInt" | "mapToLong" | "mapToDouble" | "forEach" | "forEachOrdered"
+            | "peek" | "anyMatch" | "allMatch" | "noneMatch" | "takeWhile" | "dropWhile"
+            | "removeIf" | "ifPresent",
+            1,
+            0,
+        ) => Some(1),
+        ("sorted" | "min" | "max" | "reduce", 1, 0) | ("reduce", 2, 1) => Some(2),
+        _ => None,
+    }
+}
+
 fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
     Some(match (class, method) {
         ("Integer", "parseInt")
@@ -12314,7 +12391,8 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Integer" | "Long", "signum")
         // `Objects::toString` and `Objects::requireNonNull` are overloaded on
         // *arity* (1 and 2), so neither has an unambiguous one and neither is
-        // here; `javac` picks by target type, which this table cannot see.
+        // here; `javac` picks by target type, which [`stdlib_static_ref_arities`]
+        // resolves from the target's arity.
         //
         // `Integer::hashCode` and its siblings are absent for a stronger
         // reason: `javac` *rejects* them. The static `hashCode(int)` and the
