@@ -16753,6 +16753,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 0,
             ))))
         }
+        // `isDefined` is the JDK's `getType(cp) != UNASSIGNED`: a surrogate and a
+        // private-use character are defined, a noncharacter and a value beyond
+        // `MAX_CODE_POINT` are not.
+        ("Character", "isDefined", 1) => {
+            use crate::unicode_tables::{lookup, GENERAL_CATEGORY};
+            Ok(Value::bool(
+                lookup(GENERAL_CATEGORY, code_point_arg(&args[0]), 0) != 0,
+            ))
+        }
         // An out-of-range code point is the JDK's `IllegalArgumentException`, its
         // value printed as the unsigned hex of the `int`.
         ("Character", "getName", 1) => {
@@ -17036,6 +17045,45 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         // `deepHashCode` folds a nested array by its own `deepHashCode` instead
         // of its identity.
         ("Arrays", "hashCode", 1) => Ok(Value::Int(arrays_hash(&args[0], false).into())),
+        // `new String(int[] codePoints, offset, count)`, lowered here by the
+        // compiler when the first argument is statically an `int[]`: each code
+        // point is its one or two UTF-16 units, a surrogate value is that one
+        // unit (pairing with a neighbour as Java's `char`s would), and an
+        // invalid one is `IllegalArgumentException` naming the decimal value —
+        // the JDK's `StringUTF16.toBytes(int[], …)` wording.
+        ("String", "#fromCodePoints", 3) => {
+            let Some(cps) = array_items(&args[0]) else {
+                return Err(Fault::java(
+                    "NullPointerException",
+                    "Cannot read the array length because \"codePoints\" is null",
+                ));
+            };
+            let (off, count) = (args[1].jint(), args[2].jint());
+            if off < 0 || count < 0 || off + count > cps.len() as i64 {
+                return Err(Fault::java(
+                    "StringIndexOutOfBoundsException",
+                    format!(
+                        "Range [{off}, {off} + {count}) out of bounds for length {}",
+                        cps.len()
+                    ),
+                ));
+            }
+            let mut out = String::new();
+            for v in &cps[off as usize..(off + count) as usize] {
+                let cp = v.jint();
+                match jstr::checked_code_point(cp) {
+                    Ok(Some(c)) => jstr::push_str(&mut out, &c.to_string()),
+                    Ok(None) => {
+                        return Err(Fault::java(
+                            "IllegalArgumentException",
+                            (cp as i32).to_string(),
+                        ))
+                    }
+                    Err(e) => return Err(Fault::internal(e)),
+                }
+            }
+            Ok(Value::str(out))
+        }
         // `new String(bytes [, offset, length] [, charset])`, lowered here by the
         // compiler when the first argument is statically a `byte[]`.
         ("String", "#fromBytes", 1..=4) => {

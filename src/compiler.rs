@@ -2780,6 +2780,27 @@ impl Compiler {
         n: usize,
         i: usize,
     ) -> Option<Vec<String>> {
+        // A primitive stream's lambdas take its primitive element: `chars()`
+        // hands `mapToObj` an `int`, which is what selects the `(int)` overload
+        // of `Character.toUpperCase` there and its `(char)` one on a
+        // `Stream<Character>`. A static factory's receiver is the class name,
+        // not a stream, and is left alone.
+        let static_recv = matches!(recv, Expr::Var(c) if !self.is_declared_var(c));
+        if let Some(prim) = self.primitive_stream_elem(recv).filter(|_| !static_recv) {
+            let one = || Some(vec![prim.to_string()]);
+            let two = || Some(vec![prim.to_string(), prim.to_string()]);
+            return match (method, n, i) {
+                (
+                    "filter" | "map" | "mapToObj" | "mapToInt" | "mapToLong" | "mapToDouble"
+                    | "flatMap" | "forEach" | "forEachOrdered" | "anyMatch" | "allMatch"
+                    | "noneMatch" | "peek" | "takeWhile" | "dropWhile",
+                    1,
+                    0,
+                ) => one(),
+                ("reduce", 1, 0) | ("reduce", 2, 1) => two(),
+                _ => None,
+            };
+        }
         let (base, targs) = crate::ast::generic_parts(&self.expr_generic(recv)?);
         if self.classes.contains_key(&base) {
             return None;
@@ -2819,14 +2840,17 @@ impl Compiler {
     }
 
     /// Lower one argument of a JDK generic call, handing a lambda literal the
-    /// parameter types [`Compiler::lambda_param_generics`] reads for it.
+    /// parameter types [`Compiler::lambda_param_generics`] reads for it. A
+    /// method reference takes them too, for the lambda it desugars to:
+    /// `Character::toUpperCase` over an `IntStream` is the `(int)` overload,
+    /// over a `Stream<Character>` the `(char)` one.
     fn with_lambda_param_hint(
         &mut self,
         a: &Expr,
         hint: Option<Vec<String>>,
         lower: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
-        if matches!(a, Expr::Lambda { .. }) {
+        if matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             self.lambda_param_hint = hint;
         }
         let r = lower(self);
@@ -5863,7 +5887,7 @@ impl Compiler {
         target: Option<&str>,
         generic: Option<String>,
     ) -> Result<(), String> {
-        if matches!(e, Expr::Lambda { .. }) {
+        if matches!(e, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             self.lambda_generic = generic.clone();
         }
         self.pending_target_generic = generic;
@@ -9968,7 +9992,7 @@ impl Compiler {
                 if ref_result {
                     self.lambda_ret_hint = Some("Object".to_string());
                 }
-                if matches!(a, Expr::Lambda { .. }) {
+                if matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
                     self.lambda_param_hint =
                         self.lambda_param_generics(recv, method, args.len(), i);
                 }
@@ -10231,7 +10255,7 @@ impl Compiler {
         box_char: bool,
         ref_result: bool,
     ) -> Result<(), String> {
-        if ref_result && matches!(a, Expr::Lambda { .. }) {
+        if ref_result && matches!(a, Expr::Lambda { .. } | Expr::MethodRef { .. }) {
             self.lambda_ret_hint = Some("Object".to_string());
         }
         let r = self.emit_erased_arg(a, raw, boxed, box_char);
@@ -10584,6 +10608,24 @@ impl Compiler {
                     args.len() as u8 + 2,
                     line,
                 );
+                self.b
+                    .emit(Op::CallBuiltin(crate::host::JNEW_STRING, 1), line);
+                return Ok(());
+            }
+            // `new String(int[] codePoints, offset, count)` builds from code
+            // points; the `char[]` overload of the same shape reads `char`s,
+            // and only the static type tells the two arrays apart.
+            if args.len() == 3 && self.expr_java_type(&args[0]).as_deref() == Some("int[]") {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let class_c = self.b.add_constant(Value::str("String".to_string()));
+                self.b.emit(Op::LoadConst(class_c), line);
+                let method_c = self
+                    .b
+                    .add_constant(Value::str("#fromCodePoints".to_string()));
+                self.b.emit(Op::LoadConst(method_c), line);
+                self.emit_raising_builtin(crate::host::JSTATIC_DISPATCH, 5, line);
                 self.b
                     .emit(Op::CallBuiltin(crate::host::JNEW_STRING, 1), line);
                 return Ok(());
@@ -12828,6 +12870,7 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
         (
             "Character",
             "isIdeographic"
+            | "isDefined"
             | "isDigit"
             | "isLetter"
             | "isLetterOrDigit"
@@ -13306,9 +13349,14 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
         | ("Objects", "hashCode")
         // `Character`'s predicates and `getNumericValue` are overloaded on
         // `char` and `int` only, and `Character` declares no instance method of
-        // the same name, so a reference to one is unambiguous. The case maps are
-        // left out: their `(int)` overload answers an `int` and their `(char)`
-        // one a `char`, which only the target type javars lacks can choose.
+        // the same name, so a reference to one is unambiguous. The case maps
+        // answer in their argument's type — `(int)` an `int`, `(char)` a `char` —
+        // which the lambda the reference desugars to reads off its parameter, typed
+        // from the stream or collection it is handed to (`lambda_param_generics`).
+        // `toChars` has a three-argument overload javars does not model, so the
+        // one-argument form is the only reading. `getName` takes an `int` only. The surrogate predicates are
+        // `(char)` only, which javac refuses an `IntStream` element for and javars
+        // accepts.
         //
         // `Character::toString` names the static `toString(char)`/`(int)` and
         // the instance `toString()`. `javac` rejects it as ambiguous wherever
@@ -13320,7 +13368,11 @@ fn stdlib_static_ref_arity(class: &str, method: &str) -> Option<usize> {
             "isLetter" | "isDigit" | "isLetterOrDigit" | "isAlphabetic" | "isWhitespace"
             | "isSpaceChar" | "isUpperCase" | "isLowerCase" | "isISOControl"
             | "isJavaIdentifierStart" | "isJavaIdentifierPart" | "getNumericValue"
-            | "charCount" | "toString",
+            | "charCount" | "toString"
+            | "toUpperCase" | "toLowerCase" | "toTitleCase" | "toChars" | "isDefined" | "getName"
+            | "isIdeographic" | "getType" | "isSurrogate" | "isHighSurrogate"
+            | "isLowSurrogate" | "isValidCodePoint" | "isBmpCodePoint"
+            | "isSupplementaryCodePoint",
         )
  => 1,
         ("Math", "max") | ("Math", "min") | ("Math", "pow") => 2,
@@ -13560,6 +13612,11 @@ fn wrapper_constant(class: &str, name: &str) -> Option<(Value, &'static str)> {
         ("Character", "MIN_CODE_POINT") => (Value::Int(0), "int"),
         ("Character", "MAX_CODE_POINT") => (Value::Int(0x10_FFFF), "int"),
         ("Character", "MIN_SUPPLEMENTARY_CODE_POINT") => (Value::Int(0x1_0000), "int"),
+        // The UTF-16 surrogate ranges, typed `char` as the JDK declares them.
+        ("Character", "MIN_HIGH_SURROGATE" | "MIN_SURROGATE") => (Value::Int(0xD800), "char"),
+        ("Character", "MAX_HIGH_SURROGATE") => (Value::Int(0xDBFF), "char"),
+        ("Character", "MIN_LOW_SURROGATE") => (Value::Int(0xDC00), "char"),
+        ("Character", "MAX_LOW_SURROGATE" | "MAX_SURROGATE") => (Value::Int(0xDFFF), "char"),
         // `Boolean.TRUE`/`FALSE` are the two cached boxes. javars does not box
         // `Boolean` (see `BOX_CLASSES`), so each is its primitive, typed as the
         // wrapper.

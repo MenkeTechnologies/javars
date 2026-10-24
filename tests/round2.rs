@@ -4819,3 +4819,85 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "true 1 1 true {a=3} false true true 7 5 9 8\n");
 }
+
+/// `new String(int[] codePoints, offset, count)` builds from code points (a surrogate value is one unit and pairs with its neighbour; an invalid one is `IllegalArgumentException` naming the value), the surrogate-range `Character` constants are `char`s, and `isDefined` is `getType != UNASSIGNED`.
+#[test]
+fn code_point_string_constructor_surrogate_constants_and_is_defined() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    static void t(Runnable r) {
+        try { r.run(); } catch (RuntimeException e) { System.out.println(e); }
+    }
+    public static void main(String[] a) {
+        int[] cps = {0x1F600, 0x41, 0x1F601, 0xD83D, 0xDE00};
+        String s = new String(cps, 0, 3);
+        System.out.println(s + " " + s.length() + " " + s.codePointCount(0, s.length()));
+        String paired = new String(cps, 3, 2);
+        System.out.println(paired.equals("😀") + " " + paired.length() + " " + new String(cps, 3, 1).length());
+        System.out.println(new String(cps, 1, 0).isEmpty());
+        t(() -> new String(cps, 1, 5));
+        t(() -> new String(cps, -1, 1));
+        t(() -> new String(new int[]{0x110000}, 0, 1));
+        t(() -> new String(new int[]{-1}, 0, 1));
+        System.out.println((int) Character.MIN_HIGH_SURROGATE + " " + (int) Character.MAX_HIGH_SURROGATE + " "
+            + (int) Character.MIN_LOW_SURROGATE + " " + (int) Character.MAX_LOW_SURROGATE + " "
+            + (int) Character.MIN_SURROGATE + " " + (int) Character.MAX_SURROGATE + " "
+            + Character.MIN_SUPPLEMENTARY_CODE_POINT);
+        System.out.println(Character.isHighSurrogate(Character.MIN_HIGH_SURROGATE) + " " + (Character.MAX_SURROGATE + 1));
+        System.out.println(Character.isDefined('a') + " " + Character.isDefined(0x0378) + " " + Character.isDefined(0xD800)
+            + " " + Character.isDefined(0xE000) + " " + Character.isDefined(0xFFFF) + " " + Character.isDefined(-1)
+            + " " + Character.isDefined(0x110000) + " " + Character.isDefined(0x1F600));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "😀A😁 5 3\ntrue 2 1\ntrue\njava.lang.StringIndexOutOfBoundsException: Range [1, 1 + 5) out of bounds for length 5\njava.lang.StringIndexOutOfBoundsException: Range [-1, -1 + 1) out of bounds for length 5\njava.lang.IllegalArgumentException: 1114112\njava.lang.IllegalArgumentException: -1\n55296 56319 56320 57343 55296 57343 65536\ntrue 57344\ntrue false true true false false false true\n"
+    );
+}
+
+/// A `Character` method reference takes its parameter type from what it maps: the `(int)` case map over `chars()`, the `(char)` one over a `Stream<Character>` or a `List<Character>`, the target's type arguments when assigned to a `Function`; `toChars`, `getName`, `getType` and the code-point predicates are references too.
+#[test]
+fn character_method_references_follow_the_element_type() {
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        System.out.println("Hello".chars().mapToObj(Character::toUpperCase).collect(Collectors.toList()));
+        System.out.println("Hello".chars().map(Character::toUpperCase).mapToObj(c -> (char) c).map(String::valueOf).collect(Collectors.joining()));
+        System.out.println("Hello".chars().mapToObj(c -> Character.toUpperCase(c)).collect(Collectors.toList()));
+        System.out.println(Stream.of('a', 'B').map(Character::toUpperCase).collect(Collectors.toList()));
+        System.out.println(Stream.of('a', 'B').map(Character::toLowerCase).map(Character::isLowerCase).collect(Collectors.toList()));
+        System.out.println(Stream.of(97, 98).map(Character::toUpperCase).collect(Collectors.toList()));
+        List<Character> cs = new ArrayList<>(List.of('q', 'r'));
+        cs.replaceAll(Character::toUpperCase);
+        System.out.println(cs);
+        Function<Character, Character> up = Character::toUpperCase;
+        UnaryOperator<Character> low = Character::toLowerCase;
+        IntUnaryOperator iu = Character::toUpperCase;
+        System.out.println(up.apply('z') + " " + low.apply('Q') + " " + iu.applyAsInt('z'));
+        System.out.println("Hi😀".codePoints().mapToObj(Character::toChars).map(String::new).collect(Collectors.joining("|")));
+        System.out.println("Hi😀".codePoints().mapToObj(c -> Character.toChars(c)).map(String::valueOf).collect(Collectors.toList()));
+        System.out.println("Hi😀".codePoints().mapToObj(Character::getName).collect(Collectors.toList()));
+        System.out.println("Hi😀".codePoints().filter(Character::isSupplementaryCodePoint).count()
+            + " " + "Hi😀".chars().filter(c -> Character.isSurrogate((char) c)).count()
+            + " " + Stream.of('\uD83D', 'x').filter(Character::isHighSurrogate).count()
+            + " " + "ab".chars().allMatch(Character::isDefined));
+        System.out.println(Stream.of('x', '1').map(Character::getType).collect(Collectors.toList()));
+        System.out.println(IntStream.of(1, 2, 3).map(x -> x * 1000000000).sum() + " " + IntStream.of(1, 2, 3).reduce(Integer::sum).getAsInt());
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[72, 69, 76, 76, 79]\nHELLO\n[72, 69, 76, 76, 79]\n[A, B]\n[true, true]\n[65, 66]\n[Q, R]\nZ q 90\nH|i|😀\n[H, i, 😀]\n[LATIN CAPITAL LETTER H, LATIN SMALL LETTER I, GRINNING FACE]\n1 2 1 true\n[2, 9]\n1705032704 6\n"
+    );
+}

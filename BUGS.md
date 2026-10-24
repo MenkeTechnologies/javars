@@ -428,6 +428,19 @@ at the bottom, and are summarized in the section right after this one.
   because only the target type — which javars does not carry — could choose. A
   bound `sb::append` on a `StringBuilder` variable is accepted alongside the
   `String` and collection receivers.
+- **`Character` method references typed by the element they map.** The case
+  maps (`Character::toUpperCase`/`toLowerCase`/`toTitleCase`), `toChars`,
+  `getName`, `getType`, `isDefined`, `isIdeographic` and the surrogate and
+  code-point predicates are references too. A method reference handed to a
+  stream or collection method takes the same parameter types a lambda there
+  does, and a primitive stream's lambdas take its primitive element, so
+  `Character::toUpperCase` is the `(int)` overload over `s.chars()` (`[72, 69]`)
+  and the `(char)` one over a `Stream<Character>` (`[H, E]`); a reference
+  assigned to `Function<Character, Character>` reads the target's type
+  arguments the same way. `codePoints().mapToObj(Character::toChars)
+  .map(String::new)` is each character's text. The `(char)`-only surrogate
+  predicates are accepted over an `IntStream`, which `javac` refuses.
+  Measured on openjdk 27.
 - **`switch` type patterns and `when` guards.** `case Circle c ->` tests and
   binds the way an `instanceof` pattern does, in both the arrow and the colon
   form, and a `when` guard runs after its label matched — a failed guard is a
@@ -579,6 +592,16 @@ at the bottom, and are summarized in the section right after this one.
   surrogate is held as a stand-in code point from `U+10F800..=U+10FFFF`, and a
   per-string UTF-16 offset index is cached for the strings most recently
   indexed. Measured on `openjdk 21.0.13`.
+  `new String(int[] codePoints, offset, count)` builds from code points (a
+  surrogate value is that one unit, an invalid one
+  `IllegalArgumentException: <value>`), and `Character.isDefined` and the
+  `MIN_`/`MAX_` `HIGH_SURROGATE`/`LOW_SURROGATE`/`SURROGATE` constants are
+  modeled. Measured on openjdk 27.
+  `isDefined` reads the same generated category table as `getType`
+  (`src/unicode_tables.rs`, dumped from openjdk 21.0.13), so a character a
+  later Unicode version assigns is undefined to javars: over
+  `0..=0x10F7FF` javars counts 286,721 defined code points, openjdk 25.0.2
+  292,533 and openjdk 27 297,336. `getType` has the same lag.
 - **`StringBuilder` and `StringBuffer`.** The mutable character sequence, as a
   host shape rather than a class instance: `append` (every overload, including
   `char[]` and another builder), `appendCodePoint`, `insert`, `delete`,
@@ -1260,6 +1283,13 @@ storage-model differences:
 
 - `int` arithmetic whose operand types are not statically known keeps fusevm's
   64-bit result rather than wrapping at 32 bits.
+- **A regular expression's empty match never falls inside a surrogate pair.**
+  The match engine walks code points, so an empty match after one before an
+  astral character resumes after the whole pair, where Java's `Matcher` steps
+  one `char` and matches again between the halves: `"h😀i".split("")` is
+  `[h, ?, ?, i]` in Java (the halves printed as `?`) and `[h, 😀, i]` in javars,
+  and `Pattern.compile("").matcher("h😀i")` finds at `0,1,2,3,4` in Java and
+  `0,1,3,4` in javars. A non-empty match is unaffected.
 - A subclass that **re-declares a field its parent already declares** gets one
   cell rather than two, so the parent's own methods and a parent-typed reference
   read the subclass's value. See "Field *hiding* collapses to one cell" below
@@ -1540,8 +1570,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   for a `K` with consistent `equals`/`hashCode`. An `Optional` of a `String`,
   a boxed primitive or another `Optional` of one is found, and buckets and
   iterates in the JDK's order.
-- **`EnumSet.complementOf` and `EnumSet.range`** need the enum type, which the
-  `TreeSet` an `EnumSet` is modeled as does not keep. They are refused by name.
+- ~~**`EnumSet.complementOf` and `EnumSet.range`**~~ — implemented: the
+  compiler reads the enum type off the arguments' static type and hands the
+  host its `values()` array, so `range` is the constants between the two
+  ordinals (`IllegalArgumentException: B > A` when reversed) and
+  `complementOf` the ones the set lacks.
 - **`java.lang.StackOverflowError` is not modeled by name in `catch`**, and
   unbounded recursion runs until the OS stops it (see the entry below).
 - ~~**A `\uXXXX` escape that names a lone surrogate is refused.**~~ — fixed.
@@ -1843,14 +1876,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   deconstruction patterns (nested, with `var`), `case null`, and guarded `when`
   labels, in switch statements and expressions, and record patterns in
   `instanceof`.
-- **`EnumSet.range` and `EnumSet.complementOf`.** `new EnumMap<>(K.class)`
+- **`EnumMap` and `EnumSet`.** `new EnumMap<>(K.class)`
   (and the copy constructor), `EnumSet.of`/`noneOf`/`allOf`/`copyOf` run: an
   `EnumMap` or `EnumSet` iterates in ordinal order, which is an enum's natural
   order — `Enum.compareTo` is supplied, the ordinal difference — so each is
   modeled as the `TreeMap`/`TreeSet` it behaves as, and prints, orders, and
-  answers every query the same. Two things show the model: `getClass()` names
-  `java.util.TreeMap`/`TreeSet`, and `range`/`complementOf` are refused,
-  because they need the element type, which an erased receiver does not carry.
+  answers every query the same. One thing shows the model: `getClass()` names
+  `java.util.TreeMap`/`TreeSet`. `range` and `complementOf` read the enum type
+  off their arguments' static type (see the entry above).
 - ~~**Sealed types.**~~ — implemented: `sealed`, `permits` and `non-sealed`
   are accepted, and a pattern switch over a sealed hierarchy needs no `default`.
 - **A type *parameter* that shadows a class name.** `class Box<T>` inside a

@@ -377,7 +377,9 @@ Implemented and checked against the reference `java`:
   `new PriorityQueue<>(cmp)` call the method its functional interface names. `return`, `break`/`continue`,
   `try`/`finally` and `throw` all work inside a lambda body.
 - **Method references** — `String::length`, `Integer::parseInt`, `Integer::sum`,
-  `Character::isLetter` and the other `Character` predicates,
+  `Character::isLetter` and the other `Character` predicates, the case maps
+  (`Character::toUpperCase` is the `(int)` overload over `s.chars()` and the
+  `(char)` one over a `Stream<Character>`), `Character::toChars`, `getName`,
   `Point::area`, `obj::method` (a user, `String` or collection receiver, or a
   string literal), `this::method`, `Point::new`,
   `System.out::println`. A constructor reference also names a modeled stdlib
@@ -641,7 +643,7 @@ bit-twiddling (`bitCount`, `reverse`, `reverseBytes`, `highestOneBit`,
 `lowestOneBit`, `numberOfLeading`/`TrailingZeros`, `rotateLeft`/`rotateRight`,
 each answering at its declared width) and constant statics,
 `Boolean.parseBoolean`, the `Character` predicates (with `getType`,
-`getNumericValue`, `isIdeographic`, the emoji predicates and `getName`
+`getNumericValue`, `isIdeographic`, `isDefined`, the emoji predicates and `getName`
 answering from data `scripts/GenUnicodeTables.java` generates from the JDK's
 own answers for every code point), the `java.util.Objects`
 statics (`hashCode`/`hash`/`toString`/`isNull`/`nonNull`/`equals`/
