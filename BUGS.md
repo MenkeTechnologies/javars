@@ -850,7 +850,11 @@ at the bottom, and are summarized in the section right after this one.
   already *is* the array matches the declared `T[]` in the fixed-arity phase and
   passes through unwrapped (`sum(new int[]{1, 2})` is two elements, not one).
   That same rule is why `f(null)` against `f(Object... xs)` passes `null` as the
-  whole array — the reading `javac` warns about and then compiles. Among two
+  whole array — the reading `javac` warns about and then compiles. Against
+  `f(Object)` as well, the variable-arity method competes in the fixed-arity
+  phase as its array type, and `Object[]` is the more specific, so `f(null)`
+  calls `f(Object...)` as `javac` does; a genuine tie is refused as
+  `reference to f is ambiguous`. Among two
   variable-arity candidates the more specific element type wins
   (`h(String...)` over `h(Object...)`, including for the zero-argument call);
   mutually-specific ones are ambiguous and select nothing, exactly as `javac`
@@ -2257,8 +2261,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `class CC$A cannot be cast to class java.lang.String`.
 
   The second gap: a value whose class javars erases — an array (element type
-  gone), a collection, a lambda — passes any cast rather than inventing a
-  failure, so `(String) anIntArray` succeeds where Java throws.
+  gone), a collection, a lambda whose target type the compiler could not
+  name — passes any cast rather than inventing a failure, so `(String)
+  anIntArray` succeeds where Java throws. A lambda converted to a known
+  functional interface is an instance of that interface and its
+  superinterfaces for `instanceof` and a cast, and a failing cast names its
+  hidden class up to the address (`class T$$Lambda cannot be cast to class
+  T$Other`, where Java prints `T$$Lambda/0x…`).
 - **A `float` reaching `String.format` through a *non-literal* format string
   prints its `double` form under `%s`.** `String.format` is the one place a
   `float` argument splits by conversion — `%s` wants `Float.toString`, `%f` and

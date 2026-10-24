@@ -5394,3 +5394,91 @@ fn the_first_of_several_errors_is_the_one_javac_reports_first() {
         assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
     }
 }
+
+/// JLS 15.12.2.5 between two fixed-arity candidates compares the declared
+/// parameters as written: a variable-arity method competing in the first
+/// phase is its array type, so `v(null)` against `v(Object)`/`v(Object...)`
+/// picks `v(Object...)` (`Object[]` is the more specific) — it used to be
+/// refused as matching nothing — and a genuine tie is `reference to f is
+/// ambiguous`, javac's words. Measured on openjdk 21.0.13.
+#[test]
+fn a_varargs_method_competes_in_the_fixed_phase_as_its_array_type() {
+    let src = r####"
+public class T {
+  static void v(Object o) { System.out.println("O"); } static void v(Object... o) { System.out.println("O..."); }
+  static void w(int a, double b) { System.out.println("id"); } static void w(double a, int b) { System.out.println("di"); }
+  static void x(Integer... a) { System.out.println("I..."); } static void x(int... a) { System.out.println("i..."); }
+  static void y(long a, long b) { System.out.println("ll"); } static void y(Integer a, Integer b) { System.out.println("II"); }
+  static void z(char c) { System.out.println("c"); } static void z(int i) { System.out.println("i"); } static void z(Character c) { System.out.println("C"); }
+  public static void main(String[] a) { v(null); v(1, 2); v(new Object[]{1}); v((Object) new Object[]{1}); y(1, 2); z('a'); z(97); z(Character.valueOf('q')); short s = 1; z(s); byte b = 2; y(b, b); }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "O...\nO...\nO...\nO\nll\nc\ni\nC\ni\nll\n");
+    let ambiguous = [
+        "public class T {\n  static void f(String... x) { } static void f(Integer... o) { }\n  public static void main(String[] a) { f(null); } }\n",
+        "public class T {\n  static void f(String x) { } static void f(Object[] o) { }\n  public static void main(String[] a) { f(null); } }\n",
+    ];
+    for src in ambiguous {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(
+            err.contains("reference to f is ambiguous (line 3)"),
+            "{err}\n{src}"
+        );
+    }
+}
+
+/// A lambda or method reference is an instance of the functional interface
+/// it was converted to (JLS 15.27.3) — and of that interface's
+/// superinterfaces (`BinaryOperator` is a `BiFunction`) — for `instanceof`
+/// and a checked cast, which throws `ClassCastException` naming the hidden
+/// class up to its address. Measured on openjdk 21.0.13.
+#[test]
+fn a_lambda_is_an_instance_of_its_functional_interface() {
+    let src = r####"
+import java.util.function.*;
+public class T {
+  interface Shape { double area(); }
+  interface Other { void x(); }
+  public static void main(String[] a) {
+    Shape s = () -> 3; Runnable r = () -> {}; Function<Integer, Integer> f = x -> x; Supplier<String> sup = String::new;
+    Object o = s; Object or = r;
+    System.out.println((s instanceof Shape) + " " + (o instanceof Shape) + " " + (or instanceof Runnable) + " " + (o instanceof Other) + " " + (or instanceof Shape) + " " + (f instanceof Function) + " " + (sup instanceof Supplier) + " " + (o instanceof Object));
+    Object cast = (Shape) o; System.out.println(cast != null);
+    try { Other bad = (Other) o; System.out.println("no CCE"); } catch (ClassCastException e) { System.out.println("CCE"); }
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "true true true false false true true true\ntrue\nCCE\n"
+    );
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+  interface Other { void x(); }
+  interface Sub extends Runnable { }
+  static boolean isR(Object o) { return o instanceof Runnable; }
+  static Object make() { Runnable r = () -> {}; return r; }
+  public static void main(String[] a) {
+    Object o = (Runnable) () -> {};
+    try { Other bad = (Other) o; } catch (ClassCastException e) { System.out.println(e.getMessage().replaceAll("/0x[0-9a-f]+", "").split(" \\(")[0]); }
+    System.out.println(isR(make()) + " " + isR((Sub) () -> {}) + " " + ((Object) (Sub) () -> {} instanceof Runnable));
+    Comparator<String> c = Comparator.naturalOrder(); BinaryOperator<Integer> add = Integer::sum; Object oa = add;
+    System.out.println((oa instanceof BiFunction) + " " + (oa instanceof BinaryOperator) + " " + (oa instanceof Function));
+    Predicate<String> p = s -> s.isEmpty(); Object op = p.negate(); System.out.println(op instanceof Predicate);
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "class T$$Lambda cannot be cast to class T$Other\ntrue true true\ntrue true false\ntrue\n"
+    );
+}

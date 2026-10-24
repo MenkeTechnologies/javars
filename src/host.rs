@@ -3654,6 +3654,7 @@ fn closure_meta(v: &Value) -> Option<(u16, u8, Vec<Value>)> {
                 name_idx,
                 params,
                 captures,
+                ..
             }) => Some((*name_idx, *params, captures.clone())),
             _ => None,
         }
@@ -7257,6 +7258,37 @@ fn b_class_name(vm: &mut VM, argc: u8) -> Value {
     v
 }
 
+/// The functional interface a closure was converted to, with the binary name
+/// of the class that wrote it — `None` for any other value, and for a lambda
+/// whose target type the compiler did not know. Both are read off the body's
+/// subroutine name, which the compiler mints as
+/// `#lambda#<n>#<interface>#<enclosing binary>` when it knows the target
+/// (JLS 15.27.3), so creating a closure costs nothing extra.
+fn lambda_iface(vm: &VM, v: &Value) -> Option<(String, String)> {
+    let (name_idx, ..) = closure_meta(v)?;
+    let name = vm.chunk.names.get(name_idx as usize)?;
+    let mut parts = name.strip_prefix("#lambda#")?.splitn(3, '#');
+    let (_, iface, encloser) = (parts.next()?, parts.next()?, parts.next()?);
+    Some((iface.to_string(), encloser.to_string()))
+}
+
+/// Whether a lambda converted to `iface` is an instance of `target`: the
+/// interface itself, one of its superinterfaces, or `Object`.
+fn lambda_is(iface: &str, target: &str) -> bool {
+    target == "Object" || iface == target || is_subclass_of(iface, target)
+        // The prelude declares `UnaryOperator` and `BinaryOperator` without
+        // their JDK superinterfaces, so those come from the table generated
+        // off the real JDK.
+        || crate::jdk_supertypes::JDK_SUPERTYPES
+            .binary_search_by(|(n, _, _)| (*n).cmp(iface))
+            .is_ok_and(|i| {
+                crate::jdk_supertypes::JDK_SUPERTYPES[i]
+                    .2
+                    .iter()
+                    .any(|(s, _)| *s == target)
+            })
+}
+
 /// [`JARRAY_TAG`].
 fn b_array_tag(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
@@ -7528,6 +7560,9 @@ fn b_instanceof(vm: &mut VM, argc: u8) -> Value {
             ),
         };
     }
+    if let Some((iface, _)) = lambda_iface(vm, &obj) {
+        return Value::bool(lambda_is(&iface, &target));
+    }
     Value::bool(is_instance_of(&obj, &target))
 }
 
@@ -7535,8 +7570,9 @@ fn b_instanceof(vm: &mut VM, argc: u8) -> Value {
 /// model names one.
 ///
 /// `None` means the class is genuinely not recorded rather than absent from this
-/// list: `null`, and a lambda, whose closure carries its body and its captures
-/// but not the functional interface it was assigned to.
+/// list: `null`, and a lambda, whose closure carries its body and its captures;
+/// the functional interface it was converted to rides in its body's name
+/// (`lambda_iface`), which [`b_instanceof`] and [`b_checkcast`] read.
 ///
 /// The two names that are not legal Java identifiers — `[]` and `List$view` —
 /// exist so an array and a non-`ArrayList` list view can carry supertypes in
@@ -7681,8 +7717,8 @@ fn value_class(v: &Value) -> Option<String> {
 fn is_instance_of(v: &Value, target: &str) -> bool {
     let Some(class) = value_class(v) else {
         // `null` is an instance of nothing. A lambda is at least an `Object`;
-        // its functional interface is not recorded, so that is as far as the
-        // answer goes.
+        // the functional interface it was converted to is answered by
+        // [`b_instanceof`], which can read it off the chunk.
         return target == "Object" && matches!(v, Value::Obj(_));
     };
     target == "Object" || is_subclass_of(&class, target)
@@ -22049,9 +22085,23 @@ fn b_checkcast(vm: &mut VM, argc: u8) -> Value {
         .get(1)
         .map(|v| v.as_str_cow().into_owned())
         .unwrap_or_default();
-    // `(Anything) null` succeeds in Java, and a lambda carries no interface to
-    // check against — the two shapes [`value_class`] does not name.
+    // `(Anything) null` succeeds in Java. A lambda is checked against the
+    // functional interface it was converted to; its class is a hidden one
+    // (`T$$Lambda/0x…`) whose address javars has no counterpart for, so the
+    // message names it up to the address.
     let Some(runtime) = value_class(&value) else {
+        if let Some((iface, encloser)) = lambda_iface(vm, &value) {
+            if !lambda_is(&iface, &target) {
+                let to = binary_name(&target, &Value::Undef).unwrap_or(target);
+                return raise(
+                    vm,
+                    Fault::java(
+                        "ClassCastException",
+                        format!("class {encloser}$$Lambda cannot be cast to class {to}"),
+                    ),
+                );
+            }
+        }
         return value;
     };
     if cast_allowed(&runtime, &target, &value) {

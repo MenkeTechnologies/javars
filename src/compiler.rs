@@ -3800,10 +3800,9 @@ impl Compiler {
                     .filter(|&&(_, c)| c == best)
                     .map(|&(i, _)| i)
                     .collect();
-                let n = arg_tys.len();
                 let mut winners = tied.iter().filter(|&&i| {
                     tied.iter()
-                        .all(|&j| self.at_least_as_specific(cands[i].0, cands[j].0, n))
+                        .all(|&j| self.fixed_at_least_as_specific(cands[i].0, cands[j].0))
                 });
                 match (winners.next(), winners.next()) {
                     (Some(&i), None) => Ok(i),
@@ -3909,22 +3908,7 @@ impl Compiler {
         arg_tys: &[Option<String>],
     ) -> Option<(usize, usize)> {
         let n = arg_tys.len();
-        let applicable: Vec<(usize, u32)> = cands
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (ptys, varargs))| {
-                if !varargs || ptys.is_empty() || n + 1 < ptys.len() {
-                    return None;
-                }
-                let fixed = ptys.len() - 1;
-                let elem = ptys[fixed].strip_suffix("[]")?;
-                let mut total = self.signature_cost(&ptys[..fixed], &arg_tys[..fixed])?;
-                for a in arg_tys[fixed..].iter().flatten() {
-                    total += self.assign_cost(a, elem)?;
-                }
-                Some((i, total))
-            })
-            .collect();
+        let applicable = self.varargs_applicable(cands, arg_tys);
         let best = applicable.iter().map(|&(_, c)| c).min()?;
         let tied: Vec<usize> = applicable
             .iter()
@@ -3940,6 +3924,66 @@ impl Compiler {
             .next()
             .is_none()
             .then(|| (idx, cands[idx].0.len() - 1))
+    }
+
+    /// The variable-arity candidates applicable to `arg_tys` in Java's third
+    /// phase, each with its conversion cost (see [`Compiler::pick_varargs`]).
+    fn varargs_applicable(
+        &self,
+        cands: &[(&[String], bool)],
+        arg_tys: &[Option<String>],
+    ) -> Vec<(usize, u32)> {
+        let n = arg_tys.len();
+        cands
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (ptys, varargs))| {
+                if !varargs || ptys.is_empty() || n + 1 < ptys.len() {
+                    return None;
+                }
+                let fixed = ptys.len() - 1;
+                let elem = ptys[fixed].strip_suffix("[]")?;
+                let mut total = self.signature_cost(&ptys[..fixed], &arg_tys[..fixed])?;
+                for a in arg_tys[fixed..].iter().flatten() {
+                    total += self.assign_cost(a, elem)?;
+                }
+                Some((i, total))
+            })
+            .collect()
+    }
+
+    /// Whether resolving `arg_tys` against `cands` failed for ambiguity —
+    /// some candidate applies in the deciding phase but none is most specific
+    /// — rather than because none applies. Only claimed when every argument's
+    /// static type is known.
+    fn overload_ambiguous(&self, cands: &[(&[String], bool)], arg_tys: &[Option<String>]) -> bool {
+        if !arg_tys.iter().all(Option::is_some) {
+            return false;
+        }
+        let fixed: Vec<(&[String], bool)> = cands
+            .iter()
+            .copied()
+            .filter(|c| c.0.len() == arg_tys.len())
+            .collect();
+        match self.pick_overload(&fixed, arg_tys) {
+            Ok(_) => false,
+            Err(NoPick::Ambiguous) => true,
+            Err(NoPick::Inapplicable) => {
+                self.pick_varargs(cands, arg_tys).is_none()
+                    && !self.varargs_applicable(cands, arg_tys).is_empty()
+            }
+        }
+    }
+
+    /// JLS 15.12.2.5 for two fixed-arity candidates of the same arity: every
+    /// declared parameter of `a` is assignable to `b`'s. A variable-arity
+    /// declaration competing here is read as its declared array (`Object...`
+    /// is `Object[]`), never expanded — which is what makes `f(null)` pick
+    /// `f(Object...)` over `f(Object)`, `Object[]` being the more specific.
+    fn fixed_at_least_as_specific(&self, a: &[String], b: &[String]) -> bool {
+        a.iter()
+            .zip(b)
+            .all(|(p, q)| self.assign_cost(p, q).is_some())
     }
 
     /// True when every expanded parameter of `a` is assignable to `b`'s — JLS
@@ -5795,7 +5839,21 @@ impl Compiler {
             self.emit_this(line);
         }
 
-        let name_idx = self.b.add_name(&format!("#lambda#{}", self.lambda_counter));
+        // The functional interface the lambda converts to is its type for
+        // `instanceof` and a checked cast (JLS 15.27.3). It rides in the body's
+        // subroutine name, with the class that wrote it, where the host reads
+        // it back ([`crate::host`]'s `lambda_iface`) — so a closure carries it
+        // without any work at creation.
+        let mut sub_name = format!("#lambda#{}", self.lambda_counter);
+        if let Some(iface) = target.filter(|t| self.functional_sam_meta(t).is_some()) {
+            let encloser = self.current_class.clone().unwrap_or_default();
+            let encloser = self
+                .classes
+                .get(&encloser)
+                .map_or(encloser.clone(), |ci| ci.binary.clone());
+            sub_name = format!("{sub_name}#{iface}#{encloser}");
+        }
+        let name_idx = self.b.add_name(&sub_name);
         self.lambda_counter += 1;
         let ncap = captures.len() + usize::from(captures_this);
         self.pending_lambdas.push(PendingLambda {
@@ -11629,10 +11687,18 @@ impl Compiler {
         if self.methods.contains_key(name) {
             let arg_tys: Vec<Option<String>> = self.arg_types(args);
             let resolved = self.resolve_static_call(name, &arg_tys).ok_or_else(|| {
-                format!(
-                    "javars: no `{name}` overload matches {} argument(s) (line {line})",
-                    args.len()
-                )
+                let sigs: Vec<(&[String], bool)> = self.methods[name]
+                    .iter()
+                    .map(|s| (s.param_tys.as_slice(), s.varargs))
+                    .collect();
+                if self.overload_ambiguous(&sigs, &arg_tys) {
+                    format!("javars: reference to {name} is ambiguous (line {line})")
+                } else {
+                    format!(
+                        "javars: no `{name}` overload matches {} argument(s) (line {line})",
+                        args.len()
+                    )
+                }
             })?;
             let args = Self::effective_args(args, &resolved.param_tys, resolved.vararg_from);
             self.call_args_generic(&args, &resolved.param_tys, &resolved.mangled)?;
