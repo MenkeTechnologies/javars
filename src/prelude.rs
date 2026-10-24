@@ -480,6 +480,27 @@ fn prelude_source(declared: &[String]) -> String {
                  String m = getLocalizedMessage(); \
                  if (m == null) { return n; } return n + \": \" + m; }\n",
             );
+        } else if *name == "PatternSyntaxException" {
+            // The JDK's class: one constructor, the three accessors, and a
+            // `getMessage()` built from them — the description, ` near index
+            // N`, the pattern on its own line, and a caret under the index. A
+            // refusal javars raises itself (a construct it cannot run) is marked
+            // `refused` and keeps the message it was raised with.
+            src.push_str(
+                "  String desc;\n  String pattern;\n  int index;\n  boolean refused;\n  \
+                 PatternSyntaxException(String desc, String regex, int index) { \
+                 super(desc); this.desc = desc; this.pattern = regex; this.index = index; }\n  \
+                 String getDescription() { return desc; }\n  \
+                 int getIndex() { return index; }\n  \
+                 String getPattern() { return pattern; }\n  \
+                 String getMessage() { if (refused) { return detailMessage; } \
+                 StringBuilder sb = new StringBuilder(); sb.append(desc); \
+                 if (index >= 0) { sb.append(\" near index \"); sb.append(index); } \
+                 sb.append(\"\n\"); sb.append(pattern); \
+                 if (index >= 0 && pattern != null && index < pattern.length()) { sb.append(\"\n\"); \
+                 for (int i = 0; i < index; i++) { sb.append(pattern.charAt(i) == '\t' ? '\t' : ' '); } \
+                 sb.append('^'); } return sb.toString(); }\n",
+            );
         } else {
             src.push_str(&format!("  {name}() {{ }}\n"));
             src.push_str(&format!("  {name}(String m) {{ super(m); }}\n"));

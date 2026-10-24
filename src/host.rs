@@ -2670,6 +2670,9 @@ pub fn set_exceptions_enabled(on: bool) {
 struct Fault {
     class: &'static str,
     msg: String,
+    /// Fields the throwable carries beside `detailMessage` — a
+    /// `PatternSyntaxException`'s `desc`, `pattern` and `index`.
+    fields: Vec<(&'static str, Value)>,
 }
 
 impl Fault {
@@ -2689,6 +2692,7 @@ impl Fault {
         Fault {
             class: class.rsplit('.').next().unwrap_or(class),
             msg: msg.into(),
+            fields: Vec::new(),
         }
     }
 
@@ -2697,6 +2701,7 @@ impl Fault {
         Fault {
             class: "",
             msg: msg.into(),
+            fields: Vec::new(),
         }
     }
 }
@@ -2740,6 +2745,9 @@ fn raise(vm: &mut VM, f: Fault) -> Value {
         Value::str(f.msg)
     };
     fields.insert("detailMessage".to_string(), msg);
+    for (name, v) in f.fields {
+        fields.insert(name.to_string(), v);
+    }
     let id = heap_alloc(HostObj::Instance {
         class: f.class.to_string(),
         fields,
@@ -13085,6 +13093,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // `split(regex)` is `split(regex, 0)`: trailing empty fields are dropped
         // (interior ones are not), and a no-match returns the whole input.
         ("split", 1) | ("split", 2) => {
+            regex_check(&args[0].as_str_cow(), 0)?;
             let compiled = crate::regex::compile(&args[0].as_str_cow());
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
             let limit = args.get(1).map_or(0, JavaNumeric::jint);
@@ -13095,6 +13104,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             ))
         }
         ("replaceAll", 2) | ("replaceFirst", 2) => {
+            regex_check(&args[0].as_str_cow(), 0)?;
             let compiled = crate::regex::compile(&args[0].as_str_cow());
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
             let out = pat
@@ -13104,6 +13114,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         }
         // `matches` matches the whole input, not a substring of it.
         ("matches", 1) => {
+            regex_check(&args[0].as_str_cow(), 0)?;
             let compiled = crate::regex::compile_whole(&args[0].as_str_cow());
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
             Ok(Value::bool(pat.matches_whole(s).map_err(engine_fault)?))
@@ -14408,6 +14419,9 @@ fn io_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value,
         Some(HostObj::Tokenizer(t)) => Some(t.call(method, args.len())),
         _ => None,
     })?;
+    if let Some(msg) = crate::jio::take_input_refusal() {
+        return Some(Err(Fault::internal(msg)));
+    }
     let Some(out) = out else {
         return Some(Err(Fault::internal(format!(
             "javars: unsupported method `{method}` with {} argument(s) on {}",
@@ -17031,7 +17045,13 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 None => Charset::Utf8,
             };
             let raw: Vec<u8> = bytes[range].iter().map(|b| b.jint() as u8).collect();
-            Ok(Value::str(cs.decode(&raw)))
+            let text = cs.decode(&raw);
+            // A decoded character javars reserves for an unpaired surrogate
+            // (`src/jstr.rs`) cannot be held, so the decoding is refused.
+            if let Some(c) = text.chars().find(|c| jstr::is_reserved(*c as u32)) {
+                return Err(Fault::internal(jstr::reserved_message(c as u32)));
+            }
+            Ok(Value::str(text))
         }
         ("Arrays", "deepHashCode", 1) => Ok(Value::Int(arrays_hash(&args[0], true).into())),
 
@@ -17183,6 +17203,7 @@ fn regex_source(shown: &str, flags: i64) -> Result<String, Fault> {
             "javars: Pattern flag 0x{other:x} is not modeled"
         )));
     }
+    regex_check(shown, flags)?;
     let mut src = String::new();
     if flags & RE_CASE_INSENSITIVE != 0 {
         src.push_str("(?i)");
@@ -17368,6 +17389,9 @@ fn regex_static(class: &str, method: &str, args: &[Value]) -> Option<Result<Valu
             })
         }
         ("Pattern", "matches", [re, input]) => {
+            if let Err(f) = regex_check(&re.as_str_cow(), 0) {
+                return Some(Err(f));
+            }
             let c = crate::regex::compile_whole(&re.as_str_cow());
             match c.as_ref() {
                 Ok(p) => p
@@ -17623,9 +17647,32 @@ fn matcher_method(
 }
 
 /// The `PatternSyntaxException` a pattern the translator or the engine
-/// refused raises, carrying its message.
+/// refused raises, carrying its message. [`regex_check`] has already
+/// passed the pattern by the JDK's rules, so this is a construct javars
+/// cannot run, named in the message (see BUGS.md).
 fn pattern_fault(msg: &str) -> Fault {
-    Fault::java("PatternSyntaxException", msg)
+    let mut f = Fault::java("PatternSyntaxException", msg);
+    f.fields = vec![("refused", Value::bool(true))];
+    f
+}
+
+/// `Pattern.compile`'s syntax check (`src/regex_syntax.rs`) on `pattern`
+/// under `flags`: a pattern the JDK refuses raises its
+/// `PatternSyntaxException`, with the JDK's description, index and message.
+fn regex_check(pattern: &str, flags: i64) -> Result<(), Fault> {
+    let Err(e) = crate::regex_syntax::check(pattern, flags as u32) else {
+        return Ok(());
+    };
+    let mut f = Fault::java(
+        "PatternSyntaxException",
+        crate::regex_syntax::message(&e, pattern),
+    );
+    f.fields = vec![
+        ("desc", Value::str(e.desc)),
+        ("pattern", Value::str(pattern.to_string())),
+        ("index", Value::Int(e.index)),
+    ];
+    Err(f)
 }
 
 /// A replacement string Java rejects: a dangling `\`, a bare `$`, or a

@@ -35,6 +35,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         anon_supers: Vec::new(),
         class_names: std::collections::HashSet::new(),
         last_targs: Vec::new(),
+        last_targs_wildcard: false,
     };
     // The names declared as classes (not interfaces) anywhere in the unit, so
     // an anonymous class can tell a superclass from an interface even when the
@@ -105,6 +106,8 @@ struct Parser {
     /// [`crate::ast::generic_parts`] form — what a declaration site copies into
     /// its `targs`.
     last_targs: Vec<String>,
+    /// Whether a top-level argument of [`Parser::last_targs`] was a wildcard.
+    last_targs_wildcard: bool,
     /// The binary names of the type declarations enclosing the cursor,
     /// innermost last — what a local type declared in a method body is named
     /// after.
@@ -972,6 +975,7 @@ fn record_members(
             line,
             StmtKind::Local {
                 targs: Vec::new(),
+                wildcard: false,
                 ty: "int".to_string(),
                 name: acc.to_string(),
                 init: Some(Expr::Int(0)),
@@ -1363,6 +1367,7 @@ impl Parser {
             }
         }
         let (_, args) = crate::ast::generic_parts(&format!("T{text}"));
+        self.last_targs_wildcard = args.iter().any(|a| a.trim_start().starts_with('?'));
         args.iter()
             .map(|a| crate::ast::normalize_type_arg(a))
             .collect()
@@ -2169,6 +2174,7 @@ impl Parser {
             }
             let base_ty = self.type_name()?;
             let targs = self.last_targs.clone();
+            let wildcard = self.last_targs_wildcard;
             // Every declarator of the statement, in source order: `int a = 1,
             // b = 2;` is two, and `int a[], b;` gives them different types.
             let mut decls = Vec::new();
@@ -2187,6 +2193,7 @@ impl Parser {
                     StmtKind::Local {
                         ty,
                         targs: targs.clone(),
+                        wildcard,
                         name,
                         init,
                     },
@@ -2753,6 +2760,7 @@ impl Parser {
                 line,
                 StmtKind::Local {
                     targs: Vec::new(),
+                    wildcard: false,
                     ty: "Throwable".to_string(),
                     name: primary.clone(),
                     init: Some(var("null")),
@@ -2772,6 +2780,7 @@ impl Parser {
                         line,
                         StmtKind::Local {
                             targs: Vec::new(),
+                            wildcard: false,
                             ty,
                             name: r.name,
                             init: Some(init),
@@ -4241,6 +4250,7 @@ impl Parser {
             StmtKind::Local {
                 ty: ty.to_string(),
                 targs: Vec::new(),
+                wildcard: false,
                 name: self_name.to_string(),
                 init: Some(Expr::NewObject {
                     class: ty.to_string(),

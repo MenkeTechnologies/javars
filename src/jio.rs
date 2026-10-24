@@ -29,6 +29,18 @@
 //!     closed one throws `IOException: Stream closed`.
 
 use std::cell::RefCell;
+
+thread_local! {
+    /// The refusal a stdin read raised (see [`Cursor::fill`]), until the
+    /// host takes it with [`take_input_refusal`].
+    static INPUT_REFUSAL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The refusal the last stdin read raised, if any — a javars error the host
+/// reports in place of the method's answer.
+pub fn take_input_refusal() -> Option<String> {
+    INPUT_REFUSAL.with(|r| r.borrow_mut().take())
+}
 use std::io::{BufRead, Write};
 
 /// A character cursor: the characters read so far, the read position, and
@@ -69,10 +81,21 @@ impl Cursor {
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         match std::io::stdin().lock().read_line(&mut line) {
-            Ok(n) if n > 0 => {
-                self.buf.extend(line.chars());
-                true
-            }
+            // A character javars reserves for an unpaired surrogate
+            // (`src/jstr.rs`) cannot be held: the read is refused rather than
+            // handing the program a surrogate it did not send.
+            Ok(n) if n > 0 => match line.chars().find(|c| crate::jstr::is_reserved(*c as u32)) {
+                Some(c) => {
+                    INPUT_REFUSAL
+                        .with(|r| *r.borrow_mut() = Some(crate::jstr::reserved_message(c as u32)));
+                    self.done = true;
+                    false
+                }
+                None => {
+                    self.buf.extend(line.chars());
+                    true
+                }
+            },
             _ => {
                 self.done = true;
                 false

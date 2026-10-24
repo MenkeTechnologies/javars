@@ -290,6 +290,10 @@ pub enum StmtKind {
         /// Empty for a raw or non-generic type, a type variable erases to
         /// `Object`, and a wildcard reads as its upper bound.
         targs: Vec<String>,
+        /// Whether one of those top-level arguments was written as a wildcard
+        /// (`Comparable<? extends Number>`), which `targs` alone cannot tell
+        /// from the exact `Comparable<Number>`.
+        wildcard: bool,
         name: String,
         init: Option<Expr>,
     },

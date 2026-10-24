@@ -120,8 +120,14 @@ at the bottom, and are summarized in the section right after this one.
   and its `limit`; the `$n`/`${name}` replacement grammar with Java's `\`
   escaping (which is not the `regex` crate's); and `matches`'s whole-region
   anchoring. A malformed pattern raises `java.util.regex.PatternSyntaxException`
-  and a replacement naming an absent group raises `IndexOutOfBoundsException`,
-  both catchable.
+  with the JDK's description, index and pattern (`getDescription`/`getIndex`/
+  `getPattern`, and the three-line `getMessage`), from a port of
+  `Pattern.compile`'s parser in `src/regex_syntax.rs` that stops at the first
+  error the JDK reports, its look-behind length study included; a replacement
+  naming an absent group raises `IndexOutOfBoundsException`. Both are
+  catchable. Two JDK checks need tables javars lacks and are left to the
+  translation: whether a `\p{…}` property name or a `\N{…}` character name
+  exists.
 - **32-bit `float`.** `float` is Java's 32-bit type, not an alias for `double`:
   `1.0f / 3.0f` is `0.33333334`, `(float) 0.1` is not `0.1`, and `(double) 0.1f`
   is `0.10000000149011612`. fusevm has one floating representation, so a `float`
@@ -1344,14 +1350,17 @@ storage-model differences:
   reference that conflicts with its target is refused as `javac` refuses it
   when the target is a primitive (`int x = id(1.5)`), a final JDK class
   (`String s = id(5)`) or a user class (`B y = id(new A())`), and against
-  any other JDK type whenever the bound's whole supertype set is known — a
-  final JDK class's, or a user class's declared supertypes and the JDK
-  interfaces they extend — so `List<String> l = id(5)`, `CharSequence cs =
-  id(5)` and `Runnable r = id(new Foo())` are refused (`openjdk 21.0.13`).
-  Two conflicts are still accepted: one in the target's *type arguments*
-  (`Comparable<String> c = id(5)` — the target reaches the check erased), and
-  one whose bound is a JDK class outside javars's supertype table (an
-  `ArrayList` bound against an unrelated interface).
+  any other JDK type, its type arguments included: `List<String> l = id(5)`,
+  `Comparable<String> c = id(5)`, `Comparable<Number> c = id(5)`,
+  `Iterable<String> it = id(new Baz())` for a `Baz implements
+  Iterable<Integer>`, and `Runnable r = id(new ArrayList<Integer>())` are
+  refused (`openjdk 21.0.13`). A JDK class's supertypes, with their type
+  arguments, come from `src/jdk_supertypes.rs`, which
+  `scripts/GenJdkSupertypes.java` generates off the real JDK by reflection.
+  A wildcard argument (`Comparable<? extends Number>`) is checked only for
+  being unrelated, since javars keeps its upper bound; and only a local
+  declaration's target keeps its type arguments to the check — an
+  assignment or a parameter target compares the class alone.
 - **Compile errors `javac` reports that javars accepts.** Found in round 5,
   each measured on `openjdk 21.0.13`, each running instead of being refused:
   `new O.I()` for an inner class with no enclosing instance (`an enclosing
@@ -1366,12 +1375,10 @@ storage-model differences:
   name (`illegal forward reference`); a `static final` field never assigned
   (`variable K might not have been initialized`); and `List<? super Integer>
   l; Integer x = l.get(0);` (`CAP#1 cannot be converted to Integer`).
-- **`PatternSyntaxException`'s message is fancy-regex's.** `"abc".split("(")`
-  throws, but `getMessage()` reads `Parsing error at position 1: Opening
-  parenthesis without closing parenthesis near index 0` where the JDK writes
-  `Unclosed group near index 1` and the pattern on a second line; and
-  `getDescription`/`getIndex`/`getPattern` are refused at compile time.
-  Measured on `openjdk 21.0.13`.
+- ~~**`PatternSyntaxException`'s message is fancy-regex's.**~~ — fixed: the
+  JDK's description, index, pattern and message, from the parser port in
+  `src/regex_syntax.rs` (see the regular-expression entry). Measured on
+  `openjdk 21.0.13`.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1496,9 +1503,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **The code points `U+10F800..=U+10FFFF` cannot be held as characters.**
   javars stores an unpaired surrogate as one of them (`src/jstr.rs`), so a
   source file holding one, `Character.toChars`/`toString`/`appendCodePoint` of
-  one, are refused with a javars error. Two entry points are not guarded:
-  text read from `System.in` and `new String(bytes, …)` decoding the UTF-8 of
-  such a code point read it as unpaired surrogates (Java: the character).
+  one, text read from `System.in` holding one, and `new String(bytes, …)`
+  decoding one are refused with a javars error (Java reads the character).
 
 - **`StackOverflowError` and `OutOfMemoryError` are never raised**, and a
   program that would provoke either does not fail — it runs until the OS stops

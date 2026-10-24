@@ -578,6 +578,13 @@ struct Compiler {
     /// what substitutes the `java.util.function` interface's erased `Object`
     /// parameters and result (see [`functional_type_arg_slots`]).
     lambda_generic: Option<String>,
+    /// The generic target (`Comparable<String>`) of the expression about to be
+    /// lowered by [`Compiler::expr_targeted`], which takes it: only that one
+    /// expression's bounds check reads it.
+    pending_target_generic: Option<String>,
+    /// Whether [`Compiler::pending_target_generic`] was written with a
+    /// wildcard argument, so its arguments are bounds rather than exact.
+    target_wildcard: Option<bool>,
     /// The parameter types, with type arguments, of a lambda literal passed to
     /// a JDK generic method whose receiver's type arguments are known —
     /// `li.replaceAll(x -> x * 2)` on a `List<Integer>` takes an `Integer`.
@@ -780,6 +787,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_target: None,
         lambda_ret_hint: None,
         lambda_generic: None,
+        pending_target_generic: None,
+        target_wildcard: None,
         lambda_param_hint: None,
         switch_is_statement: false,
         ref_arity_hint: None,
@@ -2631,6 +2640,7 @@ impl Compiler {
                     targs,
                     name,
                     init,
+                    ..
                 } => {
                     let t = if ty == "var" {
                         init.as_ref()
@@ -5622,7 +5632,11 @@ impl Compiler {
                 return Ok(());
             }
         }
-        if let Some(msg) = target.and_then(|t| self.incompatible_inferred_return(t, e)) {
+        let generic = self.pending_target_generic.take();
+        let exact = self.target_wildcard.take().map(|w| !w);
+        if let Some(msg) =
+            target.and_then(|t| self.incompatible_inferred_return(t, generic.as_deref(), exact, e))
+        {
             return Err(msg);
         }
         // A targeted `switch` expression is a poly expression: the target
@@ -5703,8 +5717,9 @@ impl Compiler {
         generic: Option<String>,
     ) -> Result<(), String> {
         if matches!(e, Expr::Lambda { .. }) {
-            self.lambda_generic = generic;
+            self.lambda_generic = generic.clone();
         }
+        self.pending_target_generic = generic;
         let r = self.expr_targeted(e, target);
         self.lambda_generic = None;
         r
@@ -5807,7 +5822,13 @@ impl Compiler {
     /// target makes `R` its wrapper, and a lambda returning anything else
     /// leaves `R` with incompatible bounds — `double d = ap(1, x -> 9)` binds
     /// `R` to both `Double` and `Integer`. `Some(message)` for such a call.
-    fn incompatible_inferred_return(&self, target: &str, init: &Expr) -> Option<String> {
+    fn incompatible_inferred_return(
+        &self,
+        target: &str,
+        generic: Option<&str>,
+        exact: Option<bool>,
+        init: &Expr,
+    ) -> Option<String> {
         let (name, args, line) = match init {
             Expr::Call { name, args, line } => (name.as_str(), args, *line),
             _ => return None,
@@ -5893,46 +5914,115 @@ impl Compiler {
                 // is known: a final JDK class's are fixed, and a user class's
                 // are its declared ones plus what the JDK interfaces among
                 // them extend.
-                // The target arrives erased, so only its class is compared:
-                // a type-argument conflict (`Comparable<String> c = id(5)`)
-                // is not seen.
+                // A JDK target: one javars does not model as a class, or one of
+                // the functional interfaces the prelude declares.
                 let base = erased_simple_name(target);
-                if user(base) || jdk_supertypes_of(base).is_none() {
+                let jdk_target = jdk_supertype_entry(base).is_some()
+                    && (!user(base) || crate::prelude::is_functional(base));
+                if !jdk_target {
                     return None;
                 }
                 let sups = self.known_supertypes(&got)?;
-                (!sups.iter().any(|s| s == base)).then(reject).flatten()
+                let Some((_, have)) = sups.iter().find(|(s, _)| s == base) else {
+                    return reject();
+                };
+                // The target's type arguments against the ones the bound
+                // gives that supertype (`Integer` is `Comparable<Integer>`).
+                // Written exactly, an argument must be the same type
+                // (`Comparable<Number> c = id(5)` is refused); one written as a
+                // wildcard arrives as its upper bound, so it conflicts only
+                // when neither type is a subtype of the other.
+                let want = generic
+                    .map(|g| crate::ast::generic_parts(g).1)
+                    .unwrap_or_default();
+                let conflict = have.iter().zip(&want).any(|(h, w)| {
+                    let concrete = |t: &str| !t.contains(['#', '?']);
+                    let differ = match exact {
+                        Some(true) => h.replace(' ', "") != w.replace(' ', ""),
+                        Some(false) => w != "Object" && !self.related(h, w),
+                        None => false,
+                    };
+                    concrete(h) && concrete(w) && differ
+                });
+                conflict.then(reject).flatten()
             }
         }
     }
 
-    /// Every supertype of `t` by simple name, `Object` aside, when javars can
-    /// know them all: a final JDK class's from its declaration, a user
-    /// class's from its declared supertypes and the JDK interfaces they
-    /// extend. `None` when one of them is a JDK type outside
-    /// [`jdk_supertypes_of`]'s table, whose supertypes javars does not know.
-    fn known_supertypes(&self, t: &str) -> Option<Vec<String>> {
-        if let Some(fixed) = final_jdk_supertypes(t) {
-            return Some(fixed.iter().map(|s| s.to_string()).collect());
+    /// Every supertype of `t` (`Object` aside), each with its type arguments
+    /// in terms of `t`'s own type parameters (`#E`), as concrete simple names,
+    /// or `?` — when javars can know them all: a JDK type's from the table
+    /// generated off the real JDK (`src/jdk_supertypes.rs`), a user class's
+    /// from its declared supertypes and theirs. `None` when one of them is a
+    /// type javars knows nothing of.
+    fn known_supertypes(&self, t: &str) -> Option<Vec<(String, Vec<String>)>> {
+        self.known_supertypes_depth(t, 0)
+    }
+
+    fn known_supertypes_depth(&self, t: &str, depth: usize) -> Option<Vec<(String, Vec<String>)>> {
+        let t = erased_simple_name(t);
+        if !self.classes.contains_key(t) {
+            let (_, sups) = jdk_supertype_entry(t)?;
+            return Some(
+                sups.iter()
+                    .map(|(s, args)| (s.to_string(), args.iter().map(|a| a.to_string()).collect()))
+                    .collect(),
+            );
         }
-        self.classes.get(t)?;
-        let mut out: Vec<String> = Vec::new();
-        let mut stack: Vec<String> = vec![t.to_string()];
-        while let Some(cur) = stack.pop() {
-            let cur = erased_simple_name(&cur).to_string();
-            if out.contains(&cur) {
-                continue;
+        // A cycle is a program javac rejects; the bound keeps the walk finite.
+        if depth > 64 {
+            return None;
+        }
+        let ci = self.classes.get(t)?;
+        let mut direct: Vec<(String, Vec<String>)> = ci.interfaces.clone();
+        if let Some(sup) = &ci.superclass {
+            direct.insert(0, (sup.clone(), ci.super_targs.clone()));
+        }
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, args) in direct {
+            let name = erased_simple_name(&name).to_string();
+            let params: Vec<String> = match self.classes.get(&name) {
+                Some(sci) => sci.type_params.clone(),
+                None => jdk_supertype_entry(&name)?
+                    .0
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect(),
+            };
+            // A supertype's arguments are written in its own parameters;
+            // `subst` rewrites them into `t`'s.
+            let subst = |a: &str| -> String {
+                match a
+                    .strip_prefix('#')
+                    .and_then(|p| params.iter().position(|q| q == p))
+                {
+                    Some(i) => args.get(i).cloned().unwrap_or_else(|| "?".to_string()),
+                    None => a.to_string(),
+                }
+            };
+            let inherited = self.known_supertypes_depth(&name, depth + 1)?;
+            if !out.iter().any(|(s, _)| *s == name) {
+                out.push((name, args.clone()));
             }
-            match self.classes.get(&cur) {
-                Some(ci) => stack.extend(ci.supertypes.iter().cloned()),
-                None => {
-                    let sups = jdk_supertypes_of(&cur)?;
-                    stack.extend(sups.iter().map(|s| s.to_string()));
+            for (s, sargs) in inherited {
+                if !out.iter().any(|(o, _)| *o == s) {
+                    out.push((s, sargs.iter().map(|a| subst(a)).collect()));
                 }
             }
-            out.push(cur);
         }
         Some(out)
+    }
+
+    /// Whether one of two class names is a subtype of the other, as far as
+    /// javars can tell — `true` when it cannot, so a caller refusing on
+    /// `false` refuses only what it knows.
+    fn related(&self, a: &str, b: &str) -> bool {
+        let (a, b) = (erased_simple_name(a), erased_simple_name(b));
+        let below = |x: &str, y: &str| match self.known_supertypes(x) {
+            Some(sups) => sups.iter().any(|(s, _)| s == y),
+            None => true,
+        };
+        a == b || below(a, b) || below(b, a)
     }
 
     /// The parameter and result types of the functional interface `base`
@@ -6577,6 +6667,7 @@ impl Compiler {
             StmtKind::Local {
                 ty,
                 targs,
+                wildcard,
                 name,
                 init,
             } => {
@@ -6610,6 +6701,7 @@ impl Compiler {
                 self.declare_local(name, &raw, nt);
                 self.declare_generic(name, generic.clone());
                 if let Some(e) = init {
+                    self.target_wildcard = Some(*wildcard);
                     self.expr_targeted_generic(e, Some(&raw), generic)?;
                     self.emit_set(name, line);
                 }
@@ -7343,6 +7435,7 @@ impl Compiler {
             line,
             StmtKind::Local {
                 targs: Vec::new(),
+                wildcard: false,
                 ty: ty.to_string(),
                 name: name.to_string(),
                 init: Some(call(Expr::Var(it.clone()), "next")),
@@ -7354,6 +7447,7 @@ impl Compiler {
                 line,
                 StmtKind::Local {
                     targs: Vec::new(),
+                    wildcard: false,
                     ty: "Iterator".to_string(),
                     name: it.clone(),
                     init: Some(call(iter.clone(), "iterator")),
@@ -8842,6 +8936,7 @@ impl Compiler {
             line,
             StmtKind::Local {
                 targs: Vec::new(),
+                wildcard: false,
                 ty: "Consumer".to_string(),
                 name: action,
                 init: Some(args[0].clone()),
@@ -9559,12 +9654,14 @@ impl Compiler {
                 let body = [
                     StmtKind::Local {
                         targs: Vec::new(),
+                        wildcard: false,
                         ty: rc.clone(),
                         name: it.clone(),
                         init: Some(recv.clone()),
                     },
                     StmtKind::Local {
                         targs: Vec::new(),
+                        wildcard: false,
                         ty: "Consumer".to_string(),
                         name: action.clone(),
                         init: Some(args[0].clone()),
@@ -13711,49 +13808,16 @@ fn erased_simple_name(t: &str) -> &str {
     head.rsplit('.').next().unwrap_or(head)
 }
 
-/// The supertypes of a final JDK class (`Object` aside), from its
-/// declaration: `String` is a `CharSequence`, the numeric wrappers are
-/// `Number`s, and each is `Comparable` to itself.
-fn final_jdk_supertypes(t: &str) -> Option<&'static [&'static str]> {
-    Some(match t {
-        "String" => &[
-            "CharSequence",
-            "Comparable",
-            "Serializable",
-            "Constable",
-            "ConstantDesc",
-        ],
-        "Integer" | "Long" | "Double" | "Float" => &[
-            "Number",
-            "Comparable",
-            "Serializable",
-            "Constable",
-            "ConstantDesc",
-        ],
-        "Short" | "Byte" => &["Number", "Comparable", "Serializable", "Constable"],
-        "Character" | "Boolean" => &["Comparable", "Serializable", "Constable"],
-        _ => return None,
-    })
-}
-
-/// The direct supertypes of the JDK interfaces and classes whose whole
-/// supertype set javars knows — the ones a generic call's bound is checked
-/// against (JLS 18.5.2.1). `None` for any other JDK type.
-fn jdk_supertypes_of(t: &str) -> Option<&'static [&'static str]> {
-    Some(match t {
-        "Iterable" | "Comparable" | "Runnable" | "Map" | "Comparator" | "Cloneable"
-        | "Serializable" | "AutoCloseable" | "CharSequence" | "Iterator" | "Constable"
-        | "ConstantDesc" | "Function" | "BiFunction" | "Supplier" | "Consumer" | "BiConsumer"
-        | "Predicate" | "BiPredicate" | "Callable" | "RandomAccess" => &[],
-        "Number" => &["Serializable"],
-        "Closeable" => &["AutoCloseable"],
-        "Collection" => &["Iterable"],
-        "SequencedCollection" => &["Collection"],
-        "List" => &["SequencedCollection"],
-        "Set" | "Queue" => &["Collection"],
-        "Deque" => &["Queue", "SequencedCollection"],
-        "UnaryOperator" => &["Function"],
-        "BinaryOperator" => &["BiFunction"],
-        _ => return None,
-    })
+/// A JDK class or interface's type parameters and full supertype set, from
+/// the table `scripts/GenJdkSupertypes.java` generates off the real JDK.
+#[allow(clippy::type_complexity)]
+fn jdk_supertype_entry(
+    t: &str,
+) -> Option<(
+    &'static [&'static str],
+    &'static [(&'static str, &'static [&'static str])],
+)> {
+    let table = crate::jdk_supertypes::JDK_SUPERTYPES;
+    let i = table.binary_search_by(|(n, _, _)| (*n).cmp(t)).ok()?;
+    Some((table[i].1, table[i].2))
 }

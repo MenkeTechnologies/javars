@@ -4007,3 +4007,297 @@ fn an_enum_is_not_instantiated_with_new() {
     assert!(ok, "{out}");
     assert_eq!(out, "B 0\n");
 }
+
+/// A generic call's inferred bound is checked against the target's type
+/// arguments (exactly when written exactly, as a bound when written as a
+/// wildcard) and against JDK classes, whose supertypes come from the table
+/// `scripts/GenJdkSupertypes.java` generates off the real JDK. Each verdict
+/// measured on openjdk 21.0.13: javac reports "inference variable T has
+/// incompatible bounds" for every refused line.
+#[test]
+fn generic_bounds_check_type_arguments_and_jdk_classes() {
+    let program = |decl: &str| {
+        format!(
+            r#"import java.util.*;
+public class T {{
+    static <T> T id(T t) {{ return t; }}
+    static class Foo {{}}
+    static class Bar implements Runnable {{ public void run() {{}} }}
+    static class Baz implements Iterable<Integer> {{ public Iterator<Integer> iterator() {{ return List.of(1).iterator(); }} }}
+    static class Sub extends Baz {{}}
+    static class Qux implements Comparable<Foo> {{ public int compareTo(Foo f) {{ return 0; }} }}
+    static class Box<E> implements Comparable<Box<E>> {{ public int compareTo(Box<E> b) {{ return 0; }} }}
+    public static void main(String[] a) {{ {decl} }}
+}}
+"#
+        )
+    };
+    let refused = [
+        "List<String> l = id(5);",
+        "Comparable<String> c = id(5);",
+        "Comparable<Number> c = id(5);",
+        "Comparable<Object> c = id(5);",
+        "Comparable<String> c = id(new Qux());",
+        "Iterable<String> it = id(new Baz());",
+        "Runnable r = id(new ArrayList<Integer>());",
+        "Map<String, Integer> m = id(new ArrayList<Integer>());",
+        "Deque<Integer> d = id(new ArrayList<Integer>());",
+        "Comparable<String> cs = id(new StringBuilder(\"q\"));",
+        "Iterable<Integer> it = id(new Foo());",
+    ];
+    for decl in refused {
+        let (out, ok) = run(&program(decl));
+        assert!(!ok, "{decl} ran: {out}");
+    }
+    let accepted = [
+        (
+            "Comparable<Integer> c = id(5); System.out.println(c);",
+            "5\n",
+        ),
+        (
+            "Comparable<? extends Number> c = id(5); System.out.println(c);",
+            "5\n",
+        ),
+        (
+            "Comparable<? super Integer> c = id(5); System.out.println(c);",
+            "5\n",
+        ),
+        (
+            "Comparable<Foo> c = id(new Qux()); System.out.println(c != null);",
+            "true\n",
+        ),
+        (
+            "Iterable<Integer> it = id(new Sub()); System.out.println(it != null);",
+            "true\n",
+        ),
+        (
+            "Collection<Integer> c = id(new ArrayList<Integer>()); System.out.println(c);",
+            "[]\n",
+        ),
+        (
+            "Deque<Integer> d = id(new ArrayDeque<Integer>()); System.out.println(d);",
+            "[]\n",
+        ),
+        (
+            "CharSequence cs = id(new StringBuilder(\"q\")); System.out.println(cs);",
+            "q\n",
+        ),
+        (
+            "Comparable<StringBuilder> cs = id(new StringBuilder(\"q\")); System.out.println(cs);",
+            "q\n",
+        ),
+        (
+            "Number n = id(java.math.BigInteger.ONE); System.out.println(n);",
+            "1\n",
+        ),
+        (
+            "Comparable<Box<Integer>> c = id(new Box<Integer>()); System.out.println(c != null);",
+            "true\n",
+        ),
+    ];
+    for (decl, want) in accepted {
+        let (out, ok) = run(&program(decl));
+        assert!(ok, "{decl}: {out}");
+        assert_eq!(out, want, "{decl}");
+    }
+}
+
+/// Stdout, stderr, and success of one program fed `input` on stdin.
+fn run_with_stdin(src: &str, input: &str) -> (String, String, bool) {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("javars_round2_in_{}", fnv1a(src)));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("T.java");
+    std::fs::write(&path, src).expect("write program");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn java");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("feed stdin");
+    let out = child.wait_with_output().expect("wait");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// javars holds an unpaired surrogate as a code point from
+/// `U+10F800..=U+10FFFF` (`src/jstr.rs`), so a real character from that range
+/// arriving on stdin or decoded from bytes is refused with a javars error
+/// rather than read as a surrogate the program never sent. (Java reads it:
+/// openjdk 21.0.13 prints `4` for the line's length.) Text outside the range
+/// reads as before.
+#[test]
+fn reserved_code_points_from_input_are_refused() {
+    let reserved = char::from_u32(0x10F800).expect("scalar");
+    let src = "import java.util.*;\npublic class T { public static void main(String[] a) { Scanner sc = new Scanner(System.in); System.out.println(sc.nextLine().length()); } }\n";
+    let (out, err, ok) = run_with_stdin(src, &format!("a{reserved}b\n"));
+    assert!(!ok, "{out}");
+    assert!(err.contains("U+10F800 is reserved"), "{err}");
+    let astral = char::from_u32(0x1F600).expect("scalar");
+    let (out, _, ok) = run_with_stdin(src, &format!("a{astral}b\n"));
+    assert!(ok);
+    assert_eq!(out, "4\n");
+    let bytes = "public class T { public static void main(String[] a) throws Exception { System.out.println(new String(new byte[]{(byte) 0xF4, (byte) 0x8F, (byte) 0xA0, (byte) 0x80}, \"UTF-8\").length()); } }\n";
+    let (out, err, ok) = run_with_stderr(bytes);
+    assert!(!ok, "{out}");
+    assert!(err.contains("U+10F800 is reserved"), "{err}");
+}
+
+/// `PatternSyntaxException` carries the JDK's description, index and pattern, and
+/// `getMessage()` is its three-line form, for each error `Pattern.compile`
+/// reports: the check in `src/regex_syntax.rs` ports the JDK's parser, its
+/// look-behind length study included. Measured on openjdk 21.0.13.
+#[test]
+fn pattern_syntax_errors_carry_the_jdk_description_and_index() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String[] ps = {
+            "(",
+            "a)",
+            "*a",
+            "[a",
+            "a{2,1}",
+            "\\",
+            "a\\",
+            "a{",
+            "a{x}",
+            "a{2",
+            "a{1,x}",
+            "+",
+            "?x",
+            "a**",
+            "a{99999999999}",
+            "[b-a]",
+            "[a-",
+            "[]",
+            "[]a]",
+            "[^]",
+            "[a&&]",
+            "[&&a]",
+            "[a&&&b]",
+            "(?<n>a)(?<n>b)",
+            "(?<1n>a)",
+            "(?<n",
+            "\\k<x>",
+            "\\kx",
+            "(?$a)",
+            "(?@a)",
+            "(?q)",
+            "(?i",
+            "(?i)a",
+            "\\p",
+            "\\p{",
+            "\\p{}",
+            "\\x",
+            "\\xG",
+            "\\x{",
+            "\\x{110000}",
+            "\\x{41",
+            "\\u12",
+            "\\uZZZZ",
+            "\\0",
+            "\\08",
+            "\\c",
+            "\\y",
+            "[\\y]",
+            "[\\1]",
+            "\\Qa(\\E)",
+            "\\Q(",
+            "a\\Q)\\E*",
+            "x|*",
+            "(a|)",
+            "a{,3}",
+            "\\N",
+            "\\N{",
+            "\\N{LATIN",
+            "\\b{g",
+            "[\\v-a]",
+            "a{3}{2}",
+            "(?x)a b)",
+            ")",
+            "a||b)",
+            "[[a]",
+            "[a[b]",
+            "[a-\\d]",
+            "\\R{2}",
+            "(?:a",
+            "(?=a",
+            "(?>a",
+            "\t\\q",
+            "ab\\tc(",
+            "[z-a\\t]",
+            "\\Q*\\E+\\Qab\\E(",
+            "\\x{1F600}(",
+            "\ud83d\ude00(",
+            "(?<a>x)\\k<b>",
+            "(?x)[a b",
+            "a{1}{",
+            "[\\Q]\\E",
+        };
+        for (String p : ps) {
+            try { java.util.regex.Pattern.compile(p); System.out.println("OK " + p); }
+            catch (java.util.regex.PatternSyntaxException e) { System.out.println(e.getDescription() + " | " + e.getIndex() + " | " + e.getPattern()); System.out.println("[" + e.getMessage() + "]"); }
+        }
+        try { "abc".split("a{"); } catch (IllegalArgumentException e) { System.out.println(e.getClass().getName() + ": " + e.getMessage()); }
+        try { java.util.regex.Pattern.compile("(?<x>a)(?<x>b)", java.util.regex.Pattern.CASE_INSENSITIVE); } catch (java.util.regex.PatternSyntaxException e) { System.out.println(e.getIndex() + " " + e); }
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "Unclosed group | 1 | (\n[Unclosed group near index 1\n(]\nUnmatched closing ')' | 0 | a)\n[Unmatched closing ')' near index 0\na)\n^]\nDangling meta character '*' | 0 | *a\n[Dangling meta character '*' near index 0\n*a\n^]\nUnclosed character class | 1 | [a\n[Unclosed character class near index 1\n[a\n ^]\nIllegal repetition range | 5 | a{2,1}\n[Illegal repetition range near index 5\na{2,1}\n     ^]\nUnescaped trailing backslash | 1 | \\\n[Unescaped trailing backslash near index 1\n\\]\nUnescaped trailing backslash | 2 | a\\\n[Unescaped trailing backslash near index 2\na\\]\nIllegal repetition | 2 | a{\n[Illegal repetition near index 2\na{]\nIllegal repetition | 2 | a{x}\n[Illegal repetition near index 2\na{x}\n  ^]\nUnclosed counted closure | 3 | a{2\n[Unclosed counted closure near index 3\na{2]\nUnclosed counted closure | 4 | a{1,x}\n[Unclosed counted closure near index 4\na{1,x}\n    ^]\nDangling meta character '+' | 0 | +\n[Dangling meta character '+' near index 0\n+\n^]\nDangling meta character '?' | 0 | ?x\n[Dangling meta character '?' near index 0\n?x\n^]\nDangling meta character '*' | 2 | a**\n[Dangling meta character '*' near index 2\na**\n  ^]\nIllegal repetition range | 11 | a{99999999999}\n[Illegal repetition range near index 11\na{99999999999}\n           ^]\nIllegal character range | 3 | [b-a]\n[Illegal character range near index 3\n[b-a]\n   ^]\nIllegal character range | 3 | [a-\n[Illegal character range near index 3\n[a-]\nUnclosed character class | 1 | []\n[Unclosed character class near index 1\n[]\n ^]\nOK []a]\nUnclosed character class | 2 | [^]\n[Unclosed character class near index 2\n[^]\n  ^]\nOK [a&&]\nOK [&&a]\nOK [a&&&b]\nNamed capturing group <n> is already defined | 11 | (?<n>a)(?<n>b)\n[Named capturing group <n> is already defined near index 11\n(?<n>a)(?<n>b)\n           ^]\ncapturing group name does not start with a Latin letter | 3 | (?<1n>a)\n[capturing group name does not start with a Latin letter near index 3\n(?<1n>a)\n   ^]\nnamed capturing group is missing trailing '>' | 4 | (?<n\n[named capturing group is missing trailing '>' near index 4\n(?<n]\nnamed capturing group <x> does not exist | 4 | \\k<x>\n[named capturing group <x> does not exist near index 4\n\\k<x>\n    ^]\n\\k is not followed by '<' for named capturing group | 2 | \\kx\n[\\k is not followed by '<' for named capturing group near index 2\n\\kx\n  ^]\nUnknown group type | 2 | (?$a)\n[Unknown group type near index 2\n(?$a)\n  ^]\nUnknown group type | 2 | (?@a)\n[Unknown group type near index 2\n(?@a)\n  ^]\nUnknown inline modifier | 2 | (?q)\n[Unknown inline modifier near index 2\n(?q)\n  ^]\nUnknown inline modifier | 3 | (?i\n[Unknown inline modifier near index 3\n(?i]\nOK (?i)a\nUnknown character property name {\u{0}} | 2 | \\p\n[Unknown character property name {\u{0}} near index 2\n\\p]\nUnclosed character family | 3 | \\p{\n[Unclosed character family near index 3\n\\p{]\nEmpty character family | 3 | \\p{}\n[Empty character family near index 3\n\\p{}\n   ^]\nIllegal hexadecimal escape sequence | 2 | \\x\n[Illegal hexadecimal escape sequence near index 2\n\\x]\nIllegal hexadecimal escape sequence | 2 | \\xG\n[Illegal hexadecimal escape sequence near index 2\n\\xG\n  ^]\nIllegal hexadecimal escape sequence | 2 | \\x{\n[Illegal hexadecimal escape sequence near index 2\n\\x{\n  ^]\nHexadecimal codepoint is too big | 8 | \\x{110000}\n[Hexadecimal codepoint is too big near index 8\n\\x{110000}\n        ^]\nUnclosed hexadecimal escape sequence | 5 | \\x{41\n[Unclosed hexadecimal escape sequence near index 5\n\\x{41]\nIllegal Unicode escape sequence | 4 | \\u12\n[Illegal Unicode escape sequence near index 4\n\\u12]\nIllegal Unicode escape sequence | 2 | \\uZZZZ\n[Illegal Unicode escape sequence near index 2\n\\uZZZZ\n  ^]\nIllegal octal escape sequence | 2 | \\0\n[Illegal octal escape sequence near index 2\n\\0]\nIllegal octal escape sequence | 2 | \\08\n[Illegal octal escape sequence near index 2\n\\08\n  ^]\nIllegal control escape sequence | 1 | \\c\n[Illegal control escape sequence near index 1\n\\c\n ^]\nIllegal/unsupported escape sequence | 1 | \\y\n[Illegal/unsupported escape sequence near index 1\n\\y\n ^]\nIllegal/unsupported escape sequence | 2 | [\\y]\n[Illegal/unsupported escape sequence near index 2\n[\\y]\n  ^]\nIllegal/unsupported escape sequence | 2 | [\\1]\n[Illegal/unsupported escape sequence near index 2\n[\\1]\n  ^]\nUnmatched closing ')' | 2 | \\Qa(\\E)\n[Unmatched closing ')' near index 2\n\\Qa(\\E)\n  ^]\nOK \\Q(\nOK a\\Q)\\E*\nDangling meta character '*' | 2 | x|*\n[Dangling meta character '*' near index 2\nx|*\n  ^]\nOK (a|)\nIllegal repetition | 2 | a{,3}\n[Illegal repetition near index 2\na{,3}\n  ^]\nIllegal character name escape sequence | 2 | \\N\n[Illegal character name escape sequence near index 2\n\\N]\nUnclosed character name escape sequence | 3 | \\N{\n[Unclosed character name escape sequence near index 3\n\\N{]\nUnclosed character name escape sequence | 7 | \\N{LATIN\n[Unclosed character name escape sequence near index 7\n\\N{LATIN\n       ^]\nIllegal/unsupported escape sequence | 4 | \\b{g\n[Illegal/unsupported escape sequence near index 4\n\\b{g]\nOK [\\v-a]\nOK a{3}{2}\nUnmatched closing ')' | 6 | (?x)a b)\n[Unmatched closing ')' near index 6\n(?x)a b)\n      ^]\nUnmatched closing ')' | -1 | )\n[Unmatched closing ')'\n)]\nUnmatched closing ')' | 3 | a||b)\n[Unmatched closing ')' near index 3\na||b)\n   ^]\nUnclosed character class | 3 | [[a]\n[Unclosed character class near index 3\n[[a]\n   ^]\nUnclosed character class | 4 | [a[b]\n[Unclosed character class near index 4\n[a[b]\n    ^]\nIllegal character range | 4 | [a-\\d]\n[Illegal character range near index 4\n[a-\\d]\n    ^]\nOK \\R{2}\nUnclosed group | 4 | (?:a\n[Unclosed group near index 4\n(?:a]\nUnclosed group | 4 | (?=a\n[Unclosed group near index 4\n(?=a]\nUnclosed group | 4 | (?>a\n[Unclosed group near index 4\n(?>a]\nIllegal/unsupported escape sequence | 2 | \t\\q\n[Illegal/unsupported escape sequence near index 2\n\t\\q\n\t ^]\nUnclosed group | 6 | ab\\tc(\n[Unclosed group near index 6\nab\\tc(]\nIllegal character range | 3 | [z-a\\t]\n[Illegal character range near index 3\n[z-a\\t]\n   ^]\nUnclosed group | 6 | \\Q*\\E+\\Qab\\E(\n[Unclosed group near index 6\n\\Q*\\E+\\Qab\\E(\n      ^]\nUnclosed group | 10 | \\x{1F600}(\n[Unclosed group near index 10\n\\x{1F600}(]\nUnclosed group | 2 | \u{1F600}(\n[Unclosed group near index 2\n\u{1F600}(\n  ^]\nnamed capturing group <b> does not exist | 11 | (?<a>x)\\k<b>\n[named capturing group <b> does not exist near index 11\n(?<a>x)\\k<b>\n           ^]\nUnclosed character class | 7 | (?x)[a b\n[Unclosed character class near index 7\n(?x)[a b\n       ^]\nIllegal repetition | 5 | a{1}{\n[Illegal repetition near index 5\na{1}{]\nUnclosed character class | 2 | [\\Q]\\E\n[Unclosed character class near index 2\n[\\Q]\\E\n  ^]\njava.util.regex.PatternSyntaxException: Illegal repetition near index 2\na{\n11 java.util.regex.PatternSyntaxException: Named capturing group <x> is already defined near index 11\n(?<x>a)(?<x>b)\n           ^\n");
+}
+
+/// A look-behind is refused when `Node.study` finds no obvious maximum length:
+/// a back-reference, a non-deterministic group under a quantifier (a `Loop`),
+/// or a `Curly` whose length times its count overflows `int`; a greedy `*` on
+/// one character (`CharPropertyGreedy`) is accepted. Measured on openjdk 21.0.13.
+#[test]
+fn look_behind_length_follows_the_jdk_study() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String[] ps = {
+            "(?<=(ab)*)c",
+            "(?<=(?:ab)+)c",
+            "(?<=\\1)(a)",
+            "(a)(?<=\\1)",
+            "(?<=x(?:ab)*)c",
+            "(?<=(?<n>a)\\k<n>)b",
+            "(?<=x(ab)?)c",
+            "(?<=(?:a|bc)+)d",
+            "(?<=(a|b)*)c",
+            "(?<=xa*?)b",
+            "(?<=(ab)*+)c",
+            "(?<=(?>ab)*)c",
+            "(?<=a*)b",
+            "(?<=(a)*)b",
+            "(?<=a|bc*)d",
+            "(?<=(a|b){2})c",
+            "(?<=a{1,3})b",
+            "(?<=\\R)a",
+        };
+        for (String p : ps) {
+            try { java.util.regex.Pattern.compile(p); System.out.println("OK " + p); }
+            catch (java.util.regex.PatternSyntaxException e) { System.out.println(e.getDescription() + " | " + e.getIndex()); }
+        }
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "Look-behind group does not have an obvious maximum length | 8\nLook-behind group does not have an obvious maximum length | 10\nLook-behind group does not have an obvious maximum length | 5\nLook-behind group does not have an obvious maximum length | 8\nLook-behind group does not have an obvious maximum length | 11\nLook-behind group does not have an obvious maximum length | 15\nOK (?<=x(ab)?)c\nLook-behind group does not have an obvious maximum length | 12\nLook-behind group does not have an obvious maximum length | 9\nLook-behind group does not have an obvious maximum length | 7\nLook-behind group does not have an obvious maximum length | 9\nLook-behind group does not have an obvious maximum length | 10\nOK (?<=a*)b\nOK (?<=(a)*)b\nOK (?<=a|bc*)d\nLook-behind group does not have an obvious maximum length | 11\nOK (?<=a{1,3})b\nOK (?<=\\R)a\n");
+}
