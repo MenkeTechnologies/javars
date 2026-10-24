@@ -1948,9 +1948,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   constant by name is not recognized as one. The entry class initializes
   before `main`; a class whose initializers only store literals is seeded up
   front, since nothing can observe when. Not modeled: a static *method
-  reference* (`C::m`) and a `Class.forName` do not trigger initialization, and
-  an exception thrown by an initializer surfaces as itself rather than as
-  `ExceptionInInitializerError`.
+  reference* (`C::m`) and a `Class.forName` do not trigger initialization.
+  An initializer that completes abruptly follows JLS 12.4.2: the exception
+  reaches the use wrapped in an `ExceptionInInitializerError` (an `Error`
+  escapes as itself), the class is erroneous from then on, and every later
+  use throws `NoClassDefFoundError: Could not initialize class T$C`, caused
+  by the `ExceptionInInitializerError` the JDK records (`Exception … [in
+  thread "main"]`). Uncaught, it is reported as the
+  `ExceptionInInitializerError` with a `Caused by:` line — the entry class's
+  own initializer included.
 - **Field *hiding*: one cell per declaration, chosen by the static type.** An
   instance is one map of fields. A name only one class in the chain declares
   is keyed by the bare name; a subclass that re-declares a field an ancestor

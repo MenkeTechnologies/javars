@@ -1318,6 +1318,18 @@ impl Compiler {
         let Some(cl) = prog.classes.iter().find(|c| c.name == prog.class_name) else {
             return Ok(());
         };
+        // The entry class's initialization is bracketed like a lazy one's
+        // (see [`Compiler::emit_clinit_guard`]): an exception escaping it
+        // reaches the uncaught report while the bracket is open, which is
+        // what reports it as the `ExceptionInInitializerError` it becomes.
+        let observable = !cl.static_init.is_empty() || !cl.enum_constants.is_empty();
+        let binary_c = self.b.add_constant(Value::str(cl.binary.clone()));
+        if observable {
+            self.b.emit(Op::LoadConst(binary_c), cl.line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JCLINIT_ENTER, 1), cl.line);
+            self.b.emit(Op::Pop, cl.line);
+        }
         if let Some(sup) = cl.superclass.clone() {
             self.emit_clinit_guard(&sup, cl.line);
         }
@@ -1325,6 +1337,12 @@ impl Compiler {
         let saved = self.current_class.replace(cl.name.clone());
         let result = cl.static_init.iter().try_for_each(|s| self.stmt(s));
         self.current_class = saved;
+        if observable {
+            self.b.emit(Op::LoadConst(binary_c), cl.line);
+            self.b
+                .emit(Op::CallBuiltin(crate::host::JCLINIT_EXIT, 1), cl.line);
+            self.b.emit(Op::Pop, cl.line);
+        }
         result
     }
 
@@ -1365,9 +1383,28 @@ impl Compiler {
         }
         self.emit_global_get(&clinit_flag(class), line);
         let done = self.b.emit(Op::JumpIfTrue(0), line);
+        // JLS 12.4.2: a class whose initialization failed is erroneous, so a
+        // later use throws `NoClassDefFoundError` rather than retrying, and an
+        // exception escaping the initializer leaves it wrapped in an
+        // `ExceptionInInitializerError` (an `Error` escapes as itself). The
+        // flag drops back to false on failure, so the next use reaches the
+        // check again.
+        let binary = self.classes.get(class).map_or(class, |ci| &ci.binary);
+        let binary_c = self.b.add_constant(Value::str(binary.to_string()));
+        self.b.emit(Op::LoadConst(binary_c), line);
+        self.emit_raising_builtin(crate::host::JCLINIT_ENTER, 1, line);
+        self.b.emit(Op::Pop, line);
         let idx = self.b.add_name(&clinit_name(class));
         self.b.emit(Op::Call(idx, 0), line);
         self.b.emit(Op::Pop, line);
+        self.b.emit(Op::LoadConst(binary_c), line);
+        self.b
+            .emit(Op::CallBuiltin(crate::host::JCLINIT_EXIT, 1), line);
+        let ok = self.b.emit(Op::JumpIfFalse(0), line);
+        self.b.emit(Op::LoadFalse, line);
+        self.emit_global_set(&clinit_flag(class), line);
+        let checked = self.b.current_pos();
+        self.b.patch_jump(ok, checked);
         self.emit_exc_check(line);
         let after = self.b.current_pos();
         self.b.patch_jump(done, after);
@@ -8860,11 +8897,26 @@ impl Compiler {
         // dispatch (instead of the host's infallible rendering) is what lets
         // the `ConcurrentModificationException` surface from `"x " + view`; it
         // produces the identical text for every other list.
+        // A `null` list is the text "null" (JLS 5.1.11), not a call on nothing.
         if self.expr_java_type(e).as_deref().and_then(collection_kind) == Some("list") {
+            let list_t = self.temp();
             self.expr(e)?;
+            self.emit_set(&list_t, 0);
+            self.emit_get(&list_t, 0);
+            self.expr(&Expr::Var(NULL_LITERAL.to_string()))?;
+            self.b.emit(Op::NumEq, 0);
+            let not_null = self.b.emit(Op::JumpIfFalse(0), 0);
+            let null_c = self.b.add_constant(Value::str("null".to_string()));
+            self.b.emit(Op::LoadConst(null_c), 0);
+            let done = self.b.emit(Op::Jump(0), 0);
+            let call = self.b.current_pos();
+            self.b.patch_jump(not_null, call);
+            self.emit_get(&list_t, 0);
             let name_c = self.b.add_constant(Value::str("toString".to_string()));
             self.b.emit(Op::LoadConst(name_c), 0);
             self.emit_raising_builtin(crate::host::JCOLL_DISPATCH, 2, 0);
+            let end = self.b.current_pos();
+            self.b.patch_jump(done, end);
             return Ok(());
         }
         let Some(rc) = self.expr_class(e) else {

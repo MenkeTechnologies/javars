@@ -5215,3 +5215,123 @@ fn a_diamond_argument_names_its_own_type_parameter_in_a_bounds_error() {
     assert!(ok, "{out}");
     assert_eq!(out, "[z] [1, 2]\n");
 }
+
+/// The string conversion of a `null` reference is "null" (JLS 5.1.11) for an
+/// operand statically typed as a `List` or `Collection` too — the type routed
+/// through the collection dispatch so a stale `subList` view can report its
+/// `ConcurrentModificationException` — including a record component's in the
+/// derived `toString`. Measured on openjdk 21.0.13.
+#[test]
+fn a_null_list_concatenates_as_null() {
+    let src = r####"
+import java.util.*;
+public class T { public static void main(String[] a) {
+  List<Integer> l = null; Map<String,Integer> m = null; Set<String> s = null; StringBuilder sb = null; Optional<String> o = null; Collection<Integer> c = null;
+  System.out.println("x" + m); System.out.println("x" + s); System.out.println("x" + sb); System.out.println("x" + o); System.out.println("x" + c); System.out.println(l + "y"); System.out.println("x" + l);
+  String t = "v="; t += l; System.out.println(t); System.out.println(String.valueOf(l)); System.out.println(l);
+} }
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "xnull\nxnull\nxnull\nxnull\nxnull\nnully\nxnull\nv=null\nnull\nnull\n"
+    );
+    let src = r####"
+import java.util.*;
+public class T {
+  record R(String n, List<Integer> l, Object o, Integer i) {}
+  public static void main(String[] a) {
+    R r = new R(null, null, null, null);
+    System.out.println(r);
+    System.out.println(r.hashCode() + " " + r.equals(new R(null, null, null, null)));
+    System.out.println("" + r + r.toString());
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "R[n=null, l=null, o=null, i=null]\n0 true\nR[n=null, l=null, o=null, i=null]R[n=null, l=null, o=null, i=null]\n"
+    );
+}
+
+/// A static initializer that completes abruptly (JLS 12.4.2): the exception
+/// reaches the use wrapped in an `ExceptionInInitializerError` (an `Error`
+/// escapes as itself), the class is erroneous from then on, and every later
+/// use — a static call, a `new`, a field read, a subclass — throws
+/// `NoClassDefFoundError: Could not initialize class C`, caused by the
+/// `ExceptionInInitializerError` the JDK records. Measured on openjdk 21.0.13.
+#[test]
+fn a_failed_static_initializer_is_wrapped_and_leaves_the_class_erroneous() {
+    let src = r####"
+public class T {
+  static class Bad { static int v = 1 / Integer.parseInt("0"); static void hi() { System.out.println("hi"); } }
+  static class BadE { static { if (true) throw new AssertionError("so"); } static void hi() {} }
+  static class Ok { static int q = 5; }
+  public static void main(String[] a) {
+    try { Bad.hi(); } catch (ExceptionInInitializerError e) { System.out.println("EIIE " + e.getMessage() + " | " + e.getCause() + " | " + e.getException() + " | " + e); }
+    try { new Bad(); } catch (NoClassDefFoundError e) { System.out.println("NCDFE " + e.getMessage() + " | " + e.getCause() + " | " + e); }
+    try { System.out.println(Bad.v); } catch (LinkageError e) { System.out.println(e.getClass().getName()); }
+    try { BadE.hi(); } catch (Error e) { System.out.println(e); }
+    try { BadE.hi(); } catch (Error e) { System.out.println(e); }
+    System.out.println(Ok.q);
+    Bad.hi();
+  }
+}
+"####;
+    let (out, err, ok) = run_with_stderr(src);
+    assert!(!ok, "{out}");
+    assert_eq!(
+        out,
+        "EIIE null | java.lang.ArithmeticException: / by zero | java.lang.ArithmeticException: / by zero | java.lang.ExceptionInInitializerError\nNCDFE Could not initialize class T$Bad | java.lang.ExceptionInInitializerError: Exception java.lang.ArithmeticException: / by zero [in thread \"main\"] | java.lang.NoClassDefFoundError: Could not initialize class T$Bad\njava.lang.NoClassDefFoundError\njava.lang.AssertionError: so\njava.lang.NoClassDefFoundError: Could not initialize class T$BadE\n5\n"
+    );
+    assert!(
+        err.contains("Exception in thread \"main\" java.lang.NoClassDefFoundError: Could not initialize class T$Bad"),
+        "{err}"
+    );
+    let src = r####"
+public class T {
+  static StringBuilder log = new StringBuilder();
+  static class P { static { log.append("P;"); if (log.length() > 0) throw new IllegalStateException("p"); } }
+  static class C extends P { static int c = 1; static { log.append("C;"); } }
+  public static void main(String[] a) {
+    try { System.out.println(C.c); } catch (ExceptionInInitializerError e) { System.out.println("1 " + e.getCause() + " " + log); }
+    try { System.out.println(C.c); } catch (NoClassDefFoundError e) { System.out.println("2 " + e.getMessage() + " " + log); }
+    try { new P(); } catch (NoClassDefFoundError e) { System.out.println("3 " + e.getMessage()); }
+    try { throw new ExceptionInInitializerError("hand"); } catch (LinkageError e) { System.out.println(e + " " + e.getCause()); }
+    ExceptionInInitializerError x = new ExceptionInInitializerError(new RuntimeException("r"));
+    System.out.println(x + " | " + x.getMessage() + " | " + x.getException());
+    System.out.println(new NoClassDefFoundError("n") + " " + (new NoClassDefFoundError() instanceof Error));
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "1 java.lang.IllegalStateException: p P;\n2 Could not initialize class T$C P;\n3 Could not initialize class T$P\njava.lang.ExceptionInInitializerError: hand null\njava.lang.ExceptionInInitializerError | null | java.lang.RuntimeException: r\njava.lang.NoClassDefFoundError: n true\n"
+    );
+}
+
+/// An exception escaping a static initializer uncaught is reported as the
+/// `ExceptionInInitializerError` it becomes, the exception as its cause — for
+/// a lazily initialized class and for the entry class alike, with and without
+/// a `try` anywhere in the program — while an `Error` is reported as itself.
+/// Measured on openjdk 21.0.13.
+#[test]
+fn an_uncaught_static_initializer_failure_reports_exception_in_initializer_error() {
+    let cases = [
+        ("public class T {\n  static class Bad { static int[] arr = new int[2]; static int v = arr[5]; }\n  public static void main(String[] a) { System.out.println(\"before\"); System.out.println(Bad.v); }\n}\n", "before\n", "java.lang.ExceptionInInitializerError\nCaused by: java.lang.ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 2"),
+        ("public class T {\n  static int z = Integer.parseInt(\"x\");\n  public static void main(String[] a) { System.out.println(\"main\"); }\n}\n", "", "java.lang.ExceptionInInitializerError\nCaused by: java.lang.NumberFormatException: For input string: \"x\""),
+        ("public class T {\n  static int z = Integer.parseInt(\"x\");\n  public static void main(String[] a) { try { System.out.println(\"main\"); } catch (RuntimeException e) {} }\n}\n", "", "java.lang.ExceptionInInitializerError\nCaused by: java.lang.NumberFormatException: For input string: \"x\""),
+        ("public class T {\n  static { System.out.println(\"init\"); if (T.class != null) throw new AssertionError(\"ae\"); }\n  public static void main(String[] a) { System.out.println(\"main\"); }\n}\n", "init\n", "Exception in thread \"main\" java.lang.AssertionError: ae"),
+    ];
+    for (src, want, report) in cases {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert_eq!(out, want, "{src}");
+        assert!(err.contains(report), "{err}\nwanted: {report}\n{src}");
+    }
+}

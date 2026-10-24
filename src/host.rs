@@ -424,6 +424,19 @@ pub const JARRAY_TAG: u16 = 760;
 /// value.
 pub const JCLASS_NAME: u16 = 761;
 
+/// Entering a lazily initialized class's `<clinit>` (JLS 12.4.2 step 5): a
+/// class whose initialization already failed throws `NoClassDefFoundError:
+/// Could not initialize class C` instead, its cause the
+/// `ExceptionInInitializerError` the JDK records. Stack `[binaryName]`;
+/// `argc == 1`.
+pub const JCLINIT_ENTER: u16 = 762;
+
+/// Leaving a `<clinit>` (JLS 12.4.2 steps 10-11): when it completed abruptly,
+/// the class is marked erroneous and an exception that is not an `Error` is
+/// replaced by an `ExceptionInInitializerError` caused by it. Stack
+/// `[binaryName]`; `argc == 1`; answers whether the initialization failed.
+pub const JCLINIT_EXIT: u16 = 763;
+
 /// `Comparable.compareTo` on a receiver that is not a user class instance.
 /// Stack `[recv, arg, tag]` (`tag` on top); `argc == 3`.
 ///
@@ -2304,6 +2317,14 @@ thread_local! {
     /// When false there is no handler anywhere and no check to observe the
     /// pending value, so a runtime fault aborts instead (see [`raise`]).
     static EXC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The classes whose initialization failed, by binary name, each with the
+    /// message of the `ExceptionInInitializerError` a later use reports as the
+    /// cause of its `NoClassDefFoundError`.
+    static CLINIT_FAILED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// How many `<clinit>`s are running, innermost last — what lets a fault
+    /// that aborts (no exception machinery) report itself as the
+    /// `ExceptionInInitializerError` it becomes.
+    static CLINIT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The program arguments `main`'s `String[]` parameter is bound to — what
     /// the CLI collected after the file name. Set by [`set_argv`] before the run.
     static ARGV: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -2646,6 +2667,8 @@ pub fn heap_reset() {
     BINARY.with(|b| b.borrow_mut().clear());
     PENDING.with(|p| *p.borrow_mut() = None);
     EXC_ENABLED.with(|e| e.set(false));
+    CLINIT_FAILED.with(|f| f.borrow_mut().clear());
+    CLINIT_DEPTH.with(|d| d.set(0));
     ARGV.with(|a| a.borrow_mut().clear());
     // All three are keyed to the OUTGOING chunk: each gate answers whether
     // *that* chunk declared an override, and an entry ip indexes its ops.
@@ -2730,6 +2753,18 @@ fn raise(vm: &mut VM, f: Fault) -> Value {
         } else {
             format!(": {}", f.msg)
         };
+        // A fault escaping a static initializer is reported as the
+        // `ExceptionInInitializerError` it becomes (JLS 12.4.2), the fault
+        // as its cause; an `Error` escapes as itself.
+        if CLINIT_DEPTH.with(|d| d.get()) > 0 && !is_error_class(f.class) {
+            ffi_fault(
+                vm,
+                format!(
+                    "Exception in thread \"main\" java.lang.ExceptionInInitializerError\nCaused by: {name}{detail}"
+                ),
+            );
+            return Value::Undef;
+        }
         ffi_fault(vm, format!("Exception in thread \"main\" {name}{detail}"));
         return Value::Undef;
     }
@@ -3098,6 +3133,8 @@ pub fn install(vm: &mut VM) {
     vm.register_builtin(JITER_ARRAY, b_iter_array);
     vm.register_builtin(JARRAY_TAG, b_array_tag);
     vm.register_builtin(JCLASS_NAME, b_class_name);
+    vm.register_builtin(JCLINIT_ENTER, b_clinit_enter);
+    vm.register_builtin(JCLINIT_EXIT, b_clinit_exit);
 }
 
 /// `main`'s `String[] args` — a fresh array of the program arguments.
@@ -3183,7 +3220,19 @@ fn b_exc_abort(vm: &mut VM, argc: u8) -> Value {
     let exc = PENDING
         .with(|p| p.borrow_mut().take())
         .unwrap_or(Value::Undef);
-    let mut msg = format!("Exception in thread \"main\" {}", throwable_str(&exc));
+    // Still inside a static initializer — the entry class's, whose bracket
+    // has no caller to close it — the exception is the cause of the
+    // `ExceptionInInitializerError` it becomes; an `Error` escapes as itself.
+    let in_clinit = CLINIT_DEPTH.with(|d| d.get()) > 0
+        && !is_error_class(&instance_class(&exc).unwrap_or_default());
+    let mut msg = if in_clinit {
+        format!(
+            "Exception in thread \"main\" java.lang.ExceptionInInitializerError\nCaused by: {}",
+            throwable_str(&exc)
+        )
+    } else {
+        format!("Exception in thread \"main\" {}", throwable_str(&exc))
+    };
     // `Throwable.printEnclosedStackTrace` stops at a cause already printed,
     // which is what ends a cycle.
     let mut seen = vec![exc.clone()];
@@ -3195,6 +3244,80 @@ fn b_exc_abort(vm: &mut VM, argc: u8) -> Value {
     }
     ffi_fault(vm, msg);
     Value::Undef
+}
+
+/// Whether the throwable class `class` is an `Error` — the one kind a failed
+/// static initializer rethrows as itself rather than wrapping.
+fn is_error_class(class: &str) -> bool {
+    let mut cur = class;
+    loop {
+        if cur == "Error" {
+            return true;
+        }
+        match crate::prelude::THROWABLES.iter().find(|(n, _)| *n == cur) {
+            Some((_, sup)) if !sup.is_empty() => cur = sup,
+            _ => break,
+        }
+    }
+    let mut hit = false;
+    walk_supertypes(class, &mut |c| {
+        hit = c == "Error";
+        hit
+    });
+    hit
+}
+
+/// [`JCLINIT_ENTER`].
+fn b_clinit_enter(vm: &mut VM, argc: u8) -> Value {
+    let [name] = pop_fixed::<1>(vm, argc);
+    let name = name.as_str_cow().into_owned();
+    let failed = CLINIT_FAILED.with(|f| f.borrow().get(&name).cloned());
+    let Some(cause_msg) = failed else {
+        CLINIT_DEPTH.with(|d| d.set(d.get() + 1));
+        return Value::Undef;
+    };
+    let cause = heap_alloc(HostObj::Instance {
+        class: "ExceptionInInitializerError".to_string(),
+        fields: HashMap::from([("detailMessage".to_string(), Value::str(cause_msg))]),
+    });
+    raise(
+        vm,
+        Fault {
+            class: "NoClassDefFoundError",
+            msg: format!("Could not initialize class {name}"),
+            fields: vec![
+                ("cause", Value::Obj(cause)),
+                ("causeSet", Value::bool(true)),
+            ],
+        },
+    )
+}
+
+/// [`JCLINIT_EXIT`].
+fn b_clinit_exit(vm: &mut VM, argc: u8) -> Value {
+    let [name] = pop_fixed::<1>(vm, argc);
+    CLINIT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    let Some(exc) = PENDING.with(|p| p.borrow().clone()) else {
+        return Value::bool(false);
+    };
+    let class = instance_class(&exc).unwrap_or_default();
+    CLINIT_FAILED.with(|f| {
+        f.borrow_mut().insert(
+            name.as_str_cow().into_owned(),
+            format!("Exception {} [in thread \"main\"]", throwable_str(&exc)),
+        )
+    });
+    if !is_error_class(&class) {
+        raise(
+            vm,
+            Fault {
+                class: "ExceptionInInitializerError",
+                msg: String::new(),
+                fields: vec![("cause", exc), ("causeSet", Value::bool(true))],
+            },
+        );
+    }
+    Value::bool(true)
 }
 
 /// The `cause` a throwable holds, when it holds one.

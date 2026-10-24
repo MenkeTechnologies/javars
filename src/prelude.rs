@@ -64,6 +64,11 @@ pub const THROWABLES: &[(&str, &str)] = &[
     // The `assert`-style failure a program throws by hand
     // (`throw new AssertionError()` in an unreachable branch).
     ("AssertionError", "Error"),
+    // A static initializer that completes abruptly (JLS 12.4.2): the
+    // exception wrapped, and every later use of the erroneous class.
+    ("LinkageError", "Error"),
+    ("ExceptionInInitializerError", "LinkageError"),
+    ("NoClassDefFoundError", "LinkageError"),
     // What `Object.clone()` throws for a class that is not `Cloneable`.
     ("CloneNotSupportedException", "Exception"),
     ("IllegalFormatException", "IllegalArgumentException"),
@@ -482,6 +487,16 @@ fn prelude_source(declared: &[String]) -> String {
                 "  String toString() { String n = this.getClass().getName(); \
                  String m = getLocalizedMessage(); \
                  if (m == null) { return n; } return n + \": \" + m; }\n",
+            );
+        } else if *name == "ExceptionInInitializerError" {
+            // The JDK's three constructors: `()` records a `null` cause,
+            // `(Throwable)` the exception with no message of its own, and
+            // `getException()` is the cause by another name.
+            src.push_str(
+                "  ExceptionInInitializerError() { cause = null; causeSet = true; }\n  \
+                 ExceptionInInitializerError(String m) { detailMessage = m; cause = null; causeSet = true; }\n  \
+                 ExceptionInInitializerError(Throwable thrown) { cause = thrown; causeSet = true; }\n  \
+                 Throwable getException() { return getCause(); }\n",
             );
         } else if *name == "PatternSyntaxException" {
             // The JDK's class: one constructor, the three accessors, and a
