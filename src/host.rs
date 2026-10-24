@@ -18,6 +18,7 @@
 //!    The numeric pairs get Java's `long` wrapping and binary numeric promotion,
 //!    never a concatenation; see `java_numeric`.
 
+use crate::jstr;
 use fusevm::{NumOp, Value, VM};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1396,7 +1397,7 @@ fn joiner_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Va
             }
         },
         ("toString", 0) => Ok(Value::str(j.render())),
-        ("length", 0) => Ok(Value::Int(j.render().encode_utf16().count() as i64)),
+        ("length", 0) => Ok(Value::Int(jstr::len(&j.render()) as i64)),
         _ => Err(Fault::internal(format!(
             "javars: unsupported StringJoiner method `{method}` with {} argument(s)",
             args.len()
@@ -3166,16 +3167,38 @@ fn b_exc_cut(vm: &mut VM, argc: u8) -> Value {
 }
 
 /// An exception that reached the top of `main`. Reports it the way `java` does
-/// — `Exception in thread "main" java.lang.Foo: message` — and faults, so the
-/// process exits non-zero.
+/// — `Exception in thread "main" java.lang.Foo: message`, then a `Caused by: `
+/// line per cause, as `printStackTrace` writes them — and faults, so the
+/// process exits non-zero. The `\tat …` frame lines are absent (BUGS.md).
 fn b_exc_abort(vm: &mut VM, argc: u8) -> Value {
     pop_args(vm, argc);
     let exc = PENDING
         .with(|p| p.borrow_mut().take())
         .unwrap_or(Value::Undef);
-    let msg = format!("Exception in thread \"main\" {}", throwable_str(&exc));
+    let mut msg = format!("Exception in thread \"main\" {}", throwable_str(&exc));
+    // `Throwable.printEnclosedStackTrace` stops at a cause already printed,
+    // which is what ends a cycle.
+    let mut seen = vec![exc.clone()];
+    let mut cur = throwable_cause(&exc);
+    while let Some(c) = cur.filter(|c| !seen.iter().any(|s| ref_eq(s, c))) {
+        msg.push_str(&format!("\nCaused by: {}", throwable_str(&c)));
+        cur = throwable_cause(&c);
+        seen.push(c);
+    }
     ffi_fault(vm, msg);
     Value::Undef
+}
+
+/// The `cause` a throwable holds, when it holds one.
+fn throwable_cause(v: &Value) -> Option<Value> {
+    let Value::Obj(id) = v else { return None };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Instance { fields, .. }) => fields
+            .get("cause")
+            .filter(|c| matches!(c, Value::Obj(_)))
+            .cloned(),
+        _ => None,
+    })
 }
 
 /// Render a throwable the way `Throwable.toString()` does, from the heap object
@@ -3706,12 +3729,9 @@ fn java_hash(v: &Value) -> Option<i32> {
         return Some(d.hash());
     }
     Some(match v {
-        // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1]. Java
-        // counts UTF-16 code units; javars counts scalars, the same
-        // `char`-model simplification the `String` methods already make.
-        Value::Str(s) => s
-            .chars()
-            .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32)),
+        // `String.hashCode` is specified: s[0]*31^(n-1) + … + s[n-1], over
+        // the UTF-16 units.
+        Value::Str(s) => jstr::hash(s),
         // `Integer.hashCode` is the value; `Long.hashCode` folds the halves.
         // An unboxed integer carries no width, so one in `int` range hashes as
         // an `Integer` (a boxed `Long` is told apart above).
@@ -5823,7 +5843,7 @@ fn natural_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         return x.compare(&y);
     }
     match (a, b) {
-        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => jstr::order(x, y),
         (Value::Undef, Value::Undef) => Ordering::Equal,
         (Value::Undef, _) => Ordering::Less,
         (_, Value::Undef) => Ordering::Greater,
@@ -6340,11 +6360,14 @@ fn is_collection(v: &Value) -> bool {
 // [`builder_method`] from [`b_str_dispatch`], which is where every receiver
 // whose static type is not a user class or a collection already lands.
 //
-// Index and length semantics use Unicode scalar positions, the same
-// simplification [`string_method`] documents: Java counts UTF-16 units, so a
-// builder holding an astral character reports a length one smaller here. Every
-// bounds failure carries the JDK's own detail message, which is not one wording
-// but three — `Index i out of bounds for length n` for a single index,
+// Every index and length counts UTF-16 units, as [`string_method`]'s do, over
+// the storage model `src/jstr.rs` describes. A buffer whose byte length equals
+// its unit count is all ASCII, where a unit index is a byte index; that is the
+// common case by a wide margin and every method takes it without decoding. Any
+// other buffer is edited as its units and stored back, so a surrogate pair that
+// an edit splits or completes is exactly what Java would hold. Every bounds
+// failure carries the JDK's own detail message, which is not one wording but
+// three — `Index i out of bounds for length n` for a single index,
 // `Range [s, e) out of bounds for length n` for a pair, and
 // `String index out of range: n` for `setLength`.
 
@@ -6354,10 +6377,7 @@ pub const SB_DEFAULT_CAP: usize = 16;
 
 /// The `StringIndexOutOfBoundsException` a single out-of-range index raises.
 fn sb_index_fault(i: i64, len: usize) -> Fault {
-    Fault::java(
-        "StringIndexOutOfBoundsException",
-        format!("Index {i} out of bounds for length {len}"),
-    )
+    str_index_fault(i, len)
 }
 
 /// The `StringIndexOutOfBoundsException` an out-of-range `[start, end)` pair
@@ -6369,38 +6389,28 @@ fn sb_range_fault(start: i64, end: i64, len: usize) -> Fault {
     )
 }
 
-/// Validate a scalar index against `len`, answering its byte offset in `s`.
-fn sb_char_offset(s: &str, i: i64, len: usize) -> Result<usize, Fault> {
-    if i < 0 || i as usize >= len {
-        return Err(sb_index_fault(i, len));
-    }
-    Ok(sb_byte_of(s, len, i as usize))
-}
-
-/// The byte offset of the `n`-th character of a builder holding `len` of them.
-///
-/// A buffer whose byte length equals its character count holds nothing but
-/// ASCII — UTF-8 spends one byte per character exactly then — so the character
-/// index *is* the byte index and no decoding is needed. That is the common case
-/// by a wide margin, and it turns `charAt` (and every other indexed operation)
-/// from a walk from the start into an O(1) read.
-fn sb_byte_of(s: &str, len: usize, n: usize) -> usize {
-    if s.len() == len {
-        return n.min(s.len());
-    }
-    s.char_indices().nth(n).map(|(b, _)| b).unwrap_or(s.len())
-}
-
 /// Validate a `[start, end)` pair the way `AbstractStringBuilder`'s
-/// `checkRangeSIOOBE` does, answering the two byte offsets.
-fn sb_range(s: &str, start: i64, end: i64, len: usize) -> Result<(usize, usize), Fault> {
+/// `checkRangeSIOOBE` does.
+fn sb_check_range(start: i64, end: i64, len: usize) -> Result<(usize, usize), Fault> {
     if start < 0 || start > end || end as usize > len {
         return Err(sb_range_fault(start, end, len));
     }
-    Ok((
-        sb_byte_of(s, len, start as usize),
-        sb_byte_of(s, len, end as usize),
-    ))
+    Ok((start as usize, end as usize))
+}
+
+/// Replace the units `[a, b)` of a builder's text with `with`, answering the
+/// new unit length. ASCII text and an ASCII replacement are spliced bytewise;
+/// anything else goes through the units, which is what keeps a split or
+/// completed surrogate pair what Java would hold.
+fn sb_splice(s: &mut String, len: usize, a: usize, b: usize, with: &str) -> usize {
+    if s.len() == len && with.is_ascii() {
+        s.replace_range(a..b, with);
+        return s.len();
+    }
+    let mut units: Vec<u16> = jstr::units(s).collect();
+    units.splice(a..b, jstr::units(with));
+    *s = jstr::from_units(units.iter().copied());
+    units.len()
 }
 
 /// The next capacity `AbstractStringBuilder` grows to when `min` characters no
@@ -6423,7 +6433,13 @@ fn sb_grow(cap: usize, min: usize) -> usize {
 /// reading `String.valueOf(char[])` already takes, and for the same reason.
 fn sb_arg_str(vm: &mut VM, v: &Value) -> String {
     match array_items(v) {
-        Some(items) => items.iter().map(|e| java_str_vm(vm, e)).collect(),
+        Some(items) => {
+            let mut out = String::new();
+            for e in &items {
+                jstr::push_str(&mut out, &java_str_vm(vm, e));
+            }
+            out
+        }
         None => java_str_vm(vm, v),
     }
 }
@@ -6447,23 +6463,22 @@ fn builder_method(
     // before the exclusive borrow below is taken — allocating under it panics
     // the interpreter, which is why these two used to refuse outright and
     // `sb.chars().count()` was a hard error where Java answers `sb.length()`.
-    // The values are the `String` arm's: javars stores a builder's text as
-    // Unicode scalars, exactly as it stores a string's.
+    // The values are the `String` arm's.
     if matches!((method, args.len()), ("chars", 0) | ("codePoints", 0)) {
         let text = HEAP.with(|h| match h.borrow().get(id as usize) {
-            Some(HostObj::Builder { s, len, .. }) => Some(s.chars().take(*len).collect::<Vec<_>>()),
+            Some(HostObj::Builder { s, .. }) => Some(s.clone()),
             _ => None,
         })?;
-        let items = text
-            .into_iter()
-            .map(|c| Value::Int(i64::from(c as u32)))
-            .collect();
-        // `AbstractStringBuilder.codePoints()` reports no size; `chars()` does.
-        return Some(Ok(if method == "codePoints" {
-            unsized_stream_of(items, StreamKind::Int)
-        } else {
-            stream_of(items, StreamKind::Int)
-        }));
+        // `AbstractStringBuilder.codePoints()` reports no size, even for
+        // Latin-1 text; `chars()` does.
+        if method == "codePoints" {
+            let items = text
+                .chars()
+                .map(|c| Value::Int(i64::from(jstr::char_value(c))))
+                .collect();
+            return Some(Ok(unsized_stream_of(items, StreamKind::Int)));
+        }
+        return Some(string_method(&text, method, &[]));
     }
     Some(HEAP.with(|h| {
         let mut heap = h.borrow_mut();
@@ -6473,11 +6488,18 @@ fn builder_method(
         else {
             return Err(Fault::internal("javars: dangling StringBuilder handle"));
         };
-        // The maintained character count. Every arm that changes the text
-        // writes the new one back through `count`, from the delta it already
-        // knows — no method walks the buffer to find out how long it is.
+        // The maintained unit count. Every arm that changes the text writes the
+        // new one back through `count` — no method walks the buffer to find
+        // out how long it is.
         let len = *count;
         let this = Value::Obj(id);
+        let unit_at = |s: &str, i: usize| -> u16 {
+            if s.len() == len {
+                u16::from(s.as_bytes()[i])
+            } else {
+                jstr::index(s).unit(s, i)
+            }
+        };
         match (method, args.len()) {
             ("toString", 0) | ("substring", 0) => Ok(Value::str(s.clone())),
             ("length", 0) => Ok(Value::Int(len as i64)),
@@ -6497,137 +6519,123 @@ fn builder_method(
                 *cap = len;
                 Ok(Value::Undef)
             }
-            ("append", 1) => {
-                s.push_str(&rendered[0]);
-                *count = len + rendered[0].chars().count();
-                *cap = sb_grow(*cap, *count);
-                Ok(this)
-            }
-            // `append(CharSequence, start, end)`: the window `[start, end)` of
-            // the sequence's text, a `null` sequence reading as `"null"`. The
-            // window is checked against that text's length with the JDK's
-            // `checkFromToIndex` wording.
-            ("append", 3) => {
-                let chars: Vec<char> = rendered[0].chars().collect();
-                let (start, end) = (args[1].jint(), args[2].jint());
-                if start < 0 || start > end || end > chars.len() as i64 {
-                    return Err(Fault::java(
-                        "IndexOutOfBoundsException",
-                        format!(
-                            "Range [{start}, {end}) out of bounds for length {}",
-                            chars.len()
-                        ),
-                    ));
-                }
-                s.extend(&chars[start as usize..end as usize]);
-                *count = len + (end - start) as usize;
-                *cap = sb_grow(*cap, *count);
-                Ok(this)
-            }
             // `append(char[])` is a different method from `append(Object)`, and
             // it is the *only* one-argument `append` that rejects `null`: it
             // reads the array's length, so a null argument is an NPE where
             // `append((Object) null)` appends `"null"`. The two are one value at
             // runtime, so the compiler picks the overload from the argument's
             // static type and sends this name when it is `char[]`.
-            ("appendChars", 1) => {
-                if matches!(args[0], Value::Undef) {
-                    return Err(Fault::java(
-                        "NullPointerException",
-                        "Cannot read the array length because \"str\" is null",
-                    ));
-                }
-                s.push_str(&rendered[0]);
-                *count = len + rendered[0].chars().count();
+            ("appendChars", 1) if matches!(args[0], Value::Undef) => Err(Fault::java(
+                "NullPointerException",
+                "Cannot read the array length because \"str\" is null",
+            )),
+            ("append" | "appendChars", 1) => {
+                jstr::push_str(s, &rendered[0]);
+                *count = len + jstr::len(&rendered[0]);
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
-            // `append(char[], int, int)` — the array's characters from
-            // `offset`, `len` of them. Java checks the window against the
-            // array's length and reports the same `IndexOutOfBoundsException`
-            // a bad `String.valueOf(char[], int, int)` does.
-            ("appendChars", 3) => {
-                let chars: Vec<char> = rendered[0].chars().collect();
-                let (off, n) = (args[1].jint(), args[2].jint());
-                if off < 0 || n < 0 || off + n > chars.len() as i64 {
-                    return Err(Fault::java(
-                        "IndexOutOfBoundsException",
-                        format!("offset {off}, count {n}, length {}", chars.len()),
-                    ));
+            // `append(CharSequence, start, end)`: the window `[start, end)` of
+            // the sequence's text, a `null` sequence reading as `"null"`, and
+            // `append(char[], offset, len)`: `len` characters from `offset`.
+            // Java checks each window against the argument's length, in two
+            // different wordings.
+            ("append" | "appendChars", 3) => {
+                let units: Vec<u16> = jstr::units(&rendered[0]).collect();
+                let (a, b) = (args[1].jint(), args[2].jint());
+                let (start, end) = if method == "append" {
+                    if a < 0 || a > b || b > units.len() as i64 {
+                        return Err(Fault::java(
+                            "IndexOutOfBoundsException",
+                            format!("Range [{a}, {b}) out of bounds for length {}", units.len()),
+                        ));
+                    }
+                    (a as usize, b as usize)
+                } else {
+                    if a < 0 || b < 0 || a + b > units.len() as i64 {
+                        return Err(Fault::java(
+                            "IndexOutOfBoundsException",
+                            format!("offset {a}, count {b}, length {}", units.len()),
+                        ));
+                    }
+                    (a as usize, (a + b) as usize)
+                };
+                for &u in &units[start..end] {
+                    jstr::push_unit(s, u);
                 }
-                let text: String = chars[off as usize..(off + n) as usize].iter().collect();
-                s.push_str(&text);
-                *count = len + n as usize;
+                *count = len + (end - start);
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("appendCodePoint", 1) => {
                 let cp = args[0].jint();
-                match u32::try_from(cp).ok().and_then(char::from_u32) {
-                    Some(c) => {
-                        s.push(c);
-                        *count = len + 1;
+                match jstr::checked_code_point(cp) {
+                    Ok(Some(c)) => {
+                        jstr::push_str(s, &c.to_string());
+                        *count = len + jstr::len(&c.to_string());
                         *cap = sb_grow(*cap, *count);
                         Ok(this)
                     }
-                    None => Err(Fault::java(
+                    Ok(None) => Err(Fault::java(
                         "IllegalArgumentException",
                         format!("Not a valid Unicode code point: 0x{cp:X}"),
                     )),
+                    Err(e) => Err(Fault::internal(e)),
                 }
             }
             ("repeat", 2) => {
                 let n = args[1].jint().max(0) as usize;
-                s.push_str(&rendered[0].repeat(n));
-                *count = len + rendered[0].chars().count() * n;
+                for _ in 0..n {
+                    jstr::push_str(s, &rendered[0]);
+                }
+                *count = len + jstr::len(&rendered[0]) * n;
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
             ("charAt", 1) => {
-                let at = sb_char_offset(s, args[0].jint(), len)?;
-                Ok(Value::Int(s[at..].chars().next().map_or(0, |c| c as i64)))
+                let i = args[0].jint();
+                if i < 0 || i as usize >= len {
+                    return Err(sb_index_fault(i, len));
+                }
+                Ok(Value::Int(i64::from(unit_at(s, i as usize))))
             }
+            // `setCharAt` replaces one unit — half of a pair leaves the other
+            // half unpaired, which `sb_splice` keeps.
             ("setCharAt", 2) => {
-                let at = sb_char_offset(s, args[0].jint(), len)?;
-                let old = s[at..].chars().next().map_or(0, char::len_utf8);
-                s.replace_range(at..at + old, &rendered[1]);
-                *count = len - 1 + rendered[1].chars().count();
+                let i = args[0].jint();
+                if i < 0 || i as usize >= len {
+                    return Err(sb_index_fault(i, len));
+                }
+                *count = sb_splice(s, len, i as usize, i as usize + 1, &rendered[1]);
                 Ok(Value::Undef)
             }
             ("deleteCharAt", 1) => {
-                let at = sb_char_offset(s, args[0].jint(), len)?;
-                let old = s[at..].chars().next().map_or(0, char::len_utf8);
-                s.replace_range(at..at + old, "");
-                *count = len - 1;
+                let i = args[0].jint();
+                if i < 0 || i as usize >= len {
+                    return Err(sb_index_fault(i, len));
+                }
+                *count = sb_splice(s, len, i as usize, i as usize + 1, "");
                 Ok(this)
             }
             // `delete` and `replace` clamp the end to the length before the
             // range check, which is why `delete(2, 100)` truncates rather than
             // throwing while `substring(1, 9)` throws.
-            ("delete", 2) => {
-                let start = args[0].jint();
+            ("delete", 2) | ("replace", 3) => {
                 let end = args[1].jint().min(len as i64);
-                let (a, b) = sb_range(s, start, end, len)?;
-                s.replace_range(a..b, "");
-                *count = len - (end - start) as usize;
-                Ok(this)
-            }
-            ("replace", 3) => {
-                let start = args[0].jint();
-                let end = args[1].jint().min(len as i64);
-                let (a, b) = sb_range(s, start, end, len)?;
-                s.replace_range(a..b, &rendered[2]);
-                *count = len - (end - start) as usize + rendered[2].chars().count();
+                let (a, b) = sb_check_range(args[0].jint(), end, len)?;
+                let with = if method == "replace" {
+                    &rendered[2]
+                } else {
+                    ""
+                };
+                *count = sb_splice(s, len, a, b, with);
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
-            ("substring", 1) => {
-                let (a, b) = sb_range(s, args[0].jint(), len as i64, len)?;
-                Ok(Value::str(s[a..b].to_string()))
-            }
-            ("substring", 2) | ("subSequence", 2) => {
-                let (a, b) = sb_range(s, args[0].jint(), args[1].jint(), len)?;
-                Ok(Value::str(s[a..b].to_string()))
+            ("substring", 1 | 2) | ("subSequence", 2) => {
+                let end = args.get(1).map_or(len as i64, JavaNumeric::jint);
+                let (a, b) = sb_check_range(args[0].jint(), end, len)?;
+                Ok(Value::str(jstr::index(s).slice(s, a, b)))
             }
             // `insert`'s bounds failure names the *builder's* length as the
             // range end, which is what `checkOffset` reports:
@@ -6637,16 +6645,22 @@ fn builder_method(
                 if at < 0 || at as usize > len {
                     return Err(sb_range_fault(at, len as i64, len));
                 }
-                s.insert_str(sb_byte_of(s, len, at as usize), &rendered[1]);
-                *count = len + rendered[1].chars().count();
+                *count = sb_splice(s, len, at as usize, at as usize, &rendered[1]);
                 *cap = sb_grow(*cap, *count);
                 Ok(this)
             }
-            // `reverse` reverses code points, not UTF-16 units, so a surrogate
-            // pair survives it — which is what Java's own `reverse` guarantees.
-            // The length is unchanged, so `count` is left alone.
+            // `reverse` keeps every surrogate pair in order, so a character
+            // above the BMP survives it — `jstr::reverse_units` is the JDK's
+            // algorithm. The length is unchanged, so `count` is left alone.
             ("reverse", 0) => {
-                *s = s.chars().rev().collect();
+                if s.len() == len {
+                    // ASCII reversed bytewise is still ASCII.
+                    *s = s.chars().rev().collect();
+                } else {
+                    let mut units: Vec<u16> = jstr::units(s).collect();
+                    jstr::reverse_units(&mut units);
+                    *s = jstr::from_units(units);
+                }
                 Ok(this)
             }
             ("setLength", 1) => {
@@ -6659,7 +6673,7 @@ fn builder_method(
                 }
                 let n = n as usize;
                 if n < len {
-                    s.truncate(sb_byte_of(s, len, n));
+                    sb_splice(s, len, n, len, "");
                 } else {
                     // Java pads the extra positions with the NUL character,
                     // which is observable: after `setLength(4)` on "ab",
@@ -6670,50 +6684,40 @@ fn builder_method(
                 *cap = sb_grow(*cap, n);
                 Ok(Value::Undef)
             }
-            ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &rendered[0]))),
-            ("indexOf", 2) => {
-                let from = args[1].jint().clamp(0, len as i64) as usize;
-                let byte = sb_byte_of(s, len, from);
-                Ok(Value::Int(match char_index_of(&s[byte..], &rendered[0]) {
-                    -1 => -1,
-                    i => i + from as i64,
-                }))
+            ("indexOf", 1 | 2) => {
+                let from = args.get(1).map_or(0, JavaNumeric::jint);
+                Ok(Value::Int(jstr::index_of(
+                    s,
+                    &jstr::index(s),
+                    &rendered[0],
+                    from,
+                )))
             }
-            ("lastIndexOf", 1) => Ok(Value::Int(char_last_index_of(s, &rendered[0], len as i64))),
-            ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
-                s,
-                &rendered[0],
-                args[1].jint(),
-            ))),
+            ("lastIndexOf", 1 | 2) => {
+                let from = args.get(1).map_or(len as i64, JavaNumeric::jint);
+                Ok(Value::Int(jstr::last_index_of(
+                    s,
+                    &jstr::index(s),
+                    &rendered[0],
+                    from,
+                )))
+            }
             // `compareTo(StringBuilder)` is `String.compareTo` on the contents
             // (Java 11+); `equals` is NOT — it stays reference identity, which
             // is why it is left to `object_method`.
             ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &rendered[0], false))),
-            // `AbstractStringBuilder.codePointAt`/`codePointBefore` check the
-            // index they read — `index - 1` for `codePointBefore` — against
-            // the count, so `codePointBefore(0)` reports index -1.
+            // `codePointAt`/`codePointBefore`/`codePointCount` are the `String`
+            // methods on the contents, with the builder's own wording for a bad
+            // index: `AbstractStringBuilder` checks the index it reads —
+            // `index - 1` for `codePointBefore` — against the count.
             ("codePointAt", 1) | ("codePointBefore", 1) => {
                 let at = args[0].jint() - i64::from(method == "codePointBefore");
-                match usize::try_from(at).ok().and_then(|i| char_at(s, i)) {
-                    Some(c) if (at as usize) < len => Ok(Value::Int(i64::from(c as u32))),
-                    _ => Err(Fault::java(
-                        "StringIndexOutOfBoundsException",
-                        format!("Index {at} out of bounds for length {len}"),
-                    )),
+                if at < 0 || at as usize >= len {
+                    return Err(sb_index_fault(at, len));
                 }
+                string_method(s, method, args)
             }
-            // Characters are stored as Unicode scalars, so every one in range
-            // is one code point.
-            ("codePointCount", 2) => {
-                let (b, e) = (args[0].jint(), args[1].jint());
-                if b < 0 || e > len as i64 || b > e {
-                    return Err(Fault::java(
-                        "IndexOutOfBoundsException",
-                        format!("Range [{b}, {e}) out of bounds for length {len}"),
-                    ));
-                }
-                Ok(Value::Int(e - b))
-            }
+            ("codePointCount", 2) | ("offsetByCodePoints", 2) => string_method(s, method, args),
             _ => Err(Fault::internal(format!(
                 "javars: unsupported StringBuilder method `{method}` with {} argument(s)",
                 args.len()
@@ -6764,11 +6768,11 @@ fn b_sb_new(vm: &mut VM, argc: u8) -> Value {
         }
         other => {
             let text = java_str_vm(vm, other);
-            let n = text.chars().count();
+            let n = jstr::len(&text);
             (text, n + SB_DEFAULT_CAP)
         }
     };
-    let len = s.chars().count();
+    let len = jstr::len(&s);
     Value::Obj(heap_alloc(HostObj::Builder {
         s,
         len,
@@ -12470,6 +12474,11 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // `s.equals(anInteger)`. Unboxing them here is the mirror of the receiver
     // unboxing above, and is the identity on everything that is not a box.
     let args: Vec<Value> = args.iter().map(deboxed).collect();
+    // The receiver's `Arc` is offered to the UTF-16 index cache, so a loop of
+    // `charAt`/`length` calls on one long string indexes it once.
+    if let Value::Str(owner) = &recv {
+        jstr::adopt(owner);
+    }
     let s = recv.as_str_cow();
     // `"%s".formatted(x)` renders `x`, so it needs the VM `string_method` has
     // not got. Every other `String` method reads text only.
@@ -12493,6 +12502,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
         // `"ab".trim() == "ab"` is `true` in Java. One rule covers them because
         // the condition the JDK states is the same one each time.
         Ok(Value::Str(text)) if text.as_str() == s.as_ref() => recv,
+        // Text a method joined (`replace`, `repeat`, `concat`) may have put an
+        // unpaired high surrogate against a low one; canonical form makes them
+        // the pair Java now sees.
+        Ok(Value::Str(text)) if jstr::has_stand_in(&text) => {
+            Value::str(jstr::canon(text.as_str().to_string()))
+        }
         Ok(v) => v,
         Err(f) => raise(vm, f),
     }
@@ -12609,22 +12624,58 @@ fn boxed_method(recv: &Value, method: &str, argc: usize) -> Option<Value> {
 }
 
 /// `String.compareTo` / `compareToIgnoreCase`: the difference of the first
-/// differing `char`, else the length difference. Java compares UTF-16 code
-/// units; javars compares Unicode scalars, the same `char` simplification the
-/// index-based methods make.
+/// differing `char`, else the length difference, over the UTF-16 units.
+///
+/// The case-blind form is the JDK's `compareToCI`: two units match when they
+/// are equal, equal upper-cased, or equal lower-cased after upper-casing; two
+/// that do not are compared again as the code points they belong to (a
+/// surrogate pair folds as its character), and the first difference of the
+/// folded values is the answer.
 fn compare_strings(a: &str, b: &str, fold_case: bool) -> i64 {
-    let norm = |s: &str| -> Vec<char> {
-        if fold_case {
-            s.chars().flat_map(|c| c.to_lowercase()).collect()
-        } else {
-            s.chars().collect()
+    if !fold_case {
+        return jstr::compare(a, b);
+    }
+    let case = |cp: u32, upper: bool| -> u32 {
+        match char::from_u32(cp).filter(|c| jstr::unpaired(*c).is_none() && !jstr::is_surrogate(cp))
+        {
+            Some(c) if upper => one_to_one_case(c, char::to_uppercase) as u32,
+            Some(c) => one_to_one_case(c, char::to_lowercase) as u32,
+            None => cp,
         }
     };
-    let (x, y) = (norm(a), norm(b));
-    for (ca, cb) in x.iter().zip(&y) {
-        if ca != cb {
-            return *ca as i64 - *cb as i64;
+    let ci = |p: u32, q: u32| -> i64 {
+        let (p, q) = (case(p, true), case(q, true));
+        if p == q {
+            return 0;
         }
+        i64::from(case(p, false)) - i64::from(case(q, false))
+    };
+    // The code point unit `k` belongs to, and whether it is the high half of a
+    // pair (so the walk steps over the low half too).
+    let point = |v: &[u16], k: usize| -> (u32, bool) {
+        if k + 1 < v.len() && jstr::is_pair(v[k], v[k + 1]) {
+            (jstr::pair(v[k], v[k + 1]), true)
+        } else if k > 0 && jstr::is_pair(v[k - 1], v[k]) {
+            (jstr::pair(v[k - 1], v[k]), false)
+        } else {
+            (u32::from(v[k]), false)
+        }
+    };
+    let (x, y): (Vec<u16>, Vec<u16>) = (jstr::units(a).collect(), jstr::units(b).collect());
+    let (mut i, mut j) = (0, 0);
+    while i < x.len() && j < y.len() {
+        if x[i] == y[j] || ci(u32::from(x[i]), u32::from(y[j])) == 0 {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let ((p, pi), (q, qj)) = (point(&x, i), point(&y, j));
+        let diff = ci(p, q);
+        if diff != 0 {
+            return diff;
+        }
+        i += 1 + usize::from(pi);
+        j += 1 + usize::from(qj);
     }
     x.len() as i64 - y.len() as i64
 }
@@ -12858,124 +12909,107 @@ fn double_ulp(d: f64) -> f64 {
     next_after(d, f64::INFINITY) - d
 }
 
-/// The number of Unicode scalars in `s` — javars's `String.length()`.
-///
-/// Counting the bytes that are not UTF-8 continuation bytes is the same answer
-/// `chars().count()` gives without decoding anything, and the compiler
-/// vectorizes it.
-fn char_count(s: &str) -> usize {
-    s.as_bytes().iter().filter(|b| (*b & 0xC0) != 0x80).count()
+/// The `StringIndexOutOfBoundsException` a single bad `String` index raises.
+fn str_index_fault(i: i64, len: usize) -> Fault {
+    Fault::java(
+        "StringIndexOutOfBoundsException",
+        format!("Index {i} out of bounds for length {len}"),
+    )
 }
 
-/// The `i`-th character of `s`, or `None` when `i` is past the end.
-///
-/// `chars().nth(i)` decodes every character before the wanted one, which made
-/// the ordinary `for (i = 0; i < s.length(); i++) s.charAt(i)` walk quadratic:
-/// 40k characters took 13.9s where 5k took 0.25s. Java's `charAt` is a constant-
-/// time array read, so the shape a program writes has to stay affordable.
-///
-/// The prefix test is what recovers it. If every byte before `i` is ASCII then
-/// each of those characters is one byte, so the character index *is* the byte
-/// index and the character at it can be read directly. `is_ascii` on a slice is
-/// a vectorized byte scan rather than a decode loop, which leaves the walk with
-/// a constant small enough that the quadratic shape stops mattering at the
-/// sizes a program actually reaches. A string that really does hold multi-byte
-/// characters falls back to decoding.
-fn char_at(s: &str, i: usize) -> Option<char> {
-    let bytes = s.as_bytes();
-    if i < bytes.len() && bytes[..i].is_ascii() {
-        return s[i..].chars().next();
-    }
-    s.chars().nth(i)
-}
-
-/// The byte offset of the `i`-th character of `s`, clamped to its end. The same
-/// ASCII-prefix shortcut [`char_at`] takes, for the callers that want to slice
-/// rather than to read one character.
-fn char_byte_of(s: &str, i: usize) -> usize {
-    let bytes = s.as_bytes();
-    if i <= bytes.len() && bytes[..i].is_ascii() {
-        return i;
-    }
-    s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
-}
-
-/// Evaluate a `java.lang.String` method on `s`. Index/length semantics use
-/// Unicode scalar (`char`) positions — exact for the ASCII/BMP common case and
-/// consistent with javars's existing "a `char` literal is a one-character
-/// string" model (astral characters, which Java counts as two UTF-16 units,
-/// count as one here — the same documented simplification). An out-of-range
-/// index raises Java's `StringIndexOutOfBoundsException` with its exact detail
-/// message; an unknown method is a javars internal error.
+/// Evaluate a `java.lang.String` method on `s`. Every index and length counts
+/// UTF-16 units, as Java's do, read through the string's [`jstr::Index`] (see
+/// `src/jstr.rs` for the storage model). An out-of-range index raises Java's
+/// `StringIndexOutOfBoundsException` with its exact detail message; an unknown
+/// method is a javars internal error.
 fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> {
-    let char_len = || char_count(s) as i64;
+    let ix = || jstr::index(s);
+    let char_len = || ix().len() as i64;
     null_string_argument(method, args)?;
     match (method, args.len()) {
         ("length", 0) => Ok(Value::Int(char_len())),
         ("isEmpty", 0) => Ok(Value::bool(s.is_empty())),
         // `String.compareTo` is specified as the difference of the first
-        // differing character, else the length difference — not merely its sign,
+        // differing `char`, else the length difference — not merely its sign,
         // which is why a lexicographic `Ord` cannot stand in for it.
         ("compareTo", 1) => Ok(Value::Int(compare_strings(s, &args[0].as_str_cow(), false))),
         ("compareToIgnoreCase", 1) => {
             Ok(Value::Int(compare_strings(s, &args[0].as_str_cow(), true)))
         }
-        // `charAt` returns a `char`, i.e. the code point — `"abc".charAt(2) + 1`
-        // is 100, not "c1". The compiler converts it back to a String wherever
-        // Java's string conversion applies.
+        // `charAt` returns a `char` — one UTF-16 unit, so half of a surrogate
+        // pair above the BMP — as its number: `"abc".charAt(2) + 1` is 100, not
+        // "c1". The compiler converts it back to a String wherever Java's string
+        // conversion applies.
         ("charAt", 1) => {
-            let i = args[0].jint();
-            match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
-                Some(c) => Ok(Value::Int(c as i64)),
-                None => Err(Fault::java(
-                    "StringIndexOutOfBoundsException",
-                    format!("Index {i} out of bounds for length {}", char_len()),
-                )),
+            let (i, ix) = (args[0].jint(), ix());
+            if i < 0 || i as usize >= ix.len() {
+                return Err(str_index_fault(i, ix.len()));
             }
+            Ok(Value::Int(i64::from(ix.unit(s, i as usize))))
         }
-        ("substring", 1) => substring(s, args[0].jint(), char_len()),
-        ("substring", 2) | ("subSequence", 2) => substring(s, args[0].jint(), args[1].jint()),
+        ("substring", 1) => substring(s, args[0].jint(), None),
+        ("substring", 2) | ("subSequence", 2) => substring(s, args[0].jint(), Some(args[1].jint())),
         // `indexOf(int ch)` / `lastIndexOf(int ch)` take a code point: an `int`
         // here (`s.chars().filter(c -> "aeiou".indexOf(c) >= 0)`) is the
         // character itself, not the digits of its decimal rendering. A value
-        // that is no code point matches nothing.
-        ("indexOf" | "lastIndexOf", 1 | 2) if matches!(&args[0], Value::Int(i) if u32::try_from(*i).ok().and_then(char::from_u32).is_none()) => {
+        // that is no code point matches nothing, and neither does one javars
+        // reserves (no string here can hold it).
+        ("indexOf" | "lastIndexOf", 1 | 2) if matches!(&args[0], Value::Int(i) if needle_char(*i).is_none()) => {
             Ok(Value::Int(-1))
         }
-        ("indexOf", 1) => Ok(Value::Int(char_index_of(s, &needle_arg(&args[0])))),
-        // `indexOf(t, from)` starts the search at `from`; the result is still an
-        // index into the whole string.
-        ("indexOf", 2) => {
-            // Java clamps `fromIndex` at *both* ends before searching, so a
-            // start past the end answers `-1` for a real needle and the
-            // string's length for the empty one — `"abc".indexOf("", 9)` is 3,
-            // not 9. Clamping only the negative end returned the unclamped
-            // `from` back through the empty-needle hit.
-            let from = args[1].jint().clamp(0, char_len()) as usize;
-            let tail: String = s.chars().skip(from).collect();
-            let hit = char_index_of(&tail, &needle_arg(&args[0]));
-            Ok(Value::Int(if hit < 0 { -1 } else { hit + from as i64 }))
+        // Java clamps `fromIndex` at *both* ends before searching, so a start
+        // past the end answers `-1` for a real needle and the string's length
+        // for the empty one — `"abc".indexOf("", 9)` is 3, not 9.
+        ("indexOf", 1 | 2) => {
+            let from = args.get(1).map_or(0, JavaNumeric::jint);
+            Ok(Value::Int(jstr::index_of(
+                s,
+                &ix(),
+                &needle_arg(&args[0]),
+                from,
+            )))
         }
-        ("lastIndexOf", 1) => Ok(Value::Int(char_last_index_of(
-            s,
-            &needle_arg(&args[0]),
-            char_len(),
-        ))),
-        ("lastIndexOf", 2) => Ok(Value::Int(char_last_index_of(
-            s,
-            &needle_arg(&args[0]),
-            args[1].jint(),
-        ))),
+        ("lastIndexOf", 1 | 2) => {
+            let from = args.get(1).map_or(i64::MAX, JavaNumeric::jint);
+            Ok(Value::Int(jstr::last_index_of(
+                s,
+                &ix(),
+                &needle_arg(&args[0]),
+                from,
+            )))
+        }
+        // A high surrogate followed by a low one reads as the pair's code
+        // point; any other unit, an unpaired surrogate included, as itself.
         // `codePointBefore` checks `index - 1`, the position it reads.
         ("codePointAt", 1) | ("codePointBefore", 1) => {
-            let i = args[0].jint() - i64::from(method == "codePointBefore");
-            match usize::try_from(i).ok().and_then(|i| char_at(s, i)) {
-                Some(c) => Ok(Value::Int(c as i64)),
-                None => Err(Fault::java(
-                    "StringIndexOutOfBoundsException",
-                    format!("Index {i} out of bounds for length {}", char_len()),
-                )),
+            let before = method == "codePointBefore";
+            let (i, ix) = (args[0].jint(), ix());
+            let at = i - i64::from(before);
+            if at < 0 || at as usize >= ix.len() {
+                return Err(str_index_fault(at, ix.len()));
             }
+            let (at, u) = (at as usize, ix.unit(s, at as usize));
+            let cp = if before && at > 0 && jstr::is_pair(ix.unit(s, at - 1), u) {
+                jstr::pair(ix.unit(s, at - 1), u)
+            } else if !before && at + 1 < ix.len() && jstr::is_pair(u, ix.unit(s, at + 1)) {
+                jstr::pair(u, ix.unit(s, at + 1))
+            } else {
+                u32::from(u)
+            };
+            Ok(Value::Int(i64::from(cp)))
+        }
+        // `offsetByCodePoints(index, n)`: the index `n` code points from
+        // `index`, a pair counting once; a start outside the string, or a walk
+        // that leaves it, is an `IndexOutOfBoundsException` with no message.
+        ("offsetByCodePoints", 2) => {
+            let units: Vec<u16> = jstr::units(s).collect();
+            let (i, n) = (args[0].jint(), args[1].jint());
+            usize::try_from(i)
+                .ok()
+                .filter(|&i| i <= units.len())
+                .and_then(|i| jstr::offset_by_code_points(&units, i, n))
+                .map(|x| Value::Int(x as i64))
+                .ok_or_else(|| Fault::java("IndexOutOfBoundsException", ""))
         }
         // `strip` follows Unicode whitespace where `trim` cuts at U+0020; Rust's
         // `trim` is the Unicode one, so `trim` keeps its own ASCII-control rule
@@ -13022,11 +13056,11 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // A record or enum class, by its supertype in the class graph.
         ("isRecord", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Record"))),
         ("isEnum", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Enum"))),
-        // A `char[]` of code points, matching `charAt` — so `a[i] - 'a'` is
+        // A `char[]` of UTF-16 units, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
         ("toCharArray", 0) => Ok(typed_array(
-            s.chars().map(|c| Value::Int(c as i64)).collect(),
+            jstr::units(s).map(|u| Value::Int(i64::from(u))).collect(),
             "char[]",
         )),
         // `getBytes()` is UTF-8, the JDK 18+ default charset; the bytes are
@@ -13074,7 +13108,9 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             let pat = compiled.as_ref().as_ref().map_err(|e| pattern_fault(e))?;
             Ok(Value::bool(pat.matches_whole(s).map_err(engine_fault)?))
         }
-        ("contains", 1) => Ok(Value::bool(s.contains(args[0].as_str_cow().as_ref()))),
+        ("contains", 1) => Ok(Value::bool(
+            jstr::index_of(s, &ix(), &args[0].as_str_cow(), 0) >= 0,
+        )),
         ("equals", 1) => Ok(Value::bool(s == args[0].as_str_cow().as_ref())),
         ("equalsIgnoreCase", 1) => {
             let o = args[0].as_str_cow();
@@ -13084,19 +13120,31 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         ("toLowerCase", 0) => Ok(Value::str(s.to_lowercase())),
         // Java `trim()` removes leading/trailing chars ≤ U+0020.
         ("trim", 0) => Ok(Value::str(s.trim_matches(|c: char| c <= ' ').to_string())),
-        ("startsWith", 1) => Ok(Value::bool(s.starts_with(args[0].as_str_cow().as_ref()))),
-        // `startsWith(prefix, offset)` tests at a character offset instead of at
-        // the start. An offset outside the string is `false`, not a fault —
-        // Java bounds-checks it rather than throwing.
-        ("startsWith", 2) => {
-            let off = args[1].jint();
-            let len = char_count(s);
+        // `startsWith(prefix, offset)` tests at a unit offset instead of at the
+        // start. An offset outside the string is `false`, not a fault — Java
+        // bounds-checks it rather than throwing.
+        ("startsWith", 1 | 2) => {
+            let off = args.get(1).map_or(0, JavaNumeric::jint);
+            let prefix: Vec<u16> = jstr::units(&args[0].as_str_cow()).collect();
             Ok(Value::bool(usize::try_from(off).is_ok_and(|o| {
-                o <= len && s[char_byte_of(s, o)..].starts_with(args[0].as_str_cow().as_ref())
+                jstr::units(s)
+                    .skip(o)
+                    .take(prefix.len())
+                    .eq(prefix.iter().copied())
+                    && o + prefix.len() <= ix().len()
             })))
         }
-        ("endsWith", 1) => Ok(Value::bool(s.ends_with(args[0].as_str_cow().as_ref()))),
-        ("concat", 1) => Ok(Value::str(format!("{s}{}", args[0].as_str_cow()))),
+        ("endsWith", 1) => {
+            let suffix: Vec<u16> = jstr::units(&args[0].as_str_cow()).collect();
+            let n = ix().len();
+            Ok(Value::bool(
+                suffix.len() <= n
+                    && jstr::units(s)
+                        .skip(n - suffix.len())
+                        .eq(suffix.iter().copied()),
+            ))
+        }
+        ("concat", 1) => Ok(Value::str(jstr::concat(s, &args[0].as_str_cow()))),
         ("replace", 2) => Ok(Value::str(
             s.replace(args[0].as_str_cow().as_ref(), &args[1].as_str_cow()),
         )),
@@ -13112,22 +13160,25 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             }
         }
         // `chars()` and `codePoints()` are the two `IntStream` views of a
-        // string. They differ in Java only above the BMP, where `chars()` yields
-        // the two surrogate code *units* and `codePoints()` the one code point;
-        // javars stores a `String` as Unicode scalars, the same simplification
-        // `length` and `charAt` already make, so both read the same values here
-        // and `"é".chars().sum()` is 233 on either side.
+        // string. They differ only above the BMP, where `chars()` yields the
+        // two surrogate units and `codePoints()` the one code point; an
+        // unpaired surrogate is itself in both.
         // `String.codePoints()` is `SIZED` only for a Latin-1 string, whose
         // code points are its chars; a UTF-16 one is walked to be counted.
-        ("chars" | "codePoints", 0) => {
-            let items = s.chars().map(|c| Value::Int(i64::from(c as u32))).collect();
-            Ok(
-                if method == "codePoints" && s.chars().any(|c| c as u32 > 0xFF) {
-                    unsized_stream_of(items, StreamKind::Int)
-                } else {
-                    stream_of(items, StreamKind::Int)
-                },
-            )
+        ("chars", 0) => Ok(stream_of(
+            jstr::units(s).map(|u| Value::Int(i64::from(u))).collect(),
+            StreamKind::Int,
+        )),
+        ("codePoints", 0) => {
+            let items = s
+                .chars()
+                .map(|c| Value::Int(i64::from(jstr::char_value(c))))
+                .collect();
+            Ok(if s.chars().any(|c| c as u32 > 0xFF) {
+                unsized_stream_of(items, StreamKind::Int)
+            } else {
+                stream_of(items, StreamKind::Int)
+            })
         }
         // `lines()` splits on *terminators*, not separators: a trailing newline
         // ends the last line rather than starting an empty one, so `"a\n"` is
@@ -13147,8 +13198,8 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             };
             let other = a[1].as_str_cow();
             let (to, oo, len) = (a[0].jint(), a[2].jint(), a[3].jint());
-            let x: Vec<u16> = s.encode_utf16().collect();
-            let y: Vec<u16> = other.encode_utf16().collect();
+            let x: Vec<u16> = jstr::units(s).collect();
+            let y: Vec<u16> = jstr::units(&other).collect();
             if oo < 0 || to < 0 || to > x.len() as i64 - len || oo > y.len() as i64 - len {
                 return Ok(Value::bool(false));
             }
@@ -13172,7 +13223,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
         // `codePointCount(begin, end)` over UTF-16 indices: a surrogate pair
         // inside the range is one code point, an unpaired surrogate one too.
         ("codePointCount", 2) => {
-            let units: Vec<u16> = s.encode_utf16().collect();
+            let units: Vec<u16> = jstr::units(s).collect();
             let (b, e) = (args[0].jint(), args[1].jint());
             if b < 0 || e > units.len() as i64 || b > e {
                 return Err(Fault::java(
@@ -13180,7 +13231,7 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
                     format!("Range [{b}, {e}) out of bounds for length {}", units.len()),
                 ));
             }
-            let n = char::decode_utf16(units[b as usize..e as usize].iter().copied()).count();
+            let n = jstr::code_point_count(&units[b as usize..e as usize]);
             Ok(Value::Int(n as i64))
         }
         ("lines", 0) => Ok(unsized_stream_of(
@@ -13219,43 +13270,40 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
     }
 }
 
-/// `String.substring(begin, end)` on `char` indices — `[begin, end)`, with
-/// Java's bounds rules (`0 ≤ begin ≤ end ≤ length`) and its exact
-/// `StringIndexOutOfBoundsException` message.
-fn substring(s: &str, begin: i64, end: i64) -> Result<Value, Fault> {
-    let len = s.chars().count() as i64;
+/// `String.substring(begin[, end])` on UTF-16 indices — `[begin, end)`, `end`
+/// defaulting to the length, with Java's bounds rules (`0 ≤ begin ≤ end ≤
+/// length`) and its exact `StringIndexOutOfBoundsException` message. A bound
+/// inside a surrogate pair keeps the half on its side, unpaired.
+fn substring(s: &str, begin: i64, end: Option<i64>) -> Result<Value, Fault> {
+    let ix = jstr::index(s);
+    let len = ix.len() as i64;
+    let end = end.unwrap_or(len);
     if begin < 0 || end > len || begin > end {
         return Err(Fault::java(
             "StringIndexOutOfBoundsException",
             format!("Range [{begin}, {end}) out of bounds for length {len}"),
         ));
     }
-    let sub: String = s
-        .chars()
-        .skip(begin as usize)
-        .take((end - begin) as usize)
-        .collect();
-    Ok(Value::str(sub))
+    Ok(Value::str(ix.slice(s, begin as usize, end as usize)))
 }
 
-/// `String.indexOf(sub)` returning a `char` index (not a byte offset), or `-1`.
+/// The character an `int` `indexOf`/`lastIndexOf` argument names: a BMP
+/// value (a surrogate included) is one unit, a larger code point its pair.
+/// `None` for a value that is no code point, or one javars reserves.
+fn needle_char(i: i64) -> Option<char> {
+    jstr::checked_code_point(i).unwrap_or_default()
+}
+
 /// The text a `String.indexOf`/`lastIndexOf` argument searches for: a `char`
 /// travels as a one-character string already, while an `int` is a code point and
 /// is turned into that character.
 fn needle_arg(v: &Value) -> std::borrow::Cow<'_, str> {
     match v {
-        Value::Int(i) => match u32::try_from(*i).ok().and_then(char::from_u32) {
+        Value::Int(i) => match needle_char(*i) {
             Some(c) => std::borrow::Cow::Owned(c.to_string()),
             None => v.as_str_cow(),
         },
         _ => v.as_str_cow(),
-    }
-}
-
-fn char_index_of(s: &str, needle: &str) -> i64 {
-    match s.find(needle) {
-        Some(byte_pos) => s[..byte_pos].chars().count() as i64,
-        None => -1,
     }
 }
 
@@ -13797,12 +13845,36 @@ fn array_copy(
     }
     // Copied through a snapshot of the source range, which is what makes an
     // overlapping copy within one array behave "as if" through a temporary.
-    let chunk = from[sp as usize..(sp + len) as usize].to_vec();
+    let mut chunk = from[sp as usize..(sp + len) as usize].to_vec();
+    // A reference copy stores each element as an assignment would, so one
+    // the destination's element type refuses stops the copy there: the
+    // elements before it are written, and the JDK's fault names the source's
+    // array class and the destination's element class.
+    let refused = chunk
+        .iter()
+        .position(|v| array_store_fault(dst, v).is_some());
+    if let Some(at) = refused {
+        chunk.truncate(at);
+    }
     HEAP.with(|h| {
         if let Some(HostObj::Array(a)) = h.borrow_mut().get_mut(*did as usize) {
-            a[dp as usize..(dp + len) as usize].clone_from_slice(&chunk);
+            a[dp as usize..dp as usize + chunk.len()].clone_from_slice(&chunk);
         }
     });
+    if refused.is_some() {
+        let elem_name = |arr: &Value, fallback: &str| {
+            let ty = array_type(arr).unwrap_or_else(|| fallback.to_string());
+            jdk_name(ty.strip_suffix("[]").unwrap_or("Object"))
+        };
+        return Err(Fault::java(
+            "ArrayStoreException",
+            format!(
+                "arraycopy: element type mismatch: can not cast one of the elements of {}[] to the type of the destination array, {}",
+                elem_name(src, sty),
+                elem_name(dst, dty)
+            ),
+        ));
+    }
     Ok(Value::Undef)
 }
 
@@ -13953,6 +14025,7 @@ fn std_emit(err: bool, text: &str) {
     if STD_CLOSED.with(Cell::get)[usize::from(err)] {
         return;
     }
+    let text = jstr::encoded(text);
     if err {
         let _ = std::io::stderr().lock().write_all(text.as_bytes());
     } else {
@@ -13971,8 +14044,8 @@ fn sink_write(sink: crate::jio::Sink, text: &str) -> Result<(), Fault> {
             if let Some(HostObj::Builder { s, len, cap, .. }) =
                 heap.borrow_mut().get_mut(b as usize)
             {
-                s.push_str(text);
-                *len += text.chars().count();
+                jstr::push_str(s, text);
+                *len += jstr::len(text);
                 *cap = sb_grow(*cap, *len);
             }
         }),
@@ -14162,19 +14235,17 @@ fn writer_new(class: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
 /// string conversion of anything else (`append(null)` appends `null`).
 fn writer_text(vm: &mut VM, v: &Value) -> String {
     match v {
-        Value::Int(n) => char::from_u32(*n as u32 & 0xFFFF)
-            .map(String::from)
-            .unwrap_or_default(),
-        Value::Obj(_) if array_items(v).is_some() => array_items(v)
-            .unwrap_or_default()
-            .iter()
-            .map(|c| match c {
-                Value::Int(n) => char::from_u32(*n as u32)
-                    .map(String::from)
-                    .unwrap_or_default(),
-                other => java_str(other),
-            })
-            .collect(),
+        Value::Int(n) => jstr::from_units([*n as u16]),
+        Value::Obj(_) if array_items(v).is_some() => {
+            let mut out = String::new();
+            for c in array_items(v).unwrap_or_default() {
+                match c {
+                    Value::Int(n) => jstr::push_unit(&mut out, n as u16),
+                    other => jstr::push_str(&mut out, &java_str(&other)),
+                }
+            }
+            out
+        }
         other => java_str_vm(vm, other),
     }
 }
@@ -14372,7 +14443,7 @@ fn rendering_static(vm: &mut VM, class: &str, method: &str, args: &[Value]) -> O
         // object, which `==` can now see.
         ("String", "valueOf", 1) if matches!(args[0], Value::Str(_)) => args[0].clone(),
         ("String", "valueOf", 1) => Value::str(match array_items(&args[0]) {
-            Some(items) => items.iter().map(|v| java_str_vm(vm, v)).collect::<String>(),
+            Some(items) => jstr::canon(items.iter().map(|v| java_str_vm(vm, v)).collect()),
             None => java_str_vm(vm, &args[0]),
         }),
         // A null delimiter falls through to [`static_method`], which raises the
@@ -14385,7 +14456,7 @@ fn rendering_static(vm: &mut VM, class: &str, method: &str, args: &[Value]) -> O
                 (Some(items), 2) => items.iter().map(|v| java_str_vm(vm, v)).collect(),
                 _ => args[1..].iter().map(|v| java_str_vm(vm, v)).collect(),
             };
-            Value::str(parts.join(&sep))
+            Value::str(jstr::canon(parts.join(&sep)))
         }
         ("Arrays", "toString", 1) => match array_items(&args[0]) {
             Some(items) => {
@@ -15397,6 +15468,32 @@ fn collection_static(
         // `swap(l, i, j)` is `l.set(i, l.set(j, l.get(i)))`, through the list's
         // own methods, so the bounds message and the immutable refusal are the
         // ones `get`/`set` give, in the order the JDK reaches them.
+        // `copy(dest, src)`: `src.size()` first, a source longer than the
+        // destination refused before anything is written, then `dest.set(i,
+        // src.get(i))` element by element — so an immutable destination fails
+        // at its first `set`.
+        ("Collections", "copy") if args.len() == 2 => {
+            let (dest, src) = (&args[0], &args[1]);
+            let Some(items) = sequence_items(src) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "src")));
+            };
+            let Some(room) = sequence_items(dest).map(|d| d.len()) else {
+                return Some(Err(npe_invoke("java.util.List.size()", "dest")));
+            };
+            if items.len() > room {
+                return Some(Err(Fault::java(
+                    "IndexOutOfBoundsException",
+                    "Source does not fit in dest",
+                )));
+            }
+            for (i, v) in items.into_iter().enumerate() {
+                coll_method(vm, dest, "set", &[Value::Int(i as i64), v]);
+                if pending() {
+                    return Some(Ok(Value::Undef));
+                }
+            }
+            Ok(Value::Undef)
+        }
         ("Collections", "swap") if args.len() == 3 => {
             let l = &args[0];
             if matches!(l, Value::Undef) {
@@ -16149,7 +16246,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             Ok(Value::Int(i64::from((args[0].jint() as i16).swap_bytes())))
         }
         ("Character", "reverseBytes", 1) => Ok(Value::Int(i64::from(
-            (char_arg(&args[0]) as u32 as u16).swap_bytes(),
+            (char_num(&args[0]) as u16).swap_bytes(),
         ))),
         ("Integer", "rotateLeft", 2) => Ok(Value::Int(i64::from(
             (args[0].jint() as i32).rotate_left(args[1].jint() as u32),
@@ -16172,7 +16269,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             let v = match class {
                 "Double" => Value::float(args[0].jfloat()),
                 "Boolean" => Value::bool(matches!(args[0], Value::Bool(true))),
-                "Character" => Value::Int(i64::from(char_arg(&args[0]) as u32)),
+                "Character" => Value::Int(i64::from(char_num(&args[0]))),
                 _ => Value::Int(args[0].jint()),
             };
             Ok(Value::Int(java_hash(&v).unwrap_or(0).into()))
@@ -16421,12 +16518,121 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
         ))),
         // `Character.compare(x, y)` is `x - y`, not a sign.
         ("Character", "compare", 2) => Ok(Value::Int(
-            char_arg(&args[0]) as i64 - char_arg(&args[1]) as i64,
+            i64::from(char_num(&args[0])) - i64::from(char_num(&args[1])),
         )),
+        ("Character", "toUpperCase" | "toLowerCase" | "toTitleCase", 1)
+            if jstr::is_surrogate(char_num(&args[0])) =>
+        {
+            Ok(Value::Int(i64::from(char_num(&args[0]))))
+        }
+        // The UTF-16 encoding statics, all on the numbers a `char`/`int` holds.
+        ("Character", "isSurrogate", 1) => Ok(Value::bool(jstr::is_surrogate(char_num(&args[0])))),
+        ("Character", "isHighSurrogate", 1) => {
+            Ok(Value::bool((0xD800..=0xDBFF).contains(&char_num(&args[0]))))
+        }
+        ("Character", "isLowSurrogate", 1) => {
+            Ok(Value::bool((0xDC00..=0xDFFF).contains(&char_num(&args[0]))))
+        }
+        ("Character", "isSurrogatePair", 2) => Ok(Value::bool(jstr::is_pair(
+            char_num(&args[0]) as u16,
+            char_num(&args[1]) as u16,
+        ))),
+        // `toCodePoint` does not validate: it is the arithmetic of the
+        // encoding, whatever the two `char`s are.
+        ("Character", "toCodePoint", 2) => Ok(Value::Int(
+            ((i64::from(char_num(&args[0])) << 10) + i64::from(char_num(&args[1])))
+                + (0x10000 - (0xD800 << 10) - 0xDC00),
+        )),
+        ("Character", "highSurrogate", 1) => Ok(Value::Int(
+            ((args[0].jint() as u32 >> 10) + (0xD800 - (0x10000 >> 10))) as u16 as i64,
+        )),
+        ("Character", "lowSurrogate", 1) => Ok(Value::Int(
+            ((args[0].jint() as u32 & 0x3FF) + 0xDC00) as u16 as i64,
+        )),
+        ("Character", "isValidCodePoint", 1) => {
+            Ok(Value::bool((0..=0x10FFFF).contains(&args[0].jint())))
+        }
+        ("Character", "isBmpCodePoint", 1) => {
+            Ok(Value::bool((0..=0xFFFF).contains(&args[0].jint())))
+        }
+        ("Character", "isSupplementaryCodePoint", 1) => {
+            Ok(Value::bool((0x10000..=0x10FFFF).contains(&args[0].jint())))
+        }
+        // `codePointAt`/`codePointBefore` over a `CharSequence` or a `char[]`
+        // (with an optional limit/start for the array forms), and
+        // `codePointCount` over either. A bad index is the fault the
+        // sequence's own `charAt` — or the array access — raises.
+        ("Character", "codePointAt" | "codePointBefore" | "codePointCount", 2 | 3) => {
+            let (units, array) = char_seq_units(&args[0])?;
+            let n = units.len();
+            let index_fault = |i: i64| {
+                if array {
+                    Fault::java(
+                        "ArrayIndexOutOfBoundsException",
+                        format!("Index {i} out of bounds for length {n}"),
+                    )
+                } else {
+                    str_index_fault(i, n)
+                }
+            };
+            let i = args[1].jint();
+            match method {
+                "codePointCount" => {
+                    let e = args.get(2).map_or(0, JavaNumeric::jint);
+                    let (b, e, shown) = if array {
+                        (
+                            i,
+                            i + e,
+                            format!("Range [{i}, {i} + {e}) out of bounds for length {n}"),
+                        )
+                    } else {
+                        (
+                            i,
+                            e,
+                            format!("Range [{i}, {e}) out of bounds for length {n}"),
+                        )
+                    };
+                    if b < 0 || b > e || e > n as i64 {
+                        return Err(Fault::java("IndexOutOfBoundsException", shown));
+                    }
+                    Ok(Value::Int(
+                        jstr::code_point_count(&units[b as usize..e as usize]) as i64,
+                    ))
+                }
+                "codePointAt" => {
+                    let limit = args.get(2).map_or(n as i64, JavaNumeric::jint);
+                    if args.len() == 3 && (i >= limit || limit < 0 || limit > n as i64) {
+                        return Err(index_fault(i));
+                    }
+                    if i < 0 || i >= n as i64 {
+                        return Err(index_fault(i));
+                    }
+                    Ok(Value::Int(i64::from(jstr::code_point_at(
+                        &units,
+                        i as usize,
+                        limit as usize,
+                    ))))
+                }
+                _ => {
+                    let start = args.get(2).map_or(0, JavaNumeric::jint);
+                    if args.len() == 3 && (i <= start || start < 0 || start >= n as i64) {
+                        return Err(index_fault(i));
+                    }
+                    if i < 1 || i > n as i64 {
+                        return Err(index_fault(i - 1));
+                    }
+                    Ok(Value::Int(i64::from(jstr::code_point_before(
+                        &units,
+                        i as usize,
+                        start as usize,
+                    ))))
+                }
+            }
+        }
         ("Character", "charCount", 1) => {
             Ok(Value::Int(if args[0].jint() >= 0x10000 { 2 } else { 1 }))
         }
-        ("Character", "valueOf", 1) => Ok(Value::Int(char_arg(&args[0]) as i64)),
+        ("Character", "valueOf", 1) => Ok(Value::Int(i64::from(char_num(&args[0])))),
         ("Character", "isLetter", 1) => Ok(Value::bool(java_is_letter(char_arg(&args[0])))),
         // Read as a code point, not a `char`: a lone surrogate is a legal
         // argument (and not an identifier part), where a `char` conversion
@@ -16481,7 +16687,19 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             char::to_lowercase,
         ))),
         ("Character", "toTitleCase", 1) => Ok(Value::Int(title_case(char_arg(&args[0])))),
-        ("Character", "toString", 1) => Ok(Value::str(char_arg(&args[0]).to_string())),
+        // `toString(char)` and `toString(int codePoint)`: the one or two
+        // units the value denotes, an unpaired surrogate included.
+        ("Character", "toString", 1) => {
+            let cp = i64::from(code_point_arg(&args[0]));
+            match jstr::checked_code_point(cp) {
+                Ok(Some(c)) => Ok(Value::str(c.to_string())),
+                Ok(None) => Err(Fault::java(
+                    "IllegalArgumentException",
+                    format!("Not a valid Unicode code point: 0x{:X}", cp as i32),
+                )),
+                Err(e) => Err(Fault::internal(e)),
+            }
+        }
         // The JDK's own answers for every code point, from the generated
         // tables (`src/unicode_tables.rs`): a Roman numeral's numeric value is
         // its number, a fraction's -2, a surrogate's category `SURROGATE`.
@@ -16586,15 +16804,15 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                     ),
                 ));
             }
-            Ok(Value::str(
+            Ok(Value::str(jstr::canon(
                 items[off as usize..(off + count) as usize]
                     .iter()
                     .map(java_str)
-                    .collect::<String>(),
-            ))
+                    .collect(),
+            )))
         }
         ("String", "valueOf" | "copyValueOf", 1) => Ok(Value::str(match array_items(&args[0]) {
-            Some(items) => items.iter().map(java_str).collect::<String>(),
+            Some(items) => jstr::canon(items.iter().map(java_str).collect()),
             None => java_str(&args[0]),
         })),
         // `String.format(fmt, args…)` — printf-style formatting (subset).
@@ -16621,7 +16839,7 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
                 (Some(items), 2) => items.iter().map(java_str).collect(),
                 _ => args[1..].iter().map(java_str).collect(),
             };
-            Ok(Value::str(parts.join(&sep)))
+            Ok(Value::str(jstr::canon(parts.join(&sep))))
         }
 
         // ── java.lang.Boolean ──
@@ -16674,8 +16892,14 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             }
             Ok(Value::Int(from))
         }
+        // `Arrays.fill` stores the value into each slot as an assignment
+        // would, so a value the array's element type refuses fails the first
+        // store, before anything is written.
         ("Arrays", "fill", 2) => {
             let v = args[1].clone();
+            if let Some(f) = array_store_fault(&args[0], &v) {
+                return Err(f);
+            }
             array_mutate(&args[0], |a| a.fill(v))?;
             Ok(Value::Undef)
         }
@@ -16688,6 +16912,9 @@ fn static_method(class: &str, method: &str, args: &[Value]) -> Result<Value, Fau
             let (from, to) = (args[1].jint(), args[2].jint());
             arrays_range_check(len, from, to)?;
             let v = args[3].clone();
+            if let Some(f) = array_store_fault(&args[0], &v).filter(|_| from < to) {
+                return Err(f);
+            }
             array_mutate(&args[0], |a| a[from as usize..to as usize].fill(v))?;
             Ok(Value::Undef)
         }
@@ -16829,7 +17056,7 @@ impl Charset {
     /// `?`, the JDK's replacement byte.
     fn encode(self, s: &str) -> Vec<u8> {
         match self {
-            Charset::Utf8 => s.as_bytes().to_vec(),
+            Charset::Utf8 => jstr::encoded(s).as_bytes().to_vec(),
             Charset::Latin1 => s.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect(),
             Charset::Ascii => s
                 .chars()
@@ -16886,30 +17113,6 @@ fn arrays_hash(v: &Value, deep: bool) -> i32 {
         };
         acc.wrapping_mul(31).wrapping_add(h)
     })
-}
-
-/// The last index (in characters) at which `needle` starts at or before
-/// `from`, or -1.
-///
-/// The clamping order is the JDK's (`StringLatin1.lastIndexOf`) and it matters:
-/// `fromIndex` is first pulled *down* to the last position a needle of this
-/// length could start at, and only then rejected for being negative. Testing
-/// the empty needle before that ordering — which is what a `clamp(0, len)`
-/// does — answered `"abc".lastIndexOf("", -1)` with 0 where Java answers -1.
-fn char_last_index_of(hay: &str, needle: &str, from: i64) -> i64 {
-    let chars: Vec<char> = hay.chars().collect();
-    let pat: Vec<char> = needle.chars().collect();
-    let start = from.min(chars.len() as i64 - pat.len() as i64);
-    if start < 0 {
-        return -1;
-    }
-    if pat.is_empty() {
-        return start;
-    }
-    (0..=start)
-        .rev()
-        .find(|&i| chars[i as usize..].starts_with(&pat))
-        .unwrap_or(-1)
 }
 
 // ── java.util.regex.Pattern / Matcher ───────────────────────────────────────
@@ -17011,20 +17214,17 @@ fn regex_compiled(source: &str, mode: MatchMode) -> Result<crate::regex::Compile
 
 /// The UTF-16 index of byte offset `b` — what every `Matcher` index reports.
 fn utf16_at(text: &str, b: usize) -> i64 {
-    text[..b].encode_utf16().count() as i64
+    jstr::len(&text[..b]) as i64
 }
 
 /// The byte offset of UTF-16 index `i`; an index inside a surrogate pair
 /// resolves to the character's end.
 fn byte_at_utf16(text: &str, i: usize) -> usize {
-    let mut units = 0;
-    for (b, c) in text.char_indices() {
-        if units >= i {
-            return b;
-        }
-        units += c.len_utf16();
+    let ix = jstr::index(text);
+    match ix.at(text, i) {
+        jstr::At::Byte(b) => b,
+        jstr::At::Inside(b) => b + text[b..].chars().next().map_or(0, char::len_utf8),
     }
-    text.len()
 }
 
 impl RegexMatcher {
@@ -17341,7 +17541,7 @@ fn matcher_method(
         match (method, args) {
             ("find", []) => m.find().map(Value::bool),
             ("find", [s]) => {
-                let limit = m.text.encode_utf16().count() as i64;
+                let limit = jstr::len(&m.text) as i64;
                 let s = s.jint();
                 if s < 0 || s > limit {
                     return Err(Fault::java(
@@ -17413,7 +17613,7 @@ fn matcher_method(
                 Ok(Value::str(out))
             }
             ("regionStart", []) => Ok(Value::Int(0)),
-            ("regionEnd", []) => Ok(Value::Int(m.text.encode_utf16().count() as i64)),
+            ("regionEnd", []) => Ok(Value::Int(jstr::len(&m.text) as i64)),
             _ => Err(Fault::internal(format!(
                 "javars: unsupported Matcher method `{method}` with {} argument(s)",
                 args.len()
@@ -18835,23 +19035,62 @@ fn title_case(c: char) -> i64 {
     }
 }
 
+/// The `char`s of a `Character.codePointAt`-style sequence argument — a
+/// `String`, a builder, or a `char[]` — and whether it was the array.
+fn char_seq_units(v: &Value) -> Result<(Vec<u16>, bool), Fault> {
+    if matches!(v, Value::Undef) {
+        return Err(Fault::java("NullPointerException", String::new()));
+    }
+    if let Some(items) = array_items(v) {
+        let mut units = Vec::with_capacity(items.len());
+        for e in &items {
+            match e {
+                Value::Int(n) => units.push(*n as u16),
+                other => units.extend(jstr::units(&java_str(other))),
+            }
+        }
+        return Ok((units, true));
+    }
+    let text = match is_builder(v) {
+        Some(id) => HEAP.with(|h| match h.borrow().get(id as usize) {
+            Some(HostObj::Builder { s, .. }) => s.clone(),
+            _ => String::new(),
+        }),
+        None => v.as_str_cow().into_owned(),
+    };
+    Ok((jstr::units(&text).collect(), false))
+}
+
 /// A `Character` static's argument as a code point — the `int` overloads'
 /// view, which keeps a lone surrogate the surrogate it is.
 fn code_point_arg(v: &Value) -> u32 {
     match &deboxed(v) {
         Value::Int(n) => *n as u32,
-        other => other.as_str_cow().chars().next().map_or(0, u32::from),
+        other => other
+            .as_str_cow()
+            .chars()
+            .next()
+            .map_or(0, jstr::char_value),
     }
 }
 
+/// A `Character` static's `char` argument as a character to read properties
+/// of. A surrogate is its stand-in (`src/jstr.rs`), which has none of the
+/// properties a letter, digit or space has — as a surrogate has none.
 fn char_arg(v: &Value) -> char {
     // Through a `Character` box too: `Character.isLetter(aCharacter)` reads the
     // wrapper as its code point, and the handle would otherwise render as text
     // whose first character is a digit of the id.
     match &deboxed(v) {
-        Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{0}'),
+        Value::Int(n) => jstr::char_of(*n as u32).unwrap_or('\u{0}'),
         other => other.as_str_cow().chars().next().unwrap_or('\u{0}'),
     }
+}
+
+/// A `char` argument as the number Java holds: [`char_arg`] with a stand-in
+/// read back as its surrogate.
+fn char_num(v: &Value) -> u32 {
+    jstr::char_value(char_arg(v))
 }
 
 /// A copy of the elements of `v` when it is a heap array, else `None`.
@@ -19653,7 +19892,7 @@ fn format_conversion(
                 s = s.to_uppercase();
             }
             if let Some(p) = prec {
-                s = s.chars().take(p).collect();
+                s = format_precision(s, p);
             }
             Ok(Rendered::text(s))
         }
@@ -19665,7 +19904,7 @@ fn format_conversion(
                 s = s.to_uppercase();
             }
             if let Some(p) = prec {
-                s = s.chars().take(p).collect();
+                s = format_precision(s, p);
             }
             Ok(Rendered::text(s))
         }
@@ -19697,7 +19936,7 @@ fn format_conversion(
         'c' | 'C' => {
             let s = match arg {
                 // `%c` on an integer renders its code point as a character.
-                Value::Int(n) => char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string(),
+                Value::Int(n) => jstr::char_of(*n as u32).unwrap_or('\u{fffd}').to_string(),
                 other => java_str(other),
             };
             Ok(Rendered::text(if conv == 'C' {
@@ -19768,7 +20007,7 @@ fn format_conversion(
             };
             let mut s = if conv == 'H' { s.to_uppercase() } else { s };
             if let Some(p) = prec {
-                s = s.chars().take(p).collect();
+                s = format_precision(s, p);
             }
             Ok(Rendered::text(s))
         }
@@ -20166,7 +20405,8 @@ fn pad(
         Some(w) => w,
         None => return joined(),
     };
-    let len = prefix.chars().count() + body.chars().count() + suffix.chars().count();
+    // Width counts UTF-16 units, as `String.length()` does.
+    let len = jstr::len(prefix) + jstr::len(body) + jstr::len(suffix);
     if len >= w {
         return joined();
     }
@@ -20178,6 +20418,16 @@ fn pad(
     } else {
         format!("{}{prefix}{body}{suffix}", " ".repeat(fill))
     }
+}
+
+/// A `%s`-family precision: the first `p` UTF-16 units, the cut Formatter
+/// makes with `substring(0, precision)` — which can split a surrogate pair.
+fn format_precision(s: String, p: usize) -> String {
+    let ix = jstr::index(&s);
+    if p >= ix.len() {
+        return s;
+    }
+    ix.slice(&s, 0, p)
 }
 
 /// Parse a signed integer in the given radix with `java.lang.Integer`'s exact
@@ -20452,7 +20702,7 @@ fn print_args(vm: &mut VM, argc: u8, newline: bool, err: bool) -> Value {
     } else {
         Box::new(stdout.lock())
     };
-    let _ = write!(lock, "{text}");
+    let _ = write!(lock, "{}", jstr::encoded(&text));
     if newline {
         let _ = writeln!(lock);
     }
@@ -20749,7 +20999,7 @@ fn obj_default_str(id: u32) -> String {
     let handle = Value::Obj(id);
     if let (Some(class), Some(v)) = (box_class(&handle), unboxed(&handle)) {
         return match class {
-            "Character" => char::from_u32(as_i64(&v) as u32)
+            "Character" => jstr::char_of(as_i64(&v) as u32)
                 .map(String::from)
                 .unwrap_or_default(),
             "Float" => java_str(&float_to_string(&v)),
@@ -20829,7 +21079,7 @@ fn obj_default_str(id: u32) -> String {
             Some(HostObj::RegexMatcher(m)) => format!(
                 "java.util.regex.Matcher[pattern={} region=0,{} lastmatch={}]",
                 m.shown,
-                m.text.encode_utf16().count(),
+                jstr::len(&m.text),
                 m.first
                     .and_then(|_| m.groups.first().copied().flatten())
                     .map_or("", |(a, b)| &m.text[a..b])
@@ -21326,7 +21576,7 @@ pub fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     match op {
         // Java `+`: if either side is non-numeric (a String), concatenate using
         // Java's value-to-string rules.
-        NumOp::Add => Ok(Value::str(format!("{}{}", java_str(a), java_str(b)))),
+        NumOp::Add => Ok(Value::str(jstr::concat(&java_str(a), &java_str(b)))),
         // Value equality/ordering against a string operand (Java `.equals`/
         // `.compareTo`-style; `==` reference identity is not modeled in slice 1).
         NumOp::Eq => Ok(Value::bool(java_str(a) == java_str(b))),
@@ -21461,7 +21711,7 @@ fn b_chr_str(vm: &mut VM, _argc: u8) -> Value {
 /// through, so a `null` (or an already-boxed `Character`) is left alone.
 fn char_to_string(v: &Value) -> Value {
     match v {
-        Value::Int(n) => Value::str(char::from_u32(*n as u32).unwrap_or('\u{fffd}').to_string()),
+        Value::Int(n) => Value::str(jstr::char_of(*n as u32).unwrap_or('\u{fffd}').to_string()),
         other => other.clone(),
     }
 }
@@ -21946,7 +22196,7 @@ fn as_i64(v: &Value) -> i64 {
             let s = other.as_str_cow();
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) => c as i64,
+                (Some(c), None) => i64::from(jstr::char_value(c)),
                 _ => s.parse::<i64>().unwrap_or(0),
             }
         }

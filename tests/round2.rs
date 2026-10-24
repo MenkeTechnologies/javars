@@ -3515,3 +3515,495 @@ Hi [a, b]
     assert!(ok, "program failed:\n{out}");
     assert_eq!(out, expected);
 }
+
+/// `String` indices are UTF-16 units: an astral character is two `char`s for `length`, `charAt`, `substring`, `indexOf`, `toCharArray`, `chars`, a `Matcher` position and a `%s` width; `codePointAt`/`codePointBefore`/`codePointCount`/`offsetByCodePoints` read the pairs. Measured on openjdk 21.0.13.
+#[test]
+fn string_indices_count_utf16_units() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String s = new String(Character.toChars(0x1F600)) + "ab" + new String(Character.toChars(0x10400));
+        System.out.println(s.length() + " " + "\ud83d\ude00".length() + " " + "x\ud83d\ude00y".charAt(2) / 1);
+        StringBuilder u = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) u.append((int) s.charAt(i)).append(' ');
+        System.out.println(u);
+        System.out.println(s.codePointAt(0) + " " + s.codePointAt(1) + " " + s.codePointBefore(2) + " " + s.codePointBefore(1));
+        System.out.println(s.codePointCount(0, s.length()) + " " + s.codePointCount(1, 5));
+        System.out.println(s.offsetByCodePoints(0, 2) + " " + s.offsetByCodePoints(1, 1) + " " + s.offsetByCodePoints(6, -3));
+        System.out.println(s.substring(2, 4) + "|" + s.indexOf("a") + "|" + s.lastIndexOf('b') + "|" + s.indexOf(0x10400) + "|" + s.indexOf("b", 3) + "|" + s.indexOf(0xDE00));
+        System.out.println(s.toCharArray().length + " " + s.chars().count() + " " + s.codePoints().count() + " " + s.chars().sum() + " " + s.codePoints().sum());
+        System.out.println(s.startsWith("ab", 2) + " " + s.endsWith(s.substring(5)) + " " + s.contains(s.substring(1, 2)));
+        try { s.charAt(6); } catch (StringIndexOutOfBoundsException e) { System.out.println(e.getMessage()); }
+        try { s.offsetByCodePoints(0, 5); } catch (IndexOutOfBoundsException e) { System.out.println(e.getClass().getName()); }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("b").matcher(s);
+        System.out.println(m.find() + " " + m.start() + " " + m.end());
+        System.out.println(String.format("[%3s][%-4s][%.1s]", "\ud83d\ude00", "\ud83d\ude00", "ab").length());
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "6 2 56832\n55357 56832 97 98 55297 56320 \n128512 56832 128512 55357\n4 4\n3 2 2\nab|2|3|4|3|1\n6 6 4 224001 195267\ntrue true true\nIndex 6 out of bounds for length 6\njava.lang.IndexOutOfBoundsException\ntrue 3 4\n14\n");
+}
+
+/// Half of a surrogate pair is a one-unit string that rejoins into the character when concatenated, appended or joined, and leaves the program as `?` (`println`, `getBytes`). Measured on openjdk 21.0.13.
+#[test]
+fn unpaired_surrogates_rejoin_and_print_as_question_marks() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String e = "\ud83d\ude00";
+        String hi = e.substring(0, 1), lo = e.substring(1);
+        System.out.println(hi.length() + " " + (int) hi.charAt(0) + " " + (hi + lo).equals(e) + " " + hi.concat(lo).length());
+        System.out.println("[" + hi + "]" + hi.getBytes().length + " " + "\ud83d".equals(hi));
+        StringBuilder sb = new StringBuilder();
+        for (char c : e.toCharArray()) sb.append(c);
+        System.out.println(sb.length() + " " + sb.toString().equals(e));
+        String r = "";
+        for (int i = e.length() - 1; i >= 0; i--) r += e.charAt(i);
+        System.out.println(r.length() + " " + r.equals(e) + " " + r.codePointCount(0, 2) + " " + r.codePointAt(0));
+        System.out.println(new String(new char[]{e.charAt(0), e.charAt(1)}).equals(e) + " " + String.valueOf(e.charAt(0)).length());
+        System.out.println(Character.toString(0x1F602).length() + " " + Character.toString(0xD83D).length() + " " + ("x" + hi + "y" + lo).replace("y", "").equals("x" + e));
+        System.out.println("x\ud83dy\ude00".replace("y", "").length() + " " + (hi + "|" + lo).split("\\|").length + " " + String.join("", hi, lo).equals(e));
+        System.out.println(hi + lo + " " + lo + hi);
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "1 55357 true 2\n[?]1 true\n2 true\n2 false 2 56832\ntrue 1\n2 1 true\n3 2 true\n\u{1F600} ??\n");
+}
+
+/// `StringBuilder` edits count UTF-16 units; an edit that splits a pair leaves the halves unpaired, `reverse` keeps pairs in order and pairs a reversed `low, high`. Measured on openjdk 21.0.13.
+#[test]
+fn string_builder_edits_in_utf16_units() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String g = "\ud83d\ude00";
+        StringBuilder sb = new StringBuilder("a" + g + "b");
+        System.out.println(sb.length() + " " + (int) sb.charAt(2) + " " + sb.codePointAt(1) + " " + sb.indexOf("b") + " " + sb.lastIndexOf(g));
+        sb.insert(2, 'Z'); System.out.println(sb.length() + " " + sb.codePointCount(0, sb.length()));
+        sb = new StringBuilder("a" + g + "b"); sb.setCharAt(1, 'Q'); System.out.println(sb.length() + " " + sb.codePointAt(2));
+        sb = new StringBuilder(g + g); sb.delete(1, 3); System.out.println(sb.length() + " " + sb.codePointAt(0) + " " + sb.codePointCount(0, 2));
+        sb = new StringBuilder(g + "x"); sb.setLength(1); System.out.println(sb.length() + " " + (int) sb.charAt(0));
+        sb = new StringBuilder(g + "x"); sb.deleteCharAt(1); System.out.println(sb.length() + " " + (int) sb.charAt(1));
+        System.out.println(new StringBuilder("ab" + g + "c").reverse().codePointAt(1) + " " + new StringBuilder("\udc00\ud800").reverse().codePointCount(0, 2));
+        StringBuilder c = new StringBuilder("a").appendCodePoint(0x1F603).append(g, 0, 1).append(new char[]{'\ude00'});
+        System.out.println(c.length() + " " + c.codePointCount(0, c.length()) + " " + c.substring(3).length() + " " + c.offsetByCodePoints(0, 2));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "4 56832 128512 3 1\n5 5\n4 56832\n2 128512 1\n1 55357\n2 120\n128512 1\n5 3 2 3\n"
+    );
+}
+
+/// `String` order, `compareTo`, `compareToIgnoreCase` and `hashCode` are over UTF-16 units, so an astral character sorts below U+E000 and an unpaired surrogate between. Measured on openjdk 21.0.13.
+#[test]
+fn string_order_hash_and_case_fold_follow_utf16() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        String g = "\ud83d\ude00", h = "\ud83d";
+        List<String> l = new ArrayList<>(List.of("\ufffd", g, "z", "\ue000", h));
+        Collections.sort(l);
+        StringBuilder o = new StringBuilder();
+        for (String s : l) o.append(Integer.toHexString(s.charAt(0))).append(' ');
+        System.out.println(o);
+        String[] arr = {"\ufffd", "\ud83d\ude00", "z", "\ue000", "\ud83d"};
+        Arrays.sort(arr);
+        for (String s : arr) System.out.print(Integer.toHexString(s.charAt(0)) + " ");
+        System.out.println();
+        System.out.println(g.compareTo("\ufffd") + " " + "a\ud83d\ude00".compareToIgnoreCase("A\ud83d\ude00") + " " + g.compareToIgnoreCase("\ud83d\ude01") + " " + new TreeSet<>(l).first());
+        Map<String, Integer> m = new HashMap<>();
+        m.put(g, 1); m.put(h, 2); m.put("x", 3);
+        System.out.println(m.get(g.substring(0, 2)) + " " + m.get(g.substring(0, 1)) + " " + g.hashCode() + " " + h.hashCode() + " " + m);
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "7a d83d d83d e000 fffd \n7a d83d d83d e000 fffd \n-10176 0 -1 z\n1 2 1772899 55357 {\u{1F600}=1, x=3, ?=2}\n");
+}
+
+/// The `Character` surrogate statics and the `CharSequence`/`char[]` code-point readers. Measured on openjdk 21.0.13.
+#[test]
+fn character_surrogate_statics() {
+    let src = r####"
+public class T {
+    public static void main(String[] a) {
+        String g = "\ud83d\ude00";
+        System.out.println(Character.isSurrogate('\udc00') + " " + Character.isHighSurrogate(g.charAt(0)) + " " + Character.isLowSurrogate(g.charAt(0)) + " " + Character.isSurrogatePair(g.charAt(0), g.charAt(1)));
+        System.out.println(Character.toCodePoint('\ud83d', '\ude00') + " " + (int) Character.highSurrogate(0x1F600) + " " + (int) Character.lowSurrogate(0x1F600));
+        System.out.println(Character.isValidCodePoint(0x110000) + " " + Character.isBmpCodePoint(0xFFFF) + " " + Character.isSupplementaryCodePoint(0x10000) + " " + Character.charCount(0x1F600));
+        System.out.println(Character.codePointAt(g, 0) + " " + Character.codePointAt(g.toCharArray(), 1) + " " + Character.codePointBefore(g, 2) + " " + Character.codePointCount("a" + g, 0, 3));
+        System.out.println((int) Character.toUpperCase('\ud83d') + " " + Character.isLetter(g.charAt(0)) + " " + Character.getType(g.charAt(0)) + " " + Character.isLetter(g.codePointAt(0)));
+        try { Character.toString(0x110000); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        char[] cs = Character.toChars(0x1F601);
+        System.out.println(cs.length + " " + (int) cs[0] + " " + (int) cs[1] + " " + String.valueOf(cs).codePointAt(0));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "true true false true\n128512 55357 56832\nfalse true true 2\n128512 56832 128512 2\n55357 false 19 false\nNot a valid Unicode code point: 0x110000\n2 55357 56833 128513\n");
+}
+
+/// javac (openjdk 21.0.13) accepts an astral character in a `char` literal, raw or as two `\u` escapes, and the value is its high surrogate.
+#[test]
+fn an_astral_char_literal_is_its_high_surrogate() {
+    let raw = char::from_u32(0x1F600).expect("scalar");
+    for lit in [raw.to_string(), "\\ud83d\\ude00".to_string()] {
+        let src = format!("public class T {{ public static void main(String[] a) {{ char c = '{lit}'; System.out.println((int) c); }} }}");
+        let (out, ok) = run(&src);
+        assert!(ok, "{out}");
+        assert_eq!(out, "55357\n");
+    }
+}
+
+/// The natural order of `String` values — a stream `sorted()`, `Collections.max`, a `TreeMap` key, an `Object[]` sort — is UTF-16 order, so an astral character sorts below U+E000. Measured on openjdk 21.0.13.
+#[test]
+fn natural_string_order_is_utf16_order() {
+    let src = r####"
+import java.util.*;
+import java.util.stream.*;
+public class T {
+    public static void main(String[] a) {
+        List<String> l = List.of("\ufffd", "\ud83d\ude00", "z", "\ue000");
+        System.out.println(l.stream().sorted().map(s -> Integer.toHexString(s.charAt(0))).collect(Collectors.joining(" ")));
+        System.out.println(Integer.toHexString(Collections.max(l).charAt(0)) + " " + Integer.toHexString(new TreeMap<String, Integer>(Map.of("\ue000", 1, "\ud83d\ude00", 2)).firstKey().charAt(0)));
+        Object[] o = l.toArray(); Arrays.sort(o);
+        System.out.println(Integer.toHexString(((String) o[1]).charAt(0)));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "7a d83d e000 fffd\nfffd d83d\nd83d\n");
+}
+
+/// `System.arraycopy` into a reference array stores each element as an assignment would, stopping at the first one the destination refuses (the earlier ones stay written) with the JDK's message; `Arrays.fill` fails its first store. Measured on openjdk 21.0.13.
+#[test]
+fn arraycopy_and_fill_check_each_store() {
+    let src = r####"
+import java.util.*;
+public class T {
+  static class Animal { public String toString() { return getClass().getSimpleName(); } }
+  static class Dog extends Animal {}
+  public static void main(String[] a) {
+    first();
+    Animal[] src = {new Dog(), new Animal(), new Dog()};
+    Dog[] d = new Dog[3];
+    try { System.arraycopy(src, 0, d, 0, 3); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    System.out.println(Arrays.toString(d));
+    Animal[] w = new Dog[2];
+    try { Arrays.fill(w, new Animal()); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    Arrays.fill(w, 0, 0, new Animal());
+    Object[][] m = new String[2][];
+    try { Arrays.fill(m, new Integer[1]); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    CharSequence[] cs = new String[2];
+    System.arraycopy(new Object[]{"x", "y"}, 0, cs, 0, 2);
+    try { System.arraycopy(new Object[]{"x", new StringBuilder("y")}, 0, cs, 0, 2); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    System.out.println(Arrays.toString(cs) + Arrays.toString(w));
+  }
+  static void first() {
+    Object[] src = {"a", 1, "c"};
+    String[] dst = new String[3];
+    try { System.arraycopy(src, 0, dst, 0, 3); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    System.out.println(Arrays.toString(dst));
+    Object[] o = new String[3];
+    try { Arrays.fill(o, 5); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    try { Arrays.fill(o, 1, 2, 2.5); } catch (ArrayStoreException e) { System.out.println(e.getMessage()); }
+    System.out.println(Arrays.toString(o));
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "arraycopy: element type mismatch: can not cast one of the elements of java.lang.Object[] to the type of the destination array, java.lang.String\n[a, null, null]\njava.lang.Integer\njava.lang.Double\n[null, null, null]\narraycopy: element type mismatch: can not cast one of the elements of T$Animal[] to the type of the destination array, T$Dog\n[Dog, null, null]\nT$Animal\n[Ljava.lang.Integer;\narraycopy: element type mismatch: can not cast one of the elements of java.lang.Object[] to the type of the destination array, java.lang.String\n[x, y][null, null]\n");
+}
+
+/// A generic call whose return variable an argument binds is refused when the
+/// bound cannot be the target: an interface or other JDK type the bound does
+/// not implement, decided from the bound's full supertype set (a final JDK
+/// class's, or a user class's declared supertypes and the JDK interfaces they
+/// extend). Each verdict measured on openjdk 21.0.13: javac reports
+/// "inference variable T has incompatible bounds" for every refused line.
+#[test]
+fn generic_bounds_conflict_with_non_final_jdk_targets() {
+    let program = |decl: &str| {
+        format!(
+            r#"import java.util.*;
+public class T {{
+    static <T> T id(T t) {{ return t; }}
+    static class Foo {{}}
+    static class Bar implements Runnable {{ public void run() {{}} }}
+    static class Baz implements Iterable<Integer> {{ public Iterator<Integer> iterator() {{ return List.of(1).iterator(); }} }}
+    static class Sub extends Baz {{}}
+    static class Qux implements Comparable<Foo> {{ public int compareTo(Foo f) {{ return 0; }} }}
+    public static void main(String[] a) {{ {decl} }}
+}}
+"#
+        )
+    };
+    let refused = [
+        "List<String> l = id(5);",
+        "CharSequence cs = id(5);",
+        "Runnable r = id(new Foo());",
+        "Iterable<Integer> it = id(new Foo());",
+        "Collection<Integer> c = id(new Baz());",
+        "Map<String,Integer> m = id(\"s\");",
+        "Number n = id(\"s\");",
+        "Comparable c = id(new Foo());",
+    ];
+    for decl in refused {
+        let (out, ok) = run(&program(decl));
+        assert!(!ok, "{decl} ran: {out}");
+    }
+    let accepted = [
+        ("Number n = id(5); System.out.println(n);", "5\n"),
+        (
+            "Comparable<Integer> c = id(5); System.out.println(c);",
+            "5\n",
+        ),
+        (
+            "CharSequence cs = id(\"x\"); System.out.println(cs);",
+            "x\n",
+        ),
+        (
+            "Runnable r = id(new Bar()); System.out.println(r != null);",
+            "true\n",
+        ),
+        (
+            "java.io.Serializable s = id(5); System.out.println(s);",
+            "5\n",
+        ),
+        (
+            "Iterable<Integer> it = id(new Baz()); System.out.println(it != null);",
+            "true\n",
+        ),
+        (
+            "Iterable<Integer> it = id(new Sub()); System.out.println(it != null);",
+            "true\n",
+        ),
+        (
+            "Comparable<Foo> c = id(new Qux()); System.out.println(c != null);",
+            "true\n",
+        ),
+        (
+            "Object o = id(new Foo()); System.out.println(o != null);",
+            "true\n",
+        ),
+    ];
+    for (decl, want) in accepted {
+        let (out, ok) = run(&program(decl));
+        assert!(ok, "{decl}: {out}");
+        assert_eq!(out, want, "{decl}");
+    }
+}
+
+/// A constant variable (JLS 4.12.4) is a primitive or `String` `static final` field initialized by a constant expression (JLS 15.29) — not only a bare literal — and reading one does not initialize its class; a `static final` field of any other type is an ordinary field whose read does. Measured on openjdk 21.0.13.
+#[test]
+fn constant_variables_are_primitive_or_string_constant_expressions() {
+    let src = r####"
+public class T {
+    static class Cfg { static final Integer BOXED = 4; static { System.out.println("Cfg init"); } }
+    static class O { static final Object O1 = "x"; static { System.out.println("O init"); } }
+    static class Ch { static final Character CH = 'c'; static { System.out.println("Ch init"); } }
+    static class B { static final double D = 2 * 1.5; static final String S = "a" + "b"; static final int M = (int) 3.7 + (1 << 4); static final long L = 4; static final double H = 1 / 2; static final boolean F = 3 > 2 ? true : false; static { System.out.println("B init"); } }
+    public static void main(String[] a) {
+        System.out.println(B.D); System.out.println(B.S + " " + B.M + " " + B.L + " " + B.H + " " + B.F);
+        System.out.println(B.S == "ab");
+        System.out.println(Cfg.BOXED); System.out.println(O.O1); System.out.println(Ch.CH);
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "3.0\nab 19 4 0.0 true\ntrue\nCfg init\n4\nO init\nx\nCh init\nc\n"
+    );
+}
+
+/// `Collections.copy(dest, src)` overwrites the destination's leading elements, refusing a longer source with the JDK's message before writing and failing at the first `set` of an immutable destination. Measured on openjdk 21.0.13.
+#[test]
+fn collections_copy_overwrites_the_destination_prefix() {
+    let src = r####"
+import java.util.*;
+public class T {
+    public static void main(String[] a) {
+        List<Integer> cp = new ArrayList<>(List.of(9, 9, 9, 9));
+        Collections.copy(cp, List.of(1, 2));
+        System.out.println(cp);
+        try { Collections.copy(new ArrayList<>(List.of(1)), List.of(1, 2)); } catch (IndexOutOfBoundsException e) { System.out.println(e.getMessage()); }
+        try { Collections.copy(List.of(5, 6), List.of(1)); } catch (UnsupportedOperationException e) { System.out.println("UOE " + e.getMessage()); }
+        List<String> fixed = Arrays.asList("x", "y", "z");
+        Collections.copy(fixed, new LinkedList<>(List.of("p")));
+        System.out.println(fixed);
+        try { Collections.copy(null, List.of(1)); } catch (NullPointerException e) { System.out.println("NPE"); }
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "[1, 2, 9, 9]\nSource does not fit in dest\nUOE null\n[p, y, z]\nNPE\n"
+    );
+}
+
+/// Stdout, stderr, and success of one program.
+fn run_with_stderr(src: &str) -> (String, String, bool) {
+    let dir = std::env::temp_dir().join(format!("javars_round2_err_{}", fnv1a(src)));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("T.java");
+    std::fs::write(&path, src).expect("write program");
+    let out = Command::new(env!("CARGO_BIN_EXE_java"))
+        .arg(&path)
+        .current_dir(&dir)
+        .output()
+        .expect("spawn java");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// The uncaught-exception report carries the cause chain: after the
+/// `Exception in thread "main"` line, one `Caused by: ` line per cause, as
+/// `printStackTrace` writes them. openjdk 21.0.13 prints these three lines
+/// (with `\tat` frames between, which javars does not keep) and exits 1.
+#[test]
+fn the_uncaught_report_lists_each_cause() {
+    let src = r####"
+public class T {
+    static class MyEx extends RuntimeException { MyEx(String m, Throwable c) { super(m, c); } }
+    public static void main(String[] a) {
+        System.out.println("start");
+        try { int x = 1 / 0; } catch (ArithmeticException e) {
+            throw new MyEx("outer", new IllegalStateException("wrap", e));
+        }
+    }
+}
+"####;
+    let (out, err, ok) = run_with_stderr(src);
+    assert!(!ok);
+    assert_eq!(out, "start\n");
+    let lines: Vec<&str> = err
+        .lines()
+        .filter(|l| !l.starts_with('\t'))
+        .map(|l| l.trim_start_matches("javars: "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Exception in thread \"main\" T$MyEx: outer",
+            "Caused by: java.lang.IllegalStateException: wrap",
+            "Caused by: java.lang.ArithmeticException: / by zero",
+        ]
+    );
+}
+
+/// Two `case` labels naming one constant are a compile error (JLS 14.11.1),
+/// in a statement or an expression, whatever the spelling: a `char` and an
+/// `int` are one domain, and a label may be a constant expression. Each
+/// verdict measured on openjdk 21.0.13 (`duplicate case label`).
+#[test]
+fn duplicate_case_labels_are_refused() {
+    let program = |body: &str| {
+        format!(
+            "public class T {{\n  enum E {{ A, B }}\n  public static void main(String[] a) {{\n    {body}\n  }}\n}}\n"
+        )
+    };
+    let refused = [
+        r#"String s = a.length > 5 ? "x" : "a"; switch (s) { case "a": System.out.println(1); break; case "a": break; }"#,
+        "int x = a.length; switch (x) { case 97: break; case (char) 97: break; }",
+        "int x = a.length; switch (x) { case 1, 2 -> System.out.println(); case 2 -> System.out.println(); }",
+        "int x = a.length; int y = switch (x) { case -1 -> 1; case -1 -> 2; default -> 3; }; System.out.println(y);",
+        "E e = E.A; switch (e) { case A: break; case A: break; }",
+        "int x = a.length; switch (x) { case 1 + 1: break; case 2: break; }",
+    ];
+    for body in refused {
+        let (out, ok) = run(&program(body));
+        assert!(!ok, "{body} ran: {out}");
+    }
+    let accepted = [
+        (
+            r#"char c = (char) (97 + a.length); switch (c) { case 97: System.out.println("int97"); break; case 98: break; default: System.out.println("d"); }"#,
+            "int97\n",
+        ),
+        (
+            r#"int x = a.length; switch (x) { case 1: case 2: System.out.println("ok"); break; default: System.out.println("d" + x); }"#,
+            "d0\n",
+        ),
+        (
+            r#"String s = "Aa"; switch (s) { case "Aa": System.out.println("Aa"); break; case "BB": System.out.println("BB"); break; }"#,
+            "Aa\n",
+        ),
+    ];
+    for (body, want) in accepted {
+        let (out, ok) = run(&program(body));
+        assert!(ok, "{body}: {out}");
+        assert_eq!(out, want, "{body}");
+    }
+}
+
+/// A catch clause whose type an earlier clause already catches, and a
+/// multi-catch whose alternatives are related by subclassing, are compile
+/// errors (JLS 11.2.3, 14.20). Each verdict measured on openjdk 21.0.13.
+#[test]
+fn unreachable_catch_clauses_are_refused() {
+    let program = |body: &str| {
+        format!(
+            "public class T {{\n  static class Base extends RuntimeException {{}}\n  static class MyEx extends Base {{}}\n  public static void main(String[] a) throws Exception {{\n    {body}\n  }}\n}}\n"
+        )
+    };
+    let refused = [
+        "try { throw new RuntimeException(); } catch (Exception e) {} catch (RuntimeException e) {}",
+        r#"try { throw new IllegalStateException("x"); } catch (IllegalArgumentException | RuntimeException e) {}"#,
+        "try { throw new MyEx(); } catch (Base e) {} catch (MyEx e) {}",
+        r#"try { throw new java.io.IOException("io"); } catch (Exception e) {} catch (java.io.IOException e) {}"#,
+    ];
+    for body in refused {
+        let (out, ok) = run(&program(body));
+        assert!(!ok, "{body} ran: {out}");
+    }
+    let accepted = [
+        (
+            r#"try { throw new MyEx(); } catch (MyEx e) { System.out.println("my"); } catch (Base e) {} catch (Exception e) {}"#,
+            "my\n",
+        ),
+        (
+            r#"try { throw new IllegalStateException("s"); } catch (IllegalArgumentException | IllegalStateException e) { System.out.println(e.getMessage()); } catch (Throwable t) {}"#,
+            "s\n",
+        ),
+        (
+            r#"try { throw new Error("e"); } catch (Exception e) {} catch (Error e) { System.out.println("err"); }"#,
+            "err\n",
+        ),
+    ];
+    for (body, want) in accepted {
+        let (out, ok) = run(&program(body));
+        assert!(ok, "{body}: {out}");
+        assert_eq!(out, want, "{body}");
+    }
+}
+
+/// `new` on an enum is a compile error (JLS 8.9: an enum's instances are its
+/// constants). openjdk 21.0.13: `enum classes may not be instantiated`.
+#[test]
+fn an_enum_is_not_instantiated_with_new() {
+    let (out, ok) = run("public class T { enum C { A } public static void main(String[] a) { C c = new C(); System.out.println(c); } }");
+    assert!(!ok, "{out}");
+    let (out, ok) = run("public class T { enum C { A, B; C() {} } public static void main(String[] a) { System.out.println(C.B + \" \" + C.valueOf(\"A\").ordinal()); } }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "B 0\n");
+}

@@ -757,7 +757,8 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
                 cl.static_fields
                     .iter()
                     .filter(|f| {
-                        f.is_final && constant_initializer(&cl.static_init, &f.name).is_some()
+                        f.is_final
+                            && constant_initializer(&cl.static_init, &f.name, &f.ty).is_some()
                     })
                     .map(|f| static_global(&cl.name, &f.name))
             })
@@ -1192,10 +1193,12 @@ impl Compiler {
                 // its class, so it holds its value from the start.
                 let constant = f
                     .is_final
-                    .then(|| constant_initializer(&cl.static_init, &f.name))
+                    .then(|| constant_initializer(&cl.static_init, &f.name, &f.ty))
                     .flatten();
                 match constant {
-                    Some(value) => self.expr(value).expect("a literal lowers without error"),
+                    Some(value) => self
+                        .expr_targeted(value, Some(&f.ty))
+                        .expect("a constant expression lowers without error"),
                     None => self.emit_type_default(&f.ty, cl.line),
                 }
                 self.emit_global_set(&static_global(&cl.name, &f.name), cl.line);
@@ -1623,6 +1626,24 @@ impl Compiler {
                     } if components.is_empty() => Some(class.as_str()),
                     _ => None,
                 }));
+            }
+        }
+        // Two constant labels naming one value (JLS 14.11.1). A `char` and an
+        // `int` label are one domain, so `case 'a'` and `case 97` collide.
+        let mut constants: Vec<String> = Vec::new();
+        for (ls, _, _) in labels {
+            for l in ls.iter() {
+                let key = match l {
+                    Expr::Str(s) => Some(format!("\"{s}")),
+                    Expr::Var(n) => Some(n.clone()),
+                    other => int_label_value(other).map(|n| format!("#{n}")),
+                };
+                if let Some(k) = key {
+                    if constants.contains(&k) {
+                        return Err(format!("javars: duplicate case label (line {line})"));
+                    }
+                    constants.push(k);
+                }
             }
         }
         let uses_patterns = labels.iter().any(|(ls, _, _)| {
@@ -4983,7 +5004,7 @@ impl Compiler {
                 lhs,
                 rhs,
             } if self.is_string_concat(lhs, rhs) => {
-                format!("{}{}", self.const_string(lhs)?, self.const_string(rhs)?)
+                crate::jstr::concat(&self.const_string(lhs)?, &self.const_string(rhs)?)
             }
             _ => return None,
         })
@@ -5864,9 +5885,54 @@ impl Compiler {
                 let unrelated = (final_jdk(target) && (final_jdk(&got) || user(&got)))
                     || (user(target)
                         && (final_jdk(&got) || (user(&got) && !self.is_subclass(&got, target))));
-                unrelated.then(reject).flatten()
+                if unrelated {
+                    return reject();
+                }
+                // Any other JDK target — an interface, or a class a user class
+                // could extend — is decided when every supertype of the bound
+                // is known: a final JDK class's are fixed, and a user class's
+                // are its declared ones plus what the JDK interfaces among
+                // them extend.
+                // The target arrives erased, so only its class is compared:
+                // a type-argument conflict (`Comparable<String> c = id(5)`)
+                // is not seen.
+                let base = erased_simple_name(target);
+                if user(base) || jdk_supertypes_of(base).is_none() {
+                    return None;
+                }
+                let sups = self.known_supertypes(&got)?;
+                (!sups.iter().any(|s| s == base)).then(reject).flatten()
             }
         }
+    }
+
+    /// Every supertype of `t` by simple name, `Object` aside, when javars can
+    /// know them all: a final JDK class's from its declaration, a user
+    /// class's from its declared supertypes and the JDK interfaces they
+    /// extend. `None` when one of them is a JDK type outside
+    /// [`jdk_supertypes_of`]'s table, whose supertypes javars does not know.
+    fn known_supertypes(&self, t: &str) -> Option<Vec<String>> {
+        if let Some(fixed) = final_jdk_supertypes(t) {
+            return Some(fixed.iter().map(|s| s.to_string()).collect());
+        }
+        self.classes.get(t)?;
+        let mut out: Vec<String> = Vec::new();
+        let mut stack: Vec<String> = vec![t.to_string()];
+        while let Some(cur) = stack.pop() {
+            let cur = erased_simple_name(&cur).to_string();
+            if out.contains(&cur) {
+                continue;
+            }
+            match self.classes.get(&cur) {
+                Some(ci) => stack.extend(ci.supertypes.iter().cloned()),
+                None => {
+                    let sups = jdk_supertypes_of(&cur)?;
+                    stack.extend(sups.iter().map(|s| s.to_string()));
+                }
+            }
+            out.push(cur);
+        }
+        Some(out)
     }
 
     /// The parameter and result types of the functional interface `base`
@@ -7016,6 +7082,34 @@ impl Compiler {
     /// The exception is parked back into the pending slot only *after* the
     /// `finally` has run: leaving it in flight would make the cleanup block's
     /// own post-call checks fire immediately and skip it.
+    /// `javac`'s two checks on a `try`'s catch types (JLS 11.2.3, 14.20): a
+    /// clause whose type an earlier clause already catches is unreachable, and
+    /// the alternatives of one multi-catch may not be related by subclassing.
+    fn check_catch_order(&self, catches: &[CatchArm], line: u32) -> Result<(), String> {
+        let mut caught: Vec<&str> = Vec::new();
+        for arm in catches {
+            let types: Vec<&str> = arm.types.iter().map(|t| erased_simple_name(t)).collect();
+            for (i, t) in types.iter().enumerate() {
+                if let Some(earlier) = types[..i]
+                    .iter()
+                    .chain(types[i + 1..].iter())
+                    .find(|u| self.is_subclass(t, u))
+                {
+                    return Err(format!(
+                        "javars: Alternatives in a multi-catch statement cannot be related by subclassing (alternative {t} is a subclass of alternative {earlier}) (line {line})"
+                    ));
+                }
+                if caught.iter().any(|u| self.is_subclass(t, u)) {
+                    return Err(format!(
+                        "javars: exception {t} has already been caught (line {line})"
+                    ));
+                }
+            }
+            caught.extend(types);
+        }
+        Ok(())
+    }
+
     fn try_stmt(
         &mut self,
         body: &[Stmt],
@@ -7023,6 +7117,7 @@ impl Compiler {
         finally_body: &[Stmt],
         line: u32,
     ) -> Result<(), String> {
+        self.check_catch_order(catches, line)?;
         // Record the stack depth so the handler can discard whatever the
         // abandoned expression had already pushed.
         let depth_t = self.temp();
@@ -8454,7 +8549,8 @@ impl Compiler {
             // A `char` runs as its code point; the static type is what turns it
             // back into a one-character String at a string conversion.
             Expr::Char(c) => {
-                self.b.emit(Op::LoadInt(*c as i64), 0);
+                self.b
+                    .emit(Op::LoadInt(i64::from(crate::jstr::char_value(*c))), 0);
             }
             Expr::Bool(b) => {
                 self.b
@@ -8592,7 +8688,16 @@ impl Compiler {
                 outer,
                 line,
                 ..
-            } => self.new_object(class, args, outer.as_deref(), *line)?,
+            } => {
+                // An enum's instances are its constants (JLS 8.9): `new` on one
+                // is a compile error.
+                if self.classes.get(class).is_some_and(|ci| ci.is_enum) {
+                    return Err(format!(
+                        "javars: enum classes may not be instantiated (line {line})"
+                    ));
+                }
+                self.new_object(class, args, outer.as_deref(), *line)?
+            }
             Expr::InstanceOf {
                 expr,
                 class,
@@ -11609,18 +11714,96 @@ fn clinit_name(class: &str) -> String {
     format!("#clinit#{class}")
 }
 
-/// The literal a `static final` field is initialized with, when it is a
-/// *constant variable* (JLS 4.12.4): its value is known to the compiler, and
-/// reading it does not initialize its class. The parser lowers the field's
-/// initializer to the assignment that seeds its cell.
-fn constant_initializer<'a>(static_init: &'a [Stmt], field: &str) -> Option<&'a Expr> {
+/// The constant expression a `static final` field is initialized with, when it
+/// is a *constant variable* (JLS 4.12.4): a primitive or `String` field whose
+/// initializer is a constant expression (JLS 15.29). Its value is known to the
+/// compiler, and reading it does not initialize its class — while a `final`
+/// field of any other type (`static final Integer I = 4`) is an ordinary field
+/// whose read does. The parser lowers the field's initializer to the
+/// assignment that seeds its cell.
+fn constant_initializer<'a>(static_init: &'a [Stmt], field: &str, ty: &str) -> Option<&'a Expr> {
+    let constant_type = ty == "String" || !is_reference_type(ty);
+    if !constant_type {
+        return None;
+    }
     static_init.iter().find_map(|st| match &st.kind {
         StmtKind::Assign {
             name,
             op: AssignOp::Assign,
             value,
-        } if name == field && is_literal(value) => Some(value),
+        } if name == field && is_constant_expr(value) => Some(value),
         _ => None,
+    })
+}
+
+/// A constant expression javars recognizes (JLS 15.29): literals combined by
+/// the unary, binary and conditional operators and by casts to a primitive
+/// type or `String`. A name, even of another constant, is not followed; and an
+/// integral division by a literal zero is left out, since it does not complete
+/// normally and so is no constant.
+fn is_constant_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Unary { rhs, .. } => is_constant_expr(rhs),
+        Expr::Binary { op, lhs, rhs } => {
+            let by_zero = matches!(op, BinOp::Div | BinOp::Mod)
+                && matches!(rhs.as_ref(), Expr::Int(0) | Expr::Long(0));
+            !by_zero && is_constant_expr(lhs) && is_constant_expr(rhs)
+        }
+        Expr::Ternary { cond, then, els } => {
+            is_constant_expr(cond) && is_constant_expr(then) && is_constant_expr(els)
+        }
+        Expr::Cast { ty, expr, .. } => {
+            (ty == "String" || !is_reference_type(ty)) && is_constant_expr(expr)
+        }
+        _ => is_literal(e),
+    }
+}
+
+/// The value of an integral constant-expression `case` label — literals,
+/// `char`s, the unary and binary integer operators and casts to an integral
+/// type, at `int` width (JLS 15.29). `None` for anything else, a division by
+/// zero included.
+fn int_label_value(e: &Expr) -> Option<i32> {
+    Some(match e {
+        Expr::Int(n) => *n as i32,
+        Expr::Char(c) => crate::jstr::char_value(*c) as i32,
+        Expr::Unary { op, rhs } => {
+            let v = int_label_value(rhs)?;
+            match op {
+                UnOp::Neg => v.wrapping_neg(),
+                UnOp::Plus => v,
+                UnOp::BitNot => !v,
+                UnOp::Not => return None,
+            }
+        }
+        Expr::Cast { ty, expr, .. } => {
+            let v = int_label_value(expr)?;
+            match ty.as_str() {
+                "int" => v,
+                "char" => i32::from(v as u16),
+                "short" => i32::from(v as i16),
+                "byte" => i32::from(v as i8),
+                _ => return None,
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let (a, b) = (int_label_value(lhs)?, int_label_value(rhs)?);
+            match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::Div if b != 0 => a.wrapping_div(b),
+                BinOp::Mod if b != 0 => a.wrapping_rem(b),
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shl => a.wrapping_shl(b as u32),
+                BinOp::Shr => a.wrapping_shr(b as u32),
+                BinOp::Ushr => (a as u32).wrapping_shr(b as u32) as i32,
+                _ => return None,
+            }
+        }
+        _ => return None,
     })
 }
 
@@ -11683,7 +11866,7 @@ fn lazy_initialized_classes(prog: &Program) -> HashSet<String> {
     let observable = |c: &Class| {
         !c.enum_constants.is_empty()
             || c.static_init.iter().any(|st| {
-                !matches!(&st.kind, StmtKind::Assign { op: AssignOp::Assign, value, .. } if is_literal(value))
+                !matches!(&st.kind, StmtKind::Assign { op: AssignOp::Assign, value, .. } if is_constant_expr(value))
             })
     };
     let lazy = |c: &Class| {
@@ -12367,6 +12550,20 @@ fn static_call_java_type(class: &str, method: &str) -> Option<&'static str> {
             | "isJavaIdentifierPart",
         ) => "boolean",
         ("Character", "toChars") => "char[]",
+        ("Character", "highSurrogate" | "lowSurrogate") => "char",
+        (
+            "Character",
+            "isSurrogate"
+            | "isHighSurrogate"
+            | "isLowSurrogate"
+            | "isSurrogatePair"
+            | "isValidCodePoint"
+            | "isBmpCodePoint"
+            | "isSupplementaryCodePoint",
+        ) => "boolean",
+        ("Character", "toCodePoint" | "codePointAt" | "codePointBefore" | "codePointCount") => {
+            "int"
+        }
         ("String", "copyValueOf") => "String",
         ("Character", "forDigit") => "char",
         ("Character", "digit" | "compare" | "charCount") => "int",
@@ -13505,4 +13702,58 @@ fn binop_symbol(op: BinOp) -> &'static str {
 /// required — a cast `(int) s`, or an assignment `int x = s`.
 fn string_to_primitive(ty: &str) -> String {
     format!("javars: incompatible types: String cannot be converted to {ty}")
+}
+
+/// `java.util.List<String>` as `List`: the type's simple name with its type
+/// arguments and package qualifier dropped.
+fn erased_simple_name(t: &str) -> &str {
+    let head = t.split('<').next().unwrap_or(t).trim();
+    head.rsplit('.').next().unwrap_or(head)
+}
+
+/// The supertypes of a final JDK class (`Object` aside), from its
+/// declaration: `String` is a `CharSequence`, the numeric wrappers are
+/// `Number`s, and each is `Comparable` to itself.
+fn final_jdk_supertypes(t: &str) -> Option<&'static [&'static str]> {
+    Some(match t {
+        "String" => &[
+            "CharSequence",
+            "Comparable",
+            "Serializable",
+            "Constable",
+            "ConstantDesc",
+        ],
+        "Integer" | "Long" | "Double" | "Float" => &[
+            "Number",
+            "Comparable",
+            "Serializable",
+            "Constable",
+            "ConstantDesc",
+        ],
+        "Short" | "Byte" => &["Number", "Comparable", "Serializable", "Constable"],
+        "Character" | "Boolean" => &["Comparable", "Serializable", "Constable"],
+        _ => return None,
+    })
+}
+
+/// The direct supertypes of the JDK interfaces and classes whose whole
+/// supertype set javars knows — the ones a generic call's bound is checked
+/// against (JLS 18.5.2.1). `None` for any other JDK type.
+fn jdk_supertypes_of(t: &str) -> Option<&'static [&'static str]> {
+    Some(match t {
+        "Iterable" | "Comparable" | "Runnable" | "Map" | "Comparator" | "Cloneable"
+        | "Serializable" | "AutoCloseable" | "CharSequence" | "Iterator" | "Constable"
+        | "ConstantDesc" | "Function" | "BiFunction" | "Supplier" | "Consumer" | "BiConsumer"
+        | "Predicate" | "BiPredicate" | "Callable" | "RandomAccess" => &[],
+        "Number" => &["Serializable"],
+        "Closeable" => &["AutoCloseable"],
+        "Collection" => &["Iterable"],
+        "SequencedCollection" => &["Collection"],
+        "List" => &["SequencedCollection"],
+        "Set" | "Queue" => &["Collection"],
+        "Deque" => &["Queue", "SequencedCollection"],
+        "UnaryOperator" => &["Function"],
+        "BinaryOperator" => &["BiFunction"],
+        _ => return None,
+    })
 }

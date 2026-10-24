@@ -483,7 +483,7 @@ pub const REFERENCE: &[Entry] = &[
         "char",
         "Types",
         "char name [= expr];",
-        "Character declaration. A `char` value is a one-character string, so `+` concatenates rather than promoting to `int`, and `String` index arithmetic counts Unicode scalars rather than UTF-16 code units.",
+        "Character declaration. A `char` value is a one-character string, so `+` concatenates rather than promoting to `int`, and a `char` is one UTF-16 code unit, so a character above the BMP is two of them.",
         "char c = 'A';",
     ),
     (
@@ -885,7 +885,7 @@ pub const REFERENCE: &[Entry] = &[
         "length",
         "String Methods",
         "int length()",
-        "The number of characters in the string. javars counts Unicode scalars where Java counts UTF-16 code units, so the two agree for every ASCII and BMP string and differ by one per astral character.",
+        "The number of UTF-16 code units in the string, as in Java: a character above the BMP counts two, an unpaired surrogate one.",
         "System.out.println(\"Hello\".length());   // 5",
     ),
     (
@@ -1032,7 +1032,7 @@ pub const REFERENCE: &[Entry] = &[
         "chars",
         "String Methods",
         "IntStream chars()   |   IntStream codePoints()",
-        "The characters as a stream of their code points. javars stores a string as Unicode scalars, so the two read the same values — they differ in Java only above the BMP, where `chars()` yields surrogate code units.",
+        "The characters as a stream of their code points. `chars()` yields UTF-16 code units, so the two differ only above the BMP, where `chars()` yields a surrogate pair's two halves and `codePoints()` the one code point.",
         "System.out.println(\"abc\".chars().sum());   // 294",
     ),
     (

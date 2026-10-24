@@ -532,8 +532,18 @@ at the bottom, and are summarized in the section right after this one.
   `Character.isWhitespace`, which excludes the non-breaking spaces `U+00A0`,
   `U+2007`, `U+202F` and `U+0085` and includes the information separators
   `U+001C`–`U+001F`. Neither is Rust's `char::is_whitespace`.
-  Index/length semantics use Unicode scalar positions — exact for ASCII/BMP,
-  one unit per astral character (which Java counts as two UTF-16 units).
+  Every index and length counts UTF-16 code units, as Java's do: an astral
+  character is two `char`s to `length`, `charAt`, `substring`, `indexOf`,
+  `toCharArray`, `chars()`, `compareTo`, `hashCode`, a `Matcher` position and a
+  `%s` width, and `codePointAt`/`codePointBefore`/`codePointCount`/
+  `offsetByCodePoints` read the pairs. An unpaired surrogate is a real value:
+  `"\ud83d\ude00".substring(0, 1)` is one `char` long, rejoins the character when its
+  other half is concatenated, appended or joined back, and is written as `?`
+  when it leaves the program (`println`, `getBytes`). The storage model is in
+  `src/jstr.rs`: text stays UTF-8 in fusevm's `Value::Str`, an unpaired
+  surrogate is held as a stand-in code point from `U+10F800..=U+10FFFF`, and a
+  per-string UTF-16 offset index is cached for the strings most recently
+  indexed. Measured on `openjdk 21.0.13`.
 - **`StringBuilder` and `StringBuffer`.** The mutable character sequence, as a
   host shape rather than a class instance: `append` (every overload, including
   `char[]` and another builder), `appendCodePoint`, `insert`, `delete`,
@@ -555,8 +565,11 @@ at the bottom, and are summarized in the section right after this one.
   their end to the length before the check while `substring` does not, which is
   why `delete(2, 100)` truncates and `substring(1, 9)` throws. `StringBuffer`
   differs only in its class name: javars runs one thread, so the synchronized
-  methods are unobservable. Index and length semantics use Unicode scalar
-  positions, the same simplification the `String` methods take.
+  methods are unobservable. Indices and lengths count UTF-16 units, as the
+  `String` methods' do: an edit that splits a surrogate pair leaves the halves
+  unpaired, one that brings two halves together pairs them, and `reverse`
+  keeps every pair in order (the JDK's own swap-back), so a reversed
+  `low, high` becomes a pair.
   `System.out.println(char[])` writes the characters too — it is a distinct
   `PrintStream` overload, and it was rendering the array handle.
 - **A boxed primitive's own methods.** `Number`'s six converters
@@ -859,7 +872,8 @@ at the bottom, and are summarized in the section right after this one.
   exception no handler claims reports Java's `Exception in thread "main" …` line
   on stderr and exits non-zero — the same exit status (1) Java uses, with the
   line prefixed `javars: ` and no `at T.main(T.java:1)` frame after it, because
-  javars keeps no call-site table to unwind. Verified one probe against
+  javars keeps no call-site table to unwind. A `Caused by: ` line follows for
+  each cause in the chain, as `printStackTrace` writes them. Verified one probe against
   `openjdk 21.0.12`: both print `x` to stdout and exit 1, and stdout is
   identical.
 - **Runtime faults are catchable exceptions.** javars's own faults raise the
@@ -1003,7 +1017,7 @@ at the bottom, and are summarized in the section right after this one.
   `Map`/`HashMap`/`LinkedHashMap`/`TreeMap`, `Set`/`HashSet`/`LinkedHashSet`/
   `TreeSet`, the copy constructors (`new ArrayList<>(other)`), `Arrays.asList`,
   `List.of`/`Set.of`, and `Collections.sort`/`reverse`/`max`/`min`/`shuffle`/
-  `frequency`/`swap`/`binarySearch`/`disjoint`/`rotate`/`fill`/
+  `frequency`/`swap`/`copy`/`binarySearch`/`disjoint`/`rotate`/`fill`/
   `indexOfSubList`/`lastIndexOfSubList` (`max`, `min` and `binarySearch` with
   no comparator order by the elements' own `compareTo`, as `sort` does; the
   `set`-based ones refuse an immutable list exactly when the JDK's `set` would
@@ -1329,10 +1343,35 @@ storage-model differences:
   them.** A return variable bound by an argument, a lambda or a method
   reference that conflicts with its target is refused as `javac` refuses it
   when the target is a primitive (`int x = id(1.5)`), a final JDK class
-  (`String s = id(5)`) or a user class (`B y = id(new A())`). A conflict with
-  any other JDK type (an interface, or a class javars does not know the
-  subtypes of) is accepted: `List<String> l = id(5);` runs where `javac`
-  reports incompatible bounds. Measured on `openjdk 21.0.12.1`.
+  (`String s = id(5)`) or a user class (`B y = id(new A())`), and against
+  any other JDK type whenever the bound's whole supertype set is known — a
+  final JDK class's, or a user class's declared supertypes and the JDK
+  interfaces they extend — so `List<String> l = id(5)`, `CharSequence cs =
+  id(5)` and `Runnable r = id(new Foo())` are refused (`openjdk 21.0.13`).
+  Two conflicts are still accepted: one in the target's *type arguments*
+  (`Comparable<String> c = id(5)` — the target reaches the check erased), and
+  one whose bound is a JDK class outside javars's supertype table (an
+  `ArrayList` bound against an unrelated interface).
+- **Compile errors `javac` reports that javars accepts.** Found in round 5,
+  each measured on `openjdk 21.0.13`, each running instead of being refused:
+  `new O.I()` for an inner class with no enclosing instance (`an enclosing
+  instance that contains O.I is required`), and an inner class constructed
+  from a static context (`non-static variable this cannot be referenced`); a
+  class inheriting two unrelated `default` methods of one signature (`types A
+  and B are incompatible`); a call to an interface's `private` method from
+  outside it (`has private access`); an interface `private` method without a
+  body (`missing method body, or declare abstract`); an implementation that
+  weakens an interface method's access (`m() in R cannot implement m()
+  in Q`); a static initializer reading a later static field by simple
+  name (`illegal forward reference`); a `static final` field never assigned
+  (`variable K might not have been initialized`); and `List<? super Integer>
+  l; Integer x = l.get(0);` (`CAP#1 cannot be converted to Integer`).
+- **`PatternSyntaxException`'s message is fancy-regex's.** `"abc".split("(")`
+  throws, but `getMessage()` reads `Parsing error at position 1: Opening
+  parenthesis without closing parenthesis near index 0` where the JDK writes
+  `Unclosed group near index 1` and the pattern on a second line; and
+  `getDescription`/`getIndex`/`getPattern` are refused at compile time.
+  Measured on `openjdk 21.0.13`.
 
 Everything else javars accepts runs with Java's meaning, and the differential
 fuzzer (`parity-fuzz`) generates none of the above precisely because they are
@@ -1448,16 +1487,18 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `TreeSet` an `EnumSet` is modeled as does not keep. They are refused by name.
 - **`java.lang.StackOverflowError` is not modeled by name in `catch`**, and
   unbounded recursion runs until the OS stops it (see the entry below).
-- **A `\uXXXX` escape that names a lone surrogate is refused.** JLS 3.3
-  translation itself is performed (over the whole source, before tokenizing, on
-  the even-preceding-backslash eligibility rule and accepting the `\uuuu0041`
-  form), so `"\u0041\u0042"` is `AB` and `'\u00e9'` is 233 — but javars stores
-  a `String` as Unicode *scalars*, the same simplification `length` and `charAt`
-  already make, and half a surrogate pair names no scalar. Measured on
-  `openjdk 21.0.12.1`, `String s = "\ud83d"; s.length()` prints 1 there;
-  javars stops with `unicode escape \ud83d names a surrogate, which javars's
-  scalar `char` model cannot hold`. Refusing is the safe direction — the
-  alternative is a replacement character presented as the program's own text.
+- ~~**A `\uXXXX` escape that names a lone surrogate is refused.**~~ — fixed.
+  A surrogate escape is one UTF-16 unit, as JLS 3.3 makes it: `"\ud83d\ude00"`
+  is the one astral character, `"\ud83d".length()` is 1, and `'\ud83d'` is
+  55357. javac (openjdk 21.0.13) also accepts an astral character between a
+  `char` literal's quotes — raw, or as its two escapes — and the literal is its
+  high surrogate; javars matches. Measured on `openjdk 21.0.13`.
+- **The code points `U+10F800..=U+10FFFF` cannot be held as characters.**
+  javars stores an unpaired surrogate as one of them (`src/jstr.rs`), so a
+  source file holding one, `Character.toChars`/`toString`/`appendCodePoint` of
+  one, are refused with a javars error. Two entry points are not guarded:
+  text read from `System.in` and `new String(bytes, …)` decoding the UTF-8 of
+  such a code point read it as unpaired surrogates (Java: the character).
 
 - **`StackOverflowError` and `OutOfMemoryError` are never raised**, and a
   program that would provoke either does not fail — it runs until the OS stops
@@ -1517,11 +1558,14 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   and `ArrayDeque` keeps walking its own array.
 - **`Integer.parseInt` reads ASCII digits only.** The JDK reads any Unicode
   decimal digit (`Integer.parseInt("١٢")` is 12, as `Character.digit` does).
-- **`ArrayStoreException` is raised by an element store only.** A store
-  through a widened reference is checked against the array's recorded type
-  (`Object[] o = new String[2]; o[0] = 3;` throws `ArrayStoreException:
-  java.lang.Integer`), but `System.arraycopy` and `Arrays.fill` into such an
-  array store without the check.
+- ~~**`ArrayStoreException` is raised by an element store only.**~~ — fixed.
+  `System.arraycopy` into a reference array stores each element as an
+  assignment would and stops at the first one the destination's element type
+  refuses — the earlier elements stay written — with the JDK's
+  `arraycopy: element type mismatch: can not cast one of the elements of
+  java.lang.Object[] to the type of the destination array, java.lang.String`;
+  `Arrays.fill` (both forms) fails its first store, naming the value's class.
+  Measured on `openjdk 21.0.13`.
 - **`Throwable.getStackTrace()` and the frames of `printStackTrace()`.** javars
   keeps no call-site table (see the uncaught-report entry above), so a stack
   trace has no frames to print: `printStackTrace()` writes the throwable's
@@ -1780,7 +1824,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   first `new`, static call or non-constant static field access, after its
   superclass (and then the superinterfaces that declare a `default` method) has
   been initialized. A *constant variable* (`static final` with a literal
-  initializer) is read without initializing anything. The entry class initializes
+  initializer) is read without initializing anything — precisely, a primitive
+  or `String` field whose initializer is a constant expression of literals,
+  operators and primitive casts (`2 * 1.5`, `"a" + "b"`, `(int) 3.7`), while a
+  `static final Integer` (any reference type but `String`) is an ordinary field
+  whose read does initialize. A constant expression that reads another
+  constant by name is not recognized as one. The entry class initializes
   before `main`; a class whose initializers only store literals is seeded up
   front, since nothing can observe when. Not modeled: a static *method
   reference* (`C::m`) and a `Class.forName` do not trigger initialization, and

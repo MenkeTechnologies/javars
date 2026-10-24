@@ -144,6 +144,20 @@ impl fmt::Display for Tok {
 
 /// Lex `src` into a token vector terminated by `Tok::Eof`.
 pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+    // javars stores an unpaired surrogate as a code point from
+    // `U+10F800..=U+10FFFF` (see `src/jstr.rs`), so source text holding one of
+    // those characters itself cannot be represented and is refused.
+    if let Some((n, c)) = src.lines().enumerate().find_map(|(n, l)| {
+        l.chars()
+            .find(|c| crate::jstr::is_reserved(*c as u32))
+            .map(|c| (n, c))
+    }) {
+        return Err(format!(
+            "{} (line {})",
+            crate::jstr::reserved_message(c as u32),
+            n + 1
+        ));
+    }
     lex_translated(&translate_unicode_escapes(src)?)
 }
 
@@ -168,9 +182,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 ///     escape. (The convention exists so a translator can mark text it has
 ///     already processed.)
 ///
-/// A lone surrogate (`\ud83d`) names no Unicode scalar. javars stores a `String`
-/// as scalars — the same model `length` and `charAt` already use — so there is
-/// no value to produce, and this refuses rather than inventing one.
+/// A surrogate escape (`\ud83d`) is one UTF-16 unit, exactly as in Java: a high
+/// one followed by a low one is the character they encode (`"\ud83d\ude00"`
+/// is one astral character), and an unpaired one becomes its stand-in (see
+/// `src/jstr.rs`), so `"\ud83d".length()` is 1 as in Java.
 ///
 /// A source with no `\u` in it at all is the overwhelmingly common case, and it
 /// borrows: returning an owned `String` here copied the whole file on every
@@ -214,13 +229,10 @@ fn translate_unicode_escapes(src: &str) -> Result<Cow<'_, str>, String> {
             .then(|| u32::from_str_radix(&hex, 16).ok())
             .flatten()
             .ok_or_else(|| format!("javars: illegal unicode escape on line {line}"))?;
-        let ch = char::from_u32(value).ok_or_else(|| {
-            format!("javars: unicode escape \\u{hex} names a surrogate, which javars's scalar `char` model cannot hold (line {line})")
-        })?;
-        if ch == '\n' {
+        if value == u32::from('\n') {
             line += 1;
         }
-        out.push(ch);
+        crate::jstr::push_unit(&mut out, value as u16);
         i += 4;
     }
     Ok(Cow::Owned(out))
@@ -555,6 +567,16 @@ fn lex_translated(src: &str) -> Result<Vec<Token>, String> {
                 let c = src[i..].chars().next().unwrap();
                 i += c.len_utf8();
                 c
+            };
+            // A `char` is one UTF-16 unit. javac (openjdk 21.0.13) accepts a
+            // character above the BMP between the quotes — written raw or as
+            // its two `\u` escapes — and the literal's value is its high
+            // surrogate, which is kept here as that unit's stand-in.
+            let cp = crate::jstr::char_value(ch);
+            let ch = if cp > 0xFFFF {
+                crate::jstr::char_of(0xD800 + ((cp - 0x10000) >> 10)).unwrap_or(ch)
+            } else {
+                ch
             };
             if i >= bytes.len() || bytes[i] != b'\'' {
                 return Err(format!("javars: unterminated char literal on line {line}"));

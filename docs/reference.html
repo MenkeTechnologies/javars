@@ -467,7 +467,7 @@ System.out.println(1.0f / 3.0f);   // 0.33333334</code></pre>
         <article class="doc-entry" id="doc-types-9">
           <h3><a class="doc-anchor" href="#doc-types-9">#</a> <code>char</code></h3>
           <pre><code class="lang-java">char name [= expr];</code></pre>
-          <p>Character declaration. A <code>char</code> value is a one-character string, so <code>+</code> concatenates rather than promoting to <code>int</code>, and <code>String</code> index arithmetic counts Unicode scalars rather than UTF-16 code units.</p>
+          <p>Character declaration. A <code>char</code> value is a one-character string, so <code>+</code> concatenates rather than promoting to <code>int</code>, and a <code>char</code> is one UTF-16 code unit, so a character above the BMP is two of them.</p>
           <pre><code class="lang-java">char c = 'A';</code></pre>
         </article>
         <article class="doc-entry" id="doc-types-10">
@@ -863,7 +863,7 @@ System.out.println();</code></pre>
         <article class="doc-entry" id="doc-string-methods-1">
           <h3><a class="doc-anchor" href="#doc-string-methods-1">#</a> <code>length</code></h3>
           <pre><code class="lang-java">int length()</code></pre>
-          <p>The number of characters in the string. javars counts Unicode scalars where Java counts UTF-16 code units, so the two agree for every ASCII and BMP string and differ by one per astral character.</p>
+          <p>The number of UTF-16 code units in the string, as in Java: a character above the BMP counts two, an unpaired surrogate one.</p>
           <pre><code class="lang-java">System.out.println("Hello".length());   // 5</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-2">
@@ -990,7 +990,7 @@ System.out.println(b[0] + " " + new String(b));   // 104 hi</code></pre>
         <article class="doc-entry" id="doc-string-methods-22">
           <h3><a class="doc-anchor" href="#doc-string-methods-22">#</a> <code>chars</code></h3>
           <pre><code class="lang-java">IntStream chars()   |   IntStream codePoints()</code></pre>
-          <p>The characters as a stream of their code points. javars stores a string as Unicode scalars, so the two read the same values — they differ in Java only above the BMP, where <code>chars()</code> yields surrogate code units.</p>
+          <p>The characters as a stream of their code points. <code>chars()</code> yields UTF-16 code units, so the two differ only above the BMP, where <code>chars()</code> yields a surrogate pair's two halves and <code>codePoints()</code> the one code point.</p>
           <pre><code class="lang-java">System.out.println("abc".chars().sum());   // 294</code></pre>
         </article>
         <article class="doc-entry" id="doc-string-methods-23">

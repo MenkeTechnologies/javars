@@ -19,6 +19,7 @@ pub mod jbigdec;
 pub mod jbitset;
 pub mod jio;
 pub mod jrandom;
+pub mod jstr;
 pub mod lexer;
 pub mod lsp;
 pub mod parser;
