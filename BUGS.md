@@ -42,7 +42,9 @@ at the bottom, and are summarized in the section right after this one.
   referenced from a lambda expression`/`a guard`/`an inner class must be
   final or effectively final`). The first diagnostic follows `javac`'s
   order: a top-level class's attribution errors, then its flow errors, then
-  its capture errors. An `assert` runs no code (assertions are disabled) but
+  its capture errors. Within a phase a member class's come ahead of the
+  class enclosing it, and a local or anonymous class's interleave by line
+  with the method that declares it, which `javac` analyzes it inside. An `assert` runs no code (assertions are disabled) but
   is read as `javac`'s `visitAssert` reads it: its condition and detail under
   the states they would run in, leaving nothing they assign definitely
   assigned. A `final` lambda parameter, and a `final` parameter of the method
@@ -1471,8 +1473,15 @@ storage-model differences:
   (`src/flow.rs`, `element_slot`). It used to be keyed on the method name
   alone and so refused the `boolean` overloads `javac` accepts
   (`l.remove((Object) x)`, `set.remove(x)`, `m.replace(k, old, new)`).
-  Not seen: a receiver typed by a JDK method's inferred result, and a
-  wildcard on a user generic class's own type parameter.
+  The wildcard also survives the JDK methods whose result is typed by the
+  receiver's element (`l.iterator().next()`, `l.stream().findFirst().get()`,
+  a stream's `filter`/`sorted`/`min`, `subList`, a map's `keySet()` and
+  `values()`), and a `var` bound to such a read is typed `Object` when read
+  again (`Object cannot be converted to Integer`). Not seen: a `? super`
+  nested inside another type argument (`m.get(k).get(0)` on a
+  `Map<String, List<? super Integer>>`, which the type-argument
+  normalization reads as `List<Object>`), and a wildcard on a user generic
+  class's own type parameter.
 - **An overload `javac` cannot infer is run.** `System.out.println(w.stream()
   .collect(Collectors.groupingBy(String::length, TreeMap::new,
   Collectors.counting())))` is refused by `javac` (openjdk 21.0.13: `method

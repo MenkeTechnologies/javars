@@ -58,18 +58,32 @@ pub fn check(prog: &Program) -> Result<(), String> {
         inner_refs.insert(cl.name.as_str(), flow.free_captured);
     }
     let classes = Classes { inner_refs, ..base };
-    let mut best: Option<(u32, Diag)> = None;
+    // Ordered by top-level class, then phase, then the class the diagnostic
+    // is reported in (a member class ahead of the class enclosing it, the
+    // order `prog.classes` holds them in). A local or anonymous class is
+    // analyzed by javac in place, inside the method that declares it, so it
+    // ranks as that class and its diagnostics interleave with the method's
+    // own by line.
+    let rank: HashMap<&str, usize> = prog
+        .classes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), i))
+        .collect();
+    let mut best: Option<((u32, Phase, usize, u32), Diag)> = None;
     for cl in &prog.classes {
         let mut flow = Flow::new(&classes, cl);
         flow.class(prog);
-        let group = classes.top_line(cl);
         if let Some(d) = flow.first_diag() {
-            let better = match &best {
-                None => true,
-                Some((g, b)) => (group, d.phase) < (*g, b.phase),
-            };
-            if better {
-                best = Some((group, d));
+            let host = classes.host(cl);
+            let key = (
+                classes.top_line(cl),
+                d.phase,
+                rank[host.name.as_str()],
+                d.line,
+            );
+            if best.as_ref().is_none_or(|(k, _)| key < *k) {
+                best = Some((key, d));
             }
         }
     }
@@ -112,6 +126,20 @@ impl<'a> Classes<'a> {
     fn top_line(&self, cl: &Class) -> u32 {
         let top = cl.binary.split('$').next().unwrap_or(&cl.binary);
         self.by_binary.get(top).map_or(cl.line, |c| c.line)
+    }
+
+    /// The class whose analysis `cl`'s belongs to: `cl` itself, or for a
+    /// local or anonymous class (a binary name ending `$1Name` or `$1`) the
+    /// member or top-level class whose method declares it.
+    fn host(&self, cl: &'a Class) -> &'a Class {
+        let mut binary = cl.binary.as_str();
+        while let Some((outer, last)) = binary.rsplit_once('$') {
+            if !last.starts_with(|c: char| c.is_ascii_digit()) {
+                break;
+            }
+            binary = outer;
+        }
+        self.by_binary.get(binary).copied().unwrap_or(cl)
     }
 
     /// The class immediately enclosing `cl`, by its binary name.
@@ -339,6 +367,9 @@ struct Decl {
     super_slots: Vec<usize>,
     /// The value, for a *constant variable* (JLS 4.12.4).
     constant: Option<Const>,
+    /// A `var` local initialized from a `? super` element read: its type is
+    /// the capture variable, whose only upper bound is `Object`.
+    captured: bool,
 }
 
 impl Decl {
@@ -582,6 +613,7 @@ impl<'a> Flow<'a> {
                 targs: Vec::new(),
                 super_slots: Vec::new(),
                 constant: None,
+                captured: false,
             },
         );
         self.scope.push((name, adr));
@@ -870,6 +902,7 @@ impl<'a> Flow<'a> {
                 targs: f.targs.clone(),
                 super_slots: f.super_slots.clone(),
                 constant: None,
+                captured: false,
             },
         );
         self.fields.insert(&f.name, adr);
@@ -1223,6 +1256,7 @@ impl<'a> Flow<'a> {
                 targs: targs.clone(),
                 super_slots: super_slots.clone(),
                 constant: None,
+                captured: false,
             },
         );
         // A local's scope starts with its own initializer (JLS 6.3).
@@ -1230,6 +1264,10 @@ impl<'a> Flow<'a> {
         if let Some(init) = init {
             self.expr(init, s.line);
             self.check_capture_conversion(init, ty, targs, s.line);
+            if ty == "var" && self.reads_captured_element(init) {
+                let d = self.vars[adr];
+                self.decls[d].captured = true;
+            }
             if *is_final && is_constant_type(ty) {
                 let value = self.const_value(init, 0).and_then(|v| v.convert(ty));
                 let d = self.vars[adr];
@@ -2218,9 +2256,19 @@ impl<'a> Flow<'a> {
     /// capture type whose only upper bound is `Object`, which converts to no
     /// other type.
     fn check_capture_conversion(&mut self, value: &Expr, ty: &str, targs: &[String], line: u32) {
-        if matches!(ty, "var" | "Object") || !self.reads_captured_element(value) {
+        if matches!(ty, "var" | "Object") {
             return;
         }
+        // A `var` bound to such a read has the capture's upper bound as its
+        // type, which javac names as `Object` when it is read again.
+        let source = if self.reads_captured_element(value) {
+            "CAP#1"
+        } else if matches!(value, Expr::Var(n) if self.local(n).is_some_and(|a| self.decl(a).captured))
+        {
+            "Object"
+        } else {
+            return;
+        };
         let target = if targs.is_empty() {
             ty.to_string()
         } else {
@@ -2229,7 +2277,7 @@ impl<'a> Flow<'a> {
         self.error(
             Phase::Attr,
             line,
-            format!("incompatible types: CAP#1 cannot be converted to {target}"),
+            format!("incompatible types: {source} cannot be converted to {target}"),
         );
     }
 
@@ -2278,11 +2326,19 @@ impl<'a> Flow<'a> {
             }
             Expr::MethodCall {
                 recv, method, args, ..
-            } => {
-                let cl = self.class_of(recv)?;
-                let m = self.classes.method(cl, method, args.len(), false)?;
-                Some((m.ret.clone(), m.ret_super_slots.clone()))
-            }
+            } => match self.class_of(recv) {
+                Some(cl) => {
+                    let m = self.classes.method(cl, method, args.len(), false)?;
+                    Some((m.ret.clone(), m.ret_super_slots.clone()))
+                }
+                // A JDK method whose result is parameterized by the
+                // receiver's element keeps the wildcard: `l.iterator()` of a
+                // `List<? super Integer>` is an `Iterator<? super Integer>`.
+                None => {
+                    let (base, slots) = self.receiver_type(recv)?;
+                    derived_receiver(&base, method, args.len(), &slots)
+                }
+            },
             Expr::Call { name, args, .. } => {
                 let m = self.classes.method(self.class, name, args.len(), true)?;
                 Some((m.ret.clone(), m.ret_super_slots.clone()))
@@ -2419,6 +2475,73 @@ impl<'a> Flow<'a> {
         // The initializer is evaluated in its own class, with no locals.
         let inner = Flow::new(self.classes, self.classes.by_name.get(c.name.as_str())?);
         inner.const_value(value, depth + 1)?.convert(&f.ty)
+    }
+}
+
+/// The type, with its `? super` positions, of `recv.method(…)` (with `argc`
+/// arguments) when the JDK declares the result in terms of the receiver's own
+/// type arguments: a collection's `iterator`/`stream`/`subList`, a map's
+/// `keySet`/`values`, a stream's intermediate stages and its
+/// `findFirst`/`min`/`max`/`reduce`, an `Optional`'s `filter`. `None` when the
+/// receiver's wildcard does not reach the result.
+fn derived_receiver(
+    base: &str,
+    method: &str,
+    argc: usize,
+    slots: &[usize],
+) -> Option<(String, Vec<usize>)> {
+    const COLLECTION: &[&str] = &[
+        "Collection",
+        "List",
+        "ArrayList",
+        "LinkedList",
+        "Vector",
+        "Stack",
+        "Set",
+        "HashSet",
+        "LinkedHashSet",
+        "SortedSet",
+        "NavigableSet",
+        "TreeSet",
+        "SequencedCollection",
+        "SequencedSet",
+        "Queue",
+        "Deque",
+        "ArrayDeque",
+        "PriorityQueue",
+    ];
+    const MAP: &[&str] = &[
+        "Map",
+        "HashMap",
+        "LinkedHashMap",
+        "TreeMap",
+        "SortedMap",
+        "NavigableMap",
+        "SequencedMap",
+        "Hashtable",
+    ];
+    let element = |ty: &str| slots.contains(&0).then(|| (ty.to_string(), vec![0]));
+    let list = matches!(
+        base,
+        "List" | "ArrayList" | "LinkedList" | "Vector" | "Stack"
+    );
+    match (method, argc) {
+        ("iterator", 0) if COLLECTION.contains(&base) => element("Iterator"),
+        ("listIterator", 0 | 1) if list => element("ListIterator"),
+        ("stream", 0) if COLLECTION.contains(&base) => element("Stream"),
+        ("subList", 2) if list => element("List"),
+        ("keySet", 0) if MAP.contains(&base) => element("Set"),
+        ("values", 0) if MAP.contains(&base) => slots
+            .contains(&1)
+            .then(|| ("Collection".to_string(), vec![0])),
+        ("filter" | "sorted" | "distinct" | "limit" | "skip" | "peek", _) if base == "Stream" => {
+            element("Stream")
+        }
+        ("findFirst" | "findAny", 0) | ("min" | "max" | "reduce", 1) if base == "Stream" => {
+            element("Optional")
+        }
+        ("filter", 1) if base == "Optional" => element("Optional"),
+        _ => None,
     }
 }
 

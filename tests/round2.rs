@@ -5335,3 +5335,62 @@ fn an_uncaught_static_initializer_failure_reports_exception_in_initializer_error
         assert!(err.contains(report), "{err}\nwanted: {report}\n{src}");
     }
 }
+
+/// A `? super` wildcard survives a JDK method whose result the JDK types by
+/// the receiver's element — `iterator()`, `stream()` and a stream's stages,
+/// `findFirst`/`min`, `subList`, a map's `keySet()`/`values()` — so reading
+/// the element through the chain into anything but `Object` is `CAP#1
+/// cannot be converted`; and a `var` bound to such a read is typed by the
+/// capture's bound, `Object`. Measured on openjdk 21.0.13.
+#[test]
+fn a_super_wildcard_reaches_reads_through_jdk_result_chains() {
+    let head = "import java.util.*;\npublic class T { public static void main(String[] a) {\n  ";
+    let refused = [
+        ("List<? super Integer> l = new ArrayList<>(List.of(3)); Integer z = l.iterator().next();", "incompatible types: CAP#1 cannot be converted to Integer (line 3)"),
+        ("List<? super Integer> l = new ArrayList<>(List.of(3)); Integer w = l.stream().findFirst().get();", "incompatible types: CAP#1 cannot be converted to Integer (line 3)"),
+        ("List<? super Integer> l = new ArrayList<>(List.of(3, 1)); Number x = l.stream().filter(q -> q != null).min((p, r) -> 0).get();", "incompatible types: CAP#1 cannot be converted to Number (line 3)"),
+        ("Map<? super String, Integer> m = new HashMap<>(Map.of(\"a\", 1)); String k = m.keySet().iterator().next();", "incompatible types: CAP#1 cannot be converted to String (line 3)"),
+        ("List<? super Integer> l = new ArrayList<>(List.of(3)); var v = l.get(0); Integer i = v;", "incompatible types: Object cannot be converted to Integer (line 3)"),
+    ];
+    for (body, desc) in refused {
+        let src = format!("{head}{body} }} }}\n");
+        let (out, err, ok) = run_with_stderr(&src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let src = r####"
+import java.util.*;
+public class T { public static void main(String[] a) {
+  List<? super Integer> l = new ArrayList<>(List.of(3, 1));
+  Object o = l.stream().findFirst().get(); var v = l.get(0); Object w = v; System.out.println(v + " " + w + " " + o);
+  Iterator<? super Integer> it = l.iterator(); Object n = it.next(); System.out.println(n + " " + l.stream().count() + " " + l.subList(0, 1));
+  Map<String, ? super Integer> m = new HashMap<>(Map.of("a", 1)); Object mv = m.values().iterator().next(); String k = m.keySet().iterator().next(); System.out.println(mv + k);
+  List<? extends Number> e = List.of(4); Number num = e.iterator().next(); Integer len = l.stream().map(x -> 5).findFirst().get(); System.out.println(num + " " + len);
+} }
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "3 3 3\n3 2 [3]\n1a\n4 5\n");
+}
+
+/// Which diagnostic comes first when a program has several, as javac orders
+/// them: attribution before flow; a member class ahead of the class enclosing
+/// it; and a local or anonymous class in place, inside the method that
+/// declares it, interleaved with the method's own by line. Measured on openjdk
+/// 21.0.13.
+#[test]
+fn the_first_of_several_errors_is_the_one_javac_reports_first() {
+    let cases = [
+        ("public class T {\n  public static void main(String[] a) {\n    int x; x++;\n    Runnable r = new Runnable() { public void run() { int w; w++; } public String toString() { return \"\"; } };\n  }\n  static class A { void f() { int q; System.out.println(q); } }\n}\n", "variable q might not have been initialized (line 6)"),
+        ("public class T {\n  public static void main(String[] a) {\n    class L { void g() { int w; w++; } }\n    int x; x++;\n  }\n}\n", "variable w might not have been initialized (line 3)"),
+        ("public class T {\n  public static void main(String[] a) {\n    int x; x++;\n    class L { void g() { int w; w++; } }\n  }\n}\n", "variable x might not have been initialized (line 3)"),
+        ("public class T {\n  public static void main(String[] a) {\n    Object o = new Object() { int g() { int w; return w; } public String toString() { return \"\"; } };\n    int x; x++;\n  }\n}\n", "variable w might not have been initialized (line 3)"),
+        ("public class T {\n  static class A { static class B { void g() { int z; z++; } } void f() { int q; System.out.println(q); } }\n  public static void main(String[] a) { }\n}\n", "variable z might not have been initialized (line 2)"),
+        ("public class T {\n  static class A { void f() { int x; System.out.println(x); } }\n  public static void main(String[] a) {\n    final int k = 1; k = 2;\n  }\n}\n", "cannot assign a value to final variable k (line 4)"),
+    ];
+    for (src, desc) in cases {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+}
