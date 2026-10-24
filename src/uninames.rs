@@ -68,3 +68,33 @@ pub fn name(cp: u32) -> Option<String> {
         block => format!("{block} {cp:X}"),
     })
 }
+
+/// `Character.codePointOf(name)`: the code point a Unicode name names,
+/// matched as the JDK matches it — trimmed and upper-cased — against the
+/// names [`name`] answers, either one of the table's or the block-and-hex
+/// form (`CJK UNIFIED IDEOGRAPHS 4E00`). `None` where the JDK throws.
+pub fn code_point_of(name: &str) -> Option<u32> {
+    static BY_NAME: OnceLock<std::collections::HashMap<String, u32>> = OnceLock::new();
+    let key = name.trim_matches(|c: char| c <= ' ').to_uppercase();
+    let n = names();
+    let by_name = BY_NAME.get_or_init(|| {
+        n.entries
+            .iter()
+            .map(|(cp, ids)| {
+                let parts: Vec<&str> = ids.iter().map(|&w| n.words[w as usize]).collect();
+                (parts.join(" "), *cp)
+            })
+            .collect()
+    });
+    if let Some(&cp) = by_name.get(&key) {
+        return Some(cp);
+    }
+    let (_, hex) = key.rsplit_once(' ')?;
+    let cp = u32::from_str_radix(hex, 16).ok()?;
+    (name_of_valid(cp).as_deref() == Some(key.as_str())).then_some(cp)
+}
+
+/// [`name`] for a code point `Character.isValidCodePoint` accepts.
+fn name_of_valid(cp: u32) -> Option<String> {
+    (cp <= 0x10_FFFF).then(|| name(cp)).flatten()
+}

@@ -4969,3 +4969,40 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "[4] 9 10 5 6 7 [3] 8 5 [1, 2]\n");
 }
+
+/// `\p{…}` names are checked as `Pattern.family` checks them, against the
+/// block, script and property names `scripts/GenRegexNames.java` reads out of
+/// the JDK (an unknown one is `Unknown character property name {…}` or
+/// `Unknown Unicode property {name=<…>, value=<…>}` at the JDK's index), and
+/// `\N{name}` is the character `Character.codePointOf` names (or `Unknown
+/// character name […]`). `L1`, `all` and `LD` match. Measured on openjdk
+/// 21.0.13; the expectations are the oracle's output, verbatim.
+#[test]
+fn regex_property_and_character_names_follow_the_jdk() {
+    let src = r####"
+import java.util.regex.*;
+public class T {
+    static void t(String p, String s) {
+        try { System.out.println(p + " -> " + s.matches(p)); }
+        catch (PatternSyntaxException e) { System.out.println(p + " !! " + e.getDescription() + " @" + e.getIndex()); }
+    }
+    public static void main(String[] a) {
+        t("\\p{Lu}+", "AB"); t("\\p{lu}", "A"); t("\\p{Foo}", "x"); t("\\pL", "x"); t("\\pQ", "x");
+        t("\\p{IsLatin}+", "ab"); t("\\p{Islatin}", "a"); t("\\p{IsGreek}", "a"); t("\\p{Isalphabetic}", "a");
+        t("\\p{IsWhite_Space}", " "); t("\\p{IsLu}", "A"); t("\\p{IsNope}", "a"); t("\\p{InNope}", "a"); t("\\p{Is}", "a");
+        t("\\p{script=Latin}", "a"); t("\\p{SC=Latin}", "a"); t("\\p{sc=Nope}", "a"); t("\\p{gc=Lu}", "A"); t("\\p{gc=lu}", "A");
+        t("\\p{blk=Nope}", "a"); t("\\p{foo=bar}", "a"); t("\\p{=x}", "a"); t("\\p{javaFoo}", "a"); t("[\\p{Alpha}\\P{Nada}]", "a");
+        t("\\p{L1}+", "aé"); t("\\P{L1}", "ā"); t("\\p{all}*", "x\ny"); t("[\\p{LD}]+", "a1é"); t("\\p{LD}", "_");
+        t("\\N{LATIN SMALL LETTER A}", "a"); t("\\N{latin small letter b}", "b"); t("\\N{ NOPE }", "a"); t("x\\N{GRINNING FACE}", "x😀");
+        t("\\N{CJK UNIFIED IDEOGRAPHS 4E00}", "一"); t("[\\N{DIGIT ONE}-\\N{DIGIT THREE}]+", "123"); t("\\N{}", "a");
+        t("\\N{LATIN SMALL LETTER A", "a"); t("\\Nx", "a");
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "\\p{Lu}+ -> true\n\\p{lu} !! Unknown character property name {lu} @5\n\\p{Foo} !! Unknown character property name {Foo} @6\n\\pL -> true\n\\pQ !! Unknown character property name {Q} @2\n\\p{IsLatin}+ -> true\n\\p{Islatin} -> true\n\\p{IsGreek} -> false\n\\p{Isalphabetic} -> true\n\\p{IsWhite_Space} -> true\n\\p{IsLu} -> true\n\\p{IsNope} !! Unknown character property name {IsNope} @9\n\\p{InNope} !! Unknown character property name {InNope} @9\n\\p{Is} !! Unknown character property name {Is} @5\n\\p{script=Latin} -> true\n\\p{SC=Latin} -> true\n\\p{sc=Nope} !! Unknown Unicode property {name=<sc>, value=<Nope>} @10\n\\p{gc=Lu} -> true\n\\p{gc=lu} !! Unknown Unicode property {name=<gc>, value=<lu>} @8\n\\p{blk=Nope} !! Unknown Unicode property {name=<blk>, value=<Nope>} @11\n\\p{foo=bar} !! Unknown Unicode property {name=<foo>, value=<bar>} @10\n\\p{=x} !! Unknown Unicode property {name=<>, value=<x>} @5\n\\p{javaFoo} !! Unknown character property name {javaFoo} @10\n[\\p{Alpha}\\P{Nada}] !! Unknown character property name {Nada} @17\n\\p{L1}+ -> true\n\\P{L1} -> true\n\\p{all}* -> true\n[\\p{LD}]+ -> true\n\\p{LD} -> false\n\\N{LATIN SMALL LETTER A} -> true\n\\N{latin small letter b} -> true\n\\N{ NOPE } !! Unknown character name [ NOPE ] @9\nx\\N{GRINNING FACE} -> true\n\\N{CJK UNIFIED IDEOGRAPHS 4E00} -> true\n[\\N{DIGIT ONE}-\\N{DIGIT THREE}]+ -> true\n\\N{} !! Unknown character name [] @3\n\\N{LATIN SMALL LETTER A !! Unclosed character name escape sequence @22\n\\Nx !! Illegal character name escape sequence @2\n"
+    );
+}

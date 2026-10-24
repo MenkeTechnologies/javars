@@ -29,6 +29,7 @@ pub mod parser;
 pub mod prelude;
 pub mod reference;
 pub mod regex;
+pub mod regex_names;
 pub mod regex_syntax;
 pub mod rust_ffi;
 pub mod tiers;

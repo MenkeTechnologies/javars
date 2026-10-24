@@ -11,8 +11,8 @@
 //! a large common core that maps one-for-one (literals, groups, classes,
 //! quantifiers, `\d`/`\w`/`\s`, the anchors, lookaround, backreferences, inline
 //! flags), a smaller set that maps mechanically once rewritten (`\Q…\E`,
-//! `\h`/`\v`/`\R`, `\Z`, `\cX`, `\0n`, the POSIX `\p{Alpha}` names), and a
-//! tail that does not map at all (`\G`, `\X`, `\N{…}`, Unicode *blocks*, the
+//! `\h`/`\v`/`\R`, `\Z`, `\cX`, `\0n`, `\N{name}`, the POSIX `\p{Alpha}` names), and a
+//! tail that does not map at all (`\G`, `\X`, Unicode *blocks*, the
 //! `(?m)`/`(?x)` flags). Handing the tail to the engine anyway would compile —
 //! and quietly answer a different question. So [`translate`] rewrites the middle
 //! set and **rejects** the tail by name, which keeps javars's standing rule: an
@@ -524,7 +524,16 @@ pub fn translate(pattern: &str) -> Result<String, String> {
                     // Constructs with no equivalent at all.
                     'G' => return Err(unsupported("\\G (end of previous match)", pattern)),
                     'X' => return Err(unsupported("\\X (grapheme cluster)", pattern)),
-                    'N' => return Err(unsupported("\\N{...} (named character)", pattern)),
+                    // `\N{name}` is the character `Character.codePointOf` names
+                    // (the syntax check has already refused an unknown one).
+                    'N' => {
+                        let (name, next) = read_braced(&cs, i, pattern, e)?;
+                        i = next;
+                        let ch = crate::uninames::code_point_of(&name)
+                            .and_then(char::from_u32)
+                            .ok_or_else(|| unsupported("\\N{...} naming a surrogate", pattern))?;
+                        push_literal(&mut out, ch, in_class, flags.ci, true);
+                    }
                     // A backreference, `\A`/`\z`, or an escaped metacharacter —
                     // all spelled identically by both flavours.
                     other => {
@@ -848,6 +857,23 @@ fn translate_property(kind: char, name: &str, pattern: &str) -> Result<String, S
         "Cntrl" => posix("cntrl"),
         "Graph" => posix("graph"),
         "Print" => posix("print"),
+        // The JDK's own categories the engine does not name: Latin-1, every
+        // character, and a letter or decimal digit.
+        "L1" if kind == 'p' => "[\\x{0}-\\x{FF}]".to_string(),
+        "L1" => "[^\\x{0}-\\x{FF}]".to_string(),
+        "all" if kind == 'p' => "[\\s\\S]".to_string(),
+        "all" => "[^\\s\\S]".to_string(),
+        "LD" if kind == 'p' => "[\\p{L}\\p{Nd}]".to_string(),
+        "LD" => "[^\\p{L}\\p{Nd}]".to_string(),
+        n if n
+            .split_once('=')
+            .is_some_and(|(k, _)| matches!(k.to_ascii_lowercase().as_str(), "blk" | "block")) =>
+        {
+            return Err(unsupported(
+                &format!("\\{kind}{{{n}}} (Unicode block)"),
+                pattern,
+            ))
+        }
         n if n.starts_with("In") => {
             return Err(unsupported(
                 &format!("\\{kind}{{{n}}} (Unicode block)"),

@@ -154,9 +154,13 @@ at the bottom, and are summarized in the section right after this one.
   `Pattern.compile`'s parser in `src/regex_syntax.rs` that stops at the first
   error the JDK reports, its look-behind length study included; a replacement
   naming an absent group raises `IndexOutOfBoundsException`. Both are
-  catchable. Two JDK checks need tables javars lacks and are left to the
-  translation: whether a `\p{…}` property name or a `\N{…}` character name
-  exists.
+  catchable. A `\p{…}` name is checked as `Pattern.family` checks it, against
+  the block, script and property names `scripts/GenRegexNames.java` reads
+  out of the JDK (`src/regex_names.rs`), so an unknown one is the JDK's
+  `Unknown character property name {…}` / `Unknown Unicode property
+  {name=<…>, value=<…>}`; `\N{name}` is the character
+  `Character.codePointOf` names (`Unknown character name […]` otherwise),
+  and the JDK-only categories `L1`, `all` and `LD` match.
 - **32-bit `float`.** `float` is Java's 32-bit type, not an alias for `double`:
   `1.0f / 3.0f` is `0.33333334`, `(float) 0.1` is not `0.1`, and `(double) 0.1f`
   is `0.10000000149011612`. fusevm has one floating representation, so a `float`
@@ -1844,7 +1848,7 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **The regular-expression constructs with no faithful translation.** Regular
   expressions themselves are implemented (see the entry under "Implemented");
   what is refused — as a `PatternSyntaxException` naming the construct — is the
-  tail that `fancy-regex` cannot reproduce: `\G`, `\X`, `\N{…}`,
+  tail that `fancy-regex` cannot reproduce: `\G`, `\X`,
   conditionals `(?(1)…)`, Unicode *blocks* (`\p{InGreek}`) and the
   `\p{javaLowerCase}` predicates, and the `(?m)`/`(?x)`/`(?d)`/`(?u)`/`(?U)`
   flags. OpenJDK *accepts* every one of these, so this is a deliberate

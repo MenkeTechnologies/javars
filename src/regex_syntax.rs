@@ -11,9 +11,10 @@
 //! each node only what `Node.study` reads, which is how the JDK decides that a
 //! look-behind "does not have an obvious maximum length".
 //!
-//! Two of the JDK's checks need tables javars does not have, and are left to
-//! the translation in `src/regex.rs`: whether a `\p{…}` property name exists,
-//! and whether a `\N{…}` character name does.
+//! Whether a `\p{…}` property name exists is decided from the tables
+//! `scripts/GenRegexNames.java` generates off the JDK (`src/regex_names.rs`),
+//! and whether a `\N{…}` character name does from `Character.codePointOf`'s
+//! own data (`src/uninames.rs`).
 
 /// `Pattern.UNIX_LINES`.
 pub const UNIX_LINES: u32 = 0x01;
@@ -877,18 +878,14 @@ impl Parser {
     }
 
     /// `Pattern.family`: the name of a `\p`/`\P` property — one letter, or
-    /// braced. Whether the name exists is decided by the translation.
+    /// braced — which must name a property the JDK knows (`property_known`).
     fn family(&mut self, single_letter: bool) -> Result<(), SyntaxError> {
         self.next();
         if single_letter {
             let c = self.at(self.cursor);
             self.read();
-            // `\p` at the very end names the terminator, a NUL, which is no
-            // property; any other name is the translation's to judge.
-            if c == 0 && self.cursor > self.len {
-                return Err(self.error("Unknown character property name {\u{0}}"));
-            }
-            return Ok(());
+            let name: String = char::from_u32(c).into_iter().collect();
+            return self.check_property(&name);
         }
         let i = self.cursor;
         let mark = self.len;
@@ -901,6 +898,26 @@ impl Parser {
         }
         if i + 1 >= j {
             return Err(self.error("Empty character family"));
+        }
+        let name: String = self.temp[i..j - 1]
+            .iter()
+            .filter_map(|&c| char::from_u32(c))
+            .collect();
+        self.check_property(&name)
+    }
+
+    /// The rest of `Pattern.family`: an unknown name is refused in the JDK's
+    /// words.
+    fn check_property(&self, name: &str) -> Result<(), SyntaxError> {
+        if let Some((key, value)) = name.split_once('=') {
+            let key = key.to_ascii_lowercase();
+            if !property_value_known(&key, value) {
+                return Err(self.error(&format!(
+                    "Unknown Unicode property {{name=<{key}>, value=<{value}>}}"
+                )));
+            }
+        } else if !property_known(name, self.has(UNICODE_CHARACTER_CLASS)) {
+            return Err(self.error(&format!("Unknown character property name {{{name}}}")));
         }
         Ok(())
     }
@@ -1240,18 +1257,54 @@ impl Parser {
         Ok(n)
     }
 
-    /// `Pattern.N`: the shape of a `\N{name}` escape; whether the name
-    /// exists is left to the translation.
+    /// `Pattern.N`: a `\N{name}` escape, the character `Character.codePointOf`
+    /// names.
     fn named_char(&mut self) -> Result<u32, SyntaxError> {
         if self.read() == ch('{') {
+            let i = self.cursor;
             while self.read() != ch('}') {
                 if self.cursor >= self.len {
                     return Err(self.error("Unclosed character name escape sequence"));
                 }
             }
-            return Ok(0);
+            let name: String = self.temp[i..self.cursor - 1]
+                .iter()
+                .filter_map(|&c| char::from_u32(c))
+                .collect();
+            return crate::uninames::code_point_of(&name)
+                .ok_or_else(|| self.error(&format!("Unknown character name [{name}]")));
         }
         Err(self.error("Illegal character name escape sequence"))
+    }
+}
+
+/// Whether `Pattern.family` finds a property named `name` (no `=`): an
+/// `In` prefix names a block, an `Is` prefix a binary property, a general
+/// category or a script, and a bare name a POSIX class (under
+/// `UNICODE_CHARACTER_CLASS`) or a category, POSIX or `java` predicate.
+fn property_known(name: &str, unicode_classes: bool) -> bool {
+    use crate::regex_names::*;
+    let has = |table: &[&str], key: &str| table.binary_search(&key).is_ok();
+    if let Some(block) = name.strip_prefix("In") {
+        has(BLOCKS, &block.to_uppercase())
+    } else if let Some(short) = name.strip_prefix("Is") {
+        has(UNICODE_PROPERTIES, &short.to_uppercase())
+            || has(PROPERTIES, short)
+            || has(SCRIPTS, &short.to_uppercase())
+    } else {
+        (unicode_classes && has(POSIX, &name.to_uppercase())) || has(PROPERTIES, name)
+    }
+}
+
+/// Whether `Pattern.family` finds `\p{key=value}`, `key` lower-cased.
+fn property_value_known(key: &str, value: &str) -> bool {
+    use crate::regex_names::*;
+    let has = |table: &[&str], key: &str| table.binary_search(&key).is_ok();
+    match key {
+        "sc" | "script" => has(SCRIPTS, &value.to_uppercase()),
+        "blk" | "block" => has(BLOCKS, &value.to_uppercase()),
+        "gc" | "general_category" => has(PROPERTIES, value),
+        _ => false,
     }
 }
 
