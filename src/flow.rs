@@ -30,11 +30,10 @@
 //! flow errors, and the capture errors after those, so the first diagnostic
 //! is chosen in that order (classes in source order).
 //!
-//! What the walk cannot see, because the parser lowered it away: an `assert`
-//! (dropped, so a read inside one is not checked), the bodies of anonymous
-//! and local classes in their enclosing method (they are analyzed as classes
-//! of their own, so a captured local is not checked there), and a lambda
-//! parameter's `final`.
+//! The bodies of anonymous and local classes are analyzed as classes of their
+//! own; the enclosing locals one names are judged where the enclosing method
+//! declares the local class ([`StmtKind::LocalClass`]) or creates the
+//! anonymous one, at the line of each reference.
 
 use std::collections::{HashMap, HashSet};
 
@@ -86,7 +85,7 @@ struct Classes<'a> {
     by_binary: HashMap<&'a str, &'a Class>,
     /// Per local or anonymous class, the captured locals its bodies name,
     /// each with whether one of them assigns it.
-    inner_refs: HashMap<&'a str, Vec<(String, bool)>>,
+    inner_refs: HashMap<&'a str, Vec<(String, bool, u32)>>,
     /// The `static` methods, by declaring class.
     statics: HashMap<&'a str, Vec<&'a Method>>,
 }
@@ -457,8 +456,12 @@ struct Flow<'a> {
     ret: Option<(&'a str, &'a [String])>,
     captures: Vec<(CaptureKind, usize)>,
     capture_refs: Vec<CaptureRef>,
-    /// The captured locals this (local or anonymous) class's bodies name.
-    free_captured: Vec<(String, bool)>,
+    /// The captured locals this (local or anonymous) class's bodies name:
+    /// whether one of them assigns it, and the line of the first reference.
+    free_captured: Vec<(String, bool, u32)>,
+    /// The local classes whose declaration this walk has passed: their
+    /// captures were judged there, so a `new` of one judges nothing again.
+    declared_local: HashSet<&'a str>,
     diags: Vec<Diag>,
     flow_errors: usize,
 }
@@ -490,6 +493,7 @@ impl<'a> Flow<'a> {
             captures: Vec::new(),
             capture_refs: Vec::new(),
             free_captured: Vec::new(),
+            declared_local: HashSet::new(),
             diags: Vec::new(),
             flow_errors: 0,
         }
@@ -1132,6 +1136,24 @@ impl<'a> Flow<'a> {
                 self.expr(e, line);
                 self.mark_dead();
             }
+            // javac's `visitAssert`: the condition and the detail are read
+            // under the states they run in, but neither may run at all, so the
+            // statement leaves what it found definitely assigned — and only a
+            // variable unassigned on the condition's true edge stays
+            // definitely unassigned.
+            StmtKind::LocalClass(class) => self.local_class_decl(class),
+            StmtKind::Assert { cond, detail } => {
+                let (exit_inits, mut exit_uninits) = (self.inits.clone(), self.uninits.clone());
+                let s = self.cond(cond, line);
+                exit_uninits.and_set(&s.t_uninits);
+                if let Some(d) = detail {
+                    self.inits = s.f_inits;
+                    self.uninits = s.f_uninits;
+                    self.expr(d, line);
+                }
+                self.inits = exit_inits;
+                self.uninits = exit_uninits;
+            }
             StmtKind::Yield(e) => {
                 self.expr(e, line);
                 let target = self
@@ -1770,16 +1792,17 @@ impl<'a> Flow<'a> {
                 }
             },
             Expr::Cast { expr, line, .. } => self.expr(expr, *line),
-            Expr::Call { name, args, line } if name == crate::parser::ANON_CLASS_CALL => {
-                match args.first().and_then(anonymous_body) {
-                    Some((params, body)) => self.inner_class_body(params, body, *line),
-                    None => {
-                        for a in args {
-                            self.expr(a, *line);
-                        }
+            Expr::Call { name, args, line } if name == crate::parser::ANON_CLASS_CALL => match args
+                .first()
+                .and_then(anonymous_body)
+            {
+                Some((params, finals, body)) => self.inner_class_body(params, finals, body, *line),
+                None => {
+                    for a in args {
+                        self.expr(a, *line);
                     }
                 }
-            }
+            },
             Expr::Call { args, line, .. } => {
                 for a in args {
                     self.expr(a, *line);
@@ -1830,7 +1853,7 @@ impl<'a> Flow<'a> {
                 for a in args {
                     self.expr(a, *line);
                 }
-                self.inner_class_creation(class, *line);
+                self.inner_class_creation(class);
             }
             Expr::InstanceOf {
                 expr,
@@ -1847,7 +1870,12 @@ impl<'a> Flow<'a> {
                     self.pattern(c);
                 }
             }
-            Expr::Lambda { params, body, line } => self.lambda(params, body, *line),
+            Expr::Lambda {
+                params,
+                finals,
+                body,
+                line,
+            } => self.lambda(params, finals, body, *line),
             Expr::MethodRef { recv, line, .. } => self.expr(recv, *line),
             Expr::SwitchExpr { disc, arms, line } => self.switch_arms(disc, arms, false, *line),
             Expr::ClassLit(_)
@@ -1866,7 +1894,7 @@ impl<'a> Flow<'a> {
 
     /// javac's `visitLambda`: nothing is DU inside a body that may run
     /// later, and its `return`s are its own.
-    fn lambda(&mut self, params: &'a [String], body: &'a LambdaBody, line: u32) {
+    fn lambda(&mut self, params: &'a [String], finals: &[bool], body: &'a LambdaBody, line: u32) {
         let prev_uninits = self.uninits.clone();
         let prev_uninits_try = self.uninits_try.clone();
         let prev_inits = self.inits.clone();
@@ -1878,8 +1906,9 @@ impl<'a> Flow<'a> {
         let prev_ret = self.ret.take();
         self.returnadr = self.nextadr;
         self.captures.push((CaptureKind::Lambda, self.nextadr));
-        for p in params {
-            let a = self.declare(p as *const _ as usize, p, Kind::Param, false, "var");
+        for (i, p) in params.iter().enumerate() {
+            let is_final = finals.get(i).copied().unwrap_or(false);
+            let a = self.declare(p as *const _ as usize, p, Kind::Param, is_final, "var");
             self.init_param(a);
         }
         match body {
@@ -1904,7 +1933,13 @@ impl<'a> Flow<'a> {
     /// the enclosing method's variables are below `firstadr` there, so a
     /// `final` one cannot be assigned, and a captured local is judged as one
     /// referenced from an inner class.
-    fn inner_class_body(&mut self, params: &'a [String], body: &'a LambdaBody, line: u32) {
+    fn inner_class_body(
+        &mut self,
+        params: &'a [String],
+        finals: &[bool],
+        body: &'a LambdaBody,
+        line: u32,
+    ) {
         let state = self.enter_method(false);
         let prev_pending = std::mem::take(&mut self.pending);
         let prev_jumps = std::mem::take(&mut self.jumps);
@@ -1912,8 +1947,9 @@ impl<'a> Flow<'a> {
         let prev_ret = self.ret.take();
         let prev_init_env = self.init_env.take();
         self.captures.push((CaptureKind::InnerClass, self.nextadr));
-        for p in params {
-            let a = self.declare(p as *const _ as usize, p, Kind::Param, false, "var");
+        for (i, p) in params.iter().enumerate() {
+            let is_final = finals.get(i).copied().unwrap_or(false);
+            let a = self.declare(p as *const _ as usize, p, Kind::Param, is_final, "var");
             self.init_param(a);
         }
         match body {
@@ -1940,7 +1976,7 @@ impl<'a> Flow<'a> {
                 }
             }
             None => {
-                self.note_free_capture(name, false);
+                self.note_free_capture(name, false, line);
                 self.forward_reference(name, line);
             }
         }
@@ -1953,35 +1989,54 @@ impl<'a> Flow<'a> {
                 self.let_init(a, line);
                 self.note_capture(a, line, true);
             }
-            None => self.note_free_capture(name, true),
+            None => self.note_free_capture(name, true, line),
         }
     }
 
     /// A name that is none of this class's own: when the class captured an
     /// enclosing local of that name, the body refers to that local.
-    fn note_free_capture(&mut self, name: &str, write: bool) {
+    fn note_free_capture(&mut self, name: &str, write: bool, line: u32) {
         if name == OUTER_THIS || !self.class.captures.iter().any(|c| c.name == name) {
             return;
         }
-        match self.free_captured.iter_mut().find(|(n, _)| n == name) {
-            Some(e) => e.1 |= write,
-            None => self.free_captured.push((name.to_string(), write)),
+        match self.free_captured.iter_mut().find(|(n, ..)| n == name) {
+            Some(e) => {
+                e.1 |= write;
+                e.2 = e.2.min(line);
+            }
+            None => self.free_captured.push((name.to_string(), write, line)),
         }
     }
 
     /// `new C(…)` of a local or anonymous class: the enclosing locals its
     /// body names must be definitely assigned here and effectively final.
-    fn inner_class_creation(&mut self, class: &str, line: u32) {
+    fn inner_class_creation(&mut self, class: &str) {
+        if !self.declared_local.contains(class) {
+            self.judge_inner_captures(class);
+        }
+    }
+
+    /// The declaration of the local class `class`: javac judges the enclosing
+    /// locals its body names here, each at the line that names it, whether or
+    /// not the class is ever instantiated.
+    fn local_class_decl(&mut self, class: &'a str) {
+        self.declared_local.insert(class);
+        self.judge_inner_captures(class);
+    }
+
+    /// The captured locals `class`'s body names must be definitely assigned
+    /// and effectively final, each reported at the line that names it.
+    fn judge_inner_captures(&mut self, class: &str) {
         let Some(refs) = self.classes.inner_refs.get(class) else {
             return;
         };
-        for (name, write) in refs {
+        for &(ref name, write, line) in refs {
             if let Some(a) = self.local(name) {
                 self.check_init(a, line);
                 self.capture_refs.push(CaptureRef {
                     decl: self.vars[a],
                     line,
-                    write: *write,
+                    write,
                     kind: CaptureKind::InnerClass,
                 });
             }
@@ -2449,7 +2504,7 @@ fn field_line(cl: &Class, name: &str) -> u32 {
 
 /// The method body an anonymous class was lowered to: the lambda itself,
 /// or the `(Supplier) () -> { … }` a double-brace initializer becomes.
-fn anonymous_body(e: &Expr) -> Option<(&[String], &LambdaBody)> {
+fn anonymous_body(e: &Expr) -> Option<(&[String], &[bool], &LambdaBody)> {
     let lambda = match e {
         Expr::MethodCall { recv, .. } => match recv.as_ref() {
             Expr::Cast { expr, .. } => expr.as_ref(),
@@ -2458,7 +2513,12 @@ fn anonymous_body(e: &Expr) -> Option<(&[String], &LambdaBody)> {
         other => other,
     };
     match lambda {
-        Expr::Lambda { params, body, .. } => Some((params, body)),
+        Expr::Lambda {
+            params,
+            finals,
+            body,
+            ..
+        } => Some((params, finals, body)),
         _ => None,
     }
 }

@@ -623,6 +623,12 @@ impl Parser {
                 } else {
                     instance_declaration(fs, &mut fields, &mut inst_init);
                 }
+            } else if self.is(&Tok::LBrace) {
+                // An instance initializer: the body is an anonymous class, so
+                // it runs after the enum's constructor with the field
+                // initializers, in textual order (JLS 8.9.1, 15.9.5.1).
+                self.advance();
+                inst_init.extend(self.block()?);
             } else {
                 return Err(format!(
                     "javars: unsupported member in the body of enum constant `{enum_name}.{constant}` (line {})",
@@ -1506,7 +1512,7 @@ impl Parser {
     }
 
     /// Parse a local type declaration and hoist it (see `statement_kind`).
-    fn local_type_decl(&mut self) -> Result<(), String> {
+    fn local_type_decl(&mut self) -> Result<String, String> {
         let mut j = self.pos;
         loop {
             let n = class_modifier_len(&self.toks, j);
@@ -1569,9 +1575,10 @@ impl Parser {
         if let Some(cl) = classes.last_mut() {
             self.capture_locals(cl, start);
         }
+        let declared = classes.last().map(|cl| cl.name.clone()).unwrap_or_default();
         self.local_methods.append(&mut methods);
         self.local_classes.append(&mut classes);
-        Ok(())
+        Ok(declared)
     }
 
     /// Give a local class the enclosing locals its body reads (JLS 8.1.3).
@@ -2159,8 +2166,8 @@ impl Parser {
         // name fails to resolve rather than capturing it. The type keeps
         // `javac`'s binary name, `Outer$1Name`.
         if self.at_nested_class() {
-            self.local_type_decl()?;
-            return Ok(StmtKind::Locals(Vec::new()));
+            let class = self.local_type_decl()?;
+            return Ok(StmtKind::LocalClass(class));
         }
         // A labeled statement `label: <stmt>` — an identifier immediately
         // followed by `:`. (A ternary is never a valid statement expression, so
@@ -2194,16 +2201,19 @@ impl Parser {
                 // `assert cond;` / `assert cond : detail;` (JLS 14.10). The
                 // reference launcher runs with assertions disabled unless `-ea`
                 // is given, and a disabled assertion evaluates *neither*
-                // expression, so the statement is parsed and compiles to nothing.
+                // expression, so the statement compiles to nothing; the flow
+                // pass still reads it (see [`StmtKind::Assert`]).
                 "assert" => {
                     self.advance();
-                    self.expression()?;
-                    if self.is(&Tok::Colon) {
+                    let cond = self.expression()?;
+                    let detail = if self.is(&Tok::Colon) {
                         self.advance();
-                        self.expression()?;
-                    }
+                        Some(self.expression()?)
+                    } else {
+                        None
+                    };
                     self.eat(&Tok::Semi)?;
-                    return Ok(StmtKind::Locals(Vec::new()));
+                    return Ok(StmtKind::Assert { cond, detail });
                 }
                 "throw" => {
                     self.uses_exceptions = true;
@@ -3431,6 +3441,7 @@ impl Parser {
             self.uses_functional = true;
             return Ok(Some(Expr::Lambda {
                 params: vec![name],
+                finals: Vec::new(),
                 body,
                 line,
             }));
@@ -3459,12 +3470,14 @@ impl Parser {
             return Ok(None);
         }
         self.eat(&Tok::LParen)?;
-        let mut params = Vec::new();
+        let (mut params, mut finals) = (Vec::new(), Vec::new());
         while !self.is(&Tok::RParen) {
             // `final` is a legal modifier on an explicitly-typed parameter.
-            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+            let is_final = matches!(self.peek(), Tok::Ident(w) if w == "final");
+            if is_final {
                 self.advance();
             }
+            finals.push(is_final);
             // An explicitly-typed parameter (`(int a, String b) -> …`) is two
             // identifiers; an inferred one (`(a, b) -> …`) is one. The declared
             // type is erased, as every other javars declared type is.
@@ -3487,7 +3500,12 @@ impl Parser {
         self.eat(&Tok::Arrow)?;
         let body = self.lambda_body()?;
         self.uses_functional = true;
-        Ok(Some(Expr::Lambda { params, body, line }))
+        Ok(Some(Expr::Lambda {
+            params,
+            finals,
+            body,
+            line,
+        }))
     }
 
     /// A lambda's body: `{ statements }` or a single expression.
@@ -3772,6 +3790,7 @@ impl Parser {
                     // static type a field read would.
                     let lambda = Expr::Lambda {
                         params: vec![a.clone(), b.clone()],
+                        finals: Vec::new(),
                         body: LambdaBody::Expr(Box::new(Expr::MethodCall {
                             recv: Box::new(Expr::Var(a)),
                             method: "compareToIgnoreCase".to_string(),
@@ -4398,6 +4417,7 @@ impl Parser {
                 targs: Vec::new(),
                 expr: Box::new(Expr::Lambda {
                     params: Vec::new(),
+                    finals: Vec::new(),
                     body: LambdaBody::Block(body),
                     line,
                 }),
@@ -4458,6 +4478,7 @@ impl Parser {
         self.uses_functional = true;
         Ok(Some(Expr::Lambda {
             params: m.params.iter().map(|p| p.name.clone()).collect(),
+            finals: m.params.iter().map(|p| p.is_final).collect(),
             body: LambdaBody::Block(m.body),
             line,
         }))

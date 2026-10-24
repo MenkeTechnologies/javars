@@ -67,6 +67,24 @@ pub fn static_global(class: &str, field: &str) -> String {
     format!("#static#{class}#{field}")
 }
 
+/// The instance-map key of a field declared in `class` that hides a
+/// same-named field an ancestor declares (JLS 8.3.1): each declaration has its
+/// own cell, so the hiding one is stored apart from the bare name the topmost
+/// declaration keeps. A name no subclass re-declares keeps its bare key, so a
+/// program without hiding stores exactly as before.
+pub fn hidden_field_key(class: &str, field: &str) -> String {
+    format!("#hide#{class}#{field}")
+}
+
+/// The Java name of the field a storage key holds — the bare name back from a
+/// [`hidden_field_key`], for the messages that name the field.
+pub fn field_key_name(key: &str) -> &str {
+    match key.strip_prefix("#hide#") {
+        Some(rest) => rest.rsplit('#').next().unwrap_or(rest),
+        None => key,
+    }
+}
+
 /// The field and trailing constructor parameter through which an inner
 /// (non-`static`) member class holds its enclosing instance — javac's own
 /// synthetic name for it.
@@ -436,6 +454,16 @@ pub enum StmtKind {
     },
     /// `throw <expr>;` — raise the (already-constructed) throwable.
     Throw(Expr),
+    /// The declaration of a local class (JLS 14.3), by its binary name. The
+    /// class itself is hoisted to the program's type list, so this lowers to
+    /// no code; it marks where definite assignment judges the enclosing
+    /// locals the class body names (javac's `visitClassDef` of a local class).
+    LocalClass(String),
+    /// `assert cond;` / `assert cond : detail;` (JLS 14.10). The launcher runs
+    /// with assertions disabled unless `-ea` is given, and a disabled assertion
+    /// evaluates neither expression, so it lowers to no code — but it is kept
+    /// for definite assignment (JLS 16.2.15), which reads both expressions.
+    Assert { cond: Expr, detail: Option<Expr> },
     /// `yield <expr>;` — supply the value of the enclosing arrow-`switch`
     /// *expression* from inside a block arm. Parsed as a keyword only inside
     /// such a block, because `yield` is a contextual keyword everywhere else.
@@ -731,6 +759,11 @@ pub enum Expr {
         /// erased by the parser, exactly as they are for every other javars
         /// declaration.
         params: Vec<String>,
+        /// Which of `params` were declared `final`, parallel to it; empty when
+        /// none was (a synthesized lambda never has one). Only definite
+        /// assignment reads it: assigning one is `final parameter x may not be
+        /// assigned` (JLS 4.12.4).
+        finals: Vec<bool>,
         body: LambdaBody,
         line: u32,
     },

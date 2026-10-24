@@ -217,6 +217,12 @@ struct ClassInfo {
     fields: Vec<FieldInit>,
     /// Declared type of every field (own + inherited), for static typing.
     field_types: HashMap<String, String>,
+    /// The storage key of every instance field visible from this class (own +
+    /// inherited), by name — see [`field_storage_key`]. A name only one class
+    /// in the chain declares keys by the bare name; a re-declaration that
+    /// *hides* an ancestor's field keys its own cell, so the two coexist in
+    /// one instance and the receiver's static type picks between them.
+    field_keys: HashMap<String, String>,
     /// The declared type, with its type arguments, of every field of this
     /// class that carries any (own, inherited and `static` alike) — see
     /// [`with_targs`].
@@ -327,6 +333,8 @@ struct MethodMeta {
 /// initialized (used to seed a fresh instance before the constructor runs).
 struct FieldInit {
     name: String,
+    /// The instance-map key this declaration's cell lives under.
+    key: String,
     ty: String,
     init: Option<Expr>,
 }
@@ -929,6 +937,17 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
 /// Resolve every class's metadata with inheritance flattened: fields listed
 /// ancestors-first (Java initialization order), field types merged, and each
 /// `(method, arity)` mapped to its most-derived defining class.
+/// The storage key of field `name` as `class` declares it: the bare name, or —
+/// when an ancestor already declares one (`hides`) — the key
+/// [`crate::ast::hidden_field_key`] mints for this declaration's own cell.
+fn field_storage_key(class: &str, name: &str, hides: bool) -> String {
+    if hides {
+        crate::ast::hidden_field_key(class, name)
+    } else {
+        name.to_string()
+    }
+}
+
 fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String> {
     let by_name: HashMap<&str, &Class> =
         prog.classes.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -989,6 +1008,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         }
         let mut fields = Vec::new();
         let mut field_types = HashMap::default();
+        let mut field_keys: HashMap<String, String> = HashMap::default();
         let mut field_generic: HashMap<String, (String, String)> = HashMap::default();
         let mut field_wildcard = HashSet::default();
         for anc_name in &ancestry {
@@ -1069,9 +1089,12 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         for anc_name in &ancestry {
             let anc = by_name[anc_name.as_str()];
             for f in &anc.fields {
+                let key = field_storage_key(anc_name, &f.name, field_keys.contains_key(&f.name));
+                field_keys.insert(f.name.clone(), key.clone());
                 field_types.insert(f.name.clone(), f.ty.clone());
                 fields.push(FieldInit {
                     name: f.name.clone(),
+                    key,
                     ty: f.ty.clone(),
                     init: f.init.clone(),
                 });
@@ -1117,6 +1140,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 enum_constants: cl.enum_constants.iter().map(|c| c.name.clone()).collect(),
                 fields,
                 field_types,
+                field_keys,
                 field_generic,
                 field_wildcard,
                 type_params: cl.type_params.clone(),
@@ -5390,6 +5414,17 @@ impl Compiler {
         self.classes.get(&rc)?.field_types.get(name).cloned()
     }
 
+    /// The instance-map key of the field `name` on `recv`: the cell of the
+    /// declaration `recv`'s static class sees (JLS 15.11.1 — a field access
+    /// is resolved against the static type, never the runtime class). The bare
+    /// name when the class is not statically known, which is the topmost
+    /// declaration's cell and the only one a program without hiding has.
+    fn field_key(&self, recv: &Expr, name: &str) -> String {
+        self.expr_class(recv)
+            .and_then(|c| self.classes.get(&c)?.field_keys.get(name).cloned())
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// The static numeric category of `e` under Java's binary numeric promotion.
     /// Drives the truncating-vs-floating choice for `/`.
     fn expr_type(&self, e: &Expr) -> NumType {
@@ -6223,7 +6258,7 @@ impl Compiler {
                 // A generic call passed as the argument is inferred jointly
                 // with this one, so `javac` reports the type argument it
                 // supplies against that call's own variable.
-                let named = self.nested_poly_var(&resolved.mangled, var, args, conflict);
+                let named = self.nested_poly_var(&resolved.mangled, var, args, base, conflict);
                 Some(format!(
                     "javars: incompatible types: inference variable {} has incompatible bounds (target {target}, lower bounds: {got}) on line {line}",
                     named.as_deref().unwrap_or(var)
@@ -6244,6 +6279,7 @@ impl Compiler {
         mangled: &str,
         var: &str,
         args: &[Expr],
+        base: &str,
         slot: usize,
     ) -> Option<String> {
         let params = self.param_generics.get(mangled)?;
@@ -6289,6 +6325,22 @@ impl Compiler {
                 let first = found.next()?;
                 found.all(|v| v == first).then_some(())?;
                 pick(first)
+            }
+            // A diamond `new C<>(…)` is a poly expression too: the variable is
+            // `C`'s own type parameter that supplies the target's argument at
+            // `slot` (`id(new HashMap<>(Map.of(1, "a")))` against
+            // `Map<String, Integer>` is `HashMap`'s `K`).
+            Expr::NewObject {
+                class,
+                targs: Some(t),
+                ..
+            } if t.is_empty() => {
+                let (params, sups) = jdk_supertype_entry(class)?;
+                if class == base {
+                    return params.get(slot).map(|p| p.to_string());
+                }
+                let (_, sup_args) = sups.iter().find(|(s, _)| *s == base)?;
+                sup_args.get(slot)?.strip_prefix('#').map(str::to_string)
             }
             _ => None,
         }
@@ -6432,6 +6484,7 @@ impl Compiler {
         let lambda = |params: Vec<String>, body: Expr| Expr::Lambda {
             body: LambdaBody::Expr(Box::new(body)),
             params,
+            finals: Vec::new(),
             line,
         };
 
@@ -7199,6 +7252,10 @@ impl Compiler {
                 finally_body,
             } => self.try_stmt(body, catches, finally_body, line),
             StmtKind::Throw(e) => self.throw_stmt(e, line),
+            // A disabled assertion evaluates neither expression (JLS 14.10).
+            StmtKind::Assert { .. } => Ok(()),
+            // The class itself was hoisted and is compiled with the others.
+            StmtKind::LocalClass(_) => Ok(()),
             // `yield v;` — leave the value on the stack (running any cleanup
             // block opened inside this arm first, exactly as `return` does),
             // then jump to the arm's exit.
@@ -8566,13 +8623,15 @@ impl Compiler {
     fn emit_named_read(&mut self, name: &str) {
         if self.implicit_this_field(name).is_some() {
             self.emit_this(0);
-            self.emit_field_get(name, 0);
+            let key = self.field_key(&Expr::This, name);
+            self.emit_field_get(&key, 0);
         } else if let Some((class, _)) = self.static_field_owner(name) {
             self.emit_static_field_init(&class, name, 0);
             self.emit_global_get(&static_global(&class, name), 0);
         } else if let Some((recv, _)) = self.outer_field_recv(name) {
             self.emit_this_chain(&recv);
-            self.emit_field_get(name, 0);
+            let key = self.field_key(&recv, name);
+            self.emit_field_get(&key, 0);
         } else {
             self.emit_get(name, 0);
         }
@@ -8584,7 +8643,8 @@ impl Compiler {
         match recv {
             Expr::Field { recv, name } => {
                 self.emit_this_chain(recv);
-                self.emit_field_get(name, 0);
+                let key = self.field_key(recv, name);
+                self.emit_field_get(&key, 0);
             }
             _ => self.emit_this(0),
         }
@@ -8671,13 +8731,14 @@ impl Compiler {
                     return Ok(());
                 }
                 let field_ty_name = self.field_type_name(recv, name);
+                let key = self.field_key(recv, name);
                 let (obj_t, val_t) = (self.temp(), self.temp());
                 self.expr(recv)?;
                 self.emit_set(&obj_t, line);
                 self.expr_targeted(value, field_ty_name.as_deref())?;
                 self.emit_set(&val_t, line);
                 self.emit_get(&obj_t, line);
-                let name_c = self.b.add_constant(Value::str(name.to_string()));
+                let name_c = self.b.add_constant(Value::str(key.clone()));
                 self.b.emit(Op::LoadConst(name_c), line);
                 self.emit_get(&val_t, line);
                 self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
@@ -9030,13 +9091,15 @@ impl Compiler {
                     self.emit_global_get(&enum_global(&class, name), 0);
                 } else if self.implicit_this_field(name).is_some() {
                     self.emit_this(0); // this
-                    self.emit_field_get(name, 0);
+                    let key = self.field_key(&Expr::This, name);
+                    self.emit_field_get(&key, 0);
                 } else if let Some((class, _)) = self.static_field_owner(name) {
                     self.emit_static_field_init(&class, name, 0);
                     self.emit_global_get(&static_global(&class, name), 0);
                 } else if let Some((recv, _)) = self.outer_field_recv(name) {
                     self.emit_this_chain(&recv);
-                    self.emit_field_get(name, 0);
+                    let key = self.field_key(&recv, name);
+                    self.emit_field_get(&key, 0);
                 } else if !self.is_declared_var(name) && name != NULL_LITERAL {
                     // Nothing declares this name. Java's answer is "cannot find
                     // symbol"; javars read the unset cell instead and got
@@ -9134,7 +9197,8 @@ impl Compiler {
                     self.emit_global_get(&static_global(&class, name), 0);
                 } else {
                     self.expr(recv)?;
-                    self.emit_field_get(name, 0);
+                    let key = self.field_key(recv, name);
+                    self.emit_field_get(&key, 0);
                 }
             }
             Expr::NewObject {
@@ -9261,7 +9325,9 @@ impl Compiler {
                 line,
             } => self.method_call(recv, method, args, *line)?,
             Expr::SwitchExpr { disc, arms, line } => self.switch_expr(disc, arms, *line, None)?,
-            Expr::Lambda { params, body, line } => self.compile_lambda(params, body, *line)?,
+            Expr::Lambda {
+                params, body, line, ..
+            } => self.compile_lambda(params, body, *line)?,
             Expr::MethodRef { recv, method, line } => {
                 // The arity a reference to an arity-overloaded method resolves
                 // at: the target interface's, or the JDK method's slot's.
@@ -10995,12 +11061,12 @@ impl Compiler {
         let has_any_ctor = !ctor_info.ctors.is_empty();
         let ctor_arities: Vec<usize> = ctor_info.ctors.iter().map(|c| c.param_tys.len()).collect();
         let info = &self.classes[class];
-        // Field-init plan (name, type, optional init expr), cloned so the
+        // Field-init plan (storage key, type, optional init expr), cloned so the
         // ChunkBuilder borrow does not alias `self.classes`.
         let field_plan: Vec<(String, String, Option<Expr>)> = info
             .fields
             .iter()
-            .map(|f| (f.name.clone(), f.ty.clone(), f.init.clone()))
+            .map(|f| (f.key.clone(), f.ty.clone(), f.init.clone()))
             .collect();
 
         // Allocate: push class name, call JNEW → instance handle.
@@ -11053,6 +11119,13 @@ impl Compiler {
             // `super()` followed by its instance initializers. There is no
             // subroutine to call for it, so its body is emitted here.
             self.emit_default_ctor(ctor_class, Recv::Temp(&obj), line, 0);
+        }
+        // An enum constant's body is an anonymous subclass whose implicit
+        // constructor is `super(args)` followed by its own instance
+        // initializers (JLS 15.9.5.1) — the enum's constructor ran above, so
+        // the body's field initializers and `{ … }` blocks run now.
+        if class != ctor_class {
+            self.emit_inst_init(class, Recv::Temp(&obj), line);
         }
 
         // The expression value is the new instance.
@@ -11151,12 +11224,13 @@ impl Compiler {
             return self.static_assign(&class, &ty, name, op, value, line);
         }
         let field_ty_name = self.field_type_name(recv, name);
+        let key = self.field_key(recv, name);
         let generic = self.expr_generic(&Expr::Field {
             recv: Box::new(recv.clone()),
             name: name.to_string(),
         });
         self.expr(recv)?;
-        let name_c = self.b.add_constant(Value::str(name.to_string()));
+        let name_c = self.b.add_constant(Value::str(key.clone()));
         self.b.emit(Op::LoadConst(name_c), line);
         self.target_wildcard = Some(self.field_wildcard(recv, name));
         self.expr_targeted_generic(value, field_ty_name.as_deref(), generic)?;
@@ -11184,19 +11258,20 @@ impl Compiler {
         // The field's declared type drives both the compound-`/` truncation and
         // the 32-bit wrap, so it is resolved here rather than at each call site.
         let field_ty_name = self.field_type_name(recv, name);
+        let key = self.field_key(recv, name);
         let obj_t = self.temp();
         self.expr(recv)?;
         self.emit_set(&obj_t, line);
         // old field value
         self.emit_get(&obj_t, line);
-        self.emit_field_get(name, line);
+        self.emit_field_get(&key, line);
         let old_t = self.stash_if(want == Yield::Old, line);
         self.emit_compound_update(op, value, field_ty_name.as_deref(), line)?;
         let new_t = self.temp();
         self.emit_set(&new_t, line);
         // write back
         self.emit_get(&obj_t, line);
-        let name_c = self.b.add_constant(Value::str(name.to_string()));
+        let name_c = self.b.add_constant(Value::str(key.clone()));
         self.b.emit(Op::LoadConst(name_c), line);
         self.emit_get(&new_t, line);
         self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
@@ -12162,6 +12237,7 @@ fn body_has_ffi(body: &[Stmt]) -> bool {
                 || body_has_ffi(finally_body)
         }
         StmtKind::Throw(e) | StmtKind::Yield(e) => expr_has_ffi(e),
+        StmtKind::Assert { .. } | StmtKind::LocalClass(_) => false,
         StmtKind::Break(_) | StmtKind::Continue(_) => false,
     })
 }
@@ -13163,6 +13239,7 @@ fn natural_order_comparator(line: u32) -> Expr {
     let (a, b) = ("#cmp0".to_string(), "#cmp1".to_string());
     Expr::Lambda {
         params: vec![a.clone(), b.clone()],
+        finals: Vec::new(),
         body: LambdaBody::Expr(Box::new(Expr::MethodCall {
             recv: Box::new(Expr::Var(a)),
             method: "compareTo".to_string(),
@@ -13187,6 +13264,7 @@ fn entry_comparator(accessor: &str, line: u32) -> Expr {
     };
     Expr::Lambda {
         params: vec![a.clone(), b.clone()],
+        finals: Vec::new(),
         body: LambdaBody::Expr(Box::new(Expr::MethodCall {
             recv: Box::new(read(a)),
             method: "compareTo".to_string(),

@@ -5006,3 +5006,212 @@ public class T {
         "\\p{Lu}+ -> true\n\\p{lu} !! Unknown character property name {lu} @5\n\\p{Foo} !! Unknown character property name {Foo} @6\n\\pL -> true\n\\pQ !! Unknown character property name {Q} @2\n\\p{IsLatin}+ -> true\n\\p{Islatin} -> true\n\\p{IsGreek} -> false\n\\p{Isalphabetic} -> true\n\\p{IsWhite_Space} -> true\n\\p{IsLu} -> true\n\\p{IsNope} !! Unknown character property name {IsNope} @9\n\\p{InNope} !! Unknown character property name {InNope} @9\n\\p{Is} !! Unknown character property name {Is} @5\n\\p{script=Latin} -> true\n\\p{SC=Latin} -> true\n\\p{sc=Nope} !! Unknown Unicode property {name=<sc>, value=<Nope>} @10\n\\p{gc=Lu} -> true\n\\p{gc=lu} !! Unknown Unicode property {name=<gc>, value=<lu>} @8\n\\p{blk=Nope} !! Unknown Unicode property {name=<blk>, value=<Nope>} @11\n\\p{foo=bar} !! Unknown Unicode property {name=<foo>, value=<bar>} @10\n\\p{=x} !! Unknown Unicode property {name=<>, value=<x>} @5\n\\p{javaFoo} !! Unknown character property name {javaFoo} @10\n[\\p{Alpha}\\P{Nada}] !! Unknown character property name {Nada} @17\n\\p{L1}+ -> true\n\\P{L1} -> true\n\\p{all}* -> true\n[\\p{LD}]+ -> true\n\\p{LD} -> false\n\\N{LATIN SMALL LETTER A} -> true\n\\N{latin small letter b} -> true\n\\N{ NOPE } !! Unknown character name [ NOPE ] @9\nx\\N{GRINNING FACE} -> true\n\\N{CJK UNIFIED IDEOGRAPHS 4E00} -> true\n[\\N{DIGIT ONE}-\\N{DIGIT THREE}]+ -> true\n\\N{} !! Unknown character name [] @3\n\\N{LATIN SMALL LETTER A !! Unclosed character name escape sequence @22\n\\Nx !! Illegal character name escape sequence @2\n"
     );
 }
+
+/// Field hiding (JLS 8.3.1, 15.11.1): a subclass field of the same name is a
+/// second cell, and every access — a qualified read or write, `super.f`, a
+/// cast `((A) b).f`, an implicit-`this` name in either class, a compound or
+/// `++` update, an array element, a method result, an inner class's own
+/// chain, an enum constant body, an anonymous class — selects the cell by the
+/// receiver's *static* type. Measured on openjdk 21.0.13.
+#[test]
+fn a_hiding_field_is_its_own_cell_selected_by_the_static_type() {
+    let src = r####"
+public class T {
+  static class A { int n = 1; String w() { return "A" + n; } static int s = 10; int get() { return n; } }
+  static class B extends A { int n = 2; static int s = 20;
+    String w() { return "B" + n + "/" + super.n + "/" + super.w() + "/" + this.n + "/" + ((A) this).n; }
+    void bump() { n += 5; super.n *= 3; ((A) this).n++; } }
+  public static void main(String[] args) {
+    B b = new B(); A a = b;
+    System.out.println(b.w() + " " + a.n + " " + b.n + " " + a.get());
+    b.bump();
+    System.out.println(b.w() + " " + a.n + " " + b.n + " " + a.get() + " " + ((A) b).n);
+    a.n = 100; b.n = 200;
+    System.out.println(a.n + " " + b.n + " " + A.s + " " + B.s + " " + a.get());
+    System.out.println(++a.n + " " + b.n-- + " " + b.n);
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "B2/1/A1/2/1 1 2 1\nB7/4/A4/7/4 4 7 4 4\n100 200 10 20 100\n101 200 199\n"
+    );
+    let src = r####"
+import java.util.*;
+import java.util.function.*;
+public class T {
+  static class A { int n = 1; String s = "a"; private int p = 7; int pa() { return p; } }
+  static class B extends A { String n = "two"; int s = 5; int p = 8; }
+  static class C extends B { double n = 3.5; String show() { return n + "|" + super.n + "|" + ((A) this).n + "|" + ((B) this).n; } }
+  class In1 { int v = 10; }
+  class In2 extends In1 { int v = 20; int both() { return v * 100 + super.v; } }
+  int outerF = 99;
+  class In3 extends In2 { int v = 30; int sum() { return v + ((In1) this).v + outerF; } }
+  enum E { X { int k = 2; int get() { return k * 10 + ((E) this).k; } }, Y; int k = 1; int get() { return k; } }
+  static B mk() { return new C(); }
+  public static void main(String[] args) {
+    C c = new C();
+    System.out.println(c.show() + " " + c.n + " " + ((B) c).n.length() + " " + ((A) c).s + " " + ((B) c).s + " " + c.pa() + " " + c.p);
+    B[] arr = { new B(), c };
+    System.out.println(arr[1].n + " " + mk().n + " " + ((A) mk()).n);
+    A a = new Random(1).nextBoolean() ? c : new B();
+    System.out.println(a.n + a.s);
+    Supplier<Integer> sup = () -> ((A) c).n + 1;
+    System.out.println(sup.get());
+    T t = new T();
+    T.In3 i3 = t.new In3();
+    System.out.println(i3.sum() + " " + i3.both() + " " + ((In2) i3).v + " " + ((In1) i3).v);
+    System.out.println(E.X.get() + " " + E.Y.get() + " " + E.X.k);
+    A anon = new A() { int n = 50; public String toString() { return n + ":" + super.n; } };
+    System.out.println(anon + " " + anon.n);
+    var vc = new C(); vc.n += 1; ((A) vc).n += 10; ((B) vc).n += "!";
+    System.out.println(vc.show());
+    A nul = null;
+    try { System.out.println(((B) nul).n); } catch (NullPointerException e) { System.out.println("NPE"); }
+  }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "3.5|two|1|two 3.5 3 a 5 7 8\ntwo two 1\n1a\n2\n139 2010 20 10\n21 1 1\n50:1 1\n4.5|two!|11|two!\nNPE\n"
+    );
+}
+
+/// An enum constant's body is an anonymous subclass: after the enum's
+/// constructor runs, its own field initializers and `{ … }` blocks run in
+/// textual order (JLS 8.9.1, 15.9.5.1). Measured on openjdk 21.0.13.
+#[test]
+fn an_enum_constant_body_runs_its_own_instance_initializers() {
+    let src = r####"
+public class T {
+  enum E { X(5) { int k = 2; { System.out.println("blk " + base + " " + k); } int get() { return k + base; } }, Y(1);
+    int base; E(int b) { base = b; System.out.println("ctor " + b); } int get() { return base; } }
+  public static void main(String[] args) { System.out.println(E.X.get() + " " + E.Y.get()); }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "ctor 5\nblk 5 2\nctor 1\n7 1\n");
+}
+
+/// An `assert` lowers to no code (assertions are disabled), but definite
+/// assignment reads it as javac's `visitAssert` does: the condition and the
+/// detail are checked under the states they would run in, and nothing either
+/// assigns is definitely assigned afterwards. Measured on openjdk 21.0.13.
+#[test]
+fn definite_assignment_reads_the_expressions_of_an_assert() {
+    let refused = [
+        ("public class T { public static void main(String[] a) { int y; assert y > 0; System.out.println(\"hi\"); } }", "variable y might not have been initialized"),
+        ("public class T { public static void main(String[] a) { int x; assert (x = 1) > 0; System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { public static void main(String[] a) { final int f; assert (f = 1) > 0; f = 2; System.out.println(f); } }", "variable f might already have been assigned"),
+        ("public class T { public static void main(String[] a) { int d; assert false : (d = 2); System.out.println(d); } }", "variable d might not have been initialized"),
+        ("public class T { public static void main(String[] a) { int c = 1; c++; Runnable r = () -> { assert c > 0; }; r.run(); } }", "local variables referenced from a lambda expression must be final or effectively final"),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let accepted = [
+        ("public class T { public static void main(String[] a) { int q; assert (q = 1) < 0 : \"q=\" + q; final int g; assert true : (g = 1); g = 5; System.out.println(\"ok \" + g); } }", "ok 5\n"),
+        ("public class T { public static void main(String[] a) { int k; boolean ok = true; assert ok : (k = 3); int z = 5; assert z > 0 : \"msg\" + z; System.out.println(\"fine \" + z); } }", "fine 5\n"),
+    ];
+    for (src, want) in accepted {
+        let (out, ok) = run(src);
+        assert!(ok, "{out}\n{src}");
+        assert_eq!(out, want, "{src}");
+    }
+}
+
+/// A `final` lambda parameter, and a `final` parameter of the one method an
+/// anonymous class is lowered from, may not be assigned (JLS 4.12.4).
+/// Measured on openjdk 21.0.13.
+#[test]
+fn a_final_lambda_parameter_may_not_be_assigned() {
+    let refused = [
+        "import java.util.function.*;\npublic class T { public static void main(String[] a) { IntUnaryOperator f = (final int v) -> { v = 2; return v; }; System.out.println(f.applyAsInt(1)); } }",
+        "import java.util.function.*;\npublic class T { public static void main(String[] a) {\n  Function<Integer, Integer> g = new Function<Integer, Integer>() { public Integer apply(final Integer q) { q++; return q; } };\n  System.out.println(g.apply(1)); } }",
+    ];
+    let lines = [
+        "final parameter v may not be assigned (line 2)",
+        "final parameter q may not be assigned (line 3)",
+    ];
+    for (src, desc) in refused.iter().zip(lines) {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let (out, ok) = run("import java.util.function.*;\npublic class T { public static void main(String[] a) {\n  BiFunction<Integer, Integer, Integer> f = (final Integer x, Integer y) -> { y = y + 1; return x + y; };\n  System.out.println(f.apply(1, 2)); IntBinaryOperator h = (final int p, final int r) -> p * r; System.out.println(h.applyAsInt(3, 4)); } }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "4\n12\n");
+}
+
+/// The enclosing locals a local class names are judged at the class's
+/// declaration, as javac does — definitely assigned there, and effectively
+/// final whether or not the class is ever instantiated — and, for a local or
+/// an anonymous class alike, reported at the line of the reference. Measured
+/// on openjdk 21.0.13.
+#[test]
+fn local_class_captures_are_judged_at_the_declaration_and_the_reference_line() {
+    let refused = [
+        ("public class T { public static void main(String[] a) { int x; class L { int g() { return x; } } x = 1; System.out.println(new L().g()); } }", "variable x might not have been initialized (line 1)"),
+        ("public class T { public static void main(String[] a) {\n  int x = 1;\n  class L {\n    int g() { return x; }\n  }\n  x = 2;\n  System.out.println(\"ok\");\n} }", "local variables referenced from an inner class must be final or effectively final (line 4)"),
+        ("public class T { public static void main(String[] a) {\n  int x = 1;\n  class L { void s() { x = 3; } }\n  System.out.println(\"ok\");\n} }", "local variables referenced from an inner class must be final or effectively final (line 3)"),
+        ("public class T { public static void main(String[] a) {\n  int x = 1;\n  Runnable r = new Runnable() {\n    public void run() {\n      System.out.println(x);\n    }\n  };\n  x++;\n  r.run();\n} }", "local variables referenced from an inner class must be final or effectively final (line 5)"),
+        ("public class T { interface S { int g(); }\n  public static void main(String[] a) {\n  int x;\n  S r = new S() {\n    public int g() {\n      return x;\n    }\n    public String toString() { return \"s\"; }\n  };\n  x = 1;\n} }", "variable x might not have been initialized (line 6)"),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let (out, ok) = run("public class T { public static void main(String[] a) {\n  int x;\n  x = 1;\n  class L { int g() { return x; } }\n  System.out.println(new L().g());\n} }");
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
+}
+
+/// A diamond `new C<>(…)` passed to a generic method is inferred jointly with
+/// it, so an incompatible bound is reported against `C`'s own type parameter
+/// at the conflicting position — directly or through the supertype the target
+/// names — while an explicit `new C<A>(…)` keeps the method's variable.
+/// Measured on openjdk 21.0.13.
+#[test]
+fn a_diamond_argument_names_its_own_type_parameter_in_a_bounds_error() {
+    let head = "import java.util.*;\npublic class T { static <X> X id(X x) { return x; }\n  public static void main(String[] a) { ";
+    let refused = [
+        (
+            "List<String> l = id(new ArrayList<>(List.of(1)));",
+            "inference variable E has incompatible bounds",
+        ),
+        (
+            "Map<String, Integer> m = id(new HashMap<>(Map.of(1, \"a\")));",
+            "inference variable K has incompatible bounds",
+        ),
+        (
+            "Map<String, Integer> m = id(new TreeMap<>(Map.of(\"a\", \"b\")));",
+            "inference variable V has incompatible bounds",
+        ),
+        (
+            "Iterable<String> m = id(new ArrayDeque<>(List.of(2)));",
+            "inference variable E has incompatible bounds",
+        ),
+        (
+            "Collection<String> c = id(new HashSet<Integer>());",
+            "inference variable X has incompatible bounds",
+        ),
+    ];
+    for (body, desc) in refused {
+        let src = format!("{head}{body} }} }}\n");
+        let (out, err, ok) = run_with_stderr(&src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+        assert!(err.contains("line 3"), "{err}\n{src}");
+    }
+    let (out, ok) = run(&format!("{head}List<String> l = id(new ArrayList<>(5)); l.add(\"z\"); Iterable<Integer> it = id(List.of(1, 2)); System.out.println(l + \" \" + it); }} }}\n"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "[z] [1, 2]\n");
+}

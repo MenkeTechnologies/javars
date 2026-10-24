@@ -42,12 +42,15 @@ at the bottom, and are summarized in the section right after this one.
   referenced from a lambda expression`/`a guard`/`an inner class must be
   final or effectively final`). The first diagnostic follows `javac`'s
   order: a top-level class's attribution errors, then its flow errors, then
-  its capture errors. What the walk cannot see, because the parser lowered it
-  away: a read inside an `assert` (the statement is dropped), a lambda
-  parameter's `final`, and the body of a local or anonymous class in its
-  enclosing method — such a class is analyzed on its own, and the enclosing
-  locals its body names are checked where it is created rather than where it
-  is declared.
+  its capture errors. An `assert` runs no code (assertions are disabled) but
+  is read as `javac`'s `visitAssert` reads it: its condition and detail under
+  the states they would run in, leaving nothing they assign definitely
+  assigned. A `final` lambda parameter, and a `final` parameter of the method
+  an anonymous class is lowered from, is a final parameter. A local or
+  anonymous class is analyzed on its own; the enclosing locals its body names
+  are judged at the local class's declaration (instantiated or not) or the
+  anonymous class's creation, each at the line of the reference, as `javac`
+  reports them.
 - **Declarations with more than one declarator.** `int a = 1, b = 2;` in
   statement position, in a `for` init clause, and as an instance or `static`
   field. Declarators run left to right, so a later initializer may read an
@@ -1015,7 +1018,10 @@ at the bottom, and are summarized in the section right after this one.
   to a real synthetic subclass of the enum, which is exactly what Java specifies
   it as — so its overrides are reached by the ordinary runtime-class virtual
   dispatch, an `abstract` method on the enum resolves to the per-constant body,
-  and a constant that declares no override inherits the enum's own.
+  and a constant that declares no override inherits the enum's own. Its body
+  is an anonymous class, so after the enum's constructor runs, the body's own
+  field initializers and `{ … }` instance-initializer blocks run, in textual
+  order (JLS 15.9.5.1).
 - **Lambdas and functional interfaces.** `() -> e`, `x -> e`, `(a, b) -> { … }`,
   and explicitly-typed `(int a, String b) -> …`. A lambda outlives the frame it
   was written in, so it compiles to a heap closure (`HostObj::Closure`) carrying
@@ -1294,10 +1300,13 @@ storage-model differences:
   `[h, ?, ?, i]` in Java (the halves printed as `?`) and `[h, 😀, i]` in javars,
   and `Pattern.compile("").matcher("h😀i")` finds at `0,1,2,3,4` in Java and
   `0,1,3,4` in javars. A non-empty match is unaffected.
-- A subclass that **re-declares a field its parent already declares** gets one
-  cell rather than two, so the parent's own methods and a parent-typed reference
-  read the subclass's value. See "Field *hiding* collapses to one cell" below
-  for the reproducer and the exact divergence.
+- ~~A subclass that **re-declares a field its parent already declares** gets one
+  cell rather than two.~~ — fixed (measured on `openjdk 21.0.13`): see "Field
+  *hiding*" below. What remains is a receiver typed by a **bounded type
+  variable**: `<Q extends B> String f(Q q) { return q.n; }` reads the topmost
+  declaration's cell (`A.n`) where Java reads `B.n`, because a type variable
+  erases to `Object` here rather than to its bound, so no static class selects
+  the cell.
 - **`keySet()`/`values()`/`entrySet()` are copies, not views.** Java's are backed
   by the map; javars builds a fresh set or list in the map's order. A *removal*
   through one is carried back to the map — `remove`, `removeIf`, `removeAll`,
@@ -1432,6 +1441,11 @@ storage-model differences:
   `List<String>` names `List.of`'s `E`); javars names it from
   `src/jdk_generic_statics.rs`, which `scripts/GenJdkGenericStatics.java`
   generates off the real JDK, or from a user generic method's declaration.
+  A diamond argument is inferred jointly the same way, and is named by its
+  own class's type parameter at the conflicting position, through the
+  supertype the target names (`id(new HashMap<>(Map.of(1, "a")))` against
+  `Map<String, Integer>` is `HashMap`'s `K`, against `Iterable<String>` an
+  `ArrayDeque<>`'s `E`).
 - ~~**Compile errors `javac` reports that javars accepts.**~~ — fixed, each
   refused in `javac`'s words (measured on `openjdk 21.0.13`): a member inner
   class created with no enclosing instance (`an enclosing instance that
@@ -1937,12 +1951,15 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   reference* (`C::m`) and a `Class.forName` do not trigger initialization, and
   an exception thrown by an initializer surfaces as itself rather than as
   `ExceptionInInitializerError`.
-- **Field *hiding* collapses to one cell.** A class's fields are resolved once,
-  ancestors first, into a single per-instance map keyed by name, so a subclass
-  that re-declares a field its parent already declares does not get a second
-  cell — both names address the one slot the subclass's initializer last wrote.
-  Java gives each declaration its own storage and selects between them by the
-  reference's *static* type, so
+- **Field *hiding*: one cell per declaration, chosen by the static type.** An
+  instance is one map of fields. A name only one class in the chain declares
+  is keyed by the bare name; a subclass that re-declares a field an ancestor
+  declares keys its own cell apart (`ast::hidden_field_key`), so both coexist
+  in the one instance, and every access picks the cell of the declaration the
+  receiver's *static* class sees (JLS 15.11.1): a qualified read or write,
+  `super.f`, a cast `((A) b).f`, an implicit-`this` name in either class's
+  methods, compound and `++` updates, an inner class's `this$0` chain, an
+  enum constant body, an anonymous class. So
 
   ```java
   class A { int n = 1; String w() { return "A" + n; } }
@@ -1951,14 +1968,13 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   System.out.println(b.w() + " " + a.n + " " + b.n);
   ```
 
-  prints `B2/1/A1 1 2` on OpenJDK 26 and `B2/2/A2 2 2` here: `super.n`, `a.n`
-  and the parent's own `w()` all see the subclass's value. Fixing it means
-  per-declaring-class field storage plus static-type-directed selection at every
-  read and write, which is a storage-model change rather than a call-site one.
-  It is called out rather than papered over because the wrong answer is a
-  plausible number; field hiding is also the one inheritance shape Java itself
-  discourages, which is why the rest of the model is unaffected. `super.method()`
-  — the far more common qualified access — is exact (see "Implemented").
+  prints `B2/1/A1 1 2`, as on `openjdk 21.0.13`. A program without hiding
+  emits exactly the bytecode it did before — every key is still the bare
+  name — so it costs nothing there: a 600k-iteration field-update loop
+  retired 91.2G instructions before and 91.1–91.3G after; a hiding loop
+  costs about 0.7% more, for the longer key. A receiver whose class is not
+  statically known reads the bare-named (topmost) cell; the one such shape
+  a valid program writes is a bounded type variable (see "Runs wrong").
 - **An unqualified name that is another class's `static` field is rejected, as
   `javac` rejects it.** javars resolves an unqualified static only against the
   enclosing class and its ancestors, so reading `v` from outside the class

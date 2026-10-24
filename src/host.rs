@@ -7309,7 +7309,10 @@ fn b_field_get(vm: &mut VM, argc: u8) -> Value {
             let msg = if name == "length" {
                 NULL_ARRAY_LENGTH.to_string()
             } else {
-                format!("Cannot read field \"{name}\" because the receiver is null")
+                format!(
+                    "Cannot read field \"{}\" because the receiver is null",
+                    crate::ast::field_key_name(name)
+                )
             };
             return raise(vm, Fault::java("NullPointerException", msg));
         }
@@ -7343,7 +7346,10 @@ fn b_field_set(vm: &mut VM, argc: u8) -> Value {
                 vm,
                 Fault::java(
                     "NullPointerException",
-                    format!("Cannot assign field \"{name}\" because the receiver is null"),
+                    format!(
+                        "Cannot assign field \"{}\" because the receiver is null",
+                        crate::ast::field_key_name(name)
+                    ),
                 ),
             )
         }
