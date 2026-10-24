@@ -239,9 +239,21 @@ pub struct Method {
     /// or an `abstract` class method. No subroutine is emitted; the method is a
     /// virtual-dispatch target resolved to a concrete override at runtime.
     pub is_abstract: bool,
+    /// The access modifier the declaration wrote (`Package` when it wrote
+    /// none — which in an interface means `public`).
+    pub access: Access,
     /// 1-based source line the method starts on (for the debug line marker and
     /// prologue ops).
     pub line: u32,
+}
+
+/// A member's access modifier, most open first (JLS 6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Access {
+    Public,
+    Protected,
+    Package,
+    Private,
 }
 
 /// A method formal parameter: its declared type and name.
@@ -294,6 +306,9 @@ pub enum StmtKind {
         /// (`Comparable<? extends Number>`), which `targs` alone cannot tell
         /// from the exact `Comparable<Number>`.
         wildcard: bool,
+        /// Whether one of them was a lower-bounded wildcard (`? super Integer`),
+        /// which `targs` reads as `Object`.
+        lower_wildcard: bool,
         name: String,
         init: Option<Expr>,
     },

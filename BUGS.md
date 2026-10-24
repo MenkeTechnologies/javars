@@ -1361,20 +1361,24 @@ storage-model differences:
   being unrelated, since javars keeps its upper bound; and only a local
   declaration's target keeps its type arguments to the check — an
   assignment or a parameter target compares the class alone.
-- **Compile errors `javac` reports that javars accepts.** Found in round 5,
-  each measured on `openjdk 21.0.13`, each running instead of being refused:
-  `new O.I()` for an inner class with no enclosing instance (`an enclosing
-  instance that contains O.I is required`), and an inner class constructed
-  from a static context (`non-static variable this cannot be referenced`); a
-  class inheriting two unrelated `default` methods of one signature (`types A
-  and B are incompatible`); a call to an interface's `private` method from
-  outside it (`has private access`); an interface `private` method without a
-  body (`missing method body, or declare abstract`); an implementation that
-  weakens an interface method's access (`m() in R cannot implement m()
-  in Q`); a static initializer reading a later static field by simple
-  name (`illegal forward reference`); a `static final` field never assigned
-  (`variable K might not have been initialized`); and `List<? super Integer>
-  l; Integer x = l.get(0);` (`CAP#1 cannot be converted to Integer`).
+- ~~**Compile errors `javac` reports that javars accepts.**~~ — fixed, each
+  refused in `javac`'s words (measured on `openjdk 21.0.13`): a member inner
+  class created with no enclosing instance (`an enclosing instance that
+  contains O.I is required`, or `non-static variable this cannot be
+  referenced from a static context` from its own class's static code); two
+  unrelated inherited `default`s (`types A and B are incompatible`); a call
+  that can reach only another top-level class's `private` methods (`has
+  private access`); a bodiless `private` interface method; an override or
+  implementation that weakens access (`cannot implement`/`cannot override`);
+  a static field initializer reading a later static field by simple name,
+  an expression lambda in it included (`illegal forward reference`); a
+  `static final` field assigned nowhere in the static initialization; and an
+  element read through `? super` into anything but `Object` (`CAP#1 cannot
+  be converted to Integer`). What remains of each: definite assignment is
+  not analysed (a `static final` assigned on only one branch runs), a forward
+  reference inside a block lambda or an instance initializer is not seen,
+  and the `? super` read is recognised for the collection and map element
+  methods on a local.
 - ~~**`PatternSyntaxException`'s message is fancy-regex's.**~~ — fixed: the
   JDK's description, index, pattern and message, from the parser port in
   `src/regex_syntax.rs` (see the regular-expression entry). Measured on

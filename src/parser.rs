@@ -36,6 +36,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         class_names: std::collections::HashSet::new(),
         last_targs: Vec::new(),
         last_targs_wildcard: false,
+        last_targs_lower: false,
     };
     // The names declared as classes (not interfaces) anywhere in the unit, so
     // an anonymous class can tell a superclass from an interface even when the
@@ -108,6 +109,8 @@ struct Parser {
     last_targs: Vec<String>,
     /// Whether a top-level argument of [`Parser::last_targs`] was a wildcard.
     last_targs_wildcard: bool,
+    /// Whether one of them was a lower-bounded wildcard (`? super X`).
+    last_targs_lower: bool,
     /// The binary names of the type declarations enclosing the cursor,
     /// innermost last — what a local type declared in a method body is named
     /// after.
@@ -922,6 +925,7 @@ fn record_members(
                 })),
             )],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -955,6 +959,7 @@ fn record_members(
             ret: "String".to_string(),
             body: vec![Stmt::new(line, StmtKind::Return(Some(text)))],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -976,6 +981,7 @@ fn record_members(
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
+                lower_wildcard: false,
                 ty: "int".to_string(),
                 name: acc.to_string(),
                 init: Some(Expr::Int(0)),
@@ -1015,6 +1021,7 @@ fn record_members(
             ret: "int".to_string(),
             body,
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -1071,6 +1078,7 @@ fn record_members(
                 Stmt::new(line, StmtKind::Return(Some(cond))),
             ],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -1171,6 +1179,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
             })),
         )],
         is_abstract: false,
+        access: Access::Public,
         line,
     };
     // `Enum.toString()` returns `name()`. A body that declares any of these
@@ -1204,6 +1213,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
                 StmtKind::Return(Some(Expr::ClassLit(owner.to_string()))),
             )],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -1241,6 +1251,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
                 })),
             )],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -1270,6 +1281,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
                 })),
             )],
             is_abstract: false,
+            access: Access::Public,
             line,
         });
     }
@@ -1368,6 +1380,11 @@ impl Parser {
         }
         let (_, args) = crate::ast::generic_parts(&format!("T{text}"));
         self.last_targs_wildcard = args.iter().any(|a| a.trim_start().starts_with('?'));
+        self.last_targs_lower = args.iter().any(|a| {
+            a.trim_start()
+                .strip_prefix('?')
+                .is_some_and(|r| r.trim_start().starts_with("super"))
+        });
         args.iter()
             .map(|a| crate::ast::normalize_type_arg(a))
             .collect()
@@ -1705,13 +1722,18 @@ impl Parser {
     fn try_any_method(&mut self, owner: &str) -> Result<Option<(Method, bool)>, String> {
         let save = self.pos;
         let mut saw_static = false;
+        let mut access = Access::Package;
         // Modifiers, including interface method modifiers (`default`, `abstract`)
         // and access/other qualifiers, in any order.
         while matches!(self.peek(), Tok::Public | Tok::Static | Tok::Default)
             || matches!(self.peek(), Tok::Ident(w) if w == "final" || w == "abstract" || w == "private" || w == "protected" || w == "synchronized" || w == "native")
         {
-            if matches!(self.peek(), Tok::Static) {
-                saw_static = true;
+            match self.peek() {
+                Tok::Static => saw_static = true,
+                Tok::Public => access = Access::Public,
+                Tok::Ident(w) if w == "private" => access = Access::Private,
+                Tok::Ident(w) if w == "protected" => access = Access::Protected,
+                _ => {}
             }
             self.advance();
         }
@@ -1763,6 +1785,7 @@ impl Parser {
                 ret_targs,
                 body,
                 is_abstract,
+                access,
                 line,
             },
             saw_static,
@@ -2175,6 +2198,7 @@ impl Parser {
             let base_ty = self.type_name()?;
             let targs = self.last_targs.clone();
             let wildcard = self.last_targs_wildcard;
+            let lower_wildcard = self.last_targs_lower;
             // Every declarator of the statement, in source order: `int a = 1,
             // b = 2;` is two, and `int a[], b;` gives them different types.
             let mut decls = Vec::new();
@@ -2194,6 +2218,7 @@ impl Parser {
                         ty,
                         targs: targs.clone(),
                         wildcard,
+                        lower_wildcard,
                         name,
                         init,
                     },
@@ -2761,6 +2786,7 @@ impl Parser {
                 StmtKind::Local {
                     targs: Vec::new(),
                     wildcard: false,
+                    lower_wildcard: false,
                     ty: "Throwable".to_string(),
                     name: primary.clone(),
                     init: Some(var("null")),
@@ -2781,6 +2807,7 @@ impl Parser {
                         StmtKind::Local {
                             targs: Vec::new(),
                             wildcard: false,
+                            lower_wildcard: false,
                             ty,
                             name: r.name,
                             init: Some(init),
@@ -4251,6 +4278,7 @@ impl Parser {
                 ty: ty.to_string(),
                 targs: Vec::new(),
                 wildcard: false,
+                lower_wildcard: false,
                 name: self_name.to_string(),
                 init: Some(Expr::NewObject {
                     class: ty.to_string(),

@@ -49,6 +49,9 @@ pub fn parse(src: &str) -> Result<ast::Program, String> {
     // so it sees the user's declarations only (see
     // [`compiler::check_duplicate_declarations`]).
     compiler::check_duplicate_declarations(&prog)?;
+    // The member rules `javac` checks on declarations alone (access, defaults,
+    // forward references, unassigned finals), on the user's declarations too.
+    compiler::check_member_rules(&prog)?;
     // A program that throws or catches also declares, implicitly, the
     // `java.lang` throwable classes it names — there is no JDK to import them
     // from. No-op for every other program (see [`prelude::inject`]).

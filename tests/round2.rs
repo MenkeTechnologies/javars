@@ -4301,3 +4301,141 @@ public class T {
     assert!(ok, "{out}");
     assert_eq!(out, "Look-behind group does not have an obvious maximum length | 8\nLook-behind group does not have an obvious maximum length | 10\nLook-behind group does not have an obvious maximum length | 5\nLook-behind group does not have an obvious maximum length | 8\nLook-behind group does not have an obvious maximum length | 11\nLook-behind group does not have an obvious maximum length | 15\nOK (?<=x(ab)?)c\nLook-behind group does not have an obvious maximum length | 12\nLook-behind group does not have an obvious maximum length | 9\nLook-behind group does not have an obvious maximum length | 7\nLook-behind group does not have an obvious maximum length | 9\nLook-behind group does not have an obvious maximum length | 10\nOK (?<=a*)b\nOK (?<=(a)*)b\nOK (?<=a|bc*)d\nLook-behind group does not have an obvious maximum length | 11\nOK (?<=a{1,3})b\nOK (?<=\\R)a\n");
 }
+
+/// Compile errors javac reports on declarations and member access, each refused
+/// with javac's wording: a member inner class created with no enclosing instance
+/// (from another class, or from its own class's static context), unrelated
+/// inherited defaults, a call reaching only another top-level class's private
+/// method, a bodiless private interface method, an implementation weakening
+/// access, a static initializer's forward reference (an expression lambda's
+/// included), a never-assigned static final, and an element read through `? super`.
+/// The accepted program exercises the legal neighbours of each. Every verdict
+/// measured on openjdk 21.0.13.
+#[test]
+fn declaration_and_access_compile_errors_are_refused() {
+    let refused = [
+        (
+            r#"public class T { static class O { class I { } } public static void main(String[] a) { O.I i = new O.I(); System.out.println(i != null); } }
+"#,
+            "an enclosing instance that contains O.I is required",
+        ),
+        (
+            r#"public class T { class In { } public static void main(String[] a) { In x = new In(); System.out.println(x != null); } }
+"#,
+            "non-static variable this cannot be referenced from a static context",
+        ),
+        (
+            r#"public class T { interface A { default String hi() { return "A"; } } interface B { default String hi() { return "B"; } } static class C implements A, B { } public static void main(String[] a) { System.out.println(new C().hi()); } }
+"#,
+            "types A and B are incompatible",
+        ),
+        (
+            r#"interface Sh { private String fmt() { return "x"; } default String show() { return fmt(); } }
+public class T { static class R implements Sh { } public static void main(String[] a) { Sh s = new R(); System.out.println(s.fmt()); } }
+"#,
+            "fmt() has private access in Sh",
+        ),
+        (
+            r#"public class T { interface I { private void p(); } public static void main(String[] a) { System.out.println("ran"); } }
+"#,
+            "missing method body, or declare abstract",
+        ),
+        (
+            r#"interface Q { void m(); }
+public class T implements Q { void m() { } public static void main(String[] a) { System.out.println("ran"); } }
+"#,
+            "m() in T cannot implement m() in Q",
+        ),
+        (
+            r#"public class T { static int x = y + 1; static int y = 5; public static void main(String[] a) { System.out.println(x); } }
+"#,
+            "illegal forward reference",
+        ),
+        (
+            r#"public class T { static final int K; public static void main(String[] a) { System.out.println("ran"); } }
+"#,
+            "variable K might not have been initialized",
+        ),
+        (
+            r#"import java.util.*;
+public class T { public static void main(String[] a) { List<? super Integer> l = new ArrayList<Number>(); l.add(1); Integer x = l.get(0); System.out.println(x); } }
+"#,
+            "incompatible types: CAP#1 cannot be converted to Integer",
+        ),
+        (
+            r#"class O { class I { } }
+public class T { public static void main(String[] a) { Object i = new O.I(); } }
+"#,
+            "an enclosing instance that contains O.I is required",
+        ),
+        (
+            r#"public class T { static class A { static class B { class C { } } } public static void main(String[] a) { Object c = new A.B.C(); } }
+"#,
+            "an enclosing instance that contains B.C is required",
+        ),
+        (
+            r#"public class T { class In { class Deep {} } static void f() { Object x = new In(); } public static void main(String[] a) { } }
+"#,
+            "non-static variable this cannot be referenced from a static context",
+        ),
+        (
+            r#"public class T { static final Runnable LATER = () -> System.out.println("later " + a5); static int a5 = 9; public static void main(String[] a) { LATER.run(); } }
+"#,
+            "illegal forward reference",
+        ),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}");
+    }
+    let src = r####"
+import java.util.*;
+public class T implements Q {
+    public void m() { System.out.println("m"); }
+    class In { int v = 1; class Deep { int w = v + 1; } }
+    void inst() { In i = new In(); In.Deep d = i.new Deep(); System.out.println(i.v + " " + d.w); }
+    interface A { default String hi() { return "A"; } }
+    interface B { default String hi() { return "B"; } }
+    interface AB extends A { default String hi() { return "AB"; } }
+    static class C implements A, B { public String hi() { return A.super.hi() + B.super.hi(); } }
+    static class D implements AB, A { }
+    static class E implements Base { }
+    interface Sh { private String fmt() { return "f"; } default String show() { return fmt() + "!"; } }
+    static class R implements Sh { }
+    static class P { private int secret() { return 42; } protected void pm() { System.out.println("pm"); } void pk() { System.out.println("pk"); } }
+    static class P2 extends P { public void pm() { System.out.println("pm2"); } protected void pk() { System.out.println("pk2"); } }
+    static int a1 = 3;
+    static int a2 = a1 + 1;
+    static int a3 = T.a4 + 1;
+    static int a4 = 10;
+    static final int K;
+    static { K = 7; }
+    public static void main(String[] a) {
+        new T().inst();
+        new T().m();
+        Runnable r = new Runnable() { public void run() { System.out.println("anon"); } };
+        r.run();
+        class Local { int x = 5; }
+        System.out.println(new Local().x);
+        System.out.println(new C().hi() + " " + new D().hi() + " " + new E().hi() + " " + new R().show());
+        System.out.println(new P().secret());
+        P p = new P2(); p.pm(); p.pk();
+        System.out.println(a2 + " " + a3 + " " + K);
+        List<? super Integer> l = new ArrayList<Number>(); l.add(1); Object o = l.get(0); System.out.println(o);
+        List<? extends Number> l2 = List.of(1, 2); Number n = l2.get(0); System.out.println(n);
+        Map<String, ? super Integer> mm = new HashMap<String, Number>(); Object v = mm.get("a"); System.out.println(v);
+        T outer = new T(); T.In i2 = outer.new In(); System.out.println(i2.v);
+    }
+}
+interface Base { default String hi() { return "Base"; } }
+interface Q { void m(); }
+
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "1 2\nm\nanon\n5\nAB AB Base f!\n42\npm2\npk2\n4 1 7\n1\n1\nnull\n1\n"
+    );
+}

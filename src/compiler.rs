@@ -582,6 +582,12 @@ struct Compiler {
     /// lowered by [`Compiler::expr_targeted`], which takes it: only that one
     /// expression's bounds check reads it.
     pending_target_generic: Option<String>,
+    /// Every user method by declaring class: name, parameter types and access
+    /// — what [`Compiler::check_private_access`] reads.
+    method_access: HashMap<String, Vec<(String, Vec<String>, Access)>>,
+    /// The locals declared with a lower-bounded wildcard argument
+    /// (`List<? super Integer> l`), whose element reads are a capture type.
+    lower_wildcard_locals: HashSet<String>,
     /// Whether [`Compiler::pending_target_generic`] was written with a
     /// wildcard argument, so its arguments are bounds rather than exact.
     target_wildcard: Option<bool>,
@@ -788,6 +794,23 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         lambda_ret_hint: None,
         lambda_generic: None,
         pending_target_generic: None,
+        method_access: {
+            let mut m: HashMap<String, Vec<(String, Vec<String>, Access)>> = HashMap::default();
+            let all = prog
+                .classes
+                .iter()
+                .flat_map(|cl| cl.methods.iter().map(move |x| (cl.name.as_str(), x)))
+                .chain(prog.methods.iter().map(|x| (x.owner.as_str(), x)));
+            for (owner, x) in all {
+                m.entry(owner.to_string()).or_default().push((
+                    x.name.clone(),
+                    x.params.iter().map(|p| p.ty.clone()).collect(),
+                    x.access,
+                ));
+            }
+            m
+        },
+        lower_wildcard_locals: HashSet::default(),
         target_wildcard: None,
         lambda_param_hint: None,
         switch_is_statement: false,
@@ -4073,6 +4096,155 @@ impl Compiler {
         }
     }
 
+    /// Whether `local.method(…)` answers the element its declared type gives
+    /// through a lower-bounded wildcard (`? super X`, which the declaration's
+    /// type arguments read as `Object`): a collection's element reads, or a
+    /// map's value reads.
+    fn reads_captured_element(&self, local: &str, method: &str) -> bool {
+        let Some(generic) = self.var_generic(local) else {
+            return false;
+        };
+        let (base, args) = crate::ast::generic_parts(&generic);
+        let map_like = matches!(
+            base.as_str(),
+            "Map" | "HashMap" | "LinkedHashMap" | "TreeMap" | "SortedMap" | "NavigableMap"
+        );
+        let slot = if map_like {
+            matches!(
+                method,
+                "get" | "getOrDefault" | "remove" | "put" | "replace"
+            )
+            .then_some(1)
+        } else {
+            matches!(
+                method,
+                "get"
+                    | "remove"
+                    | "set"
+                    | "getFirst"
+                    | "getLast"
+                    | "removeFirst"
+                    | "removeLast"
+                    | "peek"
+                    | "poll"
+                    | "pop"
+                    | "element"
+                    | "first"
+                    | "last"
+                    | "pollFirst"
+                    | "pollLast"
+                    | "peekFirst"
+                    | "peekLast"
+            )
+            .then_some(0)
+        };
+        slot.and_then(|i| args.get(i))
+            .is_some_and(|a| a == "Object")
+    }
+
+    /// `javac`'s refusal of a call that can reach only `private` methods of a
+    /// class in another top-level class (JLS 6.6.1: a private member is
+    /// accessible within the body of the top-level class that encloses it).
+    /// Every method of the receiver's class and its ancestors with the call's
+    /// name and arity is considered, so an accessible overload is never
+    /// refused.
+    fn check_private_access(
+        &self,
+        recv: &Expr,
+        method: &str,
+        argc: usize,
+        line: u32,
+    ) -> Result<(), String> {
+        let Some(cur) = self.current_class.as_deref() else {
+            return Ok(());
+        };
+        let Some(class) = self.user_class_ref(recv).or_else(|| self.expr_class(recv)) else {
+            return Ok(());
+        };
+        let top = |c: &str| {
+            let b = self.classes.get(c).map_or(c, |ci| ci.binary.as_str());
+            b.split('$').next().unwrap_or(b).to_string()
+        };
+        let mut chain = vec![class.clone()];
+        let mut i = 0;
+        while i < chain.len() && chain.len() < 256 {
+            if let Some(ci) = self.classes.get(&chain[i]) {
+                for s in &ci.supertypes {
+                    if !chain.contains(s) {
+                        chain.push(s.clone());
+                    }
+                }
+            }
+            i += 1;
+        }
+        let candidates: Vec<(&str, &Vec<String>, Access)> = chain
+            .iter()
+            .flat_map(|c| {
+                self.method_access
+                    .get(c)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(n, ps, _)| n == method && ps.len() == argc)
+                    .map(move |(_, ps, a)| (c.as_str(), ps, *a))
+            })
+            .collect();
+        let cur_top = top(cur);
+        let hidden = |(owner, _, a): &(&str, &Vec<String>, Access)| {
+            *a == Access::Private && top(owner) != cur_top
+        };
+        match candidates.first() {
+            Some(first) if candidates.iter().all(hidden) => Err(format!(
+                "javars: {method}({}) has private access in {} (line {line})",
+                first.1.join(","),
+                source_type_name(
+                    self.classes
+                        .get(first.0)
+                        .map_or(first.0, |ci| ci.binary.as_str())
+                )
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `javac`'s refusal of `new Inner()` with no enclosing instance in scope
+    /// (JLS 15.9.2): from a static context of the enclosing class itself, `this`
+    /// is what is missing; from anywhere else, the enclosing instance.
+    fn check_enclosing_instance(&self, class: &str, line: u32) -> Result<(), String> {
+        let Some(outer) = self.outer_class(class) else {
+            return Ok(());
+        };
+        if !matches!(self.enclosing_instance(outer), Expr::Var(n) if n == NULL_LITERAL) {
+            return Ok(());
+        }
+        let binary = |c: &str| {
+            self.classes
+                .get(c)
+                .map_or(c.to_string(), |ci| ci.binary.clone())
+        };
+        // An anonymous or local class (`T$1`, `T$1Local`) in a static context
+        // simply has no enclosing instance; only a member class needs one.
+        let local = binary(class)
+            .rsplit('$')
+            .next()
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()));
+        if local {
+            return Ok(());
+        }
+        let inside = self.current_class.as_deref().is_some_and(|cur| {
+            let (cur, out) = (binary(cur), binary(outer));
+            cur == out || cur.starts_with(&format!("{out}$"))
+        });
+        if inside {
+            return Err(format!(
+                "javars: non-static variable this cannot be referenced from a static context (line {line})"
+            ));
+        }
+        Err(format!(
+            "javars: an enclosing instance that contains {} is required (line {line})",
+            source_type_name(&binary(class))
+        ))
+    }
+
     /// The enclosing class an inner member class holds an instance of.
     fn outer_class(&self, class: &str) -> Option<&str> {
         self.classes
@@ -6668,6 +6840,7 @@ impl Compiler {
                 ty,
                 targs,
                 wildcard,
+                lower_wildcard,
                 name,
                 init,
             } => {
@@ -6700,6 +6873,27 @@ impl Compiler {
                 };
                 self.declare_local(name, &raw, nt);
                 self.declare_generic(name, generic.clone());
+                // An element read through a lower-bounded wildcard
+                // (`List<? super Integer> l; Integer x = l.get(0)`) has a
+                // capture type javac converts to nothing but `Object`.
+                if let Some(Expr::MethodCall { recv, method, .. }) = init {
+                    if let Expr::Var(r) = recv.as_ref() {
+                        if ty != "var"
+                            && ty != "Object"
+                            && self.lower_wildcard_locals.contains(r)
+                            && self.reads_captured_element(r, method)
+                        {
+                            return Err(format!(
+                                "javars: incompatible types: CAP#1 cannot be converted to {ty} (line {line})"
+                            ));
+                        }
+                    }
+                }
+                if *lower_wildcard {
+                    self.lower_wildcard_locals.insert(name.clone());
+                } else {
+                    self.lower_wildcard_locals.remove(name);
+                }
                 if let Some(e) = init {
                     self.target_wildcard = Some(*wildcard);
                     self.expr_targeted_generic(e, Some(&raw), generic)?;
@@ -7436,6 +7630,7 @@ impl Compiler {
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
+                lower_wildcard: false,
                 ty: ty.to_string(),
                 name: name.to_string(),
                 init: Some(call(Expr::Var(it.clone()), "next")),
@@ -7448,6 +7643,7 @@ impl Compiler {
                 StmtKind::Local {
                     targs: Vec::new(),
                     wildcard: false,
+                    lower_wildcard: false,
                     ty: "Iterator".to_string(),
                     name: it.clone(),
                     init: Some(call(iter.clone(), "iterator")),
@@ -8937,6 +9133,7 @@ impl Compiler {
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
+                lower_wildcard: false,
                 ty: "Consumer".to_string(),
                 name: action,
                 init: Some(args[0].clone()),
@@ -8969,6 +9166,7 @@ impl Compiler {
         args: &[Expr],
         line: u32,
     ) -> Result<(), String> {
+        self.check_private_access(recv, method, args.len(), line)?;
         // A call whose receiver is a bare capitalized class name (`Math.abs`,
         // `Integer.parseInt`, `String.valueOf`) is a static stdlib call: the
         // receiver is not a value, so it is not evaluated. Args, then the class
@@ -9655,6 +9853,7 @@ impl Compiler {
                     StmtKind::Local {
                         targs: Vec::new(),
                         wildcard: false,
+                        lower_wildcard: false,
                         ty: rc.clone(),
                         name: it.clone(),
                         init: Some(recv.clone()),
@@ -9662,6 +9861,7 @@ impl Compiler {
                     StmtKind::Local {
                         targs: Vec::new(),
                         wildcard: false,
+                        lower_wildcard: false,
                         ty: "Consumer".to_string(),
                         name: action.clone(),
                         init: Some(args[0].clone()),
@@ -10331,6 +10531,9 @@ impl Compiler {
             return Err(format!(
                 "javars: `{ctor_class}` is not an inner class, so a qualified `new` names no enclosing instance for it (line {line})"
             ));
+        }
+        if outer.is_none() {
+            self.check_enclosing_instance(ctor_class, line)?;
         }
         let args = self.with_captures(ctor_class, args, outer);
         let args: &[Expr] = &args;
@@ -13820,4 +14023,358 @@ fn jdk_supertype_entry(
     let table = crate::jdk_supertypes::JDK_SUPERTYPES;
     let i = table.binary_search_by(|(n, _, _)| (*n).cmp(t)).ok()?;
     Some((table[i].1, table[i].2))
+}
+
+/// `javac`'s member-level checks that need only the declarations, run on the
+/// user's own unit before the prelude is injected:
+///
+/// - a `private` interface method must have a body (JLS 9.4);
+/// - an override or implementation may not weaken access (JLS 8.4.8.3) —
+///   an interface method is `public` when it says nothing;
+/// - a class may not inherit two `default` methods of one signature from
+///   unrelated interfaces without overriding them (JLS 8.4.8.4);
+/// - a `static` field initializer may not read, by simple name, a `static`
+///   field declared after it (JLS 8.3.3);
+/// - a `static final` field must be assigned somewhere in the class's static
+///   initialization (JLS 8.3.1.2).
+///
+/// Each refusal is worded as `javac` words it.
+pub fn check_member_rules(prog: &Program) -> Result<(), String> {
+    let by_name: HashMap<&str, &Class> =
+        prog.classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let sig = |m: &Method| -> (String, Vec<String>) {
+        (
+            m.name.clone(),
+            m.params.iter().map(|p| p.ty.clone()).collect(),
+        )
+    };
+    let shown = |m: &Method| {
+        format!(
+            "{}({})",
+            m.name,
+            m.params
+                .iter()
+                .map(|p| p.ty.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    // An interface member written with no modifier is `public`.
+    let access = |cl: &Class, m: &Method| {
+        if cl.is_interface && m.access == Access::Package {
+            Access::Public
+        } else {
+            m.access
+        }
+    };
+    for cl in &prog.classes {
+        for m in &cl.methods {
+            if cl.is_interface && m.access == Access::Private && m.is_abstract {
+                return Err(format!(
+                    "javars: missing method body, or declare abstract (line {})",
+                    m.line
+                ));
+            }
+        }
+    }
+    // Every supertype of a class, nearest first, with the class itself first.
+    fn ancestors<'a>(name: &'a str, by_name: &HashMap<&str, &'a Class>, out: &mut Vec<&'a Class>) {
+        let Some(cl) = by_name.get(name) else { return };
+        if out.iter().any(|c| c.name == cl.name) || out.len() > 256 {
+            return;
+        }
+        out.push(cl);
+        if let Some(s) = &cl.superclass {
+            ancestors(s, by_name, out);
+        }
+        for i in &cl.interfaces {
+            ancestors(i, by_name, out);
+        }
+    }
+    for cl in &prog.classes {
+        let mut sups = Vec::new();
+        ancestors(&cl.name, &by_name, &mut sups);
+        // Weaker access: each of this class's own methods against the nearest
+        // supertype method of the same signature.
+        for m in cl.methods.iter().filter(|m| m.access != Access::Private) {
+            for sup in sups.iter().skip(1) {
+                let Some(over) = sup
+                    .methods
+                    .iter()
+                    .find(|o| sig(o) == sig(m) && o.access != Access::Private)
+                else {
+                    continue;
+                };
+                if access(cl, m) > access(sup, over) {
+                    let verb = if sup.is_interface && !cl.is_interface {
+                        "implement"
+                    } else {
+                        "override"
+                    };
+                    let was = match access(sup, over) {
+                        Access::Public => "public",
+                        Access::Protected => "protected",
+                        _ => "package",
+                    };
+                    return Err(format!(
+                        "javars: {} in {} cannot {verb} {} in {}; attempting to assign weaker access privileges; was {was} (line {})",
+                        shown(m),
+                        cl.name,
+                        shown(over),
+                        sup.name,
+                        m.line
+                    ));
+                }
+                break;
+            }
+        }
+        // Unrelated defaults: the maximally specific interfaces that supply a
+        // `default` for one signature the class does not get from its own
+        // methods or its superclass chain.
+        let class_chain: Vec<&Class> = {
+            let mut chain = Vec::new();
+            let mut cur: Option<&Class> = Some(cl);
+            while let Some(c) = cur.filter(|_| chain.len() < 256) {
+                chain.push(c);
+                cur = c
+                    .superclass
+                    .as_deref()
+                    .and_then(|s| by_name.get(s).copied());
+            }
+            chain
+        };
+        let ifaces: Vec<&Class> = sups
+            .iter()
+            .copied()
+            .filter(|c| c.is_interface && c.name != cl.name)
+            .collect();
+        let is_sub = |a: &str, b: &str| {
+            let mut v = Vec::new();
+            ancestors(a, &by_name, &mut v);
+            a != b && v.iter().any(|c| c.name == b)
+        };
+        for i in &ifaces {
+            for d in i
+                .methods
+                .iter()
+                .filter(|m| !m.is_abstract && m.access != Access::Private)
+            {
+                let key = sig(d);
+                if class_chain
+                    .iter()
+                    .any(|c| !c.is_interface && c.methods.iter().any(|m| sig(m) == key))
+                {
+                    continue;
+                }
+                // The interfaces that declare this signature and are not
+                // overridden by a more specific one.
+                let providers: Vec<&&Class> = ifaces
+                    .iter()
+                    .filter(|j| {
+                        j.methods
+                            .iter()
+                            .any(|m| sig(m) == key && m.access != Access::Private)
+                    })
+                    .collect();
+                let maximal: Vec<&&Class> = providers
+                    .iter()
+                    .copied()
+                    .filter(|j| !providers.iter().any(|k| is_sub(&k.name, &j.name)))
+                    .collect();
+                let defaults = maximal
+                    .iter()
+                    .filter(|j| j.methods.iter().any(|m| sig(m) == key && !m.is_abstract))
+                    .count();
+                if maximal.len() >= 2 && defaults == maximal.len() {
+                    let (a, b) = (&maximal[0].name, &maximal[1].name);
+                    let what = if cl.is_interface {
+                        "interface"
+                    } else {
+                        "class"
+                    };
+                    return Err(format!(
+                        "javars: types {a} and {b} are incompatible; {what} {} inherits unrelated defaults for {} from types {a} and {b} (line {})",
+                        cl.name,
+                        shown(d),
+                        cl.line
+                    ));
+                }
+            }
+        }
+        // Static fields: forward references and unassigned finals.
+        // A field is declared in its textual position, so an initializer may
+        // read by simple name only the fields declared before it.
+        let order: HashMap<&str, usize> = cl
+            .static_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+        // The parser lowers each initializer to an assignment on its
+        // declaration's line, in textual order (`static_declaration`).
+        for (i, f) in cl.static_fields.iter().enumerate() {
+            let Some(init) = cl.static_init.iter().find_map(|st| match &st.kind {
+                StmtKind::Assign {
+                    name,
+                    op: AssignOp::Assign,
+                    value,
+                } if *name == f.name && st.line == f.line => Some(value),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let mut reads = Vec::new();
+            simple_name_reads(init, &mut Vec::new(), &mut reads);
+            for r in &reads {
+                match order.get(r.as_str()) {
+                    Some(&j) if j == i => {
+                        return Err(format!(
+                            "javars: self-reference in initializer (line {})",
+                            f.line
+                        ))
+                    }
+                    Some(&j) if j > i => {
+                        return Err(format!(
+                            "javars: illegal forward reference (line {})",
+                            f.line
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for f in cl.static_fields.iter().filter(|f| f.is_final) {
+            if !stmts_assign(&cl.static_init, &f.name, &cl.name) {
+                return Err(format!(
+                    "javars: variable {} might not have been initialized (line {})",
+                    f.name, f.line
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The simple names `e` reads, not names a pattern in `e` or a lambda's
+/// parameters bind. An expression lambda's body counts (javac refuses a
+/// forward reference there too); a block body and a class body are not
+/// walked. An assignment's target is not read.
+fn simple_name_reads(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+    let mut go = |x: &Expr, bound: &mut Vec<String>| simple_name_reads(x, bound, out);
+    match e {
+        Expr::Var(n) if !bound.contains(n) => out.push(n.clone()),
+        Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } if !bound.contains(name) => {
+            out.push(name.clone())
+        }
+        Expr::Unary { rhs, .. } => go(rhs, bound),
+        Expr::Binary { lhs, rhs, .. } => {
+            go(lhs, bound);
+            go(rhs, bound);
+        }
+        Expr::Ternary { cond, then, els } => {
+            go(cond, bound);
+            go(then, bound);
+            go(els, bound);
+        }
+        Expr::Assign { target, value, .. } => {
+            if !matches!(target.as_ref(), Expr::Var(_)) {
+                go(target, bound);
+            }
+            go(value, bound);
+        }
+        Expr::IncDec { target, .. } => go(target, bound),
+        Expr::Println { arg: Some(arg), .. } => go(arg, bound),
+        Expr::Cast { expr, .. } => go(expr, bound),
+        Expr::Call { args, .. } | Expr::NewObject { args, .. } => {
+            for a in args {
+                go(a, bound);
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            go(recv, bound);
+            for a in args {
+                go(a, bound);
+            }
+        }
+        Expr::NewArray { sizes, .. } => {
+            for s in sizes {
+                go(s, bound);
+            }
+        }
+        Expr::ArrayLit { elems, .. } => {
+            for x in elems {
+                go(x, bound);
+            }
+        }
+        Expr::Index { array, index } => {
+            go(array, bound);
+            go(index, bound);
+        }
+        // `C.x` and `this.x` are qualified, not simple names.
+        Expr::Field { recv, .. } if !matches!(recv.as_ref(), Expr::Var(_) | Expr::This) => {
+            go(recv, bound)
+        }
+        Expr::InstanceOf { expr, binding, .. } => {
+            go(expr, bound);
+            if let Some(b) = binding {
+                bound.push(b.clone());
+            }
+        }
+        Expr::Lambda {
+            params,
+            body: LambdaBody::Expr(body),
+            ..
+        } => {
+            let mut inner = bound.clone();
+            inner.extend(params.iter().cloned());
+            go(body, &mut inner);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `stmts` assign `field` — as a simple name, or as `Class.field`
+/// with `class` its own — anywhere, nested blocks included.
+fn stmts_assign(stmts: &[Stmt], field: &str, class: &str) -> bool {
+    stmts.iter().any(|st| match &st.kind {
+        StmtKind::Assign { name, .. } => name == field,
+        StmtKind::FieldAssign { recv, name, .. } => {
+            name == field && matches!(recv, Expr::Var(c) if c == class)
+        }
+        StmtKind::Locals(b) => stmts_assign(b, field, class),
+        StmtKind::If { then, els, .. } => {
+            stmts_assign(then, field, class) || stmts_assign(els, field, class)
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::ForEach { body, .. } => stmts_assign(body, field, class),
+        StmtKind::For {
+            init, update, body, ..
+        } => {
+            stmts_assign(init, field, class)
+                || stmts_assign(update, field, class)
+                || stmts_assign(body, field, class)
+        }
+        StmtKind::Switch { groups, .. } => {
+            groups.iter().any(|g| stmts_assign(&g.body, field, class))
+        }
+        StmtKind::Labeled { body, .. } => stmts_assign(std::slice::from_ref(body), field, class),
+        StmtKind::Try {
+            body,
+            catches,
+            finally_body,
+        } => {
+            stmts_assign(body, field, class)
+                || catches.iter().any(|c| stmts_assign(&c.body, field, class))
+                || stmts_assign(finally_body, field, class)
+        }
+        _ => false,
+    })
+}
+
+/// How `javac` names a member class in a diagnostic: its simple name
+/// qualified by its immediately enclosing class (`T$O$I` is `O.I`).
+fn source_type_name(binary: &str) -> String {
+    let parts: Vec<&str> = binary.split('$').collect();
+    parts[parts.len().saturating_sub(2)..].join(".")
 }
