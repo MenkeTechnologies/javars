@@ -527,6 +527,18 @@ Implemented and checked against the reference `java`:
   (`src/hotspot_trig.rs`) and print that JVM's last digit. `StrictMath` is
   supported, `sin`/`cos` included (fdlibm by specification). `Double.doubleToLongBits`/`longBitsToDouble`
   and the `Float` pair round-trip a value through its bits.
+- **Definite assignment** — JLS chapter 16, checked the way `javac`'s
+  `Flow.AssignAnalyzer` checks it (`src/flow.rs`): a local read before it is
+  assigned, a `final` assigned twice or in a loop, a blank `final` field a
+  constructor, the default constructor, a `return` or the static
+  initialization leaves unassigned, an assigned `final` parameter, `catch`
+  parameter, multi-catch parameter or resource, with constant conditions
+  (`while (true)`, a `static final boolean`) making the impossible branch
+  vacuous as Java does. The same walk refuses a `final` assigned outside its
+  constructors and initializers, a forward reference in an initializer
+  (lambda bodies included, JLS 8.3.3), and a local referenced from a lambda,
+  guard or inner class that is not effectively final — each in `javac`'s
+  words.
 - **Inline Rust FFI** — a `rust { pub extern "C" fn … }` block inside `main`
   compiles to a cached cdylib whose exported functions are callable by name
   (via `fusevm::ffi`); see [`examples/Ffi.java`](examples/Ffi.java).

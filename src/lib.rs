@@ -12,6 +12,7 @@ pub mod cli;
 pub mod compiler;
 pub mod dap;
 pub mod fdlibm;
+pub mod flow;
 pub mod host;
 pub mod hotspot_trig;
 pub mod jbig;
@@ -52,6 +53,9 @@ pub fn parse(src: &str) -> Result<ast::Program, String> {
     // The member rules `javac` checks on declarations alone (access, defaults,
     // forward references, unassigned finals), on the user's declarations too.
     compiler::check_member_rules(&prog)?;
+    // Definite assignment (JLS 16) and the checks that ride on it: final
+    // reassignment, forward references, effective finality.
+    flow::check(&prog)?;
     // A program that throws or catches also declares, implicitly, the
     // `java.lang` throwable classes it names — there is no JDK to import them
     // from. No-op for every other program (see [`prelude::inject`]).

@@ -4503,3 +4503,245 @@ fn a_static_interface_method_is_not_called_through_a_value() {
         "{err}"
     );
 }
+
+/// Definite assignment (JLS 16), checked as javac's `Flow.AssignAnalyzer`
+/// checks it: a local read before assignment, a `final` reassigned (or
+/// assigned in a loop), a blank `final` field left unassigned by a
+/// constructor, the default constructor, a `return`, or the static
+/// initialization, a final parameter, `catch` parameter, multi-catch parameter
+/// or resource assigned, a `final` field assigned outside its constructors and
+/// initializers, and the `switch`/`try`/lambda rules. Each refused in javac's
+/// words, at javac's line where the program spans lines; every verdict
+/// measured on openjdk 21.0.13.
+#[test]
+fn definite_assignment_errors_are_refused_in_javacs_words() {
+    let refused = [
+        ("public class T { public static void main(String[] a) { int n; System.out.println(n); } }", "variable n might not have been initialized"),
+        ("public class T { public static void main(String[] a) { final int n = 1; n = 2; } }", "cannot assign a value to final variable n"),
+        ("public class T { public static void main(String[] a) { final int n = 1; n++; } }", "cannot assign a value to final variable n"),
+        ("public class T { public static void main(String[] a) { final int n; n = 1; n = 2; } }", "variable n might already have been assigned"),
+        ("public class T { static void f(final int p) { p = 2; } public static void main(String[] a) { f(1); } }", "final parameter p may not be assigned"),
+        ("public class T { public static void main(String[] a) { try { throw new RuntimeException(); } catch (final RuntimeException e) { e = null; } } }", "final parameter e may not be assigned"),
+        ("public class T { public static void main(String[] a) { try { throw new RuntimeException(); } catch (IllegalStateException | IllegalArgumentException e) { e = null; } } }", "multi-catch parameter e may not be assigned"),
+        ("public class T { public static void main(String[] a) { for (final String s : a) { s = \"x\"; } } }", "variable s might already have been assigned"),
+        ("public class T implements AutoCloseable { public void close() {} public static void main(String[] a) { try (T r = new T()) { r = null; } } }", "auto-closeable resource r may not be assigned"),
+        ("public class T { static final int K; static { if (Math.random() > 2) K = 1; } public static void main(String[] a) { System.out.println(K); } }", "variable K might not have been initialized"),
+        ("public class T { static final int K; static { T.K = 1; } public static void main(String[] a) { } }", "cannot assign a value to static final variable K"),
+        ("public class T { static final int K; static void f() { K = 1; } static { K = 2; } public static void main(String[] a) { } }", "cannot assign a value to static final variable K"),
+        ("public class T { final int x; T() { x = 1; x = 2; } public static void main(String[] a) { new T(); } }", "variable x might already have been assigned"),
+        ("public class T { final int x; T() { x = 1; } void m() { x = 3; } public static void main(String[] a) { new T(); } }", "cannot assign a value to final variable x"),
+        ("public class T { final int x = 1; T() { x = 2; } public static void main(String[] a) { new T(); } }", "cannot assign a value to final variable x"),
+        ("public class T { final int x; T() { System.out.println(this.x); x = 1; } public static void main(String[] a) { new T(); } }", "variable x might not have been initialized"),
+        ("public class T { final int x; { System.out.println(x); } T() { x = 1; } public static void main(String[] a) { new T(); } }", "variable x might not have been initialized"),
+        ("public class T { final int x; T() { Runnable r = () -> System.out.println(x); x = 1; } public static void main(String[] a) { new T(); } }", "variable x might not have been initialized"),
+        ("public class T { final int x; T() { Runnable r = () -> { x = 1; }; x = 2; } public static void main(String[] a) { new T(); } }", "variable x might already have been assigned"),
+        ("public class T { public static void main(String[] a) { Object o = new Object() { final int z; }; } }", "variable z not initialized in the default constructor"),
+        ("public class T { static class B { B(int q) {} } public static void main(String[] a) { Object o = new B(1) { final int z; }; } }", "variable z not initialized in the default constructor"),
+        ("public class T { enum E { A; final int z; } public static void main(String[] a) { System.out.println(E.A); } }", "variable z not initialized in the default constructor"),
+        ("public class T { public static void main(String[] a) { int x; Runnable r = () -> { int y = x; }; } }", "variable x might not have been initialized"),
+        ("public class T { public static void main(String[] a) { final int x; Runnable r = () -> { x = 1; }; } }", "variable x might already have been assigned"),
+        ("public class T { public static void main(String[] a) { int x; try { x = Integer.parseInt(\"1\"); } catch (NumberFormatException e) { } System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { public static void main(String[] a) { int x; switch (a.length) { case 0: x = 1; break; case 1: x = 2; } System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { enum E { A, B } public static void main(String[] a) { E e = E.A; int x; switch (e) { case A: x = 1; break; case B: x = 2; break; } System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { enum E { A, B } public static void main(String[] a) { E e = E.A; int x; switch (e) { case A -> x = 1; case B -> x = 2; } System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { public static void main(String[] a) { final int x; switch (a.length) { case 0: x = 1; case 1: x = 2; break; default: x = 3; } } }", "variable x might already have been assigned"),
+        ("public class T { public static void main(String[] a) { int x; while (a.length > 0) { try { x = 1; break; } finally { System.out.println(\"f\"); } } System.out.println(x); } }", "variable x might not have been initialized"),
+        ("public class T { final int x; T(boolean b) { if (b) { x = 1; return; } } public static void main(String[] a) { new T(true); } }", "variable x might not have been initialized"),
+        ("public class T {\n  final int x;\n  T(boolean b) {\n    if (b) x = 1;\n  }\n  public static void main(String[] a) { new T(true); }\n}\n", "variable x might not have been initialized (line 5)"),
+        ("public class T {\n  int q;\n  final int x;\n  public static void main(String[] a) { new T(); }\n}\n", "variable x not initialized in the default constructor (line 3)"),
+        ("public class T {\n  public static void main(String[] a) {\n    final int n;\n    for (int i = 0; i < 2; i++) {\n      n = i;\n    }\n  }\n}\n", "variable n might be assigned in loop (line 5)"),
+        ("public class T {\n  final int x;\n  T(int k) {\n    if (k > 0) {\n      return;\n    }\n    x = k;\n  }\n  public static void main(String[] a) { new T(1); }\n}\n", "variable x might not have been initialized (line 5)"),
+        ("public class T {\n  static final int K;\n  public static void main(String[] a) { System.out.println(K); }\n}\n", "variable K might not have been initialized (line 2)"),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+}
+
+/// The programs definite assignment must accept: a constant `true` loop
+/// condition (a literal, a `static final`, a `final` local) leaves its
+/// variable assigned through the `break`, a labeled block, `&&`/`||`/`!`/`?:`
+/// conditions that assign, fall-through groups, `switch` expressions and an
+/// exhaustive pattern `switch` statement, `try`/`finally` and `catch` paths, a
+/// constructor delegating with `this(…)`, an instance initializer assigning a
+/// blank final, and a blank `static final` assigned once after a `try`.
+/// Output measured on openjdk 21.0.13.
+#[test]
+fn definitely_assigned_programs_run() {
+    let src = r####"
+import java.util.*;
+public class T implements AutoCloseable {
+    static final boolean ON = true;
+    static final int K;
+    static { int t; try { t = Integer.parseInt("42"); } catch (NumberFormatException e) { t = 0; } K = t; }
+    final int id;
+    final String tag;
+    { tag = "t"; }
+    T() { this(7); }
+    T(int q) { if (q > 5) { id = q; return; } id = -q; }
+    public void close() { System.out.println("closed " + id); }
+    sealed interface S permits A, B {}
+    record A(int v) implements S {}
+    record B(String w) implements S {}
+    static String kind(S s) {
+        String out;
+        switch (s) {
+            case A(int v) when v > 0 -> out = "posA";
+            case A(int v) -> out = "A" + v;
+            case B(String w) -> out = "B" + w;
+        }
+        return out;
+    }
+    static int firstOver(int n) {
+        int r;
+        while (true) { if (n > 10) { r = n; break; } n *= 2; }
+        return r;
+    }
+    public static void main(String[] args) {
+        int x;
+        while (ON) { x = 1; break; }
+        final boolean local = true;
+        int y;
+        while (local) { y = 2; break; }
+        int z;
+        blk: { if (args.length == 0) { z = 3; break blk; } z = 4; }
+        final String s;
+        if (args.length == 0) s = "zero"; else if (args.length == 1) s = "one"; else s = "many";
+        int w;
+        if (args.length > 5 && (w = 9) > 0) System.out.println(w);
+        int v;
+        if (!(args.length != 0 || (v = 7) < 0)) System.out.println("v=" + v);
+        int u;
+        boolean b = args.length == 0 ? (u = 1) > 0 : (u = 2) > 0;
+        int sw;
+        switch (args.length) { case 0: case 1: sw = 1; break; default: sw = 2; }
+        int ye;
+        String r = switch (args.length) { case 0 -> { ye = 10; yield "z"; } default -> { ye = 20; yield "nz"; } };
+        int f;
+        try { f = 5; } finally { System.out.println("fin"); }
+        int c;
+        try { c = Integer.parseInt("x"); } catch (NumberFormatException e) { c = -1; }
+        int dw = 0, last;
+        do { last = dw; dw++; } while (dw < 3);
+        int lp;
+        for (;;) { lp = 6; break; }
+        System.out.println(x + " " + y + " " + z + " " + s + " " + u + " " + b + " " + sw + " " + r + ye + " " + f + " " + c + " " + last + " " + lp);
+        System.out.println(K + " " + new T().id + new T(3).id + new T().tag + " " + kind(new A(1)) + kind(new A(-1)) + kind(new B("q")) + " " + firstOver(3));
+        try (T t = new T(9)) { System.out.println("body " + t.id); }
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out,
+        "v=7\nfin\n1 2 3 zero 1 true 1 z10 5 -1 2 6\n42 7-3t posAA-1Bq 12\nbody 9\nclosed 9\n"
+    );
+}
+
+/// JLS 8.3.3 forward references, as javac's `Attr.checkInit` finds them: a
+/// field read by simple name in an initializer of its own class before its
+/// declaration — an instance field initializer or instance initializer block,
+/// a block lambda's body as well as an expression lambda's, a compound
+/// assignment or increment — and its own initializer reading it. A plain
+/// assignment, `this.x`, `T.x`, and a lambda local shadowing a later field
+/// are not forward references. Measured on openjdk 21.0.13.
+#[test]
+fn forward_references_in_block_lambdas_and_instance_initializers() {
+    let refused = [
+        ("public class T { int y = x + 1; int x = 2; public static void main(String[] a) { System.out.println(new T().y); } }", "illegal forward reference"),
+        ("public class T { { System.out.println(z); } int z = 3; public static void main(String[] a) { new T(); } }", "illegal forward reference"),
+        ("public class T { static final Runnable R = () -> { System.out.println(Q); }; static int Q = 4; public static void main(String[] a) { R.run(); } }", "illegal forward reference"),
+        ("public class T { int s = s + 1; public static void main(String[] a) { System.out.println(new T().s); } }", "self-reference in initializer"),
+        ("public class T { { z++; } int z = 3; public static void main(String[] a) { System.out.println(new T().z); } }", "illegal forward reference"),
+        ("public class T { { z += 1; } int z = 3; public static void main(String[] a) { System.out.println(new T().z); } }", "illegal forward reference"),
+        ("public class T { final Runnable run = () -> { int k = w; }; int w = 1; public static void main(String[] a) { } }", "illegal forward reference"),
+        ("public class T {\n  static int x = y + 1;\n  static int y = 5;\n  public static void main(String[] a) { System.out.println(x); }\n}\n", "illegal forward reference (line 2)"),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let src = r####"
+import java.util.function.*;
+public class T {
+    { z = 5; }
+    int z = 3;
+    int y = this.x + 1;
+    int x = 2;
+    static int q = T.r + 1;
+    static int r = 2;
+    static final IntSupplier LATER = () -> T.r * 10;
+    final Supplier<String> greet = () -> { int late = 40; return "hi" + late; };
+    int late = 1;
+    static int s1 = 1, s2 = s1 + 1;
+    public static void main(String[] a) {
+        T t = new T();
+        System.out.println(t.z + " " + t.y + " " + q + " " + LATER.getAsInt() + " " + t.greet.get() + " " + s2);
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "3 1 1 20 hi40 2\n");
+}
+
+/// A local referenced from a lambda, a `when` guard, or an inner class
+/// (local or anonymous, lowered to a closure or not) must be final or
+/// effectively final — javac's `Flow.CaptureAnalyzer`, judged on the
+/// effective finality the assignment analysis observed over the whole
+/// method. javars captures by value, so each of these used to run with the
+/// value at capture time. Measured on openjdk 21.0.13.
+#[test]
+fn captured_locals_must_be_effectively_final() {
+    let refused = [
+        ("public class T { public static void main(String[] a) { int x; Runnable r = () -> { x = 1; }; } }", "local variables referenced from a lambda expression must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { int x = 0; x = 1; Runnable r = () -> System.out.println(x); r.run(); } }", "local variables referenced from a lambda expression must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { int x = 0; Runnable r = () -> System.out.println(x); x = 2; r.run(); } }", "local variables referenced from a lambda expression must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { for (int i = 0; i < 2; i++) { Runnable r = () -> System.out.println(i); r.run(); } } }", "local variables referenced from a lambda expression must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { Object o = \"s\"; int k = 0; k++; switch (o) { case String s when s.length() > k -> System.out.println(s); default -> System.out.println(\"d\"); } } }", "local variables referenced from a guard must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { int base = 5; base++; Runnable r = new Runnable() { public void run() { System.out.println(base); } }; r.run(); } }", "local variables referenced from an inner class must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { int base = 5; Runnable r = new Runnable() { public void run() { System.out.println(base); } }; base = 6; r.run(); } }", "local variables referenced from an inner class must be final or effectively final"),
+        ("public class T { public static void main(String[] a) { int base = 5; base = 7; class L { int get() { return base; } } System.out.println(new L().get()); } }", "local variables referenced from an inner class must be final or effectively final"),
+    ];
+    for (src, desc) in refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc), "{err}\nwanted: {desc}\n{src}");
+    }
+    let src = r####"
+import java.util.*;
+public class T implements AutoCloseable {
+    public void close() { System.out.println("closed"); }
+    public static void main(String[] args) {
+        List<Runnable> rs = new ArrayList<>();
+        for (int i = 0; i < 3; i++) { int j = i; rs.add(() -> System.out.print(j)); }
+        for (String s : List.of("p", "q")) rs.add(() -> System.out.print(s));
+        int once;
+        once = 4;
+        rs.add(() -> System.out.print(once));
+        final int fin;
+        fin = 5;
+        rs.add(() -> System.out.print(fin));
+        try { throw new RuntimeException("boom"); } catch (RuntimeException e) { rs.add(() -> System.out.print(e.getMessage())); }
+        try (T t = new T()) { rs.add(() -> System.out.print(t != null)); }
+        int base = 6;
+        class L { int get() { return base + 1; } }
+        rs.add(() -> System.out.print(new L().get()));
+        Runnable anon = new Runnable() { public void run() { System.out.print(base); } };
+        rs.add(anon);
+        Object o = "str";
+        int lim = 1;
+        switch (o) { case String str when str.length() > lim -> rs.add(() -> System.out.print(str)); default -> { } }
+        rs.forEach(Runnable::run);
+        System.out.println();
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "closed\n012pq45boomtrue76str\n");
+}

@@ -19,6 +19,35 @@ at the bottom, and are summarized in the section right after this one.
   type on the rule in the next entry. `synchronized (m) { … }` is a statement too: javars
   runs one thread, so the monitor is unobservable, but the expression is
   evaluated exactly once and a `null` monitor throws before the body.
+- **Definite assignment (JLS 16).** `src/flow.rs` ports `javac`'s
+  `Flow.AssignAnalyzer`: one walk per class with a definitely-assigned and a
+  definitely-unassigned bit per local and blank `final` field, split into
+  when-true/when-false states at conditions (a constant condition, a
+  `static final boolean` or a `final` local included, leaves the branch it
+  rules out vacuously assigned), joined at `break`/`continue`/`yield`/
+  `return` targets, with `try`/`catch`/`finally`, fall-through `switch`
+  groups, arrow and pattern `switch`es, lambdas (nothing is definitely
+  unassigned inside one) and the second, speculative pass over a loop body
+  that turns a reassigned `final` into `might be assigned in loop`. Its
+  refusals, in `javac`'s words and at its line: `variable x might not have
+  been initialized` (a read, a constructor's end or `return`, the static
+  initialization), `… not initialized in the default constructor`,
+  `variable x might already have been assigned`, `final parameter x may not
+  be assigned`, `multi-catch parameter x may not be assigned`. The same walk
+  carries `Attr`'s assignability of finals (`cannot assign a value to final
+  variable x`, `… static final variable x`, `auto-closeable resource x may
+  not be assigned`), its forward-reference rule (`illegal forward
+  reference`, `self-reference in initializer`, inside lambdas and instance
+  initializers too), and `Flow.CaptureAnalyzer` (`local variables
+  referenced from a lambda expression`/`a guard`/`an inner class must be
+  final or effectively final`). The first diagnostic follows `javac`'s
+  order: a top-level class's attribution errors, then its flow errors, then
+  its capture errors. What the walk cannot see, because the parser lowered it
+  away: a read inside an `assert` (the statement is dropped), a lambda
+  parameter's `final`, and the body of a local or anonymous class in its
+  enclosing method — such a class is analyzed on its own, and the enclosing
+  locals its body names are checked where it is created rather than where it
+  is declared.
 - **Declarations with more than one declarator.** `int a = 1, b = 2;` in
   statement position, in a `for` init clause, and as an instance or `static`
   field. Declarators run left to right, so a later initializer may read an
@@ -1374,11 +1403,12 @@ storage-model differences:
   an expression lambda in it included (`illegal forward reference`); a
   `static final` field assigned nowhere in the static initialization; and an
   element read through `? super` into anything but `Object` (`CAP#1 cannot
-  be converted to Integer`). What remains of each: definite assignment is
-  not analysed (a `static final` assigned on only one branch runs), a forward
-  reference inside a block lambda or an instance initializer is not seen,
-  and the `? super` read is recognised for the collection and map element
-  methods on a local.
+  be converted to Integer`). Definite assignment and forward references
+  are now the flow pass's (see "Definite assignment" under "Implemented"):
+  a `static final` assigned on one branch only is refused, and a forward
+  reference is seen inside a block lambda and in an instance initializer as
+  well. What remains: the `? super` read is recognised for the collection
+  and map element methods on a local.
 - **An overload `javac` cannot infer is run.** `System.out.println(w.stream()
   .collect(Collectors.groupingBy(String::length, TreeMap::new,
   Collectors.counting())))` is refused by `javac` (openjdk 21.0.13: `method
@@ -1827,7 +1857,8 @@ would reject the sibling-block form that Java accepts, which is the worse error.
 - **Types are not checked.** Declared types (`int`, `String`, …) are retained for
   diagnostics and for overload resolution / `/`-truncation typing, but do not gate
   execution — the runtime is dynamically typed on the fusevm value model.
-  Definite-assignment and type errors that `javac` would reject may run.
+  Type errors that `javac` would reject may run; definite-assignment errors
+  do not (see "Definite assignment" under "Implemented").
   *Resolution* is checked, though: a name nothing declares is
   `javars: cannot find symbol: \`n\``, not a `null`. It used to read the unset
   cell, so `undefinedVar` printed `null` and `undefinedVar + 1` printed `null1`.
@@ -2178,11 +2209,10 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   fusevm's 64-bit result, so an overflow there still differs from Java. The wrap
   is a native `Shl 32; Shr 32` pair rather than a builtin, so hot integer loops
   keep their JIT trace.
-- **Uninitialized locals are unbound** rather than rejected; reading one before
-  assignment yields `null` instead of a compile error. Measured: `int n;
-  System.out.println(n);` prints `null` and exits 0 here, where `javac` answers
-  `error: variable n might not have been initialized`. Definite-assignment
-  analysis is what would be needed, and javars has none.
+- ~~**Uninitialized locals are unbound**~~ — fixed: `int n;
+  System.out.println(n);` printed `null` and exited 0; it is now refused with
+  `javac`'s `variable n might not have been initialized` (see "Definite
+  assignment" under "Implemented").
 - **`NullPointerException` detail messages drop the provenance clause.** Java's
   "helpful NPE" names the *bytecode local slot* of the null reference — `Cannot
   read field "x" because "<local4>" is null` — which javars cannot reproduce: it

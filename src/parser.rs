@@ -454,9 +454,9 @@ impl Parser {
                 // constant, read as `G.P`, as a bare `P` in the interface's own
                 // methods, and as a bare `P` in every implementing class.
                 if is_static || is_interface {
-                    static_declaration(line, fs, &mut static_fields, &mut static_init);
+                    static_declaration(fs, &mut static_fields, &mut static_init);
                 } else {
-                    instance_declaration(line, fs, &mut fields, &mut inst_init);
+                    instance_declaration(fs, &mut fields, &mut inst_init);
                 }
             } else if self.is(&Tok::LBrace) {
                 // A bare `{ … }` at member position is an instance initializer
@@ -518,6 +518,7 @@ impl Parser {
                 ty: outer,
                 name: OUTER_THIS.to_string(),
                 varargs: false,
+                is_final: false,
             };
             attach_captures(cl, vec![this0], 0);
         }
@@ -616,9 +617,9 @@ impl Parser {
                 methods.push(m);
             } else if let Some((fs, is_static)) = self.try_fields()? {
                 if is_static {
-                    static_declaration(line, fs, &mut static_fields, &mut static_init);
+                    static_declaration(fs, &mut static_fields, &mut static_init);
                 } else {
-                    instance_declaration(line, fs, &mut fields, &mut inst_init);
+                    instance_declaration(fs, &mut fields, &mut inst_init);
                 }
             } else {
                 return Err(format!(
@@ -686,6 +687,8 @@ fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
             is_final: true,
             init: None,
             line: cl.line,
+            has_init: false,
+            init_pos: 0,
         });
     }
     if cl.ctors.is_empty() {
@@ -693,6 +696,8 @@ fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
             params: Vec::new(),
             body: Vec::new(),
             line: cl.line,
+            end_line: cl.line,
+            implicit: true,
         });
     }
     for ctor in &mut cl.ctors {
@@ -870,6 +875,8 @@ fn record_members(
             // never a *constant variable* and folding must not reach it.
             is_final: false,
             line,
+            has_init: false,
+            init_pos: 0,
         });
     }
     // The canonical constructor assigns each component to its field. A compact
@@ -901,6 +908,8 @@ fn record_members(
             params: components.to_vec(),
             body: assigns,
             line,
+            end_line: line,
+            implicit: true,
         }),
     }
     // One accessor per component.
@@ -985,6 +994,7 @@ fn record_members(
                 ty: "int".to_string(),
                 name: acc.to_string(),
                 init: Some(Expr::Int(0)),
+                is_final: false,
             },
         )];
         for c in components {
@@ -1056,6 +1066,7 @@ fn record_members(
                 ty: "Object".to_string(),
                 name: other.to_string(),
                 varargs: false,
+                is_final: false,
             }],
             ret: "boolean".to_string(),
             body: vec![
@@ -1097,16 +1108,12 @@ fn concat(lhs: Expr, rhs: Expr) -> Expr {
 /// Split a `static` field declaration into its storage (one cell per field,
 /// seeded with the type's default) and its initialization (an assignment run at
 /// class-init time, in textual order with the `static { … }` blocks).
-fn static_declaration(
-    line: u32,
-    decls: Vec<FieldDecl>,
-    fields: &mut Vec<FieldDecl>,
-    init: &mut Vec<Stmt>,
-) {
+fn static_declaration(decls: Vec<FieldDecl>, fields: &mut Vec<FieldDecl>, init: &mut Vec<Stmt>) {
     for f in decls {
+        let init_pos = init.len();
         if let Some(value) = f.init.clone() {
             init.push(Stmt::new(
-                line,
+                f.line,
                 StmtKind::Assign {
                     name: f.name.clone(),
                     op: AssignOp::Assign,
@@ -1114,7 +1121,11 @@ fn static_declaration(
                 },
             ));
         }
-        fields.push(FieldDecl { init: None, ..f });
+        fields.push(FieldDecl {
+            init: None,
+            init_pos,
+            ..f
+        });
     }
 }
 
@@ -1123,16 +1134,12 @@ fn static_declaration(
 /// textual order with the bare `{ … }` instance-initializer blocks). The mirror
 /// of [`static_declaration`], one level down: an instance initializer needs a
 /// bound `this`, which only the per-instance initialization subroutine has.
-fn instance_declaration(
-    line: u32,
-    decls: Vec<FieldDecl>,
-    fields: &mut Vec<FieldDecl>,
-    init: &mut Vec<Stmt>,
-) {
+fn instance_declaration(decls: Vec<FieldDecl>, fields: &mut Vec<FieldDecl>, init: &mut Vec<Stmt>) {
     for f in decls {
+        let init_pos = init.len();
         if let Some(value) = f.init.clone() {
             init.push(Stmt::new(
-                line,
+                f.line,
                 StmtKind::FieldAssign {
                     recv: Expr::This,
                     name: f.name.clone(),
@@ -1141,7 +1148,11 @@ fn instance_declaration(
                 },
             ));
         }
-        fields.push(FieldDecl { init: None, ..f });
+        fields.push(FieldDecl {
+            init: None,
+            init_pos,
+            ..f
+        });
     }
 }
 
@@ -1156,6 +1167,8 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         init: None,
         is_final: false,
         line,
+        has_init: false,
+        init_pos: 0,
     });
     fields.push(FieldDecl {
         targs: Vec::new(),
@@ -1164,6 +1177,8 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
         init: None,
         is_final: false,
         line,
+        has_init: false,
+        init_pos: 0,
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
         ret_targs: Vec::new(),
@@ -1234,6 +1249,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
                 ty: owner.to_string(),
                 name: "other".to_string(),
                 varargs: false,
+                is_final: false,
             }],
             ret: "int".to_string(),
             body: vec![Stmt::new(
@@ -1270,6 +1286,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
                 ty: "Object".to_string(),
                 name: "other".to_string(),
                 varargs: false,
+                is_final: false,
             }],
             ret: "boolean".to_string(),
             body: vec![Stmt::new(
@@ -1576,6 +1593,7 @@ impl Parser {
                 ty: ty.clone(),
                 name: name.clone(),
                 varargs: false,
+                is_final: false,
             });
         }
         if !captures.is_empty() {
@@ -1618,6 +1636,8 @@ impl Parser {
             params: components.to_vec(),
             body,
             line,
+            end_line: self.toks[self.pos - 1].line,
+            implicit: false,
         }))
     }
 
@@ -1646,7 +1666,13 @@ impl Parser {
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
         let body = self.body_with_params(&params, false)?;
-        Ok(Some(Ctor { params, body, line }))
+        Ok(Some(Ctor {
+            params,
+            body,
+            line,
+            end_line: self.toks[self.pos - 1].line,
+            implicit: false,
+        }))
     }
 
     /// Parse one or more field declarations sharing a type (`int x, y = 3;`).
@@ -1700,9 +1726,11 @@ impl Parser {
                 ty,
                 targs: targs.clone(),
                 name,
+                has_init: init.is_some(),
                 init,
                 is_final: saw_final,
                 line,
+                init_pos: 0,
             });
             if self.is(&Tok::Comma) {
                 self.advance();
@@ -1820,7 +1848,8 @@ impl Parser {
         }
         loop {
             // `final` on a formal parameter only forbids assigning it.
-            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+            let is_final = matches!(self.peek(), Tok::Ident(w) if w == "final");
+            if is_final {
                 self.advance();
             }
             let mut ty = self.type_name()?;
@@ -1846,6 +1875,7 @@ impl Parser {
                 targs,
                 name,
                 varargs,
+                is_final,
             });
             if self.is(&Tok::Comma) {
                 self.advance();
@@ -2192,7 +2222,8 @@ impl Parser {
         // A local declaration starts with a type keyword/ident followed by an
         // identifier: `int x`, `String s`, `var v`, `int[] a`, `Point p`.
         if self.looks_like_decl() {
-            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+            let is_final = matches!(self.peek(), Tok::Ident(w) if w == "final");
+            if is_final {
                 self.advance();
             }
             let base_ty = self.type_name()?;
@@ -2221,6 +2252,7 @@ impl Parser {
                         lower_wildcard,
                         name,
                         init,
+                        is_final,
                     },
                 ));
                 if !self.is(&Tok::Comma) {
@@ -2447,7 +2479,7 @@ impl Parser {
     fn for_stmt(&mut self) -> Result<StmtKind, String> {
         self.eat(&Tok::For)?;
         self.eat(&Tok::LParen)?;
-        if let Some((ty, name)) = self.try_foreach_header()? {
+        if let Some((ty, name, is_final)) = self.try_foreach_header()? {
             let targs = self.last_targs.clone();
             let iter = self.expression()?;
             self.eat(&Tok::RParen)?;
@@ -2457,6 +2489,7 @@ impl Parser {
                 ty,
                 targs,
                 name,
+                is_final,
                 iter,
                 body,
             });
@@ -2571,8 +2604,9 @@ impl Parser {
         while matches!(self.peek(), Tok::Ident(w) if w == "catch") {
             self.advance();
             self.eat(&Tok::LParen)?;
-            // `final` is legal on a catch parameter and carries no meaning here.
-            if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+            // `final` on a catch parameter forbids assigning it.
+            let is_final = matches!(self.peek(), Tok::Ident(w) if w == "final");
+            if is_final {
                 self.advance();
             }
             // `catch (A | B e)` — a multi-catch lists alternative types before
@@ -2597,6 +2631,7 @@ impl Parser {
             catches.push(CatchArm {
                 types,
                 name,
+                is_final,
                 body: arm_body,
             });
         }
@@ -2738,6 +2773,7 @@ impl Parser {
                     catches: vec![CatchArm {
                         types: vec!["Throwable".to_string()],
                         name: suppressed.clone(),
+                        is_final: false,
                         body: vec![Stmt::new(
                             line,
                             StmtKind::Expr(Expr::MethodCall {
@@ -2769,6 +2805,7 @@ impl Parser {
             let record_primary = CatchArm {
                 types: vec!["Throwable".to_string()],
                 name: thrown.clone(),
+                is_final: false,
                 body: vec![
                     Stmt::new(
                         line,
@@ -2790,6 +2827,7 @@ impl Parser {
                     ty: "Throwable".to_string(),
                     name: primary.clone(),
                     init: Some(var("null")),
+                    is_final: false,
                 },
             );
             let guarded = Stmt::new(
@@ -2811,6 +2849,8 @@ impl Parser {
                             ty,
                             name: r.name,
                             init: Some(init),
+                            // A resource is implicitly `final` (JLS 14.20.3).
+                            is_final: true,
                         },
                     ),
                     primary_decl,
@@ -2839,20 +2879,22 @@ impl Parser {
     /// just past the `(`. On a match the cursor is left on the iterable
     /// expression and the declared type + variable name are returned; otherwise
     /// the cursor is restored untouched so the C-style clauses can parse.
-    fn try_foreach_header(&mut self) -> Result<Option<(String, String)>, String> {
+    fn try_foreach_header(&mut self) -> Result<Option<(String, String, bool)>, String> {
         if !self.looks_like_decl() {
             return Ok(None);
         }
         let save = self.pos;
-        // `for (final String s : xs)` — the modifier is parsed and dropped.
-        if matches!(self.peek(), Tok::Ident(w) if w == "final") {
+        // `for (final String s : xs)` — the modifier is kept for the
+        // definite-assignment pass.
+        let is_final = matches!(self.peek(), Tok::Ident(w) if w == "final");
+        if is_final {
             self.advance();
         }
         let ty = self.type_name()?;
         let name = self.ident()?;
         if self.is(&Tok::Colon) {
             self.advance();
-            return Ok(Some((ty, name)));
+            return Ok(Some((ty, name, is_final)));
         }
         self.pos = save;
         Ok(None)
@@ -4287,6 +4329,7 @@ impl Parser {
                     outer: None,
                     line,
                 }),
+                is_final: false,
             },
         )];
         body.extend(self.block()?);
@@ -4419,9 +4462,9 @@ impl Parser {
                     methods.push(m);
                 } else if let Some((fs, is_static)) = self.try_fields()? {
                     if is_static {
-                        static_declaration(line, fs, &mut static_fields, &mut static_init);
+                        static_declaration(fs, &mut static_fields, &mut static_init);
                     } else {
-                        instance_declaration(line, fs, &mut fields, &mut inst_init);
+                        instance_declaration(fs, &mut fields, &mut inst_init);
                     }
                 } else if self.is(&Tok::LBrace) {
                     // An instance initializer: an anonymous class cannot declare
@@ -4453,6 +4496,7 @@ impl Parser {
                     ty: "Object".to_string(),
                     name: format!("x{i}"),
                     varargs: false,
+                    is_final: false,
                 })
                 .collect();
             let call = Expr::Call {
@@ -4464,6 +4508,8 @@ impl Parser {
                 params,
                 body: vec![Stmt::new(line, StmtKind::Expr(call))],
                 line,
+                end_line: line,
+                implicit: true,
             }]
         };
         let (superclass, interfaces) = match ty {
@@ -4502,6 +4548,7 @@ impl Parser {
                     ty: outer,
                     name: OUTER_THIS.to_string(),
                     varargs: false,
+                    is_final: false,
                 };
                 attach_captures(&mut cl, vec![this0], 0);
             }

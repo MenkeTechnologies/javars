@@ -204,6 +204,14 @@ pub struct FieldDecl {
     /// parser-synthesized field (a record component, an `enum`'s `#name`) has
     /// its declaration's line.
     pub line: u32,
+    /// True when the declaration wrote an initializer (`int x = 1;`), which
+    /// the parser moves into the class's `static_init`/`inst_init`.
+    pub has_init: bool,
+    /// Where the declaration sits among those initialization statements:
+    /// how many of them precede it. With `has_init`, its own initializer is
+    /// the statement at this index. This is the textual order a forward
+    /// reference (JLS 8.3.3) is judged by.
+    pub init_pos: usize,
 }
 
 /// A constructor: `ClassName(<params>) { <body> }`.
@@ -212,6 +220,13 @@ pub struct Ctor {
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
     pub line: u32,
+    /// The line of the body's closing brace, where `javac` reports a blank
+    /// `final` field the constructor leaves unassigned.
+    pub end_line: u32,
+    /// True for a constructor the source does not declare: the default one
+    /// `javac` synthesizes (here also for a class given captures), whose
+    /// unassigned blank `final` is reported at the field instead.
+    pub implicit: bool,
 }
 
 /// A user-defined `static` method: `static <ret> name(<params>) { <body> }`.
@@ -270,6 +285,8 @@ pub struct Param {
     /// arguments is packed into the array at the call site. Only the last
     /// parameter may carry it.
     pub varargs: bool,
+    /// Whether the parameter was declared `final`.
+    pub is_final: bool,
 }
 
 /// A Java statement with its 1-based source line (threaded through the parser so
@@ -311,6 +328,10 @@ pub enum StmtKind {
         lower_wildcard: bool,
         name: String,
         init: Option<Expr>,
+        /// Whether the declaration carried `final`, which the definite-
+        /// assignment pass (`crate::flow`) needs: a `final` local may be
+        /// assigned only while definitely unassigned (JLS 16).
+        is_final: bool,
     },
     /// One declaration statement that declares more than one variable:
     /// `int a = 1, b = 2;`. Each element is a [`StmtKind::Local`], in source
@@ -376,6 +397,8 @@ pub enum StmtKind {
         /// The element type's type arguments, see [`StmtKind::Local::targs`].
         targs: Vec<String>,
         name: String,
+        /// Whether the loop variable was declared `final`.
+        is_final: bool,
         /// The array expression, evaluated exactly once before the loop.
         iter: Expr,
         body: Vec<Stmt>,
@@ -443,6 +466,9 @@ pub struct CatchArm {
     pub types: Vec<String>,
     /// The bound exception variable.
     pub name: String,
+    /// Whether the parameter was declared `final` (a multi-catch parameter
+    /// is implicitly final whatever this says).
+    pub is_final: bool,
     pub body: Vec<Stmt>,
 }
 

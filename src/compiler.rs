@@ -2716,6 +2716,7 @@ impl Compiler {
                     name,
                     iter,
                     body,
+                    ..
                 } => {
                     let t = if ty == "var" {
                         self.foreach_elem_generic(iter)
@@ -6867,6 +6868,7 @@ impl Compiler {
                 lower_wildcard,
                 name,
                 init,
+                ..
             } => {
                 // Record the declared numeric type (for `/` truncation); `var`
                 // and untracked types are inferred from the initializer. The raw
@@ -7030,6 +7032,7 @@ impl Compiler {
                 name,
                 iter,
                 body,
+                ..
             } => self.foreach_stmt(ty, targs, name, iter, body, line),
             StmtKind::Switch { disc, groups } => self.switch_stmt(disc, groups),
             StmtKind::Labeled { label, body } => {
@@ -7658,6 +7661,7 @@ impl Compiler {
                 ty: ty.to_string(),
                 name: name.to_string(),
                 init: Some(call(Expr::Var(it.clone()), "next")),
+                is_final: false,
             },
         )];
         loop_body.extend(body.iter().cloned());
@@ -7671,6 +7675,7 @@ impl Compiler {
                     ty: "Iterator".to_string(),
                     name: it.clone(),
                     init: Some(call(iter.clone(), "iterator")),
+                    is_final: false,
                 },
             )],
             cond: Some(call(Expr::Var(it), "hasNext")),
@@ -9161,6 +9166,7 @@ impl Compiler {
                 ty: "Consumer".to_string(),
                 name: action,
                 init: Some(args[0].clone()),
+                is_final: false,
             },
         ))?;
         self.stmt(&Stmt::new(
@@ -9171,6 +9177,7 @@ impl Compiler {
                 name: each,
                 iter: recv.clone(),
                 body: vec![Stmt::new(line, StmtKind::Expr(accept))],
+                is_final: false,
             },
         ))?;
         self.b.emit(Op::LoadUndef, line);
@@ -9910,6 +9917,7 @@ impl Compiler {
                         ty: rc.clone(),
                         name: it.clone(),
                         init: Some(recv.clone()),
+                        is_final: false,
                     },
                     StmtKind::Local {
                         targs: Vec::new(),
@@ -9918,6 +9926,7 @@ impl Compiler {
                         ty: "Consumer".to_string(),
                         name: action.clone(),
                         init: Some(args[0].clone()),
+                        is_final: false,
                     },
                     StmtKind::Expr(call(
                         "Objects",
@@ -14085,13 +14094,11 @@ fn jdk_supertype_entry(
 /// - an override or implementation may not weaken access (JLS 8.4.8.3) —
 ///   an interface method is `public` when it says nothing;
 /// - a class may not inherit two `default` methods of one signature from
-///   unrelated interfaces without overriding them (JLS 8.4.8.4);
-/// - a `static` field initializer may not read, by simple name, a `static`
-///   field declared after it (JLS 8.3.3);
-/// - a `static final` field must be assigned somewhere in the class's static
-///   initialization (JLS 8.3.1.2).
+///   unrelated interfaces without overriding them (JLS 8.4.8.4).
 ///
-/// Each refusal is worded as `javac` words it.
+/// Each refusal is worded as `javac` words it. Forward references and the
+/// assignment of `final` fields are flow questions, checked by
+/// [`crate::flow`].
 pub fn check_member_rules(prog: &Program) -> Result<(), String> {
     let by_name: HashMap<&str, &Class> =
         prog.classes.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -14254,175 +14261,8 @@ pub fn check_member_rules(prog: &Program) -> Result<(), String> {
                 }
             }
         }
-        // Static fields: forward references and unassigned finals.
-        // A field is declared in its textual position, so an initializer may
-        // read by simple name only the fields declared before it.
-        let order: HashMap<&str, usize> = cl
-            .static_fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.name.as_str(), i))
-            .collect();
-        // The parser lowers each initializer to an assignment on its
-        // declaration's line, in textual order (`static_declaration`).
-        for (i, f) in cl.static_fields.iter().enumerate() {
-            let Some(init) = cl.static_init.iter().find_map(|st| match &st.kind {
-                StmtKind::Assign {
-                    name,
-                    op: AssignOp::Assign,
-                    value,
-                } if *name == f.name && st.line == f.line => Some(value),
-                _ => None,
-            }) else {
-                continue;
-            };
-            let mut reads = Vec::new();
-            simple_name_reads(init, &mut Vec::new(), &mut reads);
-            for r in &reads {
-                match order.get(r.as_str()) {
-                    Some(&j) if j == i => {
-                        return Err(format!(
-                            "javars: self-reference in initializer (line {})",
-                            f.line
-                        ))
-                    }
-                    Some(&j) if j > i => {
-                        return Err(format!(
-                            "javars: illegal forward reference (line {})",
-                            f.line
-                        ))
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for f in cl.static_fields.iter().filter(|f| f.is_final) {
-            if !stmts_assign(&cl.static_init, &f.name, &cl.name) {
-                return Err(format!(
-                    "javars: variable {} might not have been initialized (line {})",
-                    f.name, f.line
-                ));
-            }
-        }
     }
     Ok(())
-}
-
-/// The simple names `e` reads, not names a pattern in `e` or a lambda's
-/// parameters bind. An expression lambda's body counts (javac refuses a
-/// forward reference there too); a block body and a class body are not
-/// walked. An assignment's target is not read.
-fn simple_name_reads(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
-    let mut go = |x: &Expr, bound: &mut Vec<String>| simple_name_reads(x, bound, out);
-    match e {
-        Expr::Var(n) if !bound.contains(n) => out.push(n.clone()),
-        Expr::PostIncDec { name, .. } | Expr::PreIncDec { name, .. } if !bound.contains(name) => {
-            out.push(name.clone())
-        }
-        Expr::Unary { rhs, .. } => go(rhs, bound),
-        Expr::Binary { lhs, rhs, .. } => {
-            go(lhs, bound);
-            go(rhs, bound);
-        }
-        Expr::Ternary { cond, then, els } => {
-            go(cond, bound);
-            go(then, bound);
-            go(els, bound);
-        }
-        Expr::Assign { target, value, .. } => {
-            if !matches!(target.as_ref(), Expr::Var(_)) {
-                go(target, bound);
-            }
-            go(value, bound);
-        }
-        Expr::IncDec { target, .. } => go(target, bound),
-        Expr::Println { arg: Some(arg), .. } => go(arg, bound),
-        Expr::Cast { expr, .. } => go(expr, bound),
-        Expr::Call { args, .. } | Expr::NewObject { args, .. } => {
-            for a in args {
-                go(a, bound);
-            }
-        }
-        Expr::MethodCall { recv, args, .. } => {
-            go(recv, bound);
-            for a in args {
-                go(a, bound);
-            }
-        }
-        Expr::NewArray { sizes, .. } => {
-            for s in sizes {
-                go(s, bound);
-            }
-        }
-        Expr::ArrayLit { elems, .. } => {
-            for x in elems {
-                go(x, bound);
-            }
-        }
-        Expr::Index { array, index } => {
-            go(array, bound);
-            go(index, bound);
-        }
-        // `C.x` and `this.x` are qualified, not simple names.
-        Expr::Field { recv, .. } if !matches!(recv.as_ref(), Expr::Var(_) | Expr::This) => {
-            go(recv, bound)
-        }
-        Expr::InstanceOf { expr, binding, .. } => {
-            go(expr, bound);
-            if let Some(b) = binding {
-                bound.push(b.clone());
-            }
-        }
-        Expr::Lambda {
-            params,
-            body: LambdaBody::Expr(body),
-            ..
-        } => {
-            let mut inner = bound.clone();
-            inner.extend(params.iter().cloned());
-            go(body, &mut inner);
-        }
-        _ => {}
-    }
-}
-
-/// Whether `stmts` assign `field` — as a simple name, or as `Class.field`
-/// with `class` its own — anywhere, nested blocks included.
-fn stmts_assign(stmts: &[Stmt], field: &str, class: &str) -> bool {
-    stmts.iter().any(|st| match &st.kind {
-        StmtKind::Assign { name, .. } => name == field,
-        StmtKind::FieldAssign { recv, name, .. } => {
-            name == field && matches!(recv, Expr::Var(c) if c == class)
-        }
-        StmtKind::Locals(b) => stmts_assign(b, field, class),
-        StmtKind::If { then, els, .. } => {
-            stmts_assign(then, field, class) || stmts_assign(els, field, class)
-        }
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::ForEach { body, .. } => stmts_assign(body, field, class),
-        StmtKind::For {
-            init, update, body, ..
-        } => {
-            stmts_assign(init, field, class)
-                || stmts_assign(update, field, class)
-                || stmts_assign(body, field, class)
-        }
-        StmtKind::Switch { groups, .. } => {
-            groups.iter().any(|g| stmts_assign(&g.body, field, class))
-        }
-        StmtKind::Labeled { body, .. } => stmts_assign(std::slice::from_ref(body), field, class),
-        StmtKind::Try {
-            body,
-            catches,
-            finally_body,
-        } => {
-            stmts_assign(body, field, class)
-                || catches.iter().any(|c| stmts_assign(&c.body, field, class))
-                || stmts_assign(finally_body, field, class)
-        }
-        _ => false,
-    })
 }
 
 /// How `javac` names a member class in a diagnostic: its simple name
