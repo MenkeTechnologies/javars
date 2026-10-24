@@ -351,7 +351,9 @@ Implemented and checked against the reference `java`:
   control and `\0n` octal escapes translate exactly; a construct with no
   faithful translation (`\G`, a Unicode block, `(?m)`) raises
   `PatternSyntaxException` naming it rather than compiling into a different
-  language.
+  language. A malformed pattern raises the JDK's own `PatternSyntaxException`
+  — description, index, pattern and three-line message — from a port of
+  `Pattern.compile`'s parser (`src/regex_syntax.rs`).
   `Pattern.compile` (with `CASE_INSENSITIVE`, `DOTALL` and `LITERAL`) and
   `Matcher` run on the same engine: `find`/`find(int)`/`matches`/`lookingAt`,
   `group` by number or name, `start`/`end` in UTF-16 indices, `groupCount`,

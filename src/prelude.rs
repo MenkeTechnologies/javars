@@ -88,6 +88,8 @@ pub const THROWABLES: &[(&str, &str)] = &[
     ),
     ("IllegalFormatFlagsException", "IllegalFormatException"),
     ("MissingFormatWidthException", "IllegalFormatException"),
+    // `%c` of an `int` that is no code point.
+    ("IllegalFormatCodePointException", "IllegalFormatException"),
 ];
 
 /// The modeled throwables below `Throwable` that also declare Java's two
@@ -139,7 +141,8 @@ pub fn qualified_throwable(name: &str) -> Option<String> {
         | "UnknownFormatConversionException"
         | "FormatFlagsConversionMismatchException"
         | "IllegalFormatFlagsException"
-        | "MissingFormatWidthException" => format!("java.util.{name}"),
+        | "MissingFormatWidthException"
+        | "IllegalFormatCodePointException" => format!("java.util.{name}"),
         _ => format!("java.lang.{name}"),
     })
 }

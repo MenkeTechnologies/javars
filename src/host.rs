@@ -12554,11 +12554,11 @@ fn object_method(recv: &Value, method: &str, args: &[Value]) -> Option<Value> {
     // overrides neither, so two builders holding the same text are unequal and
     // a builder's hash is its identity. Left out of this gate the call reached
     // the `String` table through the receiver's rendering, and both answered
-    // for the *text*.
+    // for the *text*. An array overrides none of the three either (JLS 10.7).
     let inherits_object = HEAP.with(|h| {
         matches!(
             h.borrow().get(*id as usize),
-            Some(HostObj::Instance { .. } | HostObj::Builder { .. })
+            Some(HostObj::Instance { .. } | HostObj::Builder { .. } | HostObj::Array(_))
         )
     });
     if !inherits_object {
@@ -13318,6 +13318,10 @@ fn needle_arg(v: &Value) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The method name the compiler sends for `String.valueOf(x)` when `x` is
+/// statically not a `char[]`: the `valueOf(Object)` overload.
+pub const VALUE_OF_OBJECT: &str = "valueOf#Object";
+
 /// Static stdlib dispatch builtin (`Math.*`, `Integer.*`, `String.valueOf`, …).
 /// Pops the method name (top of stack), the class name, and the `argc - 2`
 /// arguments, then evaluates the corresponding static method. A faulting call
@@ -13418,6 +13422,22 @@ fn b_static_dispatch(vm: &mut VM, argc: u8) -> Value {
         args.push(vm.stack.pop().unwrap_or(Value::Undef));
     }
     args.reverse();
+    // `String.valueOf(Object)` on an argument whose static type is not
+    // `char[]`: an array renders as `Object.toString` (`[I@1b6d3586`), where the
+    // `valueOf(char[])` overload would write its characters.
+    if class == "String" && method == VALUE_OF_OBJECT {
+        return match args.first() {
+            Some(v @ Value::Obj(_)) if array_items(v).is_some() => Value::str(java_str_vm(vm, v)),
+            _ => {
+                for a in args {
+                    vm.stack.push(a);
+                }
+                vm.stack.push(Value::str("String"));
+                vm.stack.push(Value::str("valueOf"));
+                b_static_dispatch(vm, argc)
+            }
+        };
+    }
     if class == "EnumSet" {
         return match enum_set_static(vm, &method, &args) {
             Ok(v) => v,
@@ -19982,8 +20002,18 @@ fn format_conversion(
         }
         'c' | 'C' => {
             let s = match arg {
-                // `%c` on an integer renders its code point as a character.
-                Value::Int(n) => jstr::char_of(*n as u32).unwrap_or('\u{fffd}').to_string(),
+                // `%c` on an integer renders its code point as a character; one
+                // that is no code point is `Character.isValidCodePoint`'s refusal.
+                Value::Int(n) => match jstr::checked_code_point(*n) {
+                    Ok(Some(c)) => c.to_string(),
+                    Ok(_) => {
+                        return Err(Fault::java(
+                            "IllegalFormatCodePointException",
+                            format!("Code point = 0x{:x}", *n as i32 as u32),
+                        ))
+                    }
+                    Err(e) => return Err(Fault::internal(e)),
+                },
                 other => java_str(other),
             };
             Ok(Rendered::text(if conv == 'C' {
@@ -21053,6 +21083,11 @@ fn obj_default_str(id: u32) -> String {
             _ => java_str(&v),
         };
     }
+    // An array's class name is its descriptor (`[I`, `[Ljava.lang.String;`),
+    // which `Object.toString` prints before the hash.
+    let array_name = array_type(&handle)
+        .and_then(|t| array_descriptor(&t))
+        .unwrap_or_else(|| "[".to_string());
     HEAP.with(|h| {
         let h = h.borrow();
         match h.get(id as usize) {
@@ -21068,7 +21103,7 @@ fn obj_default_str(id: u32) -> String {
                 Some(n) if !matches!(n, Value::Undef) => n.as_str_cow().into_owned(),
                 _ => format!("{}@{id:x}", qualified_or_binary(class)),
             },
-            Some(HostObj::Array(_)) => format!("[@{id:x}"),
+            Some(HostObj::Array(_)) => format!("{array_name}@{id:x}"),
             // `StringBuilder.toString()` IS its contents, so every rendering
             // surface — `println(sb)`, `"" + sb`, `%s`, a list element — shows
             // the text rather than a handle.

@@ -585,6 +585,8 @@ struct Compiler {
     /// Every user method by declaring class: name, parameter types and access
     /// — what [`Compiler::check_private_access`] reads.
     method_access: HashMap<String, Vec<(String, Vec<String>, Access)>>,
+    /// The `static` methods of user interfaces, as `(interface, name)`.
+    interface_statics: HashSet<(String, String)>,
     /// The locals declared with a lower-bounded wildcard argument
     /// (`List<? super Integer> l`), whose element reads are a capture type.
     lower_wildcard_locals: HashSet<String>,
@@ -811,6 +813,16 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             m
         },
         lower_wildcard_locals: HashSet::default(),
+        interface_statics: prog
+            .methods
+            .iter()
+            .filter(|m| {
+                prog.classes
+                    .iter()
+                    .any(|c| c.is_interface && c.name == m.owner)
+            })
+            .map(|m| (m.owner.clone(), m.name.clone()))
+            .collect(),
         target_wildcard: None,
         lambda_param_hint: None,
         switch_is_statement: false,
@@ -1853,7 +1865,19 @@ impl Compiler {
         let past = self.b.current_pos();
         self.b.patch_jump(not_null, past);
         let msg = self.temp();
-        let canonical = self.classes[class].binary.replace('$', ".");
+        // `Class.getCanonicalName()`, which is `null` for a local class or
+        // anything nested in one (a binary-name segment that starts with the
+        // digits `javac` numbers them by).
+        let binary = &self.classes[class].binary;
+        let local = binary
+            .split('$')
+            .skip(1)
+            .any(|s| s.starts_with(|c: char| c.is_ascii_digit()));
+        let canonical = if local {
+            "null".to_string()
+        } else {
+            binary.replace('$', ".")
+        };
         let prefix = self
             .b
             .add_constant(Value::str(format!("No enum constant {canonical}.")));
@@ -9167,6 +9191,21 @@ impl Compiler {
         line: u32,
     ) -> Result<(), String> {
         self.check_private_access(recv, method, args.len(), line)?;
+        // A static interface method is called through its interface's name,
+        // never through a value (JLS 15.12.3).
+        if self.user_class_ref(recv).is_none() {
+            if let Some(class) = self.expr_class(recv) {
+                let static_only = self
+                    .interface_statics
+                    .contains(&(class.clone(), method.to_string()))
+                    && !self.has_instance_method(&class, method, args.len());
+                if static_only {
+                    return Err(format!(
+                        "javars: illegal static interface method call (line {line})"
+                    ));
+                }
+            }
+        }
         // A call whose receiver is a bare capitalized class name (`Math.abs`,
         // `Integer.parseInt`, `String.valueOf`) is a static stdlib call: the
         // receiver is not a value, so it is not evaluated. Args, then the class
@@ -9745,7 +9784,21 @@ impl Compiler {
                 }
                 let class_c = self.b.add_constant(Value::str(class.clone()));
                 self.b.emit(Op::LoadConst(class_c), line);
-                let method_c = self.b.add_constant(Value::str(method.to_string()));
+                // `String.valueOf` of a reference that is statically not a `char[]` is
+                // the `valueOf(Object)` overload, which renders an array as a handle.
+                let object_overload = class == "String"
+                    && method == "valueOf"
+                    && args.len() == 1
+                    && !self.is_char_array_expr(&args[0])
+                    && self
+                        .expr_java_type(&args[0])
+                        .is_some_and(|t| is_reference_type(&t));
+                let name = if object_overload {
+                    crate::host::VALUE_OF_OBJECT
+                } else {
+                    method
+                };
+                let method_c = self.b.add_constant(Value::str(name.to_string()));
                 self.b.emit(Op::LoadConst(method_c), line);
                 // argc counts the args plus the class-name and method-name
                 // strings, plus the width operand and the array pad when there

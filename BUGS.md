@@ -1379,6 +1379,14 @@ storage-model differences:
   reference inside a block lambda or an instance initializer is not seen,
   and the `? super` read is recognised for the collection and map element
   methods on a local.
+- **An overload `javac` cannot infer is run.** `System.out.println(w.stream()
+  .collect(Collectors.groupingBy(String::length, TreeMap::new,
+  Collectors.counting())))` is refused by `javac` (openjdk 21.0.13: `method
+  println in class PrintStream cannot be applied to given types`, the
+  collector's `R` getting incompatible bounds against `println(String)`);
+  javars, which resolves `println` by the argument's runtime value, prints
+  `{1=2, 2=2, 3=2}`. The same collector assigned to a variable first compiles
+  in both.
 - ~~**`PatternSyntaxException`'s message is fancy-regex's.**~~ — fixed: the
   JDK's description, index, pattern and message, from the parser port in
   `src/regex_syntax.rs` (see the regular-expression entry). Measured on

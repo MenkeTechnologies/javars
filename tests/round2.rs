@@ -4439,3 +4439,67 @@ interface Q { void m(); }
         "1 2\nm\nanon\n5\nAB AB Base f!\n42\npm2\npk2\n4 1 7\n1\n1\nnull\n1\n"
     );
 }
+
+/// An array is an `Object` that overrides none of `equals`/`hashCode`/`toString` (JLS 10.7): it renders as its descriptor and identity hash (`[I@â¦`), through `String.valueOf(Object)` too, and only the `char[]` overload writes characters. Measured on openjdk 21.0.13.
+#[test]
+fn arrays_render_as_object_to_string() {
+    let src = r####"
+public class T {
+    record A(int[] arr, String[] s) {}
+    public static void main(String[] a) {
+        int[] x = {1};
+        Object o = x;
+        System.out.println(("" + x).replaceAll("@[0-9a-f]+", "@H"));
+        System.out.println(o.toString().replaceAll("@[0-9a-f]+", "@H"));
+        System.out.println(String.valueOf(o).replaceAll("@[0-9a-f]+", "@H"));
+        System.out.println(String.valueOf(new double[0][0]).replaceAll("@[0-9a-f]+", "@H"));
+        System.out.println(String.valueOf((Object) new String[0]).replaceAll("@[0-9a-f]+", "@H"));
+        System.out.println(String.valueOf(new char[]{'h', 'i'}) + " " + String.valueOf("s"));
+        System.out.println(new A(x, new String[0]).toString().replaceAll("@[0-9a-f]+", "@H"));
+        int[] y = {1};
+        System.out.println(x.equals(y) + " " + x.equals(o) + " " + (x.hashCode() == o.hashCode()) + " " + x.toString().equals(o.toString()));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "[I@H\n[I@H\n[I@H\n[[D@H\n[Ljava.lang.String;@H\nhi s\nA[arr=[I@H, s=[Ljava.lang.String;@H]\nfalse true true true\n");
+}
+
+/// `valueOf` on a local enum names its class by its canonical name, which a local class lacks (`null`); `%c` of an `int` that is no code point throws `IllegalFormatCodePointException`. Measured on openjdk 21.0.13.
+#[test]
+fn enum_value_of_names_and_format_code_points() {
+    let src = r####"
+public class T {
+    enum Op { ADD }
+    interface I { static String st() { return "st"; } default String d() { return "d"; } }
+    static class C implements I {}
+    public static void main(String[] a) {
+        enum L { X }
+        try { Op.valueOf("DIV"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { L.valueOf("Y"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+        try { String.format("%c", -1); } catch (Exception e) { System.out.println(e); }
+        try { String.format("%c", 0x110000); } catch (java.util.IllegalFormatException e) { System.out.println(e.getMessage()); }
+        try { String.format("%c", 1234567); } catch (Exception e) { System.out.println(e.getClass().getName()); }
+        System.out.println(String.format("%c|%c|%C", 0x1F600, 65, 98) + " " + I.st() + " " + new C().d());
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "No enum constant T.Op.DIV\nNo enum constant null.Y\njava.util.IllegalFormatCodePointException: Code point = 0xffffffff\nCode point = 0x110000\njava.util.IllegalFormatCodePointException\n\u{1F600}|A|B st d\n");
+}
+
+/// A static interface method is called through its interface, never through a
+/// value: javac (openjdk 21.0.13) reports `illegal static interface method call`.
+#[test]
+fn a_static_interface_method_is_not_called_through_a_value() {
+    let (out, err, ok) = run_with_stderr(
+        "public class T { public static void main(String[] a) { I x = new C(); x.st(); }\n  interface I { static void st() { System.out.println(\"st\"); } } static class C implements I {} }\n",
+    );
+    assert!(!ok, "{out}");
+    assert!(
+        err.contains("illegal static interface method call"),
+        "{err}"
+    );
+}
