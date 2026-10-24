@@ -1417,9 +1417,17 @@ storage-model differences:
   arguments, come from `src/jdk_supertypes.rs`, which
   `scripts/GenJdkSupertypes.java` generates off the real JDK by reflection.
   A wildcard argument (`Comparable<? extends Number>`) is checked only for
-  being unrelated, since javars keeps its upper bound; and only a local
-  declaration's target keeps its type arguments to the check — an
-  assignment or a parameter target compares the class alone.
+  being unrelated, since javars keeps its upper bound. Every target keeps
+  its type arguments to the check — a local declaration, an assignment to a
+  local, field or static, a parameter (static, instance or constructor), and
+  a `return` — and a bound typed by a generic JDK class has its arguments
+  carried into that class's supertypes (`id(new ArrayList<Integer>())`
+  against `List<String>` is refused). When the argument binding the
+  variable is itself a generic call, `javac` reports the type argument it
+  supplies against that call's own variable (`id(List.of(1))` against
+  `List<String>` names `List.of`'s `E`); javars names it from
+  `src/jdk_generic_statics.rs`, which `scripts/GenJdkGenericStatics.java`
+  generates off the real JDK, or from a user generic method's declaration.
 - ~~**Compile errors `javac` reports that javars accepts.**~~ — fixed, each
   refused in `javac`'s words (measured on `openjdk 21.0.13`): a member inner
   class created with no enclosing instance (`an enclosing instance that

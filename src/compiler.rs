@@ -221,6 +221,10 @@ struct ClassInfo {
     /// class that carries any (own, inherited and `static` alike) — see
     /// [`with_targs`].
     field_generic: HashMap<String, (String, String)>,
+    /// The fields among those whose declared type arguments include a
+    /// wildcard (`List<? extends Number> f`), which a bounds check reads as
+    /// bounds rather than exact types.
+    field_wildcard: HashSet<String>,
     /// The type variables the declaration binds, see [`crate::ast::Class::type_params`].
     type_params: Vec<String>,
     /// See [`crate::ast::Class::super_targs`].
@@ -343,6 +347,9 @@ struct MethodScope {
     /// The declared type of each local/parameter *with* its type arguments
     /// (`List<Float>`), for the ones that carry any — see [`with_targs`].
     decl_generic: HashMap<String, String>,
+    /// The locals and parameters among those whose type arguments include a
+    /// wildcard.
+    decl_wildcard: HashSet<String>,
     /// Names actually declared as a local or parameter here — distinguishes a
     /// true local from an implicit-`this` field reference.
     declared: HashSet<String>,
@@ -372,6 +379,7 @@ impl MethodScope {
             types: HashMap::default(),
             decl_types: HashMap::default(),
             decl_generic: HashMap::default(),
+            decl_wildcard: HashSet::default(),
             declared: HashSet::default(),
             this_slot: None,
         }
@@ -529,6 +537,8 @@ struct Compiler {
     global_decl_types: HashMap<String, String>,
     /// [`MethodScope::decl_generic`] for the `main`-scope locals.
     global_decl_generic: HashMap<String, String>,
+    /// [`MethodScope::decl_wildcard`] for the `main`-scope locals.
+    global_decl_wildcard: HashSet<String>,
     /// Resolved metadata (fields/methods/ctors, inheritance-flattened) for every
     /// user class. Keyed by class name; populated before any body is lowered.
     classes: HashMap<String, ClassInfo>,
@@ -625,6 +635,13 @@ struct Compiler {
     /// The enclosing method's [`Compiler::ret_generics`] entry while its body
     /// is lowered, so a `return x -> …` reads the declared type's arguments.
     current_ret_generic: Option<String>,
+    /// Whether the current method's return type was written with a
+    /// wildcard argument.
+    current_ret_wildcard: bool,
+    /// The parameters (per method, see [`Compiler::param_generics`]) and the
+    /// method returns whose declared type arguments include a wildcard.
+    param_wildcards: HashMap<String, Vec<bool>>,
+    ret_wildcards: HashSet<String>,
     /// The declared return type of the method being lowered, so a `return
     /// <lambda>;` knows its target type.
     current_ret: Option<String>,
@@ -714,7 +731,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             varargs: is_varargs(&m.params),
         });
     }
-    let (param_generics, ret_generics) = signature_generics(prog);
+    let (param_generics, ret_generics, param_wildcards, ret_wildcards) = signature_generics(prog);
     let classes = resolve_classes(prog)?;
     // One whole-program question, asked once: does any class supply a
     // `toString()` body? It gates the concatenation rerouting in
@@ -780,6 +797,7 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         methods,
         global_decl_types: HashMap::default(),
         global_decl_generic: HashMap::default(),
+        global_decl_wildcard: HashSet::default(),
         classes,
         this_class: None,
         current_class: Some(prog.class_name.clone()),
@@ -830,6 +848,9 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
         param_generics,
         ret_generics,
         current_ret_generic: None,
+        current_ret_wildcard: false,
+        param_wildcards,
+        ret_wildcards,
         current_ret: None,
         yield_ops: Vec::new(),
         yield_finally_depth: 0,
@@ -969,11 +990,17 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
         let mut fields = Vec::new();
         let mut field_types = HashMap::default();
         let mut field_generic: HashMap<String, (String, String)> = HashMap::default();
+        let mut field_wildcard = HashSet::default();
         for anc_name in &ancestry {
             let anc = by_name[anc_name.as_str()];
             for f in anc.fields.iter().chain(&anc.static_fields) {
                 if let Some(g) = with_targs(&f.ty, &f.targs) {
                     field_generic.insert(f.name.clone(), (anc_name.clone(), g));
+                }
+                if f.wildcard {
+                    field_wildcard.insert(f.name.clone());
+                } else {
+                    field_wildcard.remove(&f.name);
                 }
             }
         }
@@ -1091,6 +1118,7 @@ fn resolve_classes(prog: &Program) -> Result<HashMap<String, ClassInfo>, String>
                 fields,
                 field_types,
                 field_generic,
+                field_wildcard,
                 type_params: cl.type_params.clone(),
                 super_targs: cl.super_targs.clone(),
                 is_sealed: cl.is_sealed,
@@ -1472,6 +1500,11 @@ impl Compiler {
             .get(class)
             .and_then(|ci| ci.field_generic.get(name))
             .map(|(_, g)| g.clone());
+        self.target_wildcard = Some(
+            self.classes
+                .get(class)
+                .is_some_and(|ci| ci.field_wildcard.contains(name)),
+        );
         self.expr_targeted_generic(value, Some(&ty), generic)?;
         self.emit_global_set(&global, line);
         Ok(())
@@ -1916,12 +1949,14 @@ impl Compiler {
             Some(scope) => {
                 scope.decl_types.insert(name.to_string(), ty.to_string());
                 scope.decl_generic.remove(name);
+                scope.decl_wildcard.remove(name);
                 scope.declared.insert(name.to_string());
             }
             None => {
                 self.global_decl_types
                     .insert(name.to_string(), ty.to_string());
                 self.global_decl_generic.remove(name);
+                self.global_decl_wildcard.remove(name);
             }
         }
     }
@@ -1980,6 +2015,40 @@ impl Compiler {
             Some(scope) => scope.decl_generic.insert(name.to_string(), g),
             None => self.global_decl_generic.insert(name.to_string(), g),
         };
+    }
+
+    /// Record that the local `name` was declared with a wildcard argument.
+    fn mark_wildcard(&mut self, name: &str) {
+        match &mut self.scope {
+            Some(scope) => scope.decl_wildcard.insert(name.to_string()),
+            None => self.global_decl_wildcard.insert(name.to_string()),
+        };
+    }
+
+    /// Whether the bare name `name` — resolved as [`Compiler::var_generic`]
+    /// resolves it — was declared with a wildcard type argument.
+    fn var_wildcard(&self, name: &str) -> bool {
+        if self.var_decl_type(name).is_some() {
+            return match &self.scope {
+                Some(scope) => scope.decl_wildcard.contains(name),
+                None => self.global_decl_wildcard.contains(name),
+            };
+        }
+        if let Some(ci) = self.this_class.as_ref().and_then(|t| self.classes.get(t)) {
+            if ci.field_types.contains_key(name) {
+                return ci.field_wildcard.contains(name);
+            }
+        }
+        self.static_field_owner(name)
+            .and_then(|(owner, _)| self.classes.get(&owner))
+            .is_some_and(|ci| ci.field_wildcard.contains(name))
+    }
+
+    /// Whether the field `recv.name` was declared with a wildcard argument.
+    fn field_wildcard(&self, recv: &Expr, name: &str) -> bool {
+        self.recv_class_generic(recv, None)
+            .and_then(|(rc, _)| self.classes.get(&rc))
+            .is_some_and(|ci| ci.field_wildcard.contains(name))
     }
 
     /// The generic declared type of a local/parameter in the active scope.
@@ -2284,25 +2353,32 @@ impl Compiler {
         rc: &str,
         method: &str,
         param_tys: &[String],
-    ) -> Vec<Option<String>> {
+    ) -> (Vec<Option<String>>, Vec<bool>) {
         let Some(meta) = self.classes.get(rc).and_then(|ci| {
             ci.methods
                 .iter()
                 .find(|m| m.name == method && m.param_tys == param_tys)
         }) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mangled = mangle(&meta.defining, method, &meta.param_tys);
         let Some(sigs) = self.param_generics.get(&mangled) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let g = self.expr_generic(recv);
-        sigs.iter()
+        let generics = sigs
+            .iter()
             .map(|s| {
                 s.as_ref()
                     .map(|s| self.through_receiver(&meta.defining, rc, g.clone(), s))
             })
-            .collect()
+            .collect();
+        let wildcards = self
+            .param_wildcards
+            .get(&mangled)
+            .cloned()
+            .unwrap_or_default();
+        (generics, wildcards)
     }
 
     /// [`Compiler::instance_ret_generic`] seen through `recv`'s own type
@@ -4553,7 +4629,8 @@ impl Compiler {
             self.functional_sam(rc),
             Some((sam, arity)) if sam == method && arity == args.len()
         );
-        let arg_generics = self.instance_param_generics(recv, rc, method, &param_tys);
+        let (arg_generics, arg_wildcards) =
+            self.instance_param_generics(recv, rc, method, &param_tys);
         // A functional interface's *other* methods — its `default` ones
         // (`Predicate.negate`, `Function.andThen`) — are reachable on a lambda
         // receiver too, and a closure's runtime class matches no concrete-class
@@ -4587,7 +4664,7 @@ impl Compiler {
         if !lambda_arm {
             if let Some(mangled) = only_body {
                 self.expr(recv)?; // this (deepest)
-                self.call_args_with_generics(args, &param_tys, &arg_generics)?;
+                self.call_args_with_generics(args, &param_tys, &arg_generics, &arg_wildcards)?;
                 let idx = self.b.add_name(&mangled);
                 self.b.emit(Op::Call(idx, args.len() as u8 + 1), line);
                 self.emit_exc_check(line);
@@ -5507,6 +5584,7 @@ impl Compiler {
         let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
         self.current_ret_generic = self.ret_generics.get(&mangled).cloned();
+        self.current_ret_wildcard = self.ret_wildcards.contains(&mangled);
 
         let mut scope = MethodScope::new();
         register_params(&mut scope, &m.params);
@@ -5731,6 +5809,7 @@ impl Compiler {
         let saved_exits = std::mem::take(&mut self.exit_ops);
         let saved_ret = std::mem::replace(&mut self.current_ret, pl.ret_ty.clone());
         let saved_ret_generic = self.current_ret_generic.take();
+        let saved_ret_wildcard = std::mem::take(&mut self.current_ret_wildcard);
 
         for i in (0..total).rev() {
             self.b.emit(Op::SetSlot(i as u16), line);
@@ -5761,6 +5840,7 @@ impl Compiler {
         self.finallys = saved_finallys;
         self.current_ret = saved_ret;
         self.current_ret_generic = saved_ret_generic;
+        self.current_ret_wildcard = saved_ret_wildcard;
         result
     }
 
@@ -5915,7 +5995,12 @@ impl Compiler {
                     .collect()
             })
             .unwrap_or_default();
-        self.call_args_with_generics(args, param_tys, &generics)
+        let wildcards = self
+            .param_wildcards
+            .get(mangled)
+            .cloned()
+            .unwrap_or_default();
+        self.call_args_with_generics(args, param_tys, &generics, &wildcards)
     }
 
     /// True when some user `static` method named `name` declares a generic
@@ -6093,7 +6178,27 @@ impl Compiler {
                 if !jdk_target {
                     return None;
                 }
-                let sups = self.known_supertypes(&got)?;
+                // The bound's own class counts, with its own type arguments
+                // (`List<Integer>` against `List<String>`).
+                let (own, own_args) = crate::ast::generic_parts(&got);
+                let sups = if erased_simple_name(&own) == base {
+                    vec![(base.to_string(), own_args)]
+                } else {
+                    // Its supertypes' arguments, in terms of its own type
+                    // parameters, take the arguments the bound gives them.
+                    let params: Vec<String> = match jdk_supertype_entry(erased_simple_name(&own)) {
+                        Some((ps, _)) => ps.iter().map(|p| format!("#{p}")).collect(),
+                        None => Vec::new(),
+                    };
+                    let subst = |a: &String| match params.iter().position(|p| p == a) {
+                        Some(i) if params.len() == own_args.len() => own_args[i].clone(),
+                        _ => a.clone(),
+                    };
+                    self.known_supertypes(&got)?
+                        .into_iter()
+                        .map(|(s, args)| (s, args.iter().map(subst).collect()))
+                        .collect()
+                };
                 let Some((_, have)) = sups.iter().find(|(s, _)| s == base) else {
                     return reject();
                 };
@@ -6106,7 +6211,7 @@ impl Compiler {
                 let want = generic
                     .map(|g| crate::ast::generic_parts(g).1)
                     .unwrap_or_default();
-                let conflict = have.iter().zip(&want).any(|(h, w)| {
+                let conflict = have.iter().zip(&want).position(|(h, w)| {
                     let concrete = |t: &str| !t.contains(['#', '?']);
                     let differ = match exact {
                         Some(true) => h.replace(' ', "") != w.replace(' ', ""),
@@ -6114,9 +6219,78 @@ impl Compiler {
                         None => false,
                     };
                     concrete(h) && concrete(w) && differ
-                });
-                conflict.then(reject).flatten()
+                })?;
+                // A generic call passed as the argument is inferred jointly
+                // with this one, so `javac` reports the type argument it
+                // supplies against that call's own variable.
+                let named = self.nested_poly_var(&resolved.mangled, var, args, conflict);
+                Some(format!(
+                    "javars: incompatible types: inference variable {} has incompatible bounds (target {target}, lower bounds: {got}) on line {line}",
+                    named.as_deref().unwrap_or(var)
+                ))
             }
+        }
+    }
+
+    /// The inference variable `javac` names when type argument `slot` of the
+    /// bound of `var` (the variable a call to `mangled` returns) conflicts
+    /// with the target, and the argument binding `var` is itself a generic
+    /// call returning a type parameterized by its own variables — a poly
+    /// expression (JLS 15.12), inferred together with the outer call: that
+    /// call's variable at `slot` (`id(List.of(1))` against `List<String>` is
+    /// `List.of`'s `E`). `None` when the argument is anything else.
+    fn nested_poly_var(
+        &self,
+        mangled: &str,
+        var: &str,
+        args: &[Expr],
+        slot: usize,
+    ) -> Option<String> {
+        let params = self.param_generics.get(mangled)?;
+        let at = params
+            .iter()
+            .position(|p| p.as_deref().and_then(|p| p.strip_prefix('#')) == Some(var))?;
+        let pick = |vars: &[&str]| -> Option<String> {
+            let v = if vars.len() == 1 {
+                vars[0]
+            } else {
+                *vars.get(slot)?
+            };
+            (!v.is_empty()).then(|| v.to_string())
+        };
+        match args.get(at)? {
+            Expr::Call { name, args, .. } => {
+                let resolved = self.resolve_static_call(name, &self.arg_types(args))?;
+                let ret = self.ret_generics.get(&resolved.mangled)?;
+                let (_, targs) = crate::ast::generic_parts(ret);
+                let vars: Vec<&str> = targs
+                    .iter()
+                    .map(|t| t.strip_prefix('#').unwrap_or(""))
+                    .collect();
+                pick(&vars)
+            }
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
+                let Expr::Var(class) = recv.as_ref() else {
+                    return None;
+                };
+                if self.var_decl_type(class).is_some() {
+                    return None;
+                }
+                let mut found = crate::jdk_generic_statics::JDK_GENERIC_STATICS
+                    .iter()
+                    .filter(|(c, m, n, varargs, _)| {
+                        c == class
+                            && m == method
+                            && (*n == args.len() || (*varargs && args.len() + 1 >= *n))
+                    })
+                    .map(|(.., vars)| *vars);
+                let first = found.next()?;
+                found.all(|v| v == first).then_some(())?;
+                pick(first)
+            }
+            _ => None,
         }
     }
 
@@ -6221,9 +6395,13 @@ impl Compiler {
         args: &[Expr],
         param_tys: &[String],
         generics: &[Option<String>],
+        wildcards: &[bool],
     ) -> Result<(), String> {
         for (i, a) in args.iter().enumerate() {
             let g = generics.get(i).cloned().flatten();
+            if g.is_some() {
+                self.target_wildcard = Some(wildcards.get(i).copied().unwrap_or(false));
+            }
             self.expr_targeted_generic(a, param_tys.get(i).map(String::as_str), g)?;
         }
         Ok(())
@@ -6687,6 +6865,7 @@ impl Compiler {
         let name_idx = self.b.add_name(&mangled);
         self.b.add_sub_entry(name_idx, entry);
         self.current_ret_generic = self.ret_generics.get(&mangled).cloned();
+        self.current_ret_wildcard = self.ret_wildcards.contains(&mangled);
 
         let mut scope = MethodScope::for_instance();
         register_params(&mut scope, &m.params);
@@ -6872,6 +7051,9 @@ impl Compiler {
                 };
                 self.declare_local(name, &raw, nt);
                 self.declare_generic(name, generic.clone());
+                if *wildcard {
+                    self.mark_wildcard(name);
+                }
                 if let Some(e) = init {
                     self.target_wildcard = Some(*wildcard);
                     self.expr_targeted_generic(e, Some(&raw), generic)?;
@@ -6908,6 +7090,7 @@ impl Compiler {
                     AssignOp::Assign => {
                         let target = self.var_decl_type(name).map(str::to_string);
                         let generic = self.var_generic(name);
+                        self.target_wildcard = Some(self.var_wildcard(name));
                         self.expr_targeted_generic(value, target.as_deref(), generic)?;
                     }
                     // `x <op>= e` → `x = x <op> e`, through the one shared
@@ -7040,6 +7223,7 @@ impl Compiler {
                         Some(e) => {
                             let want = self.current_ret.clone();
                             let generic = self.current_ret_generic.clone();
+                            self.target_wildcard = Some(self.current_ret_wildcard);
                             self.expr_targeted_generic(e, want.as_deref(), generic)?;
                         }
                         None => {
@@ -10974,6 +11158,7 @@ impl Compiler {
         self.expr(recv)?;
         let name_c = self.b.add_constant(Value::str(name.to_string()));
         self.b.emit(Op::LoadConst(name_c), line);
+        self.target_wildcard = Some(self.field_wildcard(recv, name));
         self.expr_targeted_generic(value, field_ty_name.as_deref(), generic)?;
         self.emit_raising_builtin(crate::host::JFIELD_SET, 3, line);
         self.b.emit(Op::Pop, line);
@@ -12391,6 +12576,9 @@ fn register_params(scope: &mut MethodScope, params: &[Param]) {
         if let Some(g) = with_targs(&p.ty, &p.targs) {
             scope.decl_generic.insert(p.name.clone(), g);
         }
+        if p.wildcard {
+            scope.decl_wildcard.insert(p.name.clone());
+        }
         scope.declared.insert(p.name.clone());
     }
 }
@@ -12427,33 +12615,51 @@ fn signature_generics(
 ) -> (
     HashMap<String, Vec<Option<String>>>,
     HashMap<String, String>,
+    HashMap<String, Vec<bool>>,
+    HashSet<String>,
 ) {
     let mut params = HashMap::default();
     let mut rets = HashMap::default();
-    let mut record = |mangled: String, ps: &[Param], ret: Option<(&str, &[String])>| {
+    let mut param_wildcards = HashMap::default();
+    let mut ret_wildcards = HashSet::default();
+    let mut record = |mangled: String, ps: &[Param], ret: Option<(&str, &[String], bool)>| {
         let gs: Vec<Option<String>> = ps.iter().map(|p| with_targs(&p.ty, &p.targs)).collect();
         if gs.iter().any(Option::is_some) {
             params.insert(mangled.clone(), gs);
         }
-        if let Some(g) = ret.and_then(|(ty, targs)| with_targs(ty, targs)) {
+        if ps.iter().any(|p| p.wildcard) {
+            param_wildcards.insert(mangled.clone(), ps.iter().map(|p| p.wildcard).collect());
+        }
+        if ret.is_some_and(|(_, _, w)| w) {
+            ret_wildcards.insert(mangled.clone());
+        }
+        if let Some(g) = ret.and_then(|(ty, targs, _)| with_targs(ty, targs)) {
             rets.insert(mangled, g);
         }
     };
     let tys = |ps: &[Param]| -> Vec<String> { ps.iter().map(|p| p.ty.clone()).collect() };
     for m in &prog.methods {
         let mangled = mangle_static(&m.owner, &m.name, &tys(&m.params));
-        record(mangled, &m.params, Some((&m.ret, &m.ret_targs)));
+        record(
+            mangled,
+            &m.params,
+            Some((&m.ret, &m.ret_targs, m.ret_wildcard)),
+        );
     }
     for cl in &prog.classes {
         for m in &cl.methods {
             let mangled = mangle(&cl.name, &m.name, &tys(&m.params));
-            record(mangled, &m.params, Some((&m.ret, &m.ret_targs)));
+            record(
+                mangled,
+                &m.params,
+                Some((&m.ret, &m.ret_targs, m.ret_wildcard)),
+            );
         }
         for c in &cl.ctors {
             record(mangle(&cl.name, "<init>", &tys(&c.params)), &c.params, None);
         }
     }
-    (params, rets)
+    (params, rets, param_wildcards, ret_wildcards)
 }
 
 /// `ty` written with its type arguments (`List<Float>`), the form

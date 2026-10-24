@@ -4901,3 +4901,71 @@ public class T {
         "[72, 69, 76, 76, 79]\nHELLO\n[72, 69, 76, 76, 79]\n[A, B]\n[true, true]\n[65, 66]\n[Q, R]\nZ q 90\nH|i|😀\n[H, i, 😀]\n[LATIN CAPITAL LETTER H, LATIN SMALL LETTER I, GRINNING FACE]\n1 2 1 true\n[2, 9]\n1705032704 6\n"
     );
 }
+
+/// A generic call's inferred bound is checked against its target's type
+/// arguments when the target is an assignment (to a local, a field or a
+/// static), a parameter (static, instance, constructor) or a `return`, as it
+/// already was for a local declaration — exactly where the target names its
+/// arguments, as bounds where it names a wildcard. When the argument binding
+/// the variable is itself a generic call (a poly expression), `javac` names
+/// that call's variable (`List.of`'s `E`, `Map.of`'s `K` or `V`), from a
+/// table `scripts/GenJdkGenericStatics.java` generates off the JDK. Measured
+/// on openjdk 21.0.13.
+#[test]
+fn inferred_bounds_reach_assignment_parameter_and_return_targets() {
+    let head = "import java.util.*; public class T { static <X> X id(X x) { return x; }";
+    let bounds = |v: &str| format!("inference variable {v} has incompatible bounds");
+    let refused = [
+        (format!("{head} public static void main(String[] a) {{ Comparable<String> c; c = id(5); }} }}"), bounds("X")),
+        (format!("{head} static void take(Comparable<String> c) {{ }} public static void main(String[] a) {{ take(id(5)); }} }}"), bounds("X")),
+        (format!("{head} static void take(Comparable<Number> c) {{ }} public static void main(String[] a) {{ take(id(5)); }} }}"), bounds("X")),
+        (format!("{head} void take(Comparable<String> c) {{ }} public static void main(String[] a) {{ new T().take(id(5)); }} }}"), bounds("X")),
+        (format!("{head} T(Comparable<String> c) {{ }} public static void main(String[] a) {{ new T(id(5)); }} }}"), bounds("X")),
+        (format!("{head} static Comparable<String> give() {{ return id(5); }} public static void main(String[] a) {{ give(); }} }}"), bounds("X")),
+        (format!("{head} static Comparable<String> f; public static void main(String[] a) {{ f = id(5); }} }}"), bounds("X")),
+        (format!("{head} Comparable<String> c; void m() {{ this.c = id(5); }} public static void main(String[] a) {{ }} }}"), bounds("X")),
+        (format!("{head} static List<String> f; public static void main(String[] a) {{ f = id(new ArrayList<Integer>()); }} }}"), bounds("X")),
+        (format!("{head} public static void main(String[] a) {{ List<String> l = id(new ArrayList<Integer>()); }} }}"), bounds("X")),
+        (format!("{head} public static void main(String[] a) {{ List<String> l = id(List.of(1)); }} }}"), bounds("E")),
+        (format!("{head} public static void main(String[] a) {{ Iterable<String> l = id(List.of(1)); }} }}"), bounds("E")),
+        (format!("{head} public static void main(String[] a) {{ List<String> l = id(Arrays.asList(1)); }} }}"), bounds("T")),
+        (format!("{head} public static void main(String[] a) {{ Map<String, Integer> m = id(Map.of(1, 2)); }} }}"), bounds("K")),
+        (format!("{head} public static void main(String[] a) {{ Map<String, Integer> m = id(Map.of(\"a\", \"b\")); }} }}"), bounds("V")),
+        (format!("{head} static <Z> List<Z> mk(Z z) {{ return new ArrayList<>(List.of(z)); }} public static void main(String[] a) {{ List<String> l = id(mk(1)); }} }}"), bounds("Z")),
+    ];
+    for (src, desc) in &refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc.as_str()), "{err}\nwanted: {desc}\n{src}");
+    }
+    let src = r####"
+import java.util.*;
+public class T {
+    static <X> X id(X x) { return x; }
+    static Comparable<? extends Number> wide;
+    static List<Integer> ints;
+    Comparable<Integer> field;
+    static void take(Comparable<Integer> c) { System.out.print(c + " "); }
+    static void takeWide(Comparable<? extends Number> c) { System.out.print(c + " "); }
+    static Comparable<? extends Number> give() { return id(5); }
+    static List<Integer> list() { return id(List.of(1, 2)); }
+    T(Iterable<Integer> it) { System.out.print(it + " "); }
+    public static void main(String[] a) {
+        Comparable<Integer> c;
+        c = id(5);
+        Comparable<? super Integer> s;
+        s = id(6);
+        wide = id(7);
+        ints = id(new ArrayList<Integer>(List.of(3)));
+        T t = new T(id(List.of(4)));
+        t.field = id(8);
+        take(id(9));
+        takeWide(id(10));
+        System.out.println(c + " " + s + " " + wide + " " + ints + " " + t.field + " " + give() + " " + list());
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "[4] 9 10 5 6 7 [3] 8 5 [1, 2]\n");
+}

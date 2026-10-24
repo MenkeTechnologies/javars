@@ -18,6 +18,7 @@ pub mod hotspot_trig;
 pub mod jbig;
 pub mod jbigdec;
 pub mod jbitset;
+pub mod jdk_generic_statics;
 pub mod jdk_supertypes;
 pub mod jio;
 pub mod jrandom;

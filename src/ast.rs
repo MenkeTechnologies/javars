@@ -190,6 +190,8 @@ pub struct FieldDecl {
     pub targs: Vec<String>,
     /// See [`StmtKind::Local::super_slots`].
     pub super_slots: Vec<usize>,
+    /// See [`StmtKind::Local::wildcard`].
+    pub wildcard: bool,
     pub name: String,
     /// True when the declaration carried `final`.
     ///
@@ -253,6 +255,8 @@ pub struct Method {
     pub ret_targs: Vec<String>,
     /// See [`StmtKind::Local::super_slots`], for the return type.
     pub ret_super_slots: Vec<usize>,
+    /// See [`StmtKind::Local::wildcard`], for the return type.
+    pub ret_wildcard: bool,
     pub body: Vec<Stmt>,
     /// True for a bodyless method — an interface abstract method (`void m();`)
     /// or an `abstract` class method. No subroutine is emitted; the method is a
@@ -283,6 +287,8 @@ pub struct Param {
     pub targs: Vec<String>,
     /// See [`StmtKind::Local::super_slots`].
     pub super_slots: Vec<usize>,
+    /// See [`StmtKind::Local::wildcard`].
+    pub wildcard: bool,
     pub name: String,
     /// True for the variable-arity parameter (`int... xs`). `ty` is already the
     /// array type (`int[]`) — inside the body the parameter *is* that array —
