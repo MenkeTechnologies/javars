@@ -5207,12 +5207,12 @@ fn a_unicode_escape_may_repeat_its_u_and_may_spell_an_identifier() {
 }
 
 #[test]
-fn a_surrogate_unicode_escape_is_refused_rather_than_mangled() {
-    // javars stores a `String` as Unicode scalars, so a lone surrogate names
-    // no value it can hold. Refusing beats inventing a replacement character.
-    let (_out, err, ok) = run_streams(&wrap(r#"System.out.println("\ud83d".length());"#));
-    assert!(!ok);
-    assert!(err.contains("surrogate"), "{err}");
+fn a_surrogate_unicode_escape_is_one_utf16_unit() {
+    // JLS 3.3 + 3.10.5: `\ud83d` is one `char`, an unpaired surrogate, and a
+    // string holding it has length 1. Measured on openjdk 21.0.13: `1`.
+    let (out, ok) = run(&wrap(r#"System.out.println("\ud83d".length());"#));
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n");
 }
 
 #[test]
