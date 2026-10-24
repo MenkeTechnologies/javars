@@ -87,6 +87,8 @@ struct Classes<'a> {
     /// Per local or anonymous class, the captured locals its bodies name,
     /// each with whether one of them assigns it.
     inner_refs: HashMap<&'a str, Vec<(String, bool)>>,
+    /// The `static` methods, by declaring class.
+    statics: HashMap<&'a str, Vec<&'a Method>>,
 }
 
 impl<'a> Classes<'a> {
@@ -99,6 +101,10 @@ impl<'a> Classes<'a> {
                 .map(|c| (c.binary.as_str(), c))
                 .collect(),
             inner_refs: HashMap::new(),
+            statics: prog.methods.iter().fold(HashMap::new(), |mut m, f| {
+                m.entry(f.owner.as_str()).or_insert_with(Vec::new).push(f);
+                m
+            }),
         }
     }
 
@@ -128,6 +134,66 @@ impl<'a> Classes<'a> {
             cur = self.enclosing(c);
         }
         None
+    }
+
+    /// The one method named `name` taking `argc` arguments that a call on
+    /// `cl` reaches — declared or inherited, and for an `unqualified` call
+    /// also an enclosing class's. `None` when there is none, or more than one
+    /// (an overload this cannot pick between).
+    fn method(
+        &self,
+        cl: &'a Class,
+        name: &str,
+        argc: usize,
+        unqualified: bool,
+    ) -> Option<&'a Method> {
+        let mut found: Vec<&'a Method> = Vec::new();
+        let mut cur = Some(cl);
+        while let Some(c) = cur {
+            let mut seen = HashSet::new();
+            self.member_methods(c, name, argc, &mut seen, &mut found);
+            if !found.is_empty() || !unqualified {
+                break;
+            }
+            cur = self.enclosing(c);
+        }
+        match found.as_slice() {
+            [m] => Some(m),
+            _ => None,
+        }
+    }
+
+    fn member_methods(
+        &self,
+        c: &'a Class,
+        name: &str,
+        argc: usize,
+        seen: &mut HashSet<&'a str>,
+        out: &mut Vec<&'a Method>,
+    ) {
+        if !seen.insert(c.name.as_str()) {
+            return;
+        }
+        let statics = self
+            .statics
+            .get(c.name.as_str())
+            .into_iter()
+            .flatten()
+            .copied();
+        for m in c.methods.iter().chain(statics) {
+            let overridden = out.iter().any(|o| {
+                o.params.len() == m.params.len()
+                    && o.params.iter().zip(&m.params).all(|(a, b)| a.ty == b.ty)
+            });
+            if m.name == name && m.params.len() == argc && !overridden {
+                out.push(m);
+            }
+        }
+        for s in c.superclass.iter().chain(&c.interfaces) {
+            if let Some(sc) = self.by_name.get(s.as_str()) {
+                self.member_methods(sc, name, argc, seen, out);
+            }
+        }
     }
 
     /// A field `c` declares or inherits.
@@ -268,6 +334,10 @@ struct Decl {
     eff_final: bool,
     /// Declared type (`var` included), for a field access through it.
     ty: String,
+    /// The declared type's arguments and its lower-bounded wildcard
+    /// positions (see [`StmtKind::Local::super_slots`]).
+    targs: Vec<String>,
+    super_slots: Vec<usize>,
     /// The value, for a *constant variable* (JLS 4.12.4).
     constant: Option<Const>,
 }
@@ -382,6 +452,9 @@ struct Flow<'a> {
     /// the position of the statement among the class's initialization
     /// statements (see [`FieldDecl::init_pos`]).
     init_env: Option<(bool, usize)>,
+    /// The declared return type of the method being analyzed, with its type
+    /// arguments; `None` in a lambda body, an initializer or a `void` method.
+    ret: Option<(&'a str, &'a [String])>,
     captures: Vec<(CaptureKind, usize)>,
     capture_refs: Vec<CaptureRef>,
     /// The captured locals this (local or anonymous) class's bodies name.
@@ -413,6 +486,7 @@ impl<'a> Flow<'a> {
             initial_ctor: false,
             ctx: Ctx::Method,
             init_env: None,
+            ret: None,
             captures: Vec::new(),
             capture_refs: Vec::new(),
             free_captured: Vec::new(),
@@ -501,11 +575,20 @@ impl<'a> Flow<'a> {
                 has_init: false,
                 eff_final: false,
                 ty: ty.to_string(),
+                targs: Vec::new(),
+                super_slots: Vec::new(),
                 constant: None,
             },
         );
         self.scope.push((name, adr));
         adr
+    }
+
+    /// Record a declaration's type arguments (see [`Decl::targs`]).
+    fn set_type_args(&mut self, adr: usize, targs: &[String], super_slots: &[usize]) {
+        let d = self.vars[adr];
+        self.decls[d].targs = targs.to_vec();
+        self.decls[d].super_slots = super_slots.to_vec();
     }
 
     /// A parameter is assigned on entry (javac's `initParam`).
@@ -748,7 +831,10 @@ impl<'a> Flow<'a> {
             match m {
                 Member::Ctor(c) => self.ctor(c),
                 Member::Method(m) if !m.is_abstract => {
-                    self.method(m.params.iter().map(Some).collect(), &m.body)
+                    self.ret =
+                        (m.ret != "void").then_some((m.ret.as_str(), m.ret_targs.as_slice()));
+                    self.method(m.params.iter().map(Some).collect(), &m.body);
+                    self.ret = None;
                 }
                 Member::Method(_) => {}
                 Member::Main => {
@@ -777,6 +863,8 @@ impl<'a> Flow<'a> {
                 has_init: false,
                 eff_final: false,
                 ty: f.ty.clone(),
+                targs: f.targs.clone(),
+                super_slots: f.super_slots.clone(),
                 constant: None,
             },
         );
@@ -841,6 +929,7 @@ impl<'a> Flow<'a> {
                 &p.ty,
             );
             self.init_param(a);
+            self.set_type_args(a, &p.targs, &p.super_slots);
         }
     }
 
@@ -970,6 +1059,7 @@ impl<'a> Flow<'a> {
                 self.check_assignable_name(name, line);
                 if *op == AssignOp::Assign {
                     self.expr(value, line);
+                    self.check_assigned_capture(name, value, line);
                 } else {
                     self.name_read(name, line);
                     self.expr(value, line);
@@ -1018,12 +1108,13 @@ impl<'a> Flow<'a> {
             } => self.for_loop(init, cond.as_ref(), update, body, line),
             StmtKind::ForEach {
                 ty,
+                targs,
+                super_slots,
                 name,
                 is_final,
                 iter,
                 body,
-                ..
-            } => self.foreach_loop(s, ty, name, *is_final, iter, body),
+            } => self.foreach_loop(s, (ty, targs, super_slots), name, *is_final, iter, body),
             StmtKind::Switch { disc, groups } => self.switch_groups(disc, groups, line),
             StmtKind::Labeled { label, body } => {
                 let prev = std::mem::take(&mut self.pending);
@@ -1062,6 +1153,9 @@ impl<'a> Flow<'a> {
             StmtKind::Return(e) => {
                 if let Some(e) = e {
                     self.expr(e, line);
+                    if let Some((ty, targs)) = self.ret {
+                        self.check_capture_conversion(e, ty, targs, line);
+                    }
                 }
                 self.record_exit(ExitKind::Return, 0, line);
             }
@@ -1077,6 +1171,8 @@ impl<'a> Flow<'a> {
             name,
             init,
             is_final,
+            targs,
+            super_slots,
             ..
         } = &s.kind
         else {
@@ -1102,6 +1198,8 @@ impl<'a> Flow<'a> {
                 has_init: init.is_some(),
                 eff_final: false,
                 ty: ty.clone(),
+                targs: targs.clone(),
+                super_slots: super_slots.clone(),
                 constant: None,
             },
         );
@@ -1109,6 +1207,7 @@ impl<'a> Flow<'a> {
         self.scope.push((name, adr));
         if let Some(init) = init {
             self.expr(init, s.line);
+            self.check_capture_conversion(init, ty, targs, s.line);
             if *is_final && is_constant_type(ty) {
                 let value = self.const_value(init, 0).and_then(|v| v.convert(ty));
                 let d = self.vars[adr];
@@ -1250,7 +1349,7 @@ impl<'a> Flow<'a> {
     fn foreach_loop(
         &mut self,
         s: &'a Stmt,
-        ty: &'a str,
+        (ty, targs, super_slots): (&'a str, &'a [String], &'a [usize]),
         name: &'a str,
         is_final: bool,
         iter: &'a Expr,
@@ -1260,6 +1359,7 @@ impl<'a> Flow<'a> {
         // The iterable is resolved without the loop variable in scope.
         self.expr(iter, s.line);
         let var = self.declare(s as *const _ as usize, name, Kind::Local, is_final, ty);
+        self.set_type_args(var, targs, super_slots);
         let prev = std::mem::take(&mut self.pending);
         let prev_kind = std::mem::replace(&mut self.flow_kind, FlowKind::Normal);
         let start = (self.inits.clone(), self.uninits.clone());
@@ -1775,6 +1875,7 @@ impl<'a> Flow<'a> {
         let prev_pending = std::mem::take(&mut self.pending);
         let prev_jumps = std::mem::take(&mut self.jumps);
         self.uninits.exclude_from(self.firstadr);
+        let prev_ret = self.ret.take();
         self.returnadr = self.nextadr;
         self.captures.push((CaptureKind::Lambda, self.nextadr));
         for p in params {
@@ -1792,6 +1893,7 @@ impl<'a> Flow<'a> {
         self.inits = prev_inits;
         self.pending = prev_pending;
         self.jumps = prev_jumps;
+        self.ret = prev_ret;
         self.nextadr = nextadr;
         self.scope.truncate(scope);
     }
@@ -1807,6 +1909,7 @@ impl<'a> Flow<'a> {
         let prev_pending = std::mem::take(&mut self.pending);
         let prev_jumps = std::mem::take(&mut self.jumps);
         let prev_ctx = std::mem::replace(&mut self.ctx, Ctx::Method);
+        let prev_ret = self.ret.take();
         let prev_init_env = self.init_env.take();
         self.captures.push((CaptureKind::InnerClass, self.nextadr));
         for p in params {
@@ -1821,6 +1924,7 @@ impl<'a> Flow<'a> {
         self.exit_method(state);
         self.pending = prev_pending;
         self.jumps = prev_jumps;
+        self.ret = prev_ret;
         self.ctx = prev_ctx;
         self.init_env = prev_init_env;
     }
@@ -2052,6 +2156,139 @@ impl<'a> Flow<'a> {
         }
     }
 
+    // ----- Attr: capture conversion of `? super` element reads ----------
+
+    /// `T x = e;` (or `x = e;`, `return e;`): an element read through a
+    /// lower-bounded wildcard (`List<? super Integer> l; l.get(0)`) has a
+    /// capture type whose only upper bound is `Object`, which converts to no
+    /// other type.
+    fn check_capture_conversion(&mut self, value: &Expr, ty: &str, targs: &[String], line: u32) {
+        if matches!(ty, "var" | "Object") || !self.reads_captured_element(value) {
+            return;
+        }
+        let target = if targs.is_empty() {
+            ty.to_string()
+        } else {
+            format!("{ty}<{}>", targs.join(","))
+        };
+        self.error(
+            Phase::Attr,
+            line,
+            format!("incompatible types: CAP#1 cannot be converted to {target}"),
+        );
+    }
+
+    /// `name = value;` where `name` is a typed local or field.
+    fn check_assigned_capture(&mut self, name: &str, value: &Expr, line: u32) {
+        let (ty, targs) = match self.local(name) {
+            Some(a) => (self.decl(a).ty.clone(), self.decl(a).targs.clone()),
+            None => match self.classes.field(self.class, name) {
+                Some((_, f)) => (f.ty.clone(), f.targs.clone()),
+                None => return,
+            },
+        };
+        self.check_capture_conversion(value, &ty, &targs, line);
+    }
+
+    /// Whether `e` is `recv.m(…)` answering the element a `? super` argument
+    /// of `recv`'s static type stands for.
+    fn reads_captured_element(&self, e: &Expr) -> bool {
+        let Expr::MethodCall {
+            recv, method, args, ..
+        } = e
+        else {
+            return false;
+        };
+        let Some((base, slots)) = self.receiver_type(recv) else {
+            return false;
+        };
+        let int_arg = args.first().is_some_and(|a| self.is_int(a));
+        element_slot(&base, method, args.len(), int_arg).is_some_and(|s| slots.contains(&s))
+    }
+
+    /// The erased declared type of a receiver and its `? super` positions:
+    /// a local, parameter or `for` variable, a field (simple, `this.`,
+    /// `obj.` or `C.`), or the result of a user method.
+    fn receiver_type(&self, e: &Expr) -> Option<(String, Vec<usize>)> {
+        let field = |(_, f): (&Class, &FieldDecl)| (f.ty.clone(), f.super_slots.clone());
+        match e {
+            Expr::Var(n) => match self.local(n) {
+                Some(a) => Some((self.decl(a).ty.clone(), self.decl(a).super_slots.clone())),
+                None => self.classes.field(self.class, n).map(field),
+            },
+            Expr::Field { recv, name } => {
+                let cl = self.class_of(recv)?;
+                let mut seen = HashSet::new();
+                self.classes.member_field(cl, name, &mut seen).map(field)
+            }
+            Expr::MethodCall {
+                recv, method, args, ..
+            } => {
+                let cl = self.class_of(recv)?;
+                let m = self.classes.method(cl, method, args.len(), false)?;
+                Some((m.ret.clone(), m.ret_super_slots.clone()))
+            }
+            Expr::Call { name, args, .. } => {
+                let m = self.classes.method(self.class, name, args.len(), true)?;
+                Some((m.ret.clone(), m.ret_super_slots.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The user class an expression's static type names: `this`, a local or
+    /// field of a class type, or a class name (for a static member).
+    fn class_of(&self, e: &Expr) -> Option<&'a Class> {
+        let by_type = |ty: &str| self.classes.by_name.get(ty).copied();
+        match e {
+            Expr::This => Some(self.class),
+            Expr::Var(v) => match self.local(v) {
+                Some(a) => by_type(&self.decl(a).ty),
+                None => match self.classes.field(self.class, v) {
+                    Some((_, f)) => by_type(&f.ty),
+                    None => by_type(v),
+                },
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether `e` is statically of an integral type that `List.remove`
+    /// takes as an index (`int` and what promotes to it).
+    fn is_int(&self, e: &Expr) -> bool {
+        let int_ty = |t: &str| matches!(t, "int" | "short" | "byte" | "char");
+        match e {
+            Expr::Int(_) | Expr::Char(_) => true,
+            Expr::Unary { op, rhs } => *op != UnOp::Not && self.is_int(rhs),
+            Expr::Binary { op, lhs, rhs } => {
+                matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                        | BinOp::Ushr
+                ) && self.is_int(lhs)
+                    && self.is_int(rhs)
+            }
+            Expr::Cast { ty, .. } => int_ty(ty),
+            Expr::Var(n) => match self.local(n) {
+                Some(a) => int_ty(&self.decl(a).ty),
+                None => self
+                    .classes
+                    .field(self.class, n)
+                    .is_some_and(|(_, f)| int_ty(&f.ty)),
+            },
+            _ => false,
+        }
+    }
+
     // ----- constants and types ----------------------------------------
 
     /// Whether `e` is of primitive type `boolean`, as far as the syntax
@@ -2127,6 +2364,77 @@ impl<'a> Flow<'a> {
         // The initializer is evaluated in its own class, with no locals.
         let inner = Flow::new(self.classes, self.classes.by_name.get(c.name.as_str())?);
         inner.const_value(value, depth + 1)?.convert(&f.ty)
+    }
+}
+
+/// Which type argument the result of `recv.method(…)` (with `argc`
+/// arguments) is typed by, for the JDK collection, map, iterator and
+/// `Optional` types: the element (`0`), or a map's value (`1`) or key (`0`).
+/// `None` for a method answering anything else — `List.remove(Object)` and
+/// `Set.remove` answer a `boolean`, `Map.replace(k, old, new)` too.
+fn element_slot(base: &str, method: &str, argc: usize, int_arg: bool) -> Option<usize> {
+    const LIST: &[&str] = &["List", "ArrayList", "LinkedList", "Vector", "Stack"];
+    const QUEUE: &[&str] = &[
+        "Queue",
+        "Deque",
+        "ArrayDeque",
+        "LinkedList",
+        "PriorityQueue",
+    ];
+    const SEQUENCED: &[&str] = &[
+        "SequencedCollection",
+        "SequencedSet",
+        "LinkedHashSet",
+        "Deque",
+        "ArrayDeque",
+        "LinkedList",
+        "List",
+        "ArrayList",
+        "Vector",
+        "Stack",
+    ];
+    const SORTED_SET: &[&str] = &["SortedSet", "NavigableSet", "TreeSet"];
+    const MAP: &[&str] = &[
+        "Map",
+        "HashMap",
+        "LinkedHashMap",
+        "TreeMap",
+        "SortedMap",
+        "NavigableMap",
+        "SequencedMap",
+        "Hashtable",
+    ];
+    const SORTED_MAP: &[&str] = &["SortedMap", "NavigableMap", "TreeMap"];
+    let is = |family: &[&str]| family.contains(&base);
+    let element = match (method, argc) {
+        ("get", 1) | ("set", 2) if is(LIST) => true,
+        ("remove", 1) if is(LIST) && int_arg => true,
+        ("getFirst" | "getLast" | "removeFirst" | "removeLast", 0) if is(SEQUENCED) => true,
+        ("peek" | "poll" | "element" | "remove" | "pop", 0) if is(QUEUE) => true,
+        ("peekFirst" | "peekLast" | "pollFirst" | "pollLast", 0) if is(QUEUE) => true,
+        ("peek" | "pop", 0) | ("push", 1) if base == "Stack" => true,
+        ("first" | "last" | "pollFirst" | "pollLast", 0) if is(SORTED_SET) => true,
+        ("floor" | "ceiling" | "higher" | "lower", 1) if is(SORTED_SET) => true,
+        ("next", 0) if matches!(base, "Iterator" | "ListIterator") => true,
+        ("previous", 0) if base == "ListIterator" => true,
+        ("get" | "orElseThrow", 0) | ("orElse", 1) if base == "Optional" => true,
+        _ => false,
+    };
+    if element {
+        return Some(0);
+    }
+    match (method, argc) {
+        ("get" | "remove", 1) | ("put" | "putIfAbsent" | "replace" | "getOrDefault", 2)
+            if is(MAP) =>
+        {
+            Some(1)
+        }
+        ("firstKey" | "lastKey", 0) | ("floorKey" | "ceilingKey" | "higherKey" | "lowerKey", 1)
+            if is(SORTED_MAP) =>
+        {
+            Some(0)
+        }
+        _ => None,
     }
 }
 

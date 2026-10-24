@@ -1407,8 +1407,16 @@ storage-model differences:
   are now the flow pass's (see "Definite assignment" under "Implemented"):
   a `static final` assigned on one branch only is refused, and a forward
   reference is seen inside a block lambda and in an instance initializer as
-  well. What remains: the `? super` read is recognised for the collection
-  and map element methods on a local.
+  well. The `? super` read is recognised through any receiver whose
+  declared type carries the wildcard — a local, parameter, `for` variable,
+  field, or a user method's or record accessor's result — by the
+  collection, map, iterator and `Optional` methods that answer the element
+  (or a sorted map's key), into a local, an assignment or a `return`
+  (`src/flow.rs`, `element_slot`). It used to be keyed on the method name
+  alone and so refused the `boolean` overloads `javac` accepts
+  (`l.remove((Object) x)`, `set.remove(x)`, `m.replace(k, old, new)`).
+  Not seen: a receiver typed by a JDK method's inferred result, and a
+  wildcard on a user generic class's own type parameter.
 - **An overload `javac` cannot infer is run.** `System.out.println(w.stream()
   .collect(Collectors.groupingBy(String::length, TreeMap::new,
   Collectors.counting())))` is refused by `javac` (openjdk 21.0.13: `method

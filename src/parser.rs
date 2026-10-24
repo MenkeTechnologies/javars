@@ -36,7 +36,7 @@ pub fn parse(src: &str) -> Result<Program, String> {
         class_names: std::collections::HashSet::new(),
         last_targs: Vec::new(),
         last_targs_wildcard: false,
-        last_targs_lower: false,
+        last_super_slots: Vec::new(),
     };
     // The names declared as classes (not interfaces) anywhere in the unit, so
     // an anonymous class can tell a superclass from an interface even when the
@@ -109,8 +109,8 @@ struct Parser {
     last_targs: Vec<String>,
     /// Whether a top-level argument of [`Parser::last_targs`] was a wildcard.
     last_targs_wildcard: bool,
-    /// Whether one of them was a lower-bounded wildcard (`? super X`).
-    last_targs_lower: bool,
+    /// The positions of its lower-bounded wildcard arguments (`? super X`).
+    last_super_slots: Vec<usize>,
     /// The binary names of the type declarations enclosing the cursor,
     /// innermost last — what a local type declared in a method body is named
     /// after.
@@ -515,6 +515,7 @@ impl Parser {
         if let (Some(outer), Some(cl)) = (inner_of, classes.last_mut()) {
             let this0 = Param {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: outer,
                 name: OUTER_THIS.to_string(),
                 varargs: false,
@@ -682,6 +683,7 @@ fn attach_captures(cl: &mut Class, captures: Vec<Param>, own_from: usize) {
     for c in &captures[own_from..] {
         cl.fields.push(FieldDecl {
             targs: Vec::new(),
+            super_slots: Vec::new(),
             ty: c.ty.clone(),
             name: c.name.clone(),
             is_final: true,
@@ -867,6 +869,7 @@ fn record_members(
     for c in components {
         fields.push(FieldDecl {
             targs: c.targs.clone(),
+            super_slots: c.super_slots.clone(),
             ty: c.ty.clone(),
             name: c.name.clone(),
             init: None,
@@ -922,6 +925,7 @@ fn record_members(
         }
         methods.push(Method {
             ret_targs: c.targs.clone(),
+            ret_super_slots: c.super_slots.clone(),
             name: c.name.clone(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -962,6 +966,7 @@ fn record_members(
         text = concat(text, Expr::Str("]".to_string()));
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "toString".to_string(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -990,7 +995,7 @@ fn record_members(
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
-                lower_wildcard: false,
+                super_slots: Vec::new(),
                 ty: "int".to_string(),
                 name: acc.to_string(),
                 init: Some(Expr::Int(0)),
@@ -1025,6 +1030,7 @@ fn record_members(
         ));
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "hashCode".to_string(),
             owner: name.to_string(),
             params: Vec::new(),
@@ -1059,10 +1065,12 @@ fn record_members(
         }
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "equals".to_string(),
             owner: name.to_string(),
             params: vec![Param {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: "Object".to_string(),
                 name: other.to_string(),
                 varargs: false,
@@ -1162,6 +1170,7 @@ fn instance_declaration(decls: Vec<FieldDecl>, fields: &mut Vec<FieldDecl>, init
 fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &mut Vec<Method>) {
     fields.push(FieldDecl {
         targs: Vec::new(),
+        super_slots: Vec::new(),
         ty: "String".to_string(),
         name: ENUM_NAME.to_string(),
         init: None,
@@ -1172,6 +1181,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
     });
     fields.push(FieldDecl {
         targs: Vec::new(),
+        super_slots: Vec::new(),
         ty: "int".to_string(),
         name: ENUM_ORDINAL.to_string(),
         init: None,
@@ -1182,6 +1192,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
     });
     let reader = |method: &str, field: &str, ret: &str| Method {
         ret_targs: Vec::new(),
+        ret_super_slots: Vec::new(),
         name: method.to_string(),
         owner: owner.to_string(),
         params: Vec::new(),
@@ -1219,6 +1230,7 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
     {
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "getDeclaringClass".to_string(),
             owner: owner.to_string(),
             params: Vec::new(),
@@ -1242,10 +1254,12 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
     {
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "compareTo".to_string(),
             owner: owner.to_string(),
             params: vec![Param {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: owner.to_string(),
                 name: "other".to_string(),
                 varargs: false,
@@ -1279,10 +1293,12 @@ fn enum_members(line: u32, owner: &str, fields: &mut Vec<FieldDecl>, methods: &m
     {
         methods.push(Method {
             ret_targs: Vec::new(),
+            ret_super_slots: Vec::new(),
             name: "equals".to_string(),
             owner: owner.to_string(),
             params: vec![Param {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: "Object".to_string(),
                 name: "other".to_string(),
                 varargs: false,
@@ -1359,6 +1375,8 @@ impl Parser {
     /// argument is dropped. Empty when the cursor is not on `<`.
     fn type_args(&mut self) -> Vec<String> {
         if !self.is(&Tok::Lt) {
+            self.last_targs_wildcard = false;
+            self.last_super_slots.clear();
             return Vec::new();
         }
         let start = self.pos;
@@ -1397,11 +1415,14 @@ impl Parser {
         }
         let (_, args) = crate::ast::generic_parts(&format!("T{text}"));
         self.last_targs_wildcard = args.iter().any(|a| a.trim_start().starts_with('?'));
-        self.last_targs_lower = args.iter().any(|a| {
-            a.trim_start()
-                .strip_prefix('?')
-                .is_some_and(|r| r.trim_start().starts_with("super"))
-        });
+        self.last_super_slots = (0..args.len())
+            .filter(|&i| {
+                args[i]
+                    .trim_start()
+                    .strip_prefix('?')
+                    .is_some_and(|r| r.trim_start().starts_with("super"))
+            })
+            .collect();
         args.iter()
             .map(|a| crate::ast::normalize_type_arg(a))
             .collect()
@@ -1590,6 +1611,7 @@ impl Parser {
             }
             captures.push(Param {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: ty.clone(),
                 name: name.clone(),
                 varargs: false,
@@ -1702,6 +1724,7 @@ impl Parser {
         }
         let base_ty = self.type_name()?;
         let targs = self.last_targs.clone();
+        let super_slots = self.last_super_slots.clone();
         // A field is `type name` where name is not followed by `(` (that would be
         // a method the method-probe should have taken).
         let first_is_field = matches!(self.peek(), Tok::Ident(_))
@@ -1725,6 +1748,7 @@ impl Parser {
             out.push(FieldDecl {
                 ty,
                 targs: targs.clone(),
+                super_slots: super_slots.clone(),
                 name,
                 has_init: init.is_some(),
                 init,
@@ -1778,6 +1802,7 @@ impl Parser {
         let line = self.line();
         let ret = self.type_name()?;
         let ret_targs = self.last_targs.clone();
+        let ret_super_slots = self.last_super_slots.clone();
         // `<ret> name (` — anything else (e.g. `int COUNT =`) is a field.
         let name = match self.peek().clone() {
             Tok::Ident(n) if matches!(&self.toks[self.pos + 1].kind, Tok::LParen) => {
@@ -1811,6 +1836,7 @@ impl Parser {
                 params,
                 ret,
                 ret_targs,
+                ret_super_slots,
                 body,
                 is_abstract,
                 access,
@@ -1854,6 +1880,7 @@ impl Parser {
             }
             let mut ty = self.type_name()?;
             let targs = self.last_targs.clone();
+            let super_slots = self.last_super_slots.clone();
             // A varargs parameter (`String... args`) *is* an array parameter —
             // inside the body it is a `String[]`. The dots additionally admit
             // Java's third resolution phase, so the flag rides along on the
@@ -1873,6 +1900,7 @@ impl Parser {
             out.push(Param {
                 ty,
                 targs,
+                super_slots: if varargs { Vec::new() } else { super_slots },
                 name,
                 varargs,
                 is_final,
@@ -2229,7 +2257,7 @@ impl Parser {
             let base_ty = self.type_name()?;
             let targs = self.last_targs.clone();
             let wildcard = self.last_targs_wildcard;
-            let lower_wildcard = self.last_targs_lower;
+            let super_slots = self.last_super_slots.clone();
             // Every declarator of the statement, in source order: `int a = 1,
             // b = 2;` is two, and `int a[], b;` gives them different types.
             let mut decls = Vec::new();
@@ -2249,7 +2277,7 @@ impl Parser {
                         ty,
                         targs: targs.clone(),
                         wildcard,
-                        lower_wildcard,
+                        super_slots: super_slots.clone(),
                         name,
                         init,
                         is_final,
@@ -2481,6 +2509,7 @@ impl Parser {
         self.eat(&Tok::LParen)?;
         if let Some((ty, name, is_final)) = self.try_foreach_header()? {
             let targs = self.last_targs.clone();
+            let super_slots = self.last_super_slots.clone();
             let iter = self.expression()?;
             self.eat(&Tok::RParen)?;
             self.scope.push((name.clone(), ty.clone()));
@@ -2488,6 +2517,7 @@ impl Parser {
             return Ok(StmtKind::ForEach {
                 ty,
                 targs,
+                super_slots,
                 name,
                 is_final,
                 iter,
@@ -2823,7 +2853,7 @@ impl Parser {
                 StmtKind::Local {
                     targs: Vec::new(),
                     wildcard: false,
-                    lower_wildcard: false,
+                    super_slots: Vec::new(),
                     ty: "Throwable".to_string(),
                     name: primary.clone(),
                     init: Some(var("null")),
@@ -2845,7 +2875,7 @@ impl Parser {
                         StmtKind::Local {
                             targs: Vec::new(),
                             wildcard: false,
-                            lower_wildcard: false,
+                            super_slots: Vec::new(),
                             ty,
                             name: r.name,
                             init: Some(init),
@@ -4320,7 +4350,7 @@ impl Parser {
                 ty: ty.to_string(),
                 targs: Vec::new(),
                 wildcard: false,
-                lower_wildcard: false,
+                super_slots: Vec::new(),
                 name: self_name.to_string(),
                 init: Some(Expr::NewObject {
                     class: ty.to_string(),
@@ -4493,6 +4523,7 @@ impl Parser {
             let params: Vec<Param> = (0..args.len())
                 .map(|i| Param {
                     targs: Vec::new(),
+                    super_slots: Vec::new(),
                     ty: "Object".to_string(),
                     name: format!("x{i}"),
                     varargs: false,
@@ -4545,6 +4576,7 @@ impl Parser {
             if let Some(outer) = self.enclosing_names.last().cloned() {
                 let this0 = Param {
                     targs: Vec::new(),
+                    super_slots: Vec::new(),
                     ty: outer,
                     name: OUTER_THIS.to_string(),
                     varargs: false,

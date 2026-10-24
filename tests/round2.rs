@@ -4745,3 +4745,77 @@ public class T implements AutoCloseable {
     assert!(ok, "{out}");
     assert_eq!(out, "closed\n012pq45boomtrue76str\n");
 }
+
+/// An element read through a lower-bounded wildcard has a capture type that
+/// converts to `Object` only, whatever the receiver: a field, a parameter, a
+/// `for` variable, a method's or a record accessor's result as well as a
+/// local, read by the collection, map, iterator and `Optional` methods that
+/// answer the element (or a sorted map's key), into a local, an assignment
+/// or a `return`. The overloads that answer something else (`remove(Object)`,
+/// `Set.remove`, `Map.replace(k, old, new)`, `Map.remove(k, v)`) and a
+/// wildcard on the slot not read stay legal. Measured on openjdk 21.0.13.
+#[test]
+fn super_wildcard_element_reads_are_refused_through_any_receiver() {
+    let cap = |ty: &str| format!("incompatible types: CAP#1 cannot be converted to {ty}");
+    let head = "import java.util.*; public class T { public static void main(String[] a) {";
+    let refused = [
+        ("import java.util.*; public class T { static List<? super Integer> f = new ArrayList<Number>(); public static void main(String[] a) { f.add(1); Integer x = f.get(0); System.out.println(x); } }".to_string(), cap("Integer")),
+        ("import java.util.*; public class T { static void m(List<? super Integer> l) { l.add(2); Integer x = l.get(0); System.out.println(x); } public static void main(String[] a) { m(new ArrayList<Number>()); } }".to_string(), cap("Integer")),
+        ("import java.util.*; public class T { static List<? super Integer> mk() { List<Number> n = new ArrayList<>(); n.add(3); return n; } public static void main(String[] a) { Integer x = mk().get(0); System.out.println(x); } }".to_string(), cap("Integer")),
+        ("import java.util.*; public class T { List<? super Integer> f = new ArrayList<Number>(); void go() { f.add(4); Number x = this.f.get(0); System.out.println(x); } public static void main(String[] a) { new T().go(); } }".to_string(), cap("Number")),
+        (format!("{head} List<? super Integer> l = new ArrayList<Number>(); l.add(1); Integer x; x = l.get(0); System.out.println(x); }} }}"), cap("Integer")),
+        ("import java.util.*; public class T { static int k(List<? super Integer> l) { return l.get(0); } public static void main(String[] a) { System.out.println(k(new ArrayList<Number>(List.of(1)))); } }".to_string(), cap("int")),
+        ("import java.util.*; public class T { record R(List<? super Integer> xs) {} public static void main(String[] a) { R r = new R(new ArrayList<Number>(List.of(5))); Integer x = r.xs().get(0); System.out.println(x); } }".to_string(), cap("Integer")),
+        ("import java.util.*; public class T { public static void main(String[] a) { for (List<? super Integer> l : List.of(new ArrayList<Number>(List.of(1)))) { Integer x = l.get(0); System.out.println(x); } } }".to_string(), cap("Integer")),
+        ("import java.util.*; public class T { static List<? super Integer> f = new ArrayList<Number>(List.of(1)); Integer g; void m() { g = f.get(0); } public static void main(String[] a) { } }".to_string(), cap("Integer")),
+        (format!("{head} List<? super Integer> l = new ArrayList<Number>(List.of(1)); Iterator<? super Integer> it = l.iterator(); Integer x = it.next(); }} }}"), cap("Integer")),
+        (format!("{head} Optional<? super Integer> o = Optional.of(1); Integer x = o.get(); }} }}"), cap("Integer")),
+        (format!("{head} TreeSet<? super Integer> s = new TreeSet<Integer>(List.of(1)); Integer x = s.first(); }} }}"), cap("Integer")),
+        (format!("{head} Map<String, ? super Integer> m = new HashMap<String, Number>(); Integer x = m.put(\"a\", 1); }} }}"), cap("Integer")),
+        (format!("{head} Map<String, ? super Integer> m = new TreeMap<String, Number>(); m.put(\"k\", 1); Integer x = m.getOrDefault(\"k\", 2); }} }}"), cap("Integer")),
+        (format!("{head} Deque<? super Integer> d = new ArrayDeque<Number>(List.of(1)); Integer x = d.pop(); }} }}"), cap("Integer")),
+        (format!("{head} List<? super Integer> l = new ArrayList<Number>(List.of(1)); List<String> x = l.get(0); }} }}"), cap("List<String>")),
+        (format!("{head} List<? super Integer> l = new ArrayList<Number>(List.of(1)); int i = 0; Integer x = l.remove(i); }} }}"), cap("Integer")),
+        (format!("{head} List<? super Integer> l = new ArrayList<Number>(List.of(1)); Integer x = l.set(0, 2); }} }}"), cap("Integer")),
+        (format!("{head} Stack<? super Integer> s = new Stack<Number>(); Integer x = s.push(1); }} }}"), cap("Integer")),
+        (format!("{head} TreeMap<? super String, Integer> m = new TreeMap<String, Integer>(Map.of(\"a\", 1)); String k = m.firstKey(); }} }}"), cap("String")),
+        (format!("{head} Queue<? super Integer> q = new LinkedList<Number>(List.of(1)); Integer x = q.element(); }} }}"), cap("Integer")),
+    ];
+    for (src, desc) in &refused {
+        let (out, err, ok) = run_with_stderr(src);
+        assert!(!ok, "ran: {out}\n{src}");
+        assert!(err.contains(desc.as_str()), "{err}\nwanted: {desc}\n{src}");
+    }
+    let src = r####"
+import java.util.*;
+public class T {
+    record R(List<? super Integer> xs) {}
+    static List<Number> nums() { return new ArrayList<>(List.of(9)); }
+    static Integer first(List<? super Integer> l) { return (Integer) l.get(0); }
+    public static void main(String[] a) {
+        List<? super Integer> l = new ArrayList<Number>(List.of(1, 2));
+        boolean removed = l.remove((Object) 2);
+        Object o = l.get(0);
+        var v = l.get(0);
+        Map<String, ? super Integer> m = new HashMap<String, Number>();
+        m.put("a", 1);
+        boolean replaced = m.replace("a", 1, 3);
+        boolean gone = m.remove("b", 1);
+        Deque<? super Integer> d = new ArrayDeque<Number>(List.of(4, 5));
+        boolean dr = d.remove((Object) 4);
+        Set<? super Integer> s = new HashSet<Number>(List.of(6));
+        boolean sr = s.remove(6);
+        Map<? super String, Integer> keyed = new HashMap<Object, Integer>();
+        keyed.put("k", 7);
+        Integer byKey = keyed.get("k");
+        R r = new R(new ArrayList<Number>(List.of(5)));
+        Object fromRecord = r.xs().get(0);
+        Number n = nums().get(0);
+        System.out.println(removed + " " + o + " " + v + " " + replaced + " " + m + " " + gone + " " + dr + " " + sr + " " + byKey + " " + fromRecord + " " + n + " " + first(new ArrayList<Number>(List.of(8))));
+    }
+}
+"####;
+    let (out, ok) = run(src);
+    assert!(ok, "{out}");
+    assert_eq!(out, "true 1 1 true {a=3} false true true 7 5 9 8\n");
+}

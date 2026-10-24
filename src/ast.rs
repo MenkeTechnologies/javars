@@ -188,6 +188,8 @@ pub struct FieldDecl {
     /// The declared type's type arguments (`Map<String, Integer>` → `String`,
     /// `Integer`), see [`StmtKind::Local::targs`].
     pub targs: Vec<String>,
+    /// See [`StmtKind::Local::super_slots`].
+    pub super_slots: Vec<usize>,
     pub name: String,
     /// True when the declaration carried `final`.
     ///
@@ -249,6 +251,8 @@ pub struct Method {
     /// The declared return type's type arguments, see
     /// [`StmtKind::Local::targs`].
     pub ret_targs: Vec<String>,
+    /// See [`StmtKind::Local::super_slots`], for the return type.
+    pub ret_super_slots: Vec<usize>,
     pub body: Vec<Stmt>,
     /// True for a bodyless method — an interface abstract method (`void m();`)
     /// or an `abstract` class method. No subroutine is emitted; the method is a
@@ -277,6 +281,8 @@ pub struct Param {
     pub ty: String,
     /// The declared type's type arguments, see [`StmtKind::Local::targs`].
     pub targs: Vec<String>,
+    /// See [`StmtKind::Local::super_slots`].
+    pub super_slots: Vec<usize>,
     pub name: String,
     /// True for the variable-arity parameter (`int... xs`). `ty` is already the
     /// array type (`int[]`) — inside the body the parameter *is* that array —
@@ -323,9 +329,10 @@ pub enum StmtKind {
         /// (`Comparable<? extends Number>`), which `targs` alone cannot tell
         /// from the exact `Comparable<Number>`.
         wildcard: bool,
-        /// Whether one of them was a lower-bounded wildcard (`? super Integer`),
-        /// which `targs` reads as `Object`.
-        lower_wildcard: bool,
+        /// The positions of the arguments written as a lower-bounded wildcard
+        /// (`? super Integer`), which `targs` reads as `Object`: an element
+        /// read through one is a capture type (`crate::flow` checks it).
+        super_slots: Vec<usize>,
         name: String,
         init: Option<Expr>,
         /// Whether the declaration carried `final`, which the definite-
@@ -396,6 +403,8 @@ pub enum StmtKind {
         ty: String,
         /// The element type's type arguments, see [`StmtKind::Local::targs`].
         targs: Vec<String>,
+        /// See [`StmtKind::Local::super_slots`].
+        super_slots: Vec<usize>,
         name: String,
         /// Whether the loop variable was declared `final`.
         is_final: bool,

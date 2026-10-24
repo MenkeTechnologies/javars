@@ -587,9 +587,6 @@ struct Compiler {
     method_access: HashMap<String, Vec<(String, Vec<String>, Access)>>,
     /// The `static` methods of user interfaces, as `(interface, name)`.
     interface_statics: HashSet<(String, String)>,
-    /// The locals declared with a lower-bounded wildcard argument
-    /// (`List<? super Integer> l`), whose element reads are a capture type.
-    lower_wildcard_locals: HashSet<String>,
     /// Whether [`Compiler::pending_target_generic`] was written with a
     /// wildcard argument, so its arguments are bounds rather than exact.
     target_wildcard: Option<bool>,
@@ -812,7 +809,6 @@ fn compile_with(prog: &Program, debug: bool) -> Result<Chunk, String> {
             }
             m
         },
-        lower_wildcard_locals: HashSet::default(),
         interface_statics: prog
             .methods
             .iter()
@@ -4121,52 +4117,6 @@ impl Compiler {
         }
     }
 
-    /// Whether `local.method(…)` answers the element its declared type gives
-    /// through a lower-bounded wildcard (`? super X`, which the declaration's
-    /// type arguments read as `Object`): a collection's element reads, or a
-    /// map's value reads.
-    fn reads_captured_element(&self, local: &str, method: &str) -> bool {
-        let Some(generic) = self.var_generic(local) else {
-            return false;
-        };
-        let (base, args) = crate::ast::generic_parts(&generic);
-        let map_like = matches!(
-            base.as_str(),
-            "Map" | "HashMap" | "LinkedHashMap" | "TreeMap" | "SortedMap" | "NavigableMap"
-        );
-        let slot = if map_like {
-            matches!(
-                method,
-                "get" | "getOrDefault" | "remove" | "put" | "replace"
-            )
-            .then_some(1)
-        } else {
-            matches!(
-                method,
-                "get"
-                    | "remove"
-                    | "set"
-                    | "getFirst"
-                    | "getLast"
-                    | "removeFirst"
-                    | "removeLast"
-                    | "peek"
-                    | "poll"
-                    | "pop"
-                    | "element"
-                    | "first"
-                    | "last"
-                    | "pollFirst"
-                    | "pollLast"
-                    | "peekFirst"
-                    | "peekLast"
-            )
-            .then_some(0)
-        };
-        slot.and_then(|i| args.get(i))
-            .is_some_and(|a| a == "Object")
-    }
-
     /// `javac`'s refusal of a call that can reach only `private` methods of a
     /// class in another top-level class (JLS 6.6.1: a private member is
     /// accessible within the body of the top-level class that encloses it).
@@ -6865,7 +6815,6 @@ impl Compiler {
                 ty,
                 targs,
                 wildcard,
-                lower_wildcard,
                 name,
                 init,
                 ..
@@ -6899,27 +6848,6 @@ impl Compiler {
                 };
                 self.declare_local(name, &raw, nt);
                 self.declare_generic(name, generic.clone());
-                // An element read through a lower-bounded wildcard
-                // (`List<? super Integer> l; Integer x = l.get(0)`) has a
-                // capture type javac converts to nothing but `Object`.
-                if let Some(Expr::MethodCall { recv, method, .. }) = init {
-                    if let Expr::Var(r) = recv.as_ref() {
-                        if ty != "var"
-                            && ty != "Object"
-                            && self.lower_wildcard_locals.contains(r)
-                            && self.reads_captured_element(r, method)
-                        {
-                            return Err(format!(
-                                "javars: incompatible types: CAP#1 cannot be converted to {ty} (line {line})"
-                            ));
-                        }
-                    }
-                }
-                if *lower_wildcard {
-                    self.lower_wildcard_locals.insert(name.clone());
-                } else {
-                    self.lower_wildcard_locals.remove(name);
-                }
                 if let Some(e) = init {
                     self.target_wildcard = Some(*wildcard);
                     self.expr_targeted_generic(e, Some(&raw), generic)?;
@@ -7657,7 +7585,7 @@ impl Compiler {
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
-                lower_wildcard: false,
+                super_slots: Vec::new(),
                 ty: ty.to_string(),
                 name: name.to_string(),
                 init: Some(call(Expr::Var(it.clone()), "next")),
@@ -7671,7 +7599,7 @@ impl Compiler {
                 StmtKind::Local {
                     targs: Vec::new(),
                     wildcard: false,
-                    lower_wildcard: false,
+                    super_slots: Vec::new(),
                     ty: "Iterator".to_string(),
                     name: it.clone(),
                     init: Some(call(iter.clone(), "iterator")),
@@ -9162,7 +9090,7 @@ impl Compiler {
             StmtKind::Local {
                 targs: Vec::new(),
                 wildcard: false,
-                lower_wildcard: false,
+                super_slots: Vec::new(),
                 ty: "Consumer".to_string(),
                 name: action,
                 init: Some(args[0].clone()),
@@ -9173,6 +9101,7 @@ impl Compiler {
             line,
             StmtKind::ForEach {
                 targs: Vec::new(),
+                super_slots: Vec::new(),
                 ty: "var".to_string(),
                 name: each,
                 iter: recv.clone(),
@@ -9913,7 +9842,7 @@ impl Compiler {
                     StmtKind::Local {
                         targs: Vec::new(),
                         wildcard: false,
-                        lower_wildcard: false,
+                        super_slots: Vec::new(),
                         ty: rc.clone(),
                         name: it.clone(),
                         init: Some(recv.clone()),
@@ -9922,7 +9851,7 @@ impl Compiler {
                     StmtKind::Local {
                         targs: Vec::new(),
                         wildcard: false,
-                        lower_wildcard: false,
+                        super_slots: Vec::new(),
                         ty: "Consumer".to_string(),
                         name: action.clone(),
                         init: Some(args[0].clone()),
