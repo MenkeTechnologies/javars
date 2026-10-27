@@ -3016,10 +3016,10 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
 /// (superclass + interfaces).
 ///
 /// The graph has two halves and both are walked at every node: the program's own
-/// declarations ([`SUPERS`], set before the run) and the JDK's ([`jdk_supers`]).
+/// declarations (`SUPERS`, set before the run) and the JDK's (`jdk_supers`).
 /// A user class that `implements Comparable` needs the second half to reach
 /// `Serializable`, and a modeled `TreeMap` has no entry in the first at all.
-/// [`is_subclass_of`] for the compiler, which needs the JDK half of the
+/// `is_subclass_of` for the compiler, which needs the JDK half of the
 /// supertype graph to decide what a `switch` pattern covers.
 pub fn jdk_is_subtype(class: &str, target: &str) -> bool {
     is_subclass_of(class, target)

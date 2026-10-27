@@ -730,7 +730,7 @@ fn anonymous_named(e: Expr, binary: String, line: u32) -> Expr {
     }
 }
 
-/// The internal call [`anonymous_named`] builds; `#` keeps it out of reach of
+/// The internal call `anonymous_named` builds; `#` keeps it out of reach of
 /// a Java identifier.
 pub const ANON_CLASS_CALL: &str = "#anon_class";
 
