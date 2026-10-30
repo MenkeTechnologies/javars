@@ -2698,14 +2698,17 @@ impl Parser {
                 body: arm_body,
             });
         }
-        let finally_body = if matches!(self.peek(), Tok::Ident(w) if w == "finally") {
+        // JLS 14.20: a `finally` clause is what is required, not a non-empty
+        // one, so `try { … } finally { }` is a valid statement.
+        let has_finally = matches!(self.peek(), Tok::Ident(w) if w == "finally");
+        let finally_body = if has_finally {
             self.advance();
             self.eat(&Tok::LBrace)?;
             self.block()?
         } else {
             Vec::new()
         };
-        if catches.is_empty() && finally_body.is_empty() && resources.is_empty() {
+        if catches.is_empty() && !has_finally && resources.is_empty() {
             return Err(format!(
                 "javars: `try` needs a `catch` or a `finally` (line {})",
                 self.line()

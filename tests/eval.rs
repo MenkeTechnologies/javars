@@ -6688,3 +6688,15 @@ fn a_string_operand_of_a_numeric_operator_is_rejected_as_javac_rejects_it() {
         rejected(&main(body), want);
     }
 }
+
+#[test]
+fn try_with_empty_finally_and_no_catch_runs() {
+    // JLS 14.20 requires a `finally` clause, not a non-empty one.
+    let (out, ok) = run(&wrap(
+        r#"try { System.out.println("b"); } finally { }
+           try { try { throw new RuntimeException("x"); } finally { } }
+           catch (RuntimeException e) { System.out.println(e.getMessage()); }"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "b\nx\n");
+}
