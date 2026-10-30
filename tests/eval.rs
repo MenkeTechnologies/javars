@@ -6899,3 +6899,26 @@ public class Main {
          1 java.lang.Class\n"
     );
 }
+
+#[test]
+fn a_generic_constructor_is_a_constructor() {
+    // `<T> Box(T t)` (JLS 8.8.4) was skipped as an unparseable member, leaving
+    // the class with no constructor of that arity. Expected from OpenJDK 21.0.13.
+    let (out, ok) = run(r#"import java.util.*;
+public class Main {
+    static class Box {
+        Object v;
+        <T extends Comparable<T>> Box(T t, List<? super T> sink) { v = t; sink.add(t); }
+        Box() { this("d", new ArrayList<String>()); }
+    }
+    <T> Main(T t) { System.out.println("main " + t); }
+    public static void main(String[] args) {
+        List<Object> s = new ArrayList<>();
+        System.out.println(new Box(5, s).v + " " + s + " " + new Box().v);
+        new Main(2.5);
+    }
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "5 [5] d\nmain 2.5\n");
+}

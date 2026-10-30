@@ -1698,11 +1698,15 @@ impl Parser {
         {
             self.advance();
         }
+        // A generic constructor (`<T> Main(T t)`, JLS 8.8.4) binds its own
+        // type parameters for the signature and body.
+        let generics = self.declare_generics();
         let line = self.line();
         let is_ctor = matches!(self.peek(), Tok::Ident(n) if n == class_name)
             && matches!(&self.toks[self.pos + 1].kind, Tok::LParen);
         if !is_ctor {
             self.pos = save;
+            self.undeclare_generics(generics);
             return Ok(None);
         }
         self.advance(); // class name
@@ -1712,6 +1716,7 @@ impl Parser {
         self.skip_throws()?;
         self.eat(&Tok::LBrace)?;
         let body = self.body_with_params(&params, false)?;
+        self.undeclare_generics(generics);
         Ok(Some(Ctor {
             params,
             body,
