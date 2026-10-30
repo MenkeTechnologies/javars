@@ -6772,3 +6772,25 @@ fn compound_assignment_unboxes_a_null_right_operand() {
     assert!(ok);
     assert_eq!(out, "int\nlong\ndouble\nshift\nbool\n3 8 null\n");
 }
+
+#[test]
+fn a_lambda_answers_object_methods_itself() {
+    // `toString`/`hashCode`/`equals` are never a functional interface's
+    // method (JLS 9.8); they were invoking the lambda's body.
+    let (out, ok) = run(&format!(
+        "import java.util.function.*; {}",
+        wrap(
+            r#"Runnable r = () -> {}; Runnable q = () -> {};
+               String s = r.toString();
+               System.out.println(s == null);
+               System.out.println(s.equals("" + r));
+               System.out.println(s.length() > 0);
+               Supplier<String> sup = () -> "v";
+               System.out.println(sup.toString().equals("v"));
+               System.out.println(r.equals(r) + " " + r.equals(q));
+               System.out.println(r.hashCode() == r.hashCode());"#
+        )
+    ));
+    assert!(ok);
+    assert_eq!(out, "false\ntrue\ntrue\nfalse\ntrue false\ntrue\n");
+}

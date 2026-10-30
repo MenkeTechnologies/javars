@@ -12449,7 +12449,21 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // the erasure of a nested generic (`Supplier<Supplier<String>>.get()` is
     // declared to return `Object`) is the common case. Any method call on a
     // closure receiver is its single abstract method, because `javac` has
-    // already rejected every other name, so it is invoked directly.
+    // already rejected every other name, so it is invoked directly — except
+    // the public methods of `Object`, which JLS 9.8 excludes from being that
+    // method, so `r.toString()` is the lambda's rendering, not a call of `r`.
+    // A lambda overrides none of the three, so each is `Object`'s: identity
+    // equality, the identity hash, and the rendering `println` gives it.
+    if let (Some(_), Value::Obj(id)) = (closure_meta(&recv), &recv) {
+        match (&*method, n) {
+            ("toString", 0) => return Value::str(java_str_vm(vm, &recv)),
+            ("hashCode", 0) => return Value::Int(i64::from(*id)),
+            ("equals", 1) => {
+                return Value::bool(matches!(args[0], Value::Obj(other) if other == *id))
+            }
+            _ => {}
+        }
+    }
     if closure_meta(&recv).is_some() {
         vm.stack.push(recv);
         for a in args {

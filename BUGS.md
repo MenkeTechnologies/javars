@@ -2418,6 +2418,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `Class$$Lambda/0x…@<identity hash>`, which is neither reproducible nor stable
   across JVM runs; javars prints `<lambda>@<handle>`. Printing a lambda is not
   something a deterministic program does, so this only shows up if you ask for it.
+  An explicit `r.toString()` answers that same string, and `hashCode()`/
+  `equals` are `Object`'s identity ones; all three used to run the lambda's
+  body instead, so `r.toString()` of a `Runnable` was `null`.
 - **`Arrays.asList(o)` spreads a lone array whose static type is not an
   array.** Java's varargs spreads a *reference* array (`String[]` → a
   3-element list) but not a primitive one (`int[]` → a 1-element
