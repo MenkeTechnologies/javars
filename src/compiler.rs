@@ -11420,6 +11420,20 @@ impl Compiler {
         Ok(())
     }
 
+    /// Push the right operand of a compound assignment. Into a primitive
+    /// target the operator runs on primitives (JLS 15.26.2 applies the
+    /// operator's numeric promotion, which unboxes), so a wrapper operand is
+    /// unboxed through [`Self::emit_checked_unbox`] and a `null` one throws
+    /// `NullPointerException` — `int w = 0; Integer n = null; w += n;`. A
+    /// reference target (`String +=`) takes the operand as it is.
+    fn compound_operand(&mut self, value: &Expr, target_ty: Option<&str>) -> Result<(), String> {
+        if target_ty.is_some_and(|t| !is_reference_type(t)) {
+            self.expr_unboxed(value)
+        } else {
+            self.expr(value)
+        }
+    }
+
     /// Combine an already-pushed left operand with `value` under a compound
     /// operator, leaving the result on the stack. `/=` truncates when both the
     /// target and the value are statically integral (Java `int /= int`).
@@ -11464,7 +11478,7 @@ impl Compiler {
             && self.expr_java_type(value).as_deref().map(unwrapped_ty) == Some("double");
         if target_ty == Some("float") && !via_double {
             if let Some(bop) = compound_binop(op) {
-                self.expr(value)?;
+                self.compound_operand(value, target_ty)?;
                 self.emit_f32_arith(bop, line);
                 return Ok(());
             }
@@ -11481,7 +11495,7 @@ impl Compiler {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
                 )
             }) {
-                self.expr(value)?;
+                self.compound_operand(value, target_ty)?;
                 self.emit_f32_arith(bop, line);
                 if let Some(t) = target_ty {
                     let c = self.b.add_constant(Value::str(t.to_string()));
@@ -11497,7 +11511,7 @@ impl Compiler {
             // *that* width, and `>>>` zero-fills at it. A `byte`/`short`/`char`
             // target shifts as the `int` it promotes to and is narrowed after.
             let wide = !matches!(target_ty, Some("int" | "short" | "byte" | "char"));
-            self.expr(value)?;
+            self.compound_operand(value, target_ty)?;
             self.b.emit(Op::LoadInt(if wide { 63 } else { 31 }), line);
             self.b.emit(Op::BitAnd, line);
             match op {
@@ -11513,7 +11527,7 @@ impl Compiler {
         {
             // `b &= c` on booleans is the logical form, and its result must
             // stay a boolean rather than the 0/1 an integer op would leave.
-            self.expr(value)?;
+            self.compound_operand(value, target_ty)?;
             let vop = match op {
                 AssignOp::BitAnd => Op::LogAnd,
                 AssignOp::BitOr => Op::LogOr,
@@ -11522,7 +11536,7 @@ impl Compiler {
             self.b.emit(vop, line);
         } else if op == AssignOp::Div {
             let r = self.expr_type(value);
-            self.expr(value)?;
+            self.compound_operand(value, target_ty)?;
             // `wrap32` is exactly "the target is a declared `int` and the
             // operand is `int`-width", which is the condition under which the
             // native float division is exact; a `long /=` must not take it.
@@ -11534,7 +11548,7 @@ impl Compiler {
             if op == AssignOp::Add && target == NumType::Other {
                 self.emit_stringified(value)?;
             } else {
-                self.expr(value)?;
+                self.compound_operand(value, target_ty)?;
             }
             // `x %= 0` throws the same `ArithmeticException` as `x / 0`.
             if op == AssignOp::Mod

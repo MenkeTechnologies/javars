@@ -2398,6 +2398,9 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   on a wrapper local, field, `static` or array element unbox the same way, run
   at the primitive type (an `Integer` wraps at 32 bits), and rebox through the
   `valueOf` cache, so two `Integer`s stepped to 1001 are distinct objects.
+  The right operand of a compound assignment into a primitive target unboxes
+  the same way (JLS 15.26.2), so `Integer n = null; w += n;` throws where it
+  used to leave `w` unchanged; a `String +=` takes it as `"null"`.
 - ~~**`Double.parseDouble` rejects a hexadecimal literal.**~~ — implemented.
   `Double.parseDouble`/`valueOf` and `Float.parseFloat`/`valueOf` accept the
   hex form (`"0x1.8p1"` is 3.0) and the source accepts the hexadecimal

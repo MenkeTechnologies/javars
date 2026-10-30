@@ -6752,3 +6752,23 @@ fn held_entry_set_survives_a_later_put() {
     assert!(ok, "{out}");
     assert_eq!(out, "true\nfalse\n9\n");
 }
+
+#[test]
+fn compound_assignment_unboxes_a_null_right_operand() {
+    // JLS 15.26.2: the operator's numeric promotion unboxes the right operand,
+    // so a `null` wrapper throws; a `String +=` target takes it as `"null"`.
+    let (out, ok) = run(&wrap(
+        r#"Integer n = null; Boolean nb = null;
+           int w = 0; long l = 0; double d = 0; boolean b = true;
+           try { w += n; } catch (NullPointerException e) { System.out.println("int"); }
+           try { l *= n; } catch (NullPointerException e) { System.out.println("long"); }
+           try { d -= n; } catch (NullPointerException e) { System.out.println("double"); }
+           try { w <<= n; } catch (NullPointerException e) { System.out.println("shift"); }
+           try { b &= nb; } catch (NullPointerException e) { System.out.println("bool"); }
+           Integer k = 5, q = 3; k += q; w += q;
+           String s = ""; s += n;
+           System.out.println(w + " " + k + " " + s);"#,
+    ));
+    assert!(ok);
+    assert_eq!(out, "int\nlong\ndouble\nshift\nbool\n3 8 null\n");
+}
