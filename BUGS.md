@@ -1567,10 +1567,11 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   wrong answer.
 - **`java.math` is modeled except for a few corners.** `BigInteger`, `BigDecimal`,
   `MathContext` and `RoundingMode` follow the JDK's arithmetic, preferred
-  scales, rendering and exception messages. Not covered: `BigDecimal.pow(n, mc)`,
+  scales, rendering, `%f`/`%e`/`%g` formatting (`Formatter.print(BigDecimal)`)
+  and exception messages. Not covered: `BigDecimal.pow(n, mc)`,
   `toEngineeringString`, the legacy `BigDecimal.ROUND_*` constants,
-  `BigInteger.probablePrime` and the `Random`-taking constructors, `%g` of a
-  `BigDecimal`, and non-ASCII digits in a numeric string. A `RoundingMode` is
+  `BigInteger.probablePrime` and the `Random`-taking constructors, and
+  non-ASCII digits in a numeric string. A `RoundingMode` is
   accepted and printed but cannot be a `switch` selector. `isProbablePrime` is a
   deterministic Miller-Rabin test over fixed bases rather than the JDK's
   randomized one, so the two agree except on contrived pseudoprimes.

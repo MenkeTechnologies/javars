@@ -6700,3 +6700,34 @@ fn try_with_empty_finally_and_no_catch_runs() {
     assert!(ok);
     assert_eq!(out, "b\nx\n");
 }
+
+#[test]
+fn general_conversion_of_a_bigdecimal_is_exact() {
+    // `Formatter.print(BigDecimal)`'s GENERAL arm; expected bytes from
+    // OpenJDK 21.0.13. `0.00` is not `BigDecimal.ZERO` (scale differs), so it
+    // takes the scientific layout with its own adjusted exponent.
+    let (out, ok) = run(&format!(
+        "import java.math.*; {}",
+        wrap(
+            r#"for (String x : new String[]{"1.5", "12345", "0.0001", "0.00001", "-0.5", "999999.5", "0", "0.00", "1E+2"}) {
+                 BigDecimal d = new BigDecimal(x);
+                 System.out.println(String.format("%g|%.3g|%.0g|%G|%+g", d, d, d, d, d));
+               }
+               System.out.println(String.format("%e|%.2e", new BigDecimal("0.00"), new BigDecimal("0E+3")));"#
+        )
+    ));
+    assert!(ok);
+    assert_eq!(
+        out,
+        "1.50000|1.50|2|1.50000|+1.50000\n\
+         12345.0|1.23e+04|1e+04|12345.0|+12345.0\n\
+         0.000100000|0.000100|0.0001|0.000100000|+0.000100000\n\
+         1.00000e-05|1.00e-05|1e-05|1.00000E-05|+1.00000e-05\n\
+         -0.500000|-0.500|-0.5|-0.500000|-0.500000\n\
+         1.00000e+06|1.00e+06|1e+06|1.00000E+06|+1.00000e+06\n\
+         0.00000|0.00|0|0.00000|+0.00000\n\
+         0.00000e-02|0.00e-02|0e-02|0.00000E-02|+0.00000e-02\n\
+         100.000|100|1e+02|100.000|+100.000\n\
+         0.000000e-02|0.00e+03\n"
+    );
+}

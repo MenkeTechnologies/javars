@@ -20037,9 +20037,49 @@ fn format_conversion(
         body,
         numeric: true,
     };
+    // `Formatter.print(BigDecimal)` for `%g`: round to `prec` significant
+    // digits (absent is 6, 0 is 1), then lay the result out as `%f` when it
+    // equals `BigDecimal.ZERO` (scale included) or lies in [10^-4, 10^prec),
+    // and as `%e` otherwise, each precision rewritten so the output keeps
+    // `prec` significant digits.
+    let dec = dec_of(arg);
+    let (dec, conv, prec) = match (dec, conv) {
+        (Some(d), 'g' | 'G') => {
+            use crate::jbigdec::{Dec, Mc, Rm};
+            use num_traits::Zero;
+            use std::cmp::Ordering;
+            let p = match prec {
+                None => 6,
+                Some(0) => 1,
+                Some(n) => n,
+            };
+            let mc = Mc {
+                precision: p as u32,
+                mode: Rm::HalfUp,
+            };
+            match d.round(mc) {
+                Ok(v) => {
+                    let mag = v.abs();
+                    let is_zero = v.unscaled.is_zero() && v.scale == 0;
+                    let in_range = mag.compare(&Dec::new(1.into(), 4)) != Ordering::Less
+                        && mag.compare(&Dec::new(1.into(), -(p as i64))) == Ordering::Less;
+                    if is_zero || in_range {
+                        let e = -v.scale + (v.unscaled.magnitude().to_string().len() as i64 - 1);
+                        let fprec = (p as i64 - e - 1).max(0) as usize;
+                        (Some(v), 'f', Some(fprec))
+                    } else {
+                        let sci = if conv == 'G' { 'E' } else { 'e' };
+                        (Some(v), sci, Some(p - 1))
+                    }
+                }
+                Err(_) => (Some(d), conv, prec),
+            }
+        }
+        (d, _) => (d, conv, prec),
+    };
     // `Formatter.print(BigDecimal)` for `%f`: rounded HALF_UP at the precision
     // from the exact decimal value, never through a `double`.
-    if let (Some(d), 'f') = (dec_of(arg), conv) {
+    if let (Some(d), 'f') = (dec.clone(), conv) {
         if let Ok(r) = d.set_scale(prec.unwrap_or(6) as i64, crate::jbigdec::Rm::HalfUp) {
             let mut body = r.abs().plain();
             if flags.alt && !body.contains('.') {
@@ -20055,7 +20095,7 @@ fn format_conversion(
     }
     // `%e` of a `BigDecimal` is likewise exact: round HALF_UP to `prec + 1`
     // significant digits, then lay out `d.ddde+XX`.
-    if let (Some(d), 'e' | 'E') = (dec_of(arg), conv) {
+    if let (Some(d), 'e' | 'E') = (dec, conv) {
         let p = prec.unwrap_or(6);
         let mc = crate::jbigdec::Mc {
             precision: (p + 1) as u32,
@@ -20063,11 +20103,9 @@ fn format_conversion(
         };
         if let Ok(r) = d.round(mc) {
             let mut digits = r.unscaled.magnitude().to_string();
-            let exp = if d.signum() == 0 {
-                0
-            } else {
-                digits.len() as i64 - 1 - r.scale
-            };
+            // `BigDecimalLayout`'s adjusted exponent, zero included: `%e` of
+            // `0.00` is `0.000000e-02`.
+            let exp = digits.len() as i64 - 1 - r.scale;
             while digits.len() < p + 1 {
                 digits.push('0');
             }
