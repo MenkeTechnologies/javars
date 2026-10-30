@@ -6817,3 +6817,37 @@ fn format_does_not_spread_a_lone_primitive_array() {
     assert!(ok);
     assert_eq!(out, "Format specifier '%s'\nd != [I\ntrue\na-b\ntrue\n");
 }
+
+#[test]
+fn hashed_lookup_of_an_optional_runs_the_held_values_equals() {
+    // `Optional.equals`/`hashCode` are `Objects.equals`/`hashCode` of the
+    // value, so a record or a class with its own `equals` inside an
+    // `Optional` is found by an equal `Optional`.
+    let (out, ok) = run(r#"import java.util.*;
+public class Main {
+    record K(int a) {}
+    static class P {
+        int v;
+        P(int v) { this.v = v; }
+        public boolean equals(Object o) { return o instanceof P p && p.v == v; }
+        public int hashCode() { return v; }
+    }
+    public static void main(String[] args) {
+        Set<Optional<K>> s = new HashSet<>();
+        s.add(Optional.of(new K(1)));
+        s.add(Optional.of(new K(1)));
+        s.add(Optional.empty());
+        System.out.println(s.size() + " " + s.contains(Optional.of(new K(1))) + " " + s.contains(Optional.of(new K(2))));
+        Set<Optional<P>> t = new HashSet<>(List.of(Optional.of(new P(2))));
+        System.out.println(t.contains(Optional.of(new P(2))));
+        Map<Optional<K>, Integer> m = new HashMap<>();
+        m.put(Optional.of(new K(4)), 9);
+        System.out.println(m.get(Optional.of(new K(4))));
+        List<Optional<K>> l = new ArrayList<>(List.of(Optional.of(new K(3))));
+        System.out.println(l.contains(Optional.of(new K(3))) + " " + s.remove(Optional.of(new K(1))) + " " + s.size());
+    }
+}
+"#);
+    assert!(ok);
+    assert_eq!(out, "2 true false\ntrue\n9\ntrue true 1\n");
+}

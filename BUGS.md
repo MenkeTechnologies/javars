@@ -1601,16 +1601,12 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   stage in one call) and has no way to suspend between elements. Materializing
   the stream at the call would reorder those side effects and hang on
   `Stream.iterate(…)` without a `limit`, so it is not done.
-- **A hash container keyed by an `Optional` of a user class misses.**
-  `Optional.equals`/`hashCode` called directly reach the held value's
-  bodies, but a `HashSet`/`HashMap` lookup compares and hashes an `Optional`
-  key by its contents *without* running them — the user `equals`/`hashCode`
-  plan (`eq_plan`, `file_key_hash` in `src/host.rs`) recognises a user instance or a
-  collection as the key, not one wrapped in an `Optional` — so
-  `set.contains(Optional.of(new K(5)))` is `false` where Java answers `true`
-  for a `K` with consistent `equals`/`hashCode`. An `Optional` of a `String`,
-  a boxed primitive or another `Optional` of one is found, and buckets and
-  iterates in the JDK's order.
+- ~~**A hash container keyed by an `Optional` of a user class misses.**~~ —
+  fixed: the user `equals` plan (`eq_plan`) sees through an `Optional` to the
+  value it holds, as `Optional.equals` is `Objects.equals` of the values, so
+  `set.contains(Optional.of(new K(5)))`, `map.get(Optional.of(k))` and
+  `list.contains(…)` find an equal `Optional` of a record or of a class with
+  its own `equals`/`hashCode` (measured on `openjdk 21.0.13`).
 - ~~**`EnumSet.complementOf` and `EnumSet.range`**~~ — implemented: the
   compiler reads the enum type off the arguments' static type and hands the
   host its `values()` array, so `range` is the constants between the two

@@ -5546,6 +5546,15 @@ fn eq_call(vm: &mut VM, q: &Value, other: &Value) -> bool {
     if let Some(same) = collection_equals(vm, q, other) {
         return same;
     }
+    // `Optional.equals`: the same kind of `Optional`, and `Objects.equals` on
+    // the values, which reaches a user or record `equals`.
+    if let Some((class, inner)) = as_optional_full(q) {
+        return match (inner, as_optional_full(other)) {
+            (Some(x), Some((o, Some(y)))) => o == class && objects_equals(vm, &x, &y),
+            (None, Some((o, None))) => o == class,
+            _ => false,
+        };
+    }
     match user_equals(vm, q) {
         Some((id, entry)) => run_equals(vm, entry, id, other),
         None => value_eq(q, other),
@@ -5966,6 +5975,12 @@ fn trusted_equals(vm: &VM, v: &Value, hashed: bool) -> bool {
     // the same contents, so a hash container consults it too.
     if is_collection_handle(v) {
         return true;
+    }
+    // `Optional.equals` and `hashCode` are its value's (`Objects.equals`,
+    // `Objects.hashCode`), so an `Optional` is trusted exactly when what it
+    // holds is.
+    if let Some((_, inner)) = as_optional_full(v) {
+        return inner.is_some_and(|x| trusted_equals(vm, &x, hashed));
     }
     if user_equals(vm, v).is_none() {
         return false;
