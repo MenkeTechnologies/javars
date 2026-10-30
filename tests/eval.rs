@@ -6731,3 +6731,24 @@ fn general_conversion_of_a_bigdecimal_is_exact() {
          0.000000e-02|0.00e+03\n"
     );
 }
+
+#[test]
+fn held_entry_set_survives_a_later_put() {
+    // Was a `RefCell already mutably borrowed` panic: the set call held the
+    // heap exclusively while an entry repaired itself by reading its map.
+    let (out, ok) = run(&format!(
+        "import java.util.*; {}",
+        wrap(
+            r#"Map<String, Integer> m = new LinkedHashMap<>();
+               m.put("a", 1);
+               var es = m.entrySet();
+               m.put("c", 3);
+               m.put("a", 9);
+               System.out.println(es.contains(Map.entry("a", 9)));
+               System.out.println(es.contains(Map.entry("a", 1)));
+               System.out.println(es.iterator().next().getValue());"#
+        )
+    ));
+    assert!(ok, "{out}");
+    assert_eq!(out, "true\nfalse\n9\n");
+}

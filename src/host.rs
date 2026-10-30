@@ -2039,7 +2039,12 @@ fn index_key(v: &Value) -> Option<IndexKey> {
             // `m.entrySet().contains(Map.entry(k, v))` miss where the scan it
             // replaces hits. It declines, which is what the accelerator is
             // specified to do wherever the correspondence is not provable.
-            None if entry_pair(v).is_some() => return None,
+            // Only the kind is asked here, so the entry is not reconciled:
+            // [`reconcile_entry`] reads `HEAP`, which a collection method that
+            // rebuilds its index already holds mutably.
+            None if PAIRS.with(|p| p.borrow().get(*id as usize).is_some_and(Option::is_some)) => {
+                return None
+            }
             // An `Optional` is compared by its contents, for the same reason.
             None if as_optional_full(v).is_some() => return None,
             // A `BigInteger` buckets by its digits; `value_eq` confirms.
@@ -4182,19 +4187,22 @@ fn bump_entry_generation(owner: u32) {
     });
 }
 
-/// The value `owner` holds for `key` right now, or `None` if it holds no such
-/// key.
+/// The value `owner` holds for `key` right now: `Some(None)` if it holds no
+/// such key, and `None` when the heap cannot be read because a collection call
+/// holds it exclusively. The entry then keeps its last repair;
+/// [`coll_method_unranked`] levels the entries it compares
+/// ([`level_entries`]) before it takes that borrow.
 ///
 /// Goes through the map's own [`KeyIndex`], so a repair is one hash lookup
 /// rather than a walk of the map. The borrow is shared, and `value_eq` may take
 /// one of its own, which a `RefCell` allows.
-fn map_value_of(owner: u32, key: &Value) -> Option<Value> {
+fn map_value_of(owner: u32, key: &Value) -> Option<Option<Value>> {
     HEAP.with(|h| {
-        let heap = h.borrow();
+        let heap = h.try_borrow().ok()?;
         let Some(HostObj::Map { entries, index, .. }) = heap.get(owner as usize) else {
-            return None;
+            return Some(None);
         };
-        match index.find(entries, |(k, _)| k, key) {
+        Some(match index.find(entries, |(k, _)| k, key) {
             // The index answered: a position, or a confirmed absence.
             Some(hit) => hit.map(|i| entries[i].1.clone()),
             // It declined (stale, or a key it cannot bucket) — scan, as every
@@ -4203,8 +4211,20 @@ fn map_value_of(owner: u32, key: &Value) -> Option<Value> {
                 .iter()
                 .find(|(k, _)| value_eq(k, key))
                 .map(|(_, v)| v.clone()),
-        }
+        })
     })
+}
+
+/// Bring every `Map.Entry` among `values` level with its map — see
+/// [`reconcile_entry`], which [`entry_pair`] runs. Anything else is skipped.
+fn level_entries(values: &[Value]) {
+    for v in values {
+        if let Value::Obj(id) = v {
+            if PAIRS.with(|p| p.borrow().get(*id as usize).is_some_and(Option::is_some)) {
+                entry_pair(v);
+            }
+        }
+    }
 }
 
 /// Bring one entry's copy level with its map, if the map has moved since.
@@ -4229,14 +4249,16 @@ fn reconcile_entry(id: u32, pair: Pair) -> Pair {
         return pair;
     }
     match map_value_of(owner, &pair.key) {
-        Some(v) => {
+        // The map cannot be read right now; keep the last repair.
+        None => pair,
+        Some(Some(v)) => {
             let mut fresh = pair;
             fresh.value = v;
             fresh.seen = generation;
             write_pair(id, fresh.clone());
             fresh
         }
-        None => {
+        Some(None) => {
             detach_entry(id);
             let mut dead = pair;
             dead.detached = true;
@@ -10039,6 +10061,23 @@ fn coll_method_unranked(vm: &mut VM, recv: &Value, method: &str, args: &[Value])
                 desc: false,
             }));
         }
+    }
+    // A stale `Map.Entry` repairs itself by reading its map
+    // ([`reconcile_entry`]), which cannot happen under the exclusive borrow
+    // below. So the entries this call compares are brought level first: the
+    // arguments, and the elements of an `entrySet()` held across a write to its
+    // map (`es.contains(…)`, `es.size()` after `m.put`).
+    level_entries(args);
+    let entry_view_items = HEAP.with(|h| match h.borrow().get(id) {
+        Some(HostObj::Set {
+            items,
+            view: SetView::Entries(_),
+            ..
+        }) => Some(items.clone()),
+        _ => None,
+    });
+    if let Some(items) = entry_view_items {
+        level_entries(&items);
     }
     // Likewise `addAll`/`equals` read their argument collection: snapshot it
     // first, because the borrow below is exclusive.

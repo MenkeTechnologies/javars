@@ -1344,23 +1344,19 @@ storage-model differences:
   A held view does not see later changes to the map, and the view object is
   rebuilt per call where Java's map caches one and hands back the same object.
 
-  Measured again at javars 0.1.13: the first line no longer prints `2` — it
-  aborts. `size()` on an `entrySet()` taken before a later `put` panics with
-  `RefCell already mutably borrowed` at `src/host.rs:3465` (`map_value_of`, the
-  per-entry repair that reads the map's `HEAP` slot while it is already
-  borrowed mutably). The smallest reproducer, for a `HashMap` or a
-  `LinkedHashMap`:
-
-  ```java
-  Map<String, Integer> m = new HashMap<>();
-  m.put("a", 1);
-  var es = m.entrySet();
-  m.put("c", 3);
-  System.out.println(es.size());   // Java: 2   javars: thread 'main' panicked … RefCell already mutably borrowed
-  ```
-
-  Iterating the held view instead (`for (var e : es)`) does not panic and
-  prints the snapshot (`a=1`, where Java prints `a=1` and `c=3`).
+  A held `entrySet()` queried after a later `put` used to abort with
+  `RefCell already mutably borrowed` (`map_value_of`, the per-entry repair,
+  reading the heap while the set call held it exclusively). It now answers
+  from the snapshot like the other views: the entries a collection call
+  compares — its arguments, and the elements of an `entrySet()` receiver —
+  are brought level with their map before the call takes the heap, so
+  `es.contains(Map.entry("a", 9))` after `m.put("a", 9)` is `true` as in Java.
+  An entry held in some *other* collection is not levelled first, and is
+  compared at the value it last showed: after `List<Map.Entry<String,
+  Integer>> l = new ArrayList<>(m.entrySet()); m.put("a", 7);`,
+  `l.contains(Map.entry("a", 7))` is `false` here and `true` in Java (measured
+  on `openjdk 21.0.13`) until something reads the entry (`l.get(0).getValue()`
+  repairs it).
 
   The *entries inside* an `entrySet()` are not copies in that sense: a map hands
   out one `Map.Entry` per key and keeps handing back that same object, its
