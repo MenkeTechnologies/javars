@@ -9138,14 +9138,16 @@ impl Compiler {
 
     fn expr(&mut self, e: &Expr) -> Result<(), String> {
         match e {
-            // `T.class` — a class IS its binary name here, which is what
-            // `x.getClass()` already evaluates to, so the literal resolves to
-            // the same string at COMPILE time: the name is written in the
-            // source and needs no value to read it off.
+            // `T.class` — the one `Class` object for the binary name the
+            // source spells, the same object `x.getClass()` answers for an
+            // instance of it. Whether it is an interface is known here and
+            // nowhere at run time, and `toString()` reads it.
             Expr::ClassLit(name) => {
+                let interface = self.class_value_kind(e).unwrap_or(false);
                 let c = self.string_literal(&self.class_literal_name(name));
                 self.b.emit(Op::LoadConst(c), 0);
-                self.b.emit(Op::CallBuiltin(crate::host::JCLASS_LIT, 1), 0);
+                self.b.emit(Op::LoadInt(i64::from(interface)), 0);
+                self.b.emit(Op::CallBuiltin(crate::host::JCLASS_LIT, 2), 0);
             }
             // A pattern label carries no subject of its own — the `switch`
             // supplies its discriminant — so it is lowered by

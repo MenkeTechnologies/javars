@@ -370,10 +370,10 @@ pub const JUNBOX: u16 = 748;
 /// `BOX_CLASSES.len()` for `Boolean`); `argc == 2`.
 pub const JUNBOX_NONNULL: u16 = 752;
 
-/// `T.class` — a class literal. A class is its binary name here, and `==` on
-/// two of them is reference identity, so every spelling of one class (a literal,
-/// `x.getClass()`) has to resolve to the *same* `String` handle: the name goes
-/// through one intern table. Stack `[name]`; `argc == 1`.
+/// `T.class` — a class literal. A class is a `Class` object holding its binary
+/// name, and `==` on two of them is reference identity, so every spelling of
+/// one class (a literal, `x.getClass()`) resolves to the *same* object through
+/// one intern table. Stack `[name, is_interface]`; `argc == 2`.
 pub const JCLASS_LIT: u16 = 753;
 
 /// The operand of a `+` whose static types javars could not settle: a heap
@@ -408,8 +408,9 @@ pub const JITER_HAS: u16 = 757;
 pub const JITER_GET: u16 = 758;
 
 /// `String.valueOf(Class)` — `Class.toString()`: `class T$A`, `interface T$I`,
-/// and the bare name for a primitive. Stack `[name, is_interface]`;
-/// `argc == 2`.
+/// and the bare name for a primitive; any other value is its string
+/// conversion. Stack `[value, is_interface]` (the flag is unused: the `Class`
+/// object carries it); `argc == 2`.
 pub const JCLASS_STR: u16 = 759;
 
 /// Record an array's type (`int[]`, `String[][]`) for `instanceof` to read —
@@ -542,6 +543,10 @@ enum HostObj {
     Big,
     /// A `java.math.BigDecimal` (see [`crate::jbigdec`]); the value lives in [`DECS`].
     Dec,
+    /// A `java.lang.Class`: its binary name (`getName()`) and whether it is
+    /// an interface, which `toString()` reads. One object per name
+    /// ([`CLASS_NAMES`]), so `==` between two spellings of a class holds.
+    Class { name: String, interface: bool },
     /// A `java.math.MathContext`.
     MathCtx(crate::jbigdec::Mc),
     /// A `java.math.RoundingMode` constant; one object per constant ([`ROUNDING_MODES`]),
@@ -2632,6 +2637,8 @@ pub fn set_argv(argv: Vec<String>) {
 /// start of each program run so a fresh program never sees a prior run's handles.
 pub fn heap_reset() {
     HEAP.with(|h| h.borrow_mut().clear());
+    // Class objects live in the heap, so their intern table goes with it.
+    CLASS_NAMES.with(|t| t.borrow_mut().clear());
     // The wrapper cache holds heap handles, so it has to go with the heap it
     // indexes into: a surviving entry would name a slot the next program's own
     // objects occupy, and `Integer.valueOf(1)` would answer someone else's list.
@@ -2893,6 +2900,9 @@ fn jdk_supers(class: &str) -> &'static [&'static str] {
         "java.io.BufferedInputStream" => &["BufferedInputStream"],
         "java.util.Scanner" => &["Scanner"],
         "java.util.StringTokenizer" => &["StringTokenizer"],
+        // `Class<T>` implements four `java.lang.reflect` interfaces javars does
+        // not model, and `Serializable`.
+        "java.lang.Class" => &["Class", "Serializable"],
         "java.io.PrintWriter" => &["PrintWriter"],
         "java.io.BufferedWriter" => &["BufferedWriter"],
         "java.io.OutputStreamWriter" => &["OutputStreamWriter"],
@@ -3391,28 +3401,97 @@ fn b_classof(vm: &mut VM, argc: u8) -> Value {
 }
 
 thread_local! {
-    /// The one `String` handle each class name resolves to; see [`JCLASS_LIT`].
+    /// The one `Class` object each class name resolves to; see [`JCLASS_LIT`].
     static CLASS_NAMES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
-/// The canonical handle for the class named `name`, so that two spellings of
-/// one class compare `==` as Java's `Class` objects do.
-fn intern_class(name: String) -> Value {
-    CLASS_NAMES.with(|t| {
-        t.borrow_mut()
-            .entry(name)
-            .or_insert_with_key(|k| Value::str(k.clone()))
-            .clone()
+/// The canonical `Class` object for the class named `name`, so that two
+/// spellings of one class compare `==` as Java's `Class` objects do.
+/// `interface` is read only when the object is first made: a class literal
+/// knows it, and `getClass()` always names a class.
+fn intern_class(name: String, interface: bool) -> Value {
+    if let Some(v) = CLASS_NAMES.with(|t| t.borrow().get(&name).cloned()) {
+        return v;
+    }
+    let id = heap_alloc(HostObj::Class {
+        name: name.clone(),
+        interface,
+    });
+    let v = Value::Obj(id);
+    CLASS_NAMES.with(|t| t.borrow_mut().insert(name, v.clone()));
+    v
+}
+
+/// The binary name and interface flag of a `Class` object, or `None` for any
+/// other value.
+fn class_of(v: &Value) -> Option<(String, bool)> {
+    let Value::Obj(id) = v else {
+        return None;
+    };
+    HEAP.with(|h| match h.borrow().get(*id as usize) {
+        Some(HostObj::Class { name, interface }) => Some((name.clone(), *interface)),
+        _ => None,
     })
 }
 
-/// [`JCLASS_LIT`] — resolve a class literal's name to its canonical handle.
-fn b_class_lit(vm: &mut VM, _argc: u8) -> Value {
-    let name = vm.stack.pop().unwrap_or(Value::Undef);
-    let name = name.as_str_cow().into_owned();
+/// `Class.toString()`: `class T$A`, `interface T$I`, and the bare name for a
+/// primitive.
+fn class_to_string(name: &str, interface: bool) -> String {
+    let primitive = matches!(
+        name,
+        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean" | "void"
+    );
+    match (primitive, interface) {
+        (true, _) => name.to_string(),
+        (false, true) => format!("interface {name}"),
+        (false, false) => format!("class {name}"),
+    }
+}
+
+/// The methods a `Class` object answers; `None` for any other receiver.
+fn class_method(recv: &Value, method: &str, args: &[Value]) -> Option<Result<Value, Fault>> {
+    let (s, interface) = class_of(recv)?;
+    let Value::Obj(id) = recv else {
+        return None;
+    };
+    Some(Ok(match (method, args.len()) {
+        ("getName" | "getTypeName", 0) => Value::str(s.clone()),
+        // `getSimpleName()` drops the package and enclosing-class qualifiers.
+        ("getSimpleName", 0) => Value::str(simple_class_name(&s).to_string()),
+        ("toString", 0) => Value::str(class_to_string(&s, interface)),
+        ("isInterface", 0) => Value::bool(interface),
+        // An anonymous class is `Encloser$N`, a binary name ending in a number;
+        // an array's binary name is its descriptor.
+        ("isAnonymousClass", 0) => Value::bool(
+            s.rsplit_once('$')
+                .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        ),
+        ("isArray", 0) => Value::bool(s.starts_with('[')),
+        // A record or enum class, by its supertype in the class graph.
+        ("isRecord", 0) => Value::bool(is_subclass_of(&simple_class_name(&s), "Record")),
+        ("isEnum", 0) => Value::bool(is_subclass_of(&simple_class_name(&s), "Enum")),
+        // `Class` overrides neither: identity, and the identity hash.
+        ("equals", 1) => Value::bool(matches!(args[0], Value::Obj(o) if o == *id)),
+        ("hashCode", 0) => Value::Int(i64::from(*id)),
+        _ => {
+            return Some(Err(Fault::internal(format!(
+                "javars: unsupported Class method `{method}` with {} argument(s)",
+                args.len()
+            ))))
+        }
+    }))
+}
+
+/// [`JCLASS_LIT`] — resolve a class literal's name to its canonical object.
+fn b_class_lit(vm: &mut VM, argc: u8) -> Value {
+    let args = pop_args(vm, argc);
+    let name = args
+        .first()
+        .map_or_else(String::new, |n| n.as_str_cow().into_owned());
+    let interface = args.get(1).is_some_and(|f| as_i64(f) != 0);
     // `int[].class` names an array type, which `getName()` spells as its
     // descriptor.
-    intern_class(array_descriptor(&name).unwrap_or(name))
+    intern_class(array_descriptor(&name).unwrap_or(name), interface)
 }
 
 /// [`JBINARY_CLASS`] — `x.getClass()`, as the binary name `getName()` reports.
@@ -3527,26 +3606,25 @@ fn b_binary_class(vm: &mut VM, argc: u8) -> Value {
     // An array names the type its creation recorded (`[I`,
     // `[Ljava.lang.String;`), else the compiler's static spelling of it.
     if matches!(value_class(v).as_deref(), Some("[]")) {
-        return Value::str(
-            array_type(v)
-                .or(static_type)
-                .as_deref()
-                .and_then(array_descriptor)
-                .unwrap_or_default(),
-        );
+        let descriptor = array_type(v)
+            .or(static_type)
+            .as_deref()
+            .and_then(array_descriptor)
+            .unwrap_or_default();
+        return intern_class(descriptor, false);
     }
     // A value whose class was recorded by name (an anonymous class javars
     // lowered to a closure) answers it.
     if let Value::Obj(id) = v {
         if let Some(c) = VIEW_CLASSES.with(|m| m.borrow().get(id).cloned()) {
-            return intern_class(c);
+            return intern_class(c, false);
         }
     }
     // A lambda keeps the dispatch sentinel: Java names one
     // `Class$$Lambda/0x…`, which is not reproducible (BUGS.md).
     match value_class(v) {
-        Some(class) if class == LAMBDA_CLASS => intern_class(class),
-        Some(class) => intern_class(binary_name(&class, v).unwrap_or(class)),
+        Some(class) if class == LAMBDA_CLASS => intern_class(class, false),
+        Some(class) => intern_class(binary_name(&class, v).unwrap_or(class), false),
         None => Value::str(""),
     }
 }
@@ -7017,19 +7095,10 @@ fn iter_token_of(v: &Value) -> i64 {
 /// [`JCLASS_STR`].
 fn b_class_str(vm: &mut VM, argc: u8) -> Value {
     let args = pop_args(vm, argc);
-    let Some(name) = args.first().filter(|v| !matches!(v, Value::Undef)) else {
-        return Value::str("null");
-    };
-    let name = name.as_str_cow().into_owned();
-    let primitive = matches!(
-        name.as_str(),
-        "int" | "long" | "short" | "byte" | "char" | "float" | "double" | "boolean" | "void"
-    );
-    let interface = args.get(1).is_some_and(|f| as_i64(f) != 0);
-    Value::str(match (primitive, interface) {
-        (true, _) => name,
-        (false, true) => format!("interface {name}"),
-        (false, false) => format!("class {name}"),
+    let v = args.first().unwrap_or(&Value::Undef);
+    Value::str(match class_of(v) {
+        Some((name, interface)) => class_to_string(&name, interface),
+        None => java_str(v),
     })
 }
 
@@ -7648,6 +7717,7 @@ fn value_class(v: &Value) -> Option<String> {
                     HostObj::RegexPattern { .. } => "java.util.regex.Pattern".to_string(),
                     HostObj::RegexMatcher(_) => "java.util.regex.Matcher".to_string(),
                     HostObj::Instance { class, .. } => class.clone(),
+                    HostObj::Class { .. } => "java.lang.Class".to_string(),
                     // The whole point of the box: `Integer` and `Long` are
                     // different classes for a value one `Value::Int` holds.
                     HostObj::Boxed => box_class(v)?.to_string(),
@@ -12467,6 +12537,12 @@ fn b_str_dispatch(vm: &mut VM, argc: u8) -> Value {
     // already rejected every other name, so it is invoked directly — except
     // the public methods of `Object`, which JLS 9.8 excludes from being that
     // method, so `r.toString()` is the lambda's rendering, not a call of `r`.
+    if let Some(r) = class_method(&recv, &method, &args) {
+        return match r {
+            Ok(v) => v,
+            Err(f) => raise(vm, f),
+        };
+    }
     // A lambda overrides none of the three, so each is `Object`'s: identity
     // equality, the identity hash, and the rendering `println` gives it.
     if let (Some(_), Value::Obj(id)) = (closure_meta(&recv), &recv) {
@@ -13280,23 +13356,6 @@ fn string_method(s: &str, method: &str, args: &[Value]) -> Result<Value, Fault> 
             )),
             other => Ok(Value::bool(s == java_str(other))),
         },
-        // `x.getClass()` evaluates to the runtime class's *binary name*
-        // ([`JBINARY_CLASS`]), so `Class`'s own two accessors land here:
-        // `getName()` is that string and `getSimpleName()` drops the package
-        // and enclosing-class qualifiers off it.
-        ("getSimpleName", 0) => Ok(Value::str(simple_class_name(s).to_string())),
-        ("getName", 0) => Ok(Value::str(s.to_string())),
-        // An anonymous class is `Encloser$N`, a binary name ending in a number;
-        // an array's binary name is its descriptor.
-        ("isAnonymousClass", 0) => {
-            Ok(Value::bool(s.rsplit_once('$').is_some_and(|(_, n)| {
-                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
-            })))
-        }
-        ("isArray", 0) => Ok(Value::bool(s.starts_with('['))),
-        // A record or enum class, by its supertype in the class graph.
-        ("isRecord", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Record"))),
-        ("isEnum", 0) => Ok(Value::bool(is_subclass_of(&simple_class_name(s), "Enum"))),
         // A `char[]` of UTF-16 units, matching `charAt` — so `a[i] - 'a'` is
         // arithmetic. `Arrays.toString`/`String.valueOf` of one are routed
         // through [`JCHR_STR`] by the compiler, which knows the element type.
@@ -21445,6 +21504,7 @@ fn obj_default_str(id: u32) -> String {
                 _ => format!("{}@{id:x}", qualified_or_binary(class)),
             },
             Some(HostObj::Array(_)) => format!("{array_name}@{id:x}"),
+            Some(HostObj::Class { name, interface }) => class_to_string(name, *interface),
             // `StringBuilder.toString()` IS its contents, so every rendering
             // surface — `println(sb)`, `"" + sb`, `%s`, a list element — shows
             // the text rather than a handle.

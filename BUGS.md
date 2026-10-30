@@ -1405,25 +1405,12 @@ storage-model differences:
   `generate`. What remains is a lambda passed where the receiver's type is not
   recognisable — an `Optional` held in a `var` initialized by an unmodeled call,
   say — which keeps the code point.
-- **A `Class` value prints as its bare name once its static type is lost.**
-  A class is its binary name here (see "Class literals" below), and
-  `System.out.println` prepends Java's `class ` only when the argument is
-  statically a class literal or a `getClass()` call. Stored in an `Object` or a
-  `var`, or turned into a string, it prints the name alone. Measured at javars
-  0.1.13 against `openjdk 21.0.12.1`:
-
-  ```java
-  Object o = String.class;
-  System.out.println(o);                          // Java: class java.lang.String   javars: java.lang.String
-  System.out.println("" + o);                     // Java: class java.lang.String   javars: java.lang.String
-  System.out.println(String.valueOf(Integer.class)); // Java: class java.lang.Integer javars: java.lang.Integer
-  var v = Integer.class;
-  System.out.println(v);                          // Java: class java.lang.Integer  javars: java.lang.Integer
-  Object g = "x".getClass();
-  System.out.println(g);                          // Java: class java.lang.String   javars: java.lang.String
-  System.out.println(String.class);               // both: class java.lang.String
-  ```
-
+- ~~**A `Class` value prints as its bare name once its static type is lost.**~~
+  — fixed: a class is a `Class` object now (see "Class literals" below), so
+  `Object o = String.class; System.out.println(o)`, `"" + o`,
+  `String.valueOf(Integer.class)` and a `getClass()` result held in a `var`
+  all print `class java.lang.String` (or `interface java.util.List`), as on
+  `openjdk 21.0.13`.
 - **A generic call's inferred bounds are checked where javars can decide
   them.** A return variable bound by an argument, a lambda or a method
   reference that conflicts with its target is refused as `javac` refuses it
@@ -1765,18 +1752,22 @@ would reject the sibling-block form that Java accepts, which is the worse error.
   `null` one — because the host's natural order knows numbers and strings
   and answered "equal" for everything else, so a `List` of a user `Comparable`
   came back in insertion order.
-- ~~**Class literals** (`C.class`, `int.class`)~~ — implemented. A class is its
-  binary name here, which is what `x.getClass()` already evaluates to, so the
-  literal resolves to the same string at COMPILE time: the type is named in the
-  source, and nothing has to be evaluated to read it off. A declared class
+- ~~**Class literals** (`C.class`, `int.class`)~~ — implemented. A class is a
+  `java.lang.Class` object holding its binary name, one per name, so a literal
+  and `x.getClass()` on an instance of it are the same object (`==` holds), its
+  `equals`/`hashCode` are identity, it is distinct from the `String` of its name
+  (`String.class.equals("java.lang.String")` is `false`), and it renders as
+  `Class.toString()` does (`class T$A`, `interface T$I`, `int`). It answers
+  `getName`, `getTypeName`, `getSimpleName`, `isInterface`, `isArray`,
+  `isRecord`, `isEnum` and `isAnonymousClass`. A declared class
   answers from the nesting-aware name the compiler already keeps, so `A.class`
   inside `T` is `T$A`; a JDK name is qualified through the same `jdk_name` the
   runtime path uses, so a literal and `getClass().getName()` on one type cannot
   disagree; and a primitive is its own keyword (`int.class.getName()` is `int`).
   `synchronized (C.class)` follows from it. What is still missing is everything
   a real `Class` object does BEYOND its name — no `isInstance`, `getSuperclass`,
-  `getDeclaredMethods` or reflection of any kind, because there is no object to
-  carry them.
+  `getDeclaredMethods` or reflection of any kind (`` unsupported Class method
+  `isInstance` with 1 argument(s) ``).
 - **Most of the standard library.** The `Math`/`Integer`/`Long`/`Double`/
   `Boolean`/`Character`/`String`/`Arrays`/`Collections` statics listed above,
   the `Objects` members, the `String` instance methods, and the `java.util`

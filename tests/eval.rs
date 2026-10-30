@@ -6851,3 +6851,51 @@ public class Main {
     assert!(ok);
     assert_eq!(out, "2 true false\ntrue\n9\ntrue true 1\n");
 }
+
+#[test]
+fn a_class_is_a_class_object_not_its_name() {
+    // Expected bytes from OpenJDK 21.0.13: a `Class` renders as
+    // `Class.toString()` whatever its static type, is identity-equal to every
+    // other spelling of the same class, and is not the `String` of its name.
+    let (out, ok) = run(r#"import java.util.*;
+public class Main {
+    interface I {}
+    record R(int a) {}
+    public static void main(String[] args) {
+        Object o = String.class;
+        System.out.println(o);
+        System.out.println("" + o + "|" + String.valueOf(Integer.class));
+        var v = List.class;
+        System.out.println(v);
+        Object g = "x".getClass();
+        System.out.println(g + " " + (g == String.class));
+        Object i = I.class;
+        System.out.println(i + " " + I.class.getName() + " " + I.class.getSimpleName());
+        System.out.println(int.class + " " + new int[0].getClass() + " " + int[].class.getName());
+        System.out.println(String.class.equals("java.lang.String") + " " + (o instanceof Class));
+        String n = String.class.getName();
+        System.out.println(n + " " + n.equals("java.lang.String"));
+        System.out.println(new R(1).getClass() == R.class);
+        System.out.println(List.of(String.class, I.class, int.class));
+        Map<Class<?>, Integer> m = new HashMap<>();
+        m.put(String.class, 1);
+        System.out.println(m.get("y".getClass()) + " " + o.getClass().getName());
+    }
+}
+"#);
+    assert!(ok);
+    assert_eq!(
+        out,
+        "class java.lang.String\n\
+         class java.lang.String|class java.lang.Integer\n\
+         interface java.util.List\n\
+         class java.lang.String true\n\
+         interface Main$I Main$I I\n\
+         int class [I [I\n\
+         false true\n\
+         java.lang.String true\n\
+         true\n\
+         [class java.lang.String, interface Main$I, int]\n\
+         1 java.lang.Class\n"
+    );
+}
