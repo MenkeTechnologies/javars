@@ -6794,3 +6794,26 @@ fn a_lambda_answers_object_methods_itself() {
     assert!(ok);
     assert_eq!(out, "false\ntrue\ntrue\nfalse\ntrue false\ntrue\n");
 }
+
+#[test]
+fn format_does_not_spread_a_lone_primitive_array() {
+    // An `int[]` is one `Object` argument, not an `Object[]`: OpenJDK 21
+    // throws on the second `%s`, and `%d` of the array names its class.
+    let (out, ok) = run(&format!(
+        "import java.util.*; {}",
+        wrap(
+            r#"int[] p = {1, 2};
+               try { String.format("%s %s", p); }
+               catch (MissingFormatArgumentException e) { System.out.println(e.getMessage()); }
+               try { String.format("%d", p); }
+               catch (IllegalFormatConversionException e) { System.out.println(e.getMessage()); }
+               System.out.println(String.format("%s", p).startsWith("[I@"));
+               String[] ss = {"a", "b"};
+               System.out.println(String.format("%s-%s", (Object[]) ss));
+               int[][] g = {{1}, {2}};
+               System.out.println(String.format("%s|%s", (Object[]) g).contains("|"));"#
+        )
+    ));
+    assert!(ok);
+    assert_eq!(out, "Format specifier '%s'\nd != [I\ntrue\na-b\ntrue\n");
+}

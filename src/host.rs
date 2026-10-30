@@ -19559,11 +19559,19 @@ fn java_format(
     mut vm: Option<&mut VM>,
 ) -> Result<Value, Fault> {
     // `format(String, Object...)` receives a lone array argument as the argument
-    // list itself (`String.format("%s %s", new Object[]{"a", "b"})`). Element
-    // types are erased here, so a lone primitive array spreads as well; Java would
-    // print its identity hash instead, which no program can depend on.
+    // list itself (`String.format("%s %s", new Object[]{"a", "b"})`). A lone
+    // *primitive* array is not an `Object[]`, so Java passes it as the one
+    // argument it is (`int[] p = {1, 2}; format("%s %s", p)` is
+    // `MissingFormatArgumentException`); the type its creation recorded tells
+    // the two apart. An array with no recorded type still spreads.
+    let primitive_array = |v: &Value| {
+        array_type(v)
+            .as_deref()
+            .and_then(|t| t.strip_suffix("[]"))
+            .is_some_and(|elem| !is_reference_type_name(elem))
+    };
     let spread = match args {
-        [only] => array_items(only),
+        [only] if !primitive_array(only) => array_items(only),
         _ => None,
     };
     let args = spread.as_deref().unwrap_or(args);
@@ -19819,6 +19827,20 @@ fn check_conversion(conv: char, arg: &Value, tag: &str) -> Result<(), Fault> {
             _ => true,
         }
     };
+    // An array is never a box, so every conversion that reads a number or a
+    // character refuses it, naming the array's class: `%d` of an `int[]` is
+    // `d != [I`.
+    if matches!(
+        conv,
+        'd' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E' | 'g' | 'G' | 'a' | 'A' | 'c' | 'C'
+    ) {
+        if let Some(cls) = array_type(arg).as_deref().and_then(array_descriptor) {
+            return Err(Fault::java(
+                "IllegalFormatConversionException",
+                format!("{conv} != {cls}"),
+            ));
+        }
+    }
     let Some(cls) = boxed_class(tag, arg) else {
         return Ok(());
     };

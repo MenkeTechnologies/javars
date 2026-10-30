@@ -547,7 +547,12 @@ at the bottom, and are summarized in the section right after this one.
   formatting the `int`; a `null` argument prints as `null` under every
   conversion but `%b`. The value model cannot tell an `Integer` from a `Long`
   from a `char`, so the compiler sends each argument's static Java type along
-  with the values. The other four ways a specifier can be wrong raise Java's own
+  with the values. An array argument is refused by every numeric and
+  character conversion with its class (`%d` of an `int[]` is `d != [I`). A
+  lone array argument is the argument list itself only when it is a
+  *reference* array (`String.format("%s %s", strArray)`); a lone primitive
+  array is one argument, as in Java, so `String.format("%s %s", new int[]{1,
+  2})` is `MissingFormatArgumentException` rather than `1 2`. The other four ways a specifier can be wrong raise Java's own
   classes too, all of them `java.util.IllegalFormatException` subclasses and so
   catchable as `IllegalArgumentException`: too few arguments is
   `MissingFormatArgumentException: Format specifier '%,10.2f'` (the specifier
